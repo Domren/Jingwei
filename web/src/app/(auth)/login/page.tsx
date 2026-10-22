@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 
 import { AlertTriangle, ShieldCheck } from "lucide-react";
 
+import { JingweiFooter } from "@/components/jingwei-footer";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogClose, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -68,7 +69,7 @@ export default function LoginPage() {
     setLoading(true);
     setError("");
     try {
-      const { token } = await api.login("ARTEX", password);
+      const { token } = await api.login("Jingwei", password);
       auth.setToken(token);
       window.location.replace("/function/tasks");
     } catch {
@@ -87,7 +88,7 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="flex h-dvh">
+    <div className="flex min-h-dvh">
       {/* Left panel */}
       <div className="hidden flex-col items-center justify-center bg-primary p-12 text-center lg:flex lg:w-1/3">
         <div className="relative flex items-center justify-center">
@@ -95,58 +96,61 @@ export default function LoginPage() {
           <div className="absolute size-60 rounded-full border border-primary-foreground/15" />
           <div className="absolute size-40 rounded-full border border-primary-foreground/20" />
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/logo.png" alt="ARTEX" width={160} height={160} className="relative brightness-0 invert" />
+          <img src="/logo.svg" alt="Jingwei" width={160} height={160} className="relative" />
         </div>
       </div>
 
       {/* Right panel */}
-      <div className="flex w-full items-center justify-center bg-background p-8 lg:w-2/3">
-        <div className="w-full max-w-md space-y-10 py-24 lg:py-32">
-          <div className="space-y-4 text-center">
-            <h2 className="text-2xl font-medium tracking-tight">登录</h2>
-            <p className="mx-auto max-w-xl text-muted-foreground">欢迎回来，请输入密码以继续使用 ARTEX</p>
+      <div className="flex w-full flex-col bg-background lg:w-2/3">
+        <div className="flex flex-1 items-center justify-center p-8">
+          <div className="w-full max-w-md space-y-10 py-16 lg:py-24">
+            <div className="space-y-4 text-center">
+              <h2 className="text-2xl font-medium tracking-tight">登录</h2>
+              <p className="mx-auto max-w-xl text-muted-foreground">欢迎回来，请输入密码以继续使用 Jingwei（精卫）</p>
+            </div>
+            <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="username">用户名</Label>
+                <Input id="username" value="Jingwei" readOnly className="bg-muted text-muted-foreground" />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="password">密码</Label>
+                <Input
+                  id="password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="请输入密码"
+                  autoFocus
+                  autoComplete="current-password"
+                />
+              </div>
+              <div className="flex items-start gap-2">
+                <Checkbox
+                  id="agree-terms"
+                  checked={agreed}
+                  onCheckedChange={(v) => setAgreed(v === true)}
+                  className="mt-0.5"
+                />
+                <Label htmlFor="agree-terms" className="text-sm font-normal leading-relaxed text-muted-foreground">
+                  我已阅读并同意
+                  <button
+                    type="button"
+                    onClick={() => setTermsOpen(true)}
+                    className="mx-0.5 font-medium text-primary underline-offset-4 hover:underline"
+                  >
+                    《使用须知》
+                  </button>
+                </Label>
+              </div>
+              {error && <p className="text-sm text-destructive">{error}</p>}
+              <Button type="submit" className="w-full" disabled={loading || !password || !agreed}>
+                {loading ? "登录中..." : "登录"}
+              </Button>
+            </form>
           </div>
-          <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-            <div className="space-y-1.5">
-              <Label htmlFor="username">用户名</Label>
-              <Input id="username" value="ARTEX" readOnly className="bg-muted text-muted-foreground" />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="password">密码</Label>
-              <Input
-                id="password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="请输入密码"
-                autoFocus
-                autoComplete="current-password"
-              />
-            </div>
-            <div className="flex items-start gap-2">
-              <Checkbox
-                id="agree-terms"
-                checked={agreed}
-                onCheckedChange={(v) => setAgreed(v === true)}
-                className="mt-0.5"
-              />
-              <Label htmlFor="agree-terms" className="text-sm font-normal leading-relaxed text-muted-foreground">
-                我已阅读并同意
-                <button
-                  type="button"
-                  onClick={() => setTermsOpen(true)}
-                  className="mx-0.5 font-medium text-primary underline-offset-4 hover:underline"
-                >
-                  《使用须知》
-                </button>
-              </Label>
-            </div>
-            {error && <p className="text-sm text-destructive">{error}</p>}
-            <Button type="submit" className="w-full" disabled={loading || !password || !agreed}>
-              {loading ? "登录中..." : "登录"}
-            </Button>
-          </form>
         </div>
+        <JingweiFooter className="shrink-0 px-8 pb-6" />
       </div>
 
       <Dialog open={termsOpen} onOpenChange={setTermsOpen}>
@@ -156,7 +160,7 @@ export default function LoginPage() {
               <ShieldCheck className="size-5" />
             </div>
             <div className="space-y-0.5">
-              <DialogTitle className="text-base">ARTEX 使用须知与免责声明</DialogTitle>
+              <DialogTitle className="text-base">Jingwei（精卫）使用须知与免责声明</DialogTitle>
               <p className="text-xs text-muted-foreground">
                 版本 v1.0 · 生效日期 2026-09-18 · 请在登录前完整阅读以下全部条款
               </p>
@@ -169,7 +173,7 @@ export default function LoginPage() {
             className="max-h-[60vh] space-y-5 overflow-y-auto px-6 py-5 text-sm leading-relaxed text-muted-foreground"
           >
             <p className="rounded-lg border bg-muted/40 p-3 text-foreground/80">
-              本《使用须知与免责声明》（以下简称"本声明"）是您与 ARTEX
+              本《使用须知与免责声明》（以下简称"本声明"）是您与 Jingwei（精卫）
               项目作者及贡献者之间就使用本软件所达成的约定。请您在使用前审慎阅读、充分理解各条款内容，特别是以粗体或色块标注的免责、责任限制及禁止性条款。
               <span className="font-medium text-foreground">
                 {" "}
@@ -185,9 +189,9 @@ export default function LoginPage() {
                 第一条 · 定义与开源许可
               </h4>
               <p className="pl-7">
-                本软件（ARTEX）是一款基于 GNU Affero General Public License
-                v3.0（AGPL-3.0）发布的开源程序。您可依据该协议自由使用、复制、修改和分发本软件；但任何衍生作品（包括通过网络向第三方提供的在线服务）均须同样以
-                AGPL-3.0 协议开源并向使用者公开对应的完整源代码。AGPL-3.0 完整条款以随附的 LICENSE 文件为准。
+                本软件（Jingwei 精卫）基于 GNU Affero General Public License
+                v3.0（AGPL-3.0）发布，并基于 ARTEX 项目二次开发。您可依据该协议自由使用、复制、修改和分发本软件；但任何衍生作品（包括通过网络向第三方提供的在线服务）均须同样以
+                AGPL-3.0 协议开源并向使用者公开对应的完整源代码。AGPL-3.0 完整条款以随附的 LICENSE 文件为准，原项目版权与署名信息不得移除。
               </p>
             </section>
 

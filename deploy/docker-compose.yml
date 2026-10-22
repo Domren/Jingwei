@@ -1,0 +1,47 @@
+name: jingwei
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-jingwei}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-jingwei}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-jingwei} -d ${POSTGRES_DB:-jingwei}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  jingwei:
+    image: ${JINGWEI_IMAGE:-ghcr.io/domren/jingwei:1.0.0}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ARTEX_PG_DSN: ${ARTEX_PG_DSN:-postgres://${POSTGRES_USER:-jingwei}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-jingwei}?sslmode=disable}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ARTEX_LLM_PROVIDER: ${ARTEX_LLM_PROVIDER:-}
+      ARTEX_LLM_MODEL: ${ARTEX_LLM_MODEL:-}
+      ARTEX_LLM_BASE_URL: ${ARTEX_LLM_BASE_URL:-}
+      ARTEX_LLM_PROXY: ${ARTEX_LLM_PROXY:-}
+    ports:
+      - "${JINGWEI_WEB_PORT:-9790}:8787"
+      - "127.0.0.1:${JINGWEI_PROXY_PORT:-9791}:8788"
+    volumes:
+      - jingwei_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  jingwei_data:

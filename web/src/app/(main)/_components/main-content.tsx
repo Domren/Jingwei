@@ -4,6 +4,7 @@ import { type ReactNode, useEffect, useState } from "react";
 
 import { usePathname } from "next/navigation";
 
+import { JingweiFooter } from "@/components/jingwei-footer";
 import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { useCurrentUser } from "@/hooks/use-current-user";
@@ -78,6 +79,9 @@ export function MainContent({ children }: { children: ReactNode }) {
       <div className="min-h-0 min-w-0 flex-1 overflow-x-hidden p-4 has-data-[content-padding=false]:p-0 md:p-6 md:has-data-[content-padding=false]:p-0">
         {children}
       </div>
+      <footer className="shrink-0 border-t px-4 py-3 lg:px-6">
+        <JingweiFooter />
+      </footer>
     </>
   );
 }

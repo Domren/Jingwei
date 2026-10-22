@@ -1571,3 +1571,38 @@ CREATE INDEX IF NOT EXISTS idx_task_intelligence_assets ON task_intelligence USI
 
 -- Optional derived credential presentation; raw intelligence remains authoritative.
 ALTER TABLE task_intelligence ADD COLUMN IF NOT EXISTS credential_analysis JSONB;
+
+-- =====================================================================
+-- Jingwei additions: POC template library (nuclei YAML)
+-- 模板原始 YAML 存 content；检索字段与 YAML 解析结果同步维护。
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS poc_templates (
+    id           BIGSERIAL PRIMARY KEY,
+    template_id  TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    severity     TEXT NOT NULL DEFAULT 'info',
+    protocol     TEXT NOT NULL DEFAULT '',
+    cve_id       TEXT NOT NULL DEFAULT '',
+    cwe_id       TEXT NOT NULL DEFAULT '',
+    cvss_score   DOUBLE PRECISION,
+    tags         JSONB NOT NULL DEFAULT '[]',
+    author       TEXT NOT NULL DEFAULT '',
+    description  TEXT NOT NULL DEFAULT '',
+    refs         JSONB NOT NULL DEFAULT '[]',
+    source       TEXT NOT NULL DEFAULT 'manual',
+    source_url   TEXT NOT NULL DEFAULT '',
+    content      TEXT NOT NULL,
+    digest       TEXT NOT NULL DEFAULT '',
+    enabled      BOOLEAN NOT NULL DEFAULT true,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (template_id)
+);
+CREATE INDEX IF NOT EXISTS idx_poc_templates_severity ON poc_templates(severity);
+CREATE INDEX IF NOT EXISTS idx_poc_templates_source ON poc_templates(source);
+CREATE INDEX IF NOT EXISTS idx_poc_templates_enabled ON poc_templates(enabled);
+CREATE INDEX IF NOT EXISTS idx_poc_templates_name ON poc_templates(lower(name));
+CREATE INDEX IF NOT EXISTS idx_poc_templates_tags ON poc_templates USING gin(tags);
+DROP TRIGGER IF EXISTS trg_poc_templates_upd ON poc_templates;
+CREATE TRIGGER trg_poc_templates_upd BEFORE UPDATE ON poc_templates
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();

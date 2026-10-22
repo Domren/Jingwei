@@ -2,7 +2,29 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased]
+## [1.0.0] - 2026-10-22
+
+### 品牌与界面
+
+- 品牌化为「精卫 Jingwei」：控制台、登录/初始化页、侧栏、报告、通知、后端 Banner 与健康检查服务名。
+- 登录页、初始化页与主界面底部恢复老版页脚文案，并补充 ARTEX / AGPL-3.0 署名。
+- 新增《使用须知》完整条款、首次启动密码初始化与管理员密码修改流程。
+
+### POC 模板库
+
+- 新增 POC 模板库：nuclei YAML 的搜索筛选、统计、详情、上传、启停、删除与批量执行。
+- 内置 nuclei 3.11.1；执行支持最多 50 个目标、200 个模板，超时 10–600 秒，关闭 interactsh 与自动更新。
+- 新增旧版 POC 数据迁移工具 `cmd/pocimport`，本次已导入 13,058 条模板（22 条非模板配置跳过）。
+- 修复 YAML 转义 NUL 导致 PostgreSQL 写入失败；补齐 `tcp`/`udp`/`workflows` 协议识别。
+
+### Docker 与发布
+
+- 版本号统一为 `1.0.0`；前端包版本与 Release 镜像版本一致。
+- 新增 `deploy/docker-compose.yml` 与 `deploy/.env.example`，支持独立卷、健康检查与端口覆盖。
+- 发布方式改为 Docker-only：GitHub Actions 构建 AMD64 / ARM64 镜像，原生 runner 冒烟测试后推送 GHCR。
+- 新增 Release 自动化：创建带 `docker-compose.yml`、`DEPLOY.md` 与镜像 digest 的 GitHub Release。
+- 在线更新源切换为 `Domren/Jingwei`；Docker 部署通过拉取新镜像升级。
+- 移除上游 Vercel Demo 工作流与二进制发布流程，新增 [DEPLOY.md](DEPLOY.md) 部署指南。
 
 ## [0.3.18] - 2026-10-12
 

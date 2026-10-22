@@ -1,6 +1,6 @@
 {
-  "name": "artex-web",
-  "version": "2.2.0",
+  "name": "jingwei-web",
+  "version": "1.0.0",
   "private": true,
   "scripts": {
     "dev": "next dev",

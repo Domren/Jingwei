@@ -448,7 +448,7 @@ func notifyTestMessage(baseURL string) notify.Message {
 			Name:      "测试消息 · 渠道配置正常",
 			VulnClass: "连通性测试",
 			Severity:  "low",
-			Summary:   "这是 ARTEX 推送渠道的测试消息，收到即表示该渠道配置可用。",
+			Summary:   "这是 Jingwei（精卫）推送渠道的测试消息，收到即表示该渠道配置可用。",
 			Assets:    []string{"artex.example.com"},
 			DetailURL: baseURL,
 		}},

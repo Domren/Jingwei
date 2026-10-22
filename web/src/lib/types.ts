@@ -1,4 +1,4 @@
-// ARTEX domain model — types used across the UI.
+// Jingwei domain model — types used across the UI.
 // Derived from the functional spec (section 7: 关键数据形状).
 
 export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout";
@@ -1433,6 +1433,61 @@ export interface ConvTokenSummary {
   output_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+}
+
+// ---- POC template library (Jingwei) ----
+export interface POCTemplate {
+  id: number;
+  template_id: string;
+  name: string;
+  severity: string;
+  protocol: string;
+  cve_id: string;
+  cwe_id: string;
+  cvss_score: number | null;
+  tags: string[];
+  author: string;
+  description: string;
+  references: string[];
+  source: string;
+  source_url: string;
+  digest: string;
+  enabled: boolean;
+  size_bytes: number;
+  content?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface POCStats {
+  total: number;
+  enabled: number;
+  by_severity: Record<string, number>;
+  sources: string[];
+}
+
+export interface POCRunResult {
+  template_id: string;
+  name: string;
+  severity: string;
+  host: string;
+  matched_at: string;
+  type: string;
+  timestamp: string;
+  curl_command?: string;
+}
+
+export interface POCRunResponse {
+  ok: boolean;
+  results: POCRunResult[];
+  result_count: number;
+  stdout: string;
+  stderr: string;
+  error?: string;
+  elapsed_ms: number;
+  timed_out: boolean;
+  template_count: number;
+  target_count: number;
 }
 
 // ---- Command recording (Bash execution history) ----

@@ -75,6 +75,9 @@ import type {
   NotificationDelivery,
   NotificationFilter,
   NotificationMeta,
+  POCRunResponse,
+  POCStats,
+  POCTemplate,
   PromptVar,
   PromptVersion,
   SessionTokenUsage,
@@ -174,7 +177,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
 // Token is appended as ?token= because SSE can't carry cookies cross-origin.
 // mockReport returns a canned Markdown report for the demo.
 function mockReport(_task?: string): string {
-  return `# ARTEX 渗透测试报告 — Acme Corp
+  return `# Jingwei（精卫）渗透测试报告 — Acme Corp
 
 ## 概览
 - 范围：acme.com（含 www / admin / api / shop / vpn 子域）
@@ -1404,6 +1407,36 @@ export const api = {
     if (params?.q) sp.set("q", params.q);
     return get<{ stats: ToolStat[] }>(`/commands/stats?${sp}`);
   },
+
+  // ---- POC template library (Jingwei) ----
+  pocs: (params?: {
+    q?: string;
+    severity?: string;
+    source?: string;
+    protocol?: string;
+    enabled?: string;
+    page?: number;
+    size?: number;
+  }) => {
+    const sp = new URLSearchParams();
+    if (params?.q) sp.set("q", params.q);
+    if (params?.severity) sp.set("severity", params.severity);
+    if (params?.source) sp.set("source", params.source);
+    if (params?.protocol) sp.set("protocol", params.protocol);
+    if (params?.enabled) sp.set("enabled", params.enabled);
+    sp.set("page", String(params?.page ?? 0));
+    sp.set("size", String(params?.size ?? 50));
+    return get<{ pocs: POCTemplate[]; total: number }>(`/pocs?${sp}`);
+  },
+  poc: (id: number) => get<POCTemplate>(`/pocs/${id}`),
+  pocStats: () => get<POCStats>("/pocs/stats"),
+  createPoc: (input: { content: string; source?: string; source_url?: string }) =>
+    post<POCTemplate>("/pocs", input),
+  updatePoc: (id: number, input: { name?: string; severity?: string; description?: string; enabled?: boolean }) =>
+    patch<POCTemplate>(`/pocs/${id}`, input),
+  deletePoc: (id: number) => del<{ deleted: number }>(`/pocs/${id}`),
+  runPocs: (input: { ids: number[]; targets: string[]; timeout_seconds?: number }) =>
+    post<POCRunResponse>("/pocs/run", input),
 
   // ---- LLM records ----
   llmRecords: (params?: { model?: string; session?: string; task?: string; page?: number; size?: number }) => {

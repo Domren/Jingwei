@@ -1,9 +1,10 @@
 name: release
+
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "已存在的正式版本标签，例如 v0.3.15"
+        description: "已存在的版本标签，例如 v1.0.0"
         required: true
         type: string
   push:
@@ -16,28 +17,28 @@ concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
+env:
+  IMAGE_NAME: ghcr.io/domren/jingwei
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
       commit: ${{ steps.commit.outputs.sha }}
     steps:
-      - name: Validate release version
+      - name: Validate release tag
         id: version
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-          ARTEX_DOCKER_IMAGE: ${{ vars.ARTEX_DOCKER_IMAGE }}
         run: |
           if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "正式版本必须是 v主版本.次版本.修订号，例如 v0.3.15" >&2
-            exit 1
-          fi
-          if [[ ! "$ARTEX_DOCKER_IMAGE" =~ ^[a-z0-9][a-z0-9_-]*/[a-z0-9]+([._-][a-z0-9]+)*$ ]]; then
-            echo "请先配置 Actions 变量 ARTEX_DOCKER_IMAGE，格式为 Docker Hub 用户名/镜像名" >&2
+            echo "正式版本必须是 v主版本.次版本.修订号，例如 v1.0.0" >&2
             exit 1
           fi
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           ref: refs/tags/${{ steps.version.outputs.tag }}
@@ -45,7 +46,6 @@ jobs:
         id: commit
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-  # ① 前端静态导出（一次），产物给交叉编译各平台复用
   frontend:
     needs: prepare
     runs-on: ubuntu-latest
@@ -66,19 +66,15 @@ jobs:
         with:
           name: web-dist
           path: web/out
+          retention-days: 3
 
-  # ② 五平台交叉编译（内嵌前端）+ 打 zip
   binaries:
     needs: [prepare, frontend]
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          - { goos: linux, goarch: amd64 }
-          - { goos: linux, goarch: arm64 }
-          - { goos: darwin, goarch: amd64 }
-          - { goos: darwin, goarch: arm64 }
-          - { goos: windows, goarch: amd64 }
+        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -91,108 +87,22 @@ jobs:
         with:
           name: web-dist
           path: server/webui/dist
-      - name: Build and package with build.sh
+      - name: Build embedded binary (linux/${{ matrix.arch }})
         env:
-          ARTEX_TARGET_OS: ${{ matrix.goos }}
-          ARTEX_TARGET_ARCH: ${{ matrix.goarch }}
-          ARTEX_BUILD_VERSION: ${{ needs.prepare.outputs.tag }}
-          ARTEX_SKIP_FRONTEND: "1"
-          ARTEX_SKIP_NPM_CI: "1"
-          # UPX 自解压 ELF 在部分 Linux 内核、虚拟化和安全策略下会崩溃。
-          # Release 使用 Go linker 裁剪和 zip 压缩，优先保证可移植性。
-          ARTEX_COMPRESS: "0"
-          ARTEX_PACKAGE: "1"
-          ARTEX_PACKAGE_DIR: dist
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GOARCH: ${{ matrix.arch }}
         run: |
-          ./build.sh --target "${ARTEX_TARGET_OS}/${ARTEX_TARGET_ARCH}"
-      - name: Smoke test Linux amd64 binary
-        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
-        run: dist/artex-linux-amd64/artex -h
+          mkdir -p "dist/$GOARCH"
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -tags embedui -trimpath \
+            -ldflags "-s -w -X main.version=$VERSION" \
+            -o "dist/$GOARCH/artex" ./cmd/artex
+          file "dist/$GOARCH/artex"
       - uses: actions/upload-artifact@v4
         with:
-          name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: "dist/*.zip"
-      # Linux 生二进制单独上传，供 docker job 复用（免在镜像里重编前端+Go）
-      - if: matrix.goos == 'linux'
-        uses: actions/upload-artifact@v4
-        with:
-          name: bin-linux-${{ matrix.goarch }}
-          path: dist/artex-linux-${{ matrix.goarch }}/artex
+          name: bin-linux-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}/artex
+          retention-days: 3
 
-  # ③ 汇总所有 zip → 创建 GitHub Release
-  release:
-    needs: [prepare, binaries, docker-publish]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: pkg-*
-          merge-multiple: true
-          path: dist
-      - name: Generate checksums
-        working-directory: dist
-        run: |
-          version="${RELEASE_TAG#v}"
-          for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64; do
-            test -s "artex-${version}-${target}.zip"
-          done
-          sha256sum *.zip > SHA256SUMS
-          sha256sum --check SHA256SUMS
-      - name: Replace release only when the tag moved to a new commit
-        env:
-          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
-        run: |
-          if gh release view "$RELEASE_TAG" --json isDraft,targetCommitish > /tmp/artex-release.json 2>/tmp/artex-release.err; then
-            draft=$(jq -r .isDraft /tmp/artex-release.json)
-            target=$(jq -r '.targetCommitish // empty' /tmp/artex-release.json)
-            if [[ "$draft" != "true" ]]; then
-              if [[ "$target" == "$RELEASE_COMMIT" ]]; then
-                echo "该版本已发布且已指向当前提交，拒绝重复发布" >&2
-                exit 1
-              fi
-              echo "标签已移动到新提交，删除旧 Release 后重新创建 $RELEASE_TAG"
-              gh release delete "$RELEASE_TAG" --yes
-            fi
-          elif ! grep -qi 'release not found\|HTTP 404' /tmp/artex-release.err; then
-            cat /tmp/artex-release.err >&2
-            exit 1
-          fi
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.prepare.outputs.tag }}
-          target_commitish: ${{ needs.prepare.outputs.commit }}
-          draft: true
-          fail_on_unmatched_files: true
-          files: |
-            dist/*.zip
-            dist/SHA256SUMS
-          generate_release_notes: true
-          body: |
-            Docker Hub 镜像：`${{ vars.ARTEX_DOCKER_IMAGE }}:${{ needs.prepare.outputs.tag }}`，同时提供 `latest`。
-            支持 Linux AMD64 / ARM64，Docker 会自动选择宿主机架构。
-            程序包提供 Linux、macOS 的 AMD64 / ARM64 及 Windows AMD64，并附 SHA256SUMS。
-            部署和在线更新说明见本仓库 README。
-      - name: Publish complete release
-        run: gh release edit "$RELEASE_TAG" --draft=false --latest
-
-  # GITHUB_TOKEN 发布的 Release 不会再次触发 release: published 工作流。
-  # 直接依赖发布 job，保证 ZIP、校验文件和镜像全部发布成功后才更新 Demo。
-  demo:
-    needs: [prepare, release]
-    uses: ./.github/workflows/demo.yml
-    with:
-      tag: ${{ needs.prepare.outputs.tag }}
-      commit: ${{ needs.prepare.outputs.commit }}
-    secrets:
-      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-
-  # ④ 在原生 AMD64 / ARM64 runner 上构建和测试，再推送架构镜像。
   docker:
     needs: [prepare, binaries]
     strategy:
@@ -202,20 +112,23 @@ jobs:
           - { arch: amd64, runner: ubuntu-24.04 }
           - { arch: arm64, runner: ubuntu-24.04-arm }
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
     services:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_USER: artex
-          POSTGRES_PASSWORD: artex-ci-test
-          POSTGRES_DB: artex
+          POSTGRES_USER: jingwei
+          POSTGRES_PASSWORD: jingwei-ci-test
+          POSTGRES_DB: jingwei
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U artex -d artex"
+          --health-cmd "pg_isready -U jingwei -d jingwei"
           --health-interval 5s --health-timeout 3s --health-retries 10
     steps:
-      - uses: actions/checkout@v4 # 取 Dockerfile 与 skills/
+      - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.commit }}
       - uses: actions/download-artifact@v4
@@ -225,61 +138,121 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build image for native smoke test
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build image for smoke test
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
           load: true
-          tags: artex:smoke
-          cache-from: type=gha,scope=docker-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}
-      - name: Test application startup and embedded frontend
+          tags: jingwei:smoke-${{ matrix.arch }}
+          cache-from: type=gha,scope=jingwei-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=jingwei-${{ matrix.arch }}
+      - name: Smoke test startup, version and embedded UI
         env:
-          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          docker run --rm --entrypoint /app/artex artex:smoke -h
-          docker run -d --name artex-smoke --network host \
-            -e ARTEX_PG_DSN='postgres://artex:artex-ci-test@127.0.0.1:5432/artex?sslmode=disable' artex:smoke
-          trap 'docker logs artex-smoke; docker rm -f artex-smoke' EXIT
+          docker run --rm --entrypoint /app/artex "jingwei:smoke-$ARCH" -h
+          docker run -d --name jingwei-smoke --network host \
+            -e ARTEX_PG_DSN='postgres://jingwei:jingwei-ci-test@127.0.0.1:5432/jingwei?sslmode=disable' \
+            "jingwei:smoke-$ARCH"
+          trap 'docker logs jingwei-smoke; docker rm -f jingwei-smoke' EXIT
           curl --fail --retry 30 --retry-connrefused --retry-delay 2 --max-time 3 \
-            http://127.0.0.1:8787/api/health > /tmp/artex-health.json
-          jq -e --arg version "${RELEASE_TAG#v}" '.ok == true and .version == $version' /tmp/artex-health.json
-          curl --fail http://127.0.0.1:8787/ > /tmp/artex-index.html
-          grep -qi '<!doctype html' /tmp/artex-index.html
+            http://127.0.0.1:8787/api/health > /tmp/health.json
+          jq -e --arg version "$VERSION" \
+            '.ok == true and .service == "jingwei" and .version == $version' /tmp/health.json
+          curl --fail http://127.0.0.1:8787/ | grep -qi '<!doctype html'
       - name: Push tested architecture image
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
           push: true
-          tags: ${{ vars.ARTEX_DOCKER_IMAGE }}:${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}
+          provenance: false
+          tags: ${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.prepare.outputs.tag }}
             org.opencontainers.image.revision=${{ needs.prepare.outputs.commit }}
             org.opencontainers.image.licenses=AGPL-3.0
-          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-from: type=gha,scope=jingwei-${{ matrix.arch }}
 
-  # ⑤ 只有两种架构都通过启动验证，才发布正式版本和 latest 镜像。
   docker-publish:
     needs: [prepare, docker]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish multi-platform image
         env:
-          IMAGE: ${{ vars.ARTEX_DOCKER_IMAGE }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           docker buildx imagetools create \
-            --tag "$IMAGE:$RELEASE_TAG" --tag "$IMAGE:latest" \
-            "$IMAGE:$RELEASE_TAG-amd64" "$IMAGE:$RELEASE_TAG-arm64"
-          docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --raw > /tmp/artex-manifest.json
-          jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | index("amd64") != null and index("arm64") != null' /tmp/artex-manifest.json
+            --tag "$IMAGE_NAME:$TAG" \
+            --tag "$IMAGE_NAME:$VERSION" \
+            --tag "$IMAGE_NAME:latest" \
+            "$IMAGE_NAME:$TAG-amd64" "$IMAGE_NAME:$TAG-arm64"
+          docker buildx imagetools inspect "$IMAGE_NAME:$TAG" --raw > /tmp/manifest.json
+          platforms=$(jq -r '[.manifests[].platform | select(.os=="linux") | "linux/" + .architecture] | unique | join(", ")' /tmp/manifest.json)
+          jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | index("amd64") != null and index("arm64") != null' /tmp/manifest.json
+          digest="sha256:$(sha256sum /tmp/manifest.json | cut -d' ' -f1)"
+          {
+            echo "$IMAGE_NAME:$TAG"
+            echo "$IMAGE_NAME:$VERSION"
+            echo "$IMAGE_NAME:latest"
+            echo "Digest: $digest"
+            echo "Platforms: $platforms"
+          } > image-digest.txt
+          cat image-digest.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-digest
+          path: image-digest.txt
+          retention-days: 3
+
+  release:
+    needs: [prepare, docker-publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-digest
+          path: .
+      - name: Create or update GitHub Release
+        run: |
+          notes=".github/release-notes/${RELEASE_TAG}.md"
+          test -s "$notes"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --title "Jingwei ${RELEASE_TAG}" \
+              --notes-file "$notes" \
+              --latest
+            gh release upload "$RELEASE_TAG" \
+              deploy/docker-compose.yml DEPLOY.md image-digest.txt --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "Jingwei ${RELEASE_TAG}" \
+              --notes-file "$notes" \
+              --latest \
+              deploy/docker-compose.yml DEPLOY.md image-digest.txt
+          fi

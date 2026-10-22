@@ -857,6 +857,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/traffic/blob", s.getTrafficBlob)
 	mux.HandleFunc("GET /api/commands", s.pgListCommands)
 	mux.HandleFunc("GET /api/commands/stats", s.pgToolStats) // 按工具聚合调用次数
+
+	// POC 模板库（Jingwei 二开）
+	mux.HandleFunc("GET /api/pocs", s.pgListPOCs)
+	mux.HandleFunc("GET /api/pocs/stats", s.pgPOCStats)
+	mux.HandleFunc("POST /api/pocs", s.pgCreatePOC)
+	mux.HandleFunc("POST /api/pocs/run", s.pgRunPOCs)
+	mux.HandleFunc("GET /api/pocs/{id}", s.pgGetPOC)
+	mux.HandleFunc("PATCH /api/pocs/{id}", s.pgUpdatePOC)
+	mux.HandleFunc("DELETE /api/pocs/{id}", s.pgDeletePOC)
 	mux.HandleFunc("GET /api/llm/records", s.pgListLLMRecords)
 	mux.HandleFunc("DELETE /api/llm/records", s.pgDeleteLLMRecords)
 	mux.HandleFunc("GET /api/llm/records/tasks", s.pgLLMTasks)
@@ -1027,7 +1036,7 @@ func (s *Server) Handler() http.Handler {
 // --- handlers ---
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"ok": true, "service": "artex", "version": BuildVersion})
+	writeJSON(w, 200, map[string]any{"ok": true, "service": "jingwei", "version": BuildVersion})
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
