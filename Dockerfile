@@ -37,7 +37,7 @@ ARG DALFOX_VERSION=3.2.4
 RUN set -eux; \
     case "${TARGETARCH}" in \
       amd64) arch="x86_64" ;; \
-      arm64) arch="arm64" ;; \
+      arm64) arch="aarch64" ;; \
       *) echo "dalfox 不支持架构 ${TARGETARCH}" && exit 1 ;; \
     esac; \
     url="https://github.com/hahwul/dalfox/releases/download/v${DALFOX_VERSION}/dalfox-v${DALFOX_VERSION}-linux-${arch}.tar.gz"; \
