@@ -226,6 +226,8 @@ type Manager struct {
 	traffic     *traffic.Traffic       // process-wide recording proxy (may be nil)
 	enrich      *enrich.Engine         // engine-side asset auto-completion (DNS/HTTP)
 	interceptor *intercept.Interceptor // user-configured tool-call interception rules
+	egress      *guard.EgressGuard     // process-wide platform-secret fingerprints
+	guardPolicy guard.TargetPolicy     // deterministic task scope + asset block gate
 
 	companyMu sync.Mutex // serializes task/company-scope commits with live handle registration
 	// taskStateMu preserves commit order between PostgreSQL lifecycle writes and
@@ -235,7 +237,7 @@ type Manager struct {
 	mu          sync.RWMutex
 	tasks       map[string]*Task
 	active      string
-	trafficOn   bool // 流量捕获开关（默认关；settings.traffic_capture）
+	trafficOn   bool // 流量捕获开关（默认开；settings.traffic_capture）
 	llmRecOn    bool // LLM 录制开关（默认关；settings.llm_record）
 	// 联网搜索开关与来源（默认关；settings.web_search_*）。brave-free 需要 braveKey；tavily 需要 tavilyKey。
 	// webSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关。
@@ -358,6 +360,13 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
+	// 固定的产出目录：导出的报告统一进 reports/，Agent 脚本统一进 scripts/，
+	// 便于在工作区里直接找到，不再散落在各任务目录。
+	for _, sub := range []string{"reports", "scripts"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
+			return nil, err
+		}
+	}
 	dsn, source, err := pgdb.DSN()
 	if err != nil {
 		return nil, err
@@ -378,6 +387,8 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		log.Printf("[llmusage] create table: %v", err)
 	}
 	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
+	m.egress = guard.NewEgressGuard()
+	m.guardPolicy = newGuardTargetPolicy(pg)
 	if proxyAddr != "" {
 		tr, err := traffic.Open(filepath.Join(dir, "traffic"), proxyAddr)
 		if err != nil {
@@ -413,7 +424,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	}
 	// Asset auto-completion engine (§5): HTTP probes routed through the recording
 	// proxy (via m.ProxyAddr, which honors the traffic-capture toggle).
-	m.trafficOn = pg.GetBool(settingTrafficCapture, false)
+	m.trafficOn = pg.GetBool(settingTrafficCapture, true)
 	// LLM 录制开关（默认关）。录制器每次调用时读取此标志。
 	m.llmRecOn = pg.GetBool(settingLLMRecord, false)
 	// Load persisted web-search config (default: off, ddgs).
@@ -832,7 +843,10 @@ func unixNanoOrZero(t *time.Time) int64 {
 	return t.UnixNano()
 }
 
-func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor) *Task {
+func (m *Manager) taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore) *Task {
+	g := guard.NewWithInterceptor(m.interceptor)
+	g.SetEgress(m.egress)
+	g.SetTargetPolicy(m.guardPolicy)
 	return &Task{
 		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
 		Name:       pt.Name,
@@ -851,7 +865,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled,
 		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
-		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
+		Store: store, Guard: g, notify: make(chan struct{}, 1),
 	}
 }
 
@@ -903,7 +917,7 @@ func (m *Manager) CreateTaskWithOptions(description, goal string, opts pgdb.Task
 	if err != nil {
 		return nil, err
 	}
-	t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
+	t := m.taskFromPG(pt, m.pg.Exploration(pt.ExplorationID))
 	m.mu.Lock()
 	m.tasks[t.ID] = t
 	m.active = t.ID
@@ -1050,6 +1064,37 @@ func (m *Manager) DeleteCompanyWithAssets(id int64, deleteAssets bool) (int64, e
 	return assetsDeleted, nil
 }
 
+// DeleteCompaniesWithAssets removes several companies under the same manager-level
+// critical section the single delete uses, then drops every listed id from the live
+// tasks' in-memory company handles. Ids no longer in the database simply are not
+// counted, so a re-submitted batch stays harmless.
+func (m *Manager) DeleteCompaniesWithAssets(ids []int64, deleteAssets bool) (deleted, assetsDeleted int64, err error) {
+	m.companyMu.Lock()
+	defer m.companyMu.Unlock()
+	deleted, assetsDeleted, err = m.pg.Companies().DeleteCompaniesWithAssets(ids, deleteAssets)
+	if err != nil {
+		return 0, 0, err
+	}
+	removed := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		removed[id] = true
+	}
+	m.mu.Lock()
+	for _, task := range m.tasks {
+		task.updateLifecycle(func(state *taskLifecycleState) {
+			companyIDs := make([]int64, 0, len(state.CompanyIDs))
+			for _, companyID := range state.CompanyIDs {
+				if !removed[companyID] {
+					companyIDs = append(companyIDs, companyID)
+				}
+			}
+			state.CompanyIDs = companyIDs
+		})
+	}
+	m.mu.Unlock()
+	return deleted, assetsDeleted, nil
+}
+
 // ReplaceTaskLLMProfiles resets a task's ordered provider chain and mirrors the
 // committed state onto the live task handle. Terminal tasks are editable too —
 // their 主 Agent 对话 keeps running on the chain after the task finishes.
@@ -1102,7 +1147,7 @@ func (m *Manager) LoadExisting() []*Task {
 		if _, ok := m.tasks[id]; ok {
 			continue
 		}
-		t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
+		t := m.taskFromPG(pt, m.pg.Exploration(pt.ExplorationID))
 		m.tasks[id] = t
 		loaded = append(loaded, t)
 	}

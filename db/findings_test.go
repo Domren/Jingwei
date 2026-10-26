@@ -17,13 +17,13 @@ func TestDeleteFinding(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	tk, err := d.CreateTask("删除漏洞测试", "目标", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(tk.ID)
+	defer purgeTaskNow(t, d, tk.ID)
 
 	// seed a finding node in the task's exploration graph, then a findings row on it
 	es := d.Exploration(tk.ExplorationID)
@@ -58,6 +58,85 @@ func TestDeleteFinding(t *testing.T) {
 	}
 }
 
+// TestDeleteFindingsBatch 验证批量删除与单条删除口径一致：findings 行、对应
+// exploration 节点一起消失，已不存在的 id 只跳过而不影响其余条目计数。
+func TestDeleteFindingsBatch(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	tk, err := d.CreateTask("批量删除漏洞测试", "目标", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer purgeTaskNow(t, d, tk.ID)
+
+	es := d.Exploration(tk.ExplorationID)
+	const vc = "__test_vc_batch_delete__"
+	_, _ = d.Exec(`DELETE FROM findings WHERE vulnclass=$1`, vc)
+	defer func() { _, _ = d.Exec(`DELETE FROM findings WHERE vulnclass=$1`, vc) }()
+
+	type seed struct {
+		id     int64
+		nodeID int64
+	}
+	seeds := make([]seed, 3)
+	for i := range seeds {
+		nodeID, err := es.AddNode(KindFinding, map[string]any{"summary": "x", "severity": "high"}, 5, "confirmed", "worker", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := d.AddFinding(tk.ID, nodeID, vc, fmt.Sprintf("批量删除 %d", i), "high", "summary", "poc", "worker", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seeds[i] = seed{id: id, nodeID: nodeID}
+	}
+	defer func() {
+		for _, s := range seeds {
+			_, _ = d.Exec(`DELETE FROM exploration_nodes WHERE id=$1`, s.nodeID)
+		}
+	}()
+
+	deleted, err := d.DeleteFindings([]int64{seeds[0].id, seeds[1].id, seeds[1].id, seeds[0].id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted: want 2 (duplicates counted once), got %d", deleted)
+	}
+	for _, s := range seeds[:2] {
+		if f, _ := d.GetFinding(s.id); f != nil {
+			t.Fatalf("finding %d should be gone, got %+v", s.id, f)
+		}
+		var cnt int
+		d.QueryRow(`SELECT count(*) FROM exploration_nodes WHERE id=$1`, s.nodeID).Scan(&cnt)
+		if cnt != 0 {
+			t.Fatalf("finding node %d should be deleted, still %d", s.nodeID, cnt)
+		}
+	}
+	if f, _ := d.GetFinding(seeds[2].id); f == nil {
+		t.Fatal("unlisted finding must survive")
+	}
+
+	// A stale id alongside a live one is skipped, and the live one still goes.
+	deleted, err = d.DeleteFindings([]int64{seeds[2].id, seeds[0].id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted: want 1, got %d", deleted)
+	}
+	if f, _ := d.GetFinding(seeds[2].id); f != nil {
+		t.Fatalf("finding %d should be gone, got %+v", seeds[2].id, f)
+	}
+	if deleted, err := d.DeleteFindings(nil); err != nil || deleted != 0 {
+		t.Fatalf("empty batch: want (0,nil), got (%d,%v)", deleted, err)
+	}
+}
+
 // TestFindingsPageAndStats exercises ListFindingsPage (filter/sort/paging) and
 // FindingStats against the live dev PG. It tags its rows with a unique vulnclass
 // so assertions are isolated from any pre-existing data, and cleans up after.
@@ -66,7 +145,7 @@ func TestFindingsPageAndStats(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	const vc = "__test_vc_pagination__"
 	// clean any leftovers from a prior aborted run, and clean up on exit
@@ -221,7 +300,7 @@ func TestListFindingsPageUsesStableIDTieBreaker(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	vc := fmt.Sprintf("__test_finding_stable_page_%d__", time.Now().UnixNano())
 	defer d.Exec(`DELETE FROM findings WHERE vulnclass=$1`, vc)
@@ -269,7 +348,7 @@ func TestFindingGroupsAndUnassignedPaging(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	vc := fmt.Sprintf("__test_finding_groups_%d__", time.Now().UnixNano())
 	cleanupFindings := func() { _, _ = d.Exec(`DELETE FROM findings WHERE vulnclass=$1`, vc) }
@@ -279,12 +358,12 @@ func TestFindingGroupsAndUnassignedPaging(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(taskA.ID)
+	defer purgeTaskNow(t, d, taskA.ID)
 	taskB, err := d.CreateTask("group B", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(taskB.ID)
+	defer purgeTaskNow(t, d, taskB.ID)
 
 	seed := []struct {
 		taskID   int64
@@ -413,13 +492,13 @@ func TestAddFindingFollowUpIntent(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	task, err := d.CreateTask("finding follow-up", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(task.ID)
+	defer purgeTaskNow(t, d, task.ID)
 	assetID, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{
 		Domain: fmt.Sprintf("follow-up-%d.example.test", time.Now().UnixNano()),
 		TaskID: task.ID,
@@ -515,5 +594,60 @@ func TestAddFindingFollowUpIntent(t *testing.T) {
 	}
 	if _, _, err := store.AddFindingFollowUpIntent(findingID, findingNodeID, "should fail", auditInput); !errors.Is(err, ErrFindingOriginUnavailable) {
 		t.Fatalf("missing source node: want ErrFindingOriginUnavailable, got %v", err)
+	}
+}
+
+func TestFindingHTTPArtifactsAndAutoReport(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	id, err := d.AddFinding(0, 0, "sqli", "SQL 注入", SeverityHigh, "summary", "evidence", "scan:1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM findings WHERE id=$1`, id)
+
+	req := "POST /login HTTP/1.1\r\nHost: lab\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nuser=admin&pass=1"
+	resp := "HTTP/1.1 200 OK\r\n\r\nok"
+	auto := AutoReportMarker + "\n# 自动报告\n\n旧版本"
+	if err := d.SetFindingHTTPArtifactsAndAutoReport(id, req, resp, auto); err != nil {
+		t.Fatal(err)
+	}
+	f, err := d.GetFinding(id)
+	if err != nil || f == nil {
+		t.Fatalf("GetFinding: %v %+v", err, f)
+	}
+	if f.HTTPRequest != req || f.HTTPResponse != resp {
+		t.Fatalf("HTTP artifacts not stored: %+v", f)
+	}
+	if !IsAutoReport(f.Report) || !strings.Contains(f.Report, "旧版本") {
+		t.Fatalf("auto report not stored: %q", f.Report)
+	}
+
+	// A refreshed auto report replaces the old one.
+	next := AutoReportMarker + "\n# 自动报告\n\n新版本"
+	if err := d.SetFindingHTTPArtifactsAndAutoReport(id, req, resp, next); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ = d.GetFinding(id); !strings.Contains(f.Report, "新版本") {
+		t.Fatalf("auto report should refresh: %q", f.Report)
+	}
+
+	// A human/LLM report must survive rescans while HTTP artifacts still refresh.
+	if _, err := d.Exec(`UPDATE findings SET report=$2 WHERE id=$1`, id, "# 人工报告"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetFindingHTTPArtifactsAndAutoReport(id, req, "HTTP/1.1 500 X\r\n\r\nnew", next); err != nil {
+		t.Fatal(err)
+	}
+	f, _ = d.GetFinding(id)
+	if f.Report != "# 人工报告" {
+		t.Fatalf("human report overwritten: %q", f.Report)
+	}
+	if f.HTTPResponse != "HTTP/1.1 500 X\r\n\r\nnew" {
+		t.Fatalf("HTTP artifacts should refresh: %q", f.HTTPResponse)
 	}
 }

@@ -39,7 +39,7 @@ func testCaseServer(t *testing.T) (*Server, int64, []int64) {
 		}
 		ids = append(ids, id)
 	}
-	t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM findings WHERE task_id=$1`, task.ID); _ = pg.DeleteTask(task.ID) })
+	purgeTaskFixture(t, pg, task.ID)
 	return &Server{m: &Manager{pg: pg}}, task.ID, ids
 }
 func TestFindingCaseAPIPaginationAndTools(t *testing.T) {
@@ -302,7 +302,7 @@ func TestFindingCaseGroupedTrafficExportAndInheritedAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	childID, _ := strconv.ParseInt(child.ID, 10, 64)
-	defer s.m.pg.DeleteTask(childID)
+	defer purgeTaskNow(t, s.m.pg, childID)
 	base := fmt.Sprintf("/api/exploration/finding-cases/%d", cid)
 	suffix := "?context_task=" + child.ID
 	if w = req("GET", base+suffix, ""); w.Code != 200 {

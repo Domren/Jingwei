@@ -106,7 +106,7 @@ func TestParseAutoScopeLine(t *testing.T) {
 
 func TestExplicitCompanyAttributionSurvivesScopeRebuild(t *testing.T) {
 	d, as, cs := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	stamp := time.Now().UnixNano()
 	explicitCompany, _, err := cs.UpsertCompany(fmt.Sprintf("Explicit Attribution %d", stamp), "")
@@ -342,6 +342,11 @@ func TestCompanyScopeAttribution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertCompany: %v", err)
 	}
+	// Registered after the asset sweep above, so it still has an open pool.
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM company_scope WHERE company_id=$1`, cid)
+		_, _ = d.Exec(`DELETE FROM companies WHERE id=$1`, cid)
+	})
 
 	// a pre-existing asset (inserted BEFORE any scope) — must be back-filled.
 	preID, err := as.UpsertSubdomain(UpsertSubdomainReq{Domain: sub})

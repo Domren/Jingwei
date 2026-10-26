@@ -303,8 +303,9 @@ export default function SystemSettingsPage() {
               开启后，所有 Agent 的 HTTP 流量经记录代理全量落库，并向 Agent 注入 traffic_search / traffic_get
               工具与代理配置（提示词含代理说明）。
               <br />
-              关闭（默认）时不记录任何流量：Agent
-              <b>不会</b>拿到代理配置与流量工具，提示词也<b>不含</b>代理相关内容。切换后会即时重建 Agent 生效。
+              默认开启：导出的漏洞报告需要引用真实抓包报文。关闭时不再记录新流量：Agent
+              <b>不会</b>拿到代理配置与流量工具，提示词也<b>不含</b>代理相关内容；已保存证据不受影响。切换后会即时重建
+              Agent 生效。
             </CardDescription>
           </CardHeader>
           <CardContent className="flex items-center justify-between gap-4">
@@ -327,7 +328,7 @@ export default function SystemSettingsPage() {
               Agent 自动绑定流量
             </CardTitle>
             <CardDescription id="agent-traffic-binding-description">
-              默认关闭。开启后，漏洞入库时触发的报告 Agent 会核对已有 HTTP 请求/响应，关联对应流量后再编写报告。
+              默认开启。开启后，漏洞入库时触发的报告 Agent 会核对已有 HTTP 请求/响应，关联对应流量后再编写报告，导出的报告因此带有真实报文。
               <b>查阅数据包及额外的工具调用会增加 Token 消耗。</b>
               <br />
               TCP、未抓包或没有匹配流量时仍可正常上报。此开关不影响流量捕获、人工绑定及已保存证据的查看。 对下一轮 Agent

@@ -25,7 +25,7 @@ func TestRemarksRoundTripPreservesExecutionState(t *testing.T) {
 		t.Fatal(err)
 	}
 	taskID, _ := strconv.ParseInt(task.ID, 10, 64)
-	defer func() { _ = m.pg.DeleteTask(taskID) }()
+	defer purgeTaskNow(t, m.pg, taskID)
 	scheduleInput := db.TaskScheduleInput{Name: "remark schedule", Enabled: false, ScheduleType: "once", RunDate: "2099-01-01", StartTime: "09:00", TaskIDs: []int64{taskID}}
 	schedule, err := m.pg.CreateTaskSchedule(scheduleInput)
 	if err != nil {

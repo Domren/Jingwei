@@ -24,10 +24,14 @@ import (
 // calls, so judge spend can be queried apart from the worker/planner/main lanes.
 const judgeWorkerLane = "judge"
 
-// chatGuard returns a guard wired with the manager's interceptor, used for chat
-// conversations. Called once per applyLLM so a new LLM config always gets a fresh guard.
+// chatGuard returns a guard wired with the manager's interceptor, shared egress
+// fingerprints, and deterministic target policy, used for chat conversations.
+// Called once per applyLLM so a new LLM config always gets a fresh guard.
 func (s *Server) chatGuard() *guard.Guard {
-	return guard.NewWithInterceptor(s.m.interceptor)
+	g := guard.NewWithInterceptor(s.m.interceptor)
+	g.SetEgress(s.m.egress)
+	g.SetTargetPolicy(s.m.guardPolicy)
+	return g
 }
 
 // wireInterceptReviewer installs the LLM fallback judge into the interceptor. The

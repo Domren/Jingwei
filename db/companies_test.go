@@ -19,7 +19,7 @@ func TestCompanyUpsertAndGet(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	cs := d.Companies()
 
 	id, created, err := cs.UpsertCompany("Test Corp", "https://example.com/logo.png")
@@ -66,7 +66,7 @@ func TestCreateCompanyWithScopeRejectsNormalizedDuplicate(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	cs := d.Companies()
 
 	stamp := time.Now().UnixNano()
@@ -105,7 +105,7 @@ func TestCreateCompanyWithScopeRollsBackOnScopeWriteFailure(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	cs := d.Companies()
 
 	name := fmt.Sprintf("Atomic Create %d", time.Now().UnixNano())
@@ -130,7 +130,7 @@ func TestCompanyScope(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	cs := d.Companies()
 
 	id, _, err := cs.UpsertCompany("ScopeTestCorp", "")
@@ -168,7 +168,7 @@ func TestCompanyScopeInvalid(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	cs := d.Companies()
 
 	id, _, err := cs.UpsertCompany("InvalidScopeCorp", "")
@@ -197,7 +197,7 @@ func TestResolveCompany(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	cs := d.Companies()
 
 	id, _, err := cs.UpsertCompany("ResolveCorp", "")
@@ -238,7 +238,7 @@ func TestUpdateScope(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	cs := d.Companies()
 
 	id, _, err := cs.UpsertCompany("UpdateScopeCorp", "")
@@ -283,7 +283,7 @@ func TestUpdateScopeRollsBackOnInsertFailure(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	cs := d.Companies()
 
 	name := fmt.Sprintf("Atomic Scope Update %d", time.Now().UnixNano())
@@ -318,7 +318,7 @@ func TestDeleteCompany(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	cs := d.Companies()
 
 	id, _, err := cs.UpsertCompany("DeleteMeCorp", "")
@@ -346,7 +346,7 @@ func TestDeleteCompanyWithAssetsDeletesBoth(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	cs := d.Companies()
 
 	stamp := time.Now().UnixNano()
@@ -393,7 +393,7 @@ func TestRecomputeAttribution(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	cs := d.Companies()
 	as := d.Assets()
 
@@ -435,7 +435,7 @@ func TestListCompanies(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	cs := d.Companies()
 
 	id, _, err := cs.UpsertCompany("ListTestCorp", "")
@@ -456,5 +456,105 @@ func TestListCompanies(t *testing.T) {
 	}
 	if !found {
 		t.Error("ListCompanies: created company not found")
+	}
+}
+
+func TestDeleteCompaniesWithAssets(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	cs := d.Companies()
+
+	stamp := time.Now().UnixNano()
+	mkCompany := func(tag string) int64 {
+		t.Helper()
+		id, _, err := cs.UpsertCompany(fmt.Sprintf("BatchCorp %s %d", tag, stamp), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	mkAsset := func(companyID int64, url string) int64 {
+		t.Helper()
+		var id int64
+		if err := d.QueryRow(`INSERT INTO assets(type,url,company_id) VALUES ('endpoint',$1,$2) RETURNING id`,
+			url, companyID).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+
+	a, b, c := mkCompany("a"), mkCompany("b"), mkCompany("c")
+	survivor := mkCompany("survivor")
+	// Registered after `defer d.Close()` so it runs first: the pool is still open.
+	// URL pattern catches rows the batch detached (company_id IS NULL) if the test
+	// fails before its own cleanup.
+	defer func() {
+		_, _ = d.Exec(`DELETE FROM assets WHERE company_id = ANY($1::bigint[]) OR url LIKE $2`,
+			[]int64{a, b, c, survivor}, fmt.Sprintf("https://batch-%d-%%", stamp))
+		for _, id := range []int64{a, b, c, survivor} {
+			cleanupCompany(d, id)
+		}
+	}()
+	if mkAsset(a, fmt.Sprintf("https://batch-%d-a.example/", stamp)) == 0 ||
+		mkAsset(b, fmt.Sprintf("https://batch-%d-b.example/", stamp)) == 0 ||
+		mkAsset(survivor, fmt.Sprintf("https://batch-%d-keep.example/", stamp)) == 0 {
+		t.Fatal("asset insert returned 0")
+	}
+
+	// the repeated id is deduped and the stale id is skipped: two companies go.
+	deleted, assetsDeleted, err := cs.DeleteCompaniesWithAssets([]int64{a, a, 999999999, b}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 2 || assetsDeleted != 2 {
+		t.Fatalf("deleted=%d assetsDeleted=%d, want 2/2", deleted, assetsDeleted)
+	}
+	var remaining int
+	if err := d.QueryRow(`SELECT count(*) FROM companies WHERE id = ANY($1::bigint[])`, []int64{a, b}).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("companies still present: %d", remaining)
+	}
+	var kept int
+	if err := d.QueryRow(`SELECT count(*) FROM assets WHERE company_id = $1`, survivor).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if kept != 1 {
+		t.Fatalf("survivor assets=%d, want 1", kept)
+	}
+
+	// delete_assets=false keeps the rows and only detaches them.
+	c2 := mkCompany("detach")
+	mkAsset(c2, fmt.Sprintf("https://batch-%d-detach.example/", stamp))
+	deleted, assetsDeleted, err = cs.DeleteCompaniesWithAssets([]int64{c2}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 || assetsDeleted != 0 {
+		t.Fatalf("deleted=%d assetsDeleted=%d, want 1/0", deleted, assetsDeleted)
+	}
+	// the detach URL must survive so the operator does not lose data silently
+	detachURL := fmt.Sprintf("https://batch-%d-detach.example/", stamp)
+	if got, err := cs.GetCompany(c2); err != nil || got != nil {
+		t.Fatalf("company %d still readable after batch delete (err=%v)", c2, err)
+	}
+	var detached int
+	if err := d.QueryRow(`SELECT count(*) FROM assets WHERE url = $1 AND company_id IS NULL`, detachURL).Scan(&detached); err != nil {
+		t.Fatal(err)
+	}
+	if detached != 1 {
+		t.Fatalf("detach path kept=%d rows with company_id IS NULL, want 1", detached)
+	}
+	if _, err := d.Exec(`DELETE FROM assets WHERE url = $1`, detachURL); err != nil {
+		t.Fatal(err)
+	}
+
+	// empty input is a no-op, not an error.
+	if deleted, assetsDeleted, err = cs.DeleteCompaniesWithAssets(nil, true); err != nil || deleted != 0 || assetsDeleted != 0 {
+		t.Fatalf("empty batch deleted=%d assets=%d err=%v", deleted, assetsDeleted, err)
 	}
 }

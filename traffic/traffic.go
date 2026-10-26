@@ -448,7 +448,7 @@ func (t *Traffic) record(f *mproxy.Flow) {
 	ct := f.Response.Header.Get("Content-Type")
 	url := f.Request.URL.String()
 	reqHead := fmt.Sprintf("%s %s %s\n%s", method, f.Request.URL.RequestURI(), f.Request.Proto, requestHeaderLines(f.Request))
-	respHead := fmt.Sprintf("HTTP %d\n%s", f.Response.StatusCode, headerLines(f.Response.Header))
+	respHead := fmt.Sprintf("HTTP/1.1 %d %s\n%s", f.Response.StatusCode, http.StatusText(f.Response.StatusCode), headerLines(f.Response.Header))
 	// Bodies are spilled before the transaction opens: blob writes are filesystem
 	// work and must not sit inside the SQLite write lock.
 	reqB := t.spill(f.Request.Body, f.Request.Header.Get("Content-Type"))
@@ -956,7 +956,7 @@ func (t *Traffic) Get(id string) (req, resp string, err error) {
 FROM exchange_bodies b JOIN exchanges e ON e.id=b.id WHERE b.id=?`, id).
 		Scan(&reqHead, &reqBody, &reqBlob, &respHead, &respBody, &respBlob, &reqLen, &respLen)
 	if err == nil {
-		return assembleRaw(reqHead, reqBody, reqBlob, reqLen), assembleRaw(respHead, respBody, respBlob, respLen), nil
+		return assembleRaw(reqHead, reqBody, reqBlob, reqLen), assembleRaw(normalizeResponseStatusLine(respHead), respBody, respBlob, respLen), nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", "", err
@@ -986,6 +986,29 @@ func assembleRaw(head string, body []byte, blob sql.NullString, total int) strin
 		fmt.Fprintf(&b, "\n…[truncated] @blob sha256:%s (len=%d)", blob.String, total)
 	}
 	return b.String()
+}
+
+// normalizeResponseStatusLine restores the protocol version and reason phrase
+// that older captures dropped ("HTTP 200" -> "HTTP/1.1 200 OK"). Legacy rows
+// stay untouched on disk; every reader sees the restored form.
+func normalizeResponseStatusLine(head string) string {
+	if len(head) < 8 || !strings.HasPrefix(head, "HTTP ") {
+		return head
+	}
+	code := head[5:8]
+	if len(head) > 8 && head[8] != '\n' {
+		return head
+	}
+	for i := 0; i < 3; i++ {
+		if code[i] < '0' || code[i] > '9' {
+			return head
+		}
+	}
+	n, _ := strconv.Atoi(code)
+	if reason := http.StatusText(n); reason != "" {
+		return "HTTP/1.1 " + code + " " + reason + head[8:]
+	}
+	return "HTTP/1.1 " + code + head[8:]
 }
 
 // HostCount is one distinct recorded host plus its exchange count.

@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -329,6 +331,51 @@ type RecordFindingInput struct {
 	TaskID, ExplorationID, IntentID                      int64
 	VulnClass, Name, Severity, Summary, Evidence, Worker string
 	AssetIDs                                             []int64
+	// RawRequest/RawResponse carry byte-exact non-HTTP protocol data (RESP,
+	// MySQL, SSH banners…) that the proxy cannot capture; Protocol names it so
+	// reports label the capture as raw data instead of HTTP packets.
+	Protocol    string
+	RawRequest  string
+	RawResponse string
+}
+
+// storeRawPacketsTx writes agent-supplied raw protocol bytes onto a finding.
+// Existing packets are kept when the new value is empty.
+func storeRawPacketsTx(tx *sql.Tx, findingID int64, in RecordFindingInput) (bool, error) {
+	req := safePacketText(in.RawRequest, maxRawPacketRequest)
+	resp := safePacketText(in.RawResponse, maxRawPacketResponse)
+	if req == "" && resp == "" {
+		return false, nil
+	}
+	res, err := tx.Exec(`UPDATE findings SET
+		http_request  = CASE WHEN $2 <> '' THEN $2 ELSE http_request END,
+		http_response = CASE WHEN $3 <> '' THEN $3 ELSE http_response END
+		WHERE id=$1`, findingID, req, resp)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+const (
+	maxRawPacketRequest  = 64 << 10
+	maxRawPacketResponse = 128 << 10
+)
+
+// safePacketText drops only the bytes a Postgres text column cannot store (NUL,
+// invalid UTF-8). Line terminators and trailing CRLF are kept because the saved
+// bytes must replay identically on the wire.
+func safePacketText(s string, limit int) string {
+	if s == "" {
+		return ""
+	}
+	s = strings.ReplaceAll(s, "\x00", "")
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	if limit > 0 && len(s) > limit {
+		s = strings.ToValidUTF8(s[:limit], "") + "\n\n[报文过长，已截断]"
+	}
+	return s
 }
 
 type RecordedFinding struct {
@@ -361,6 +408,17 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 			return nil, errors.New("intent_id 必须是本任务的意图（关联任务意图只读）")
 		}
 	}
+	identity := agentFindingIdentity(in, prepared)
+	if identity != "" {
+		var existingID, existingNode int64
+		err := tx.QueryRow(`SELECT id, COALESCE(node_id, 0) FROM findings WHERE dedupe_key=$1`, identity).Scan(&existingID, &existingNode)
+		if err == nil {
+			return mergeAgentFindingTx(ctx, tx, existingID, existingNode, in, prepared)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+	}
 	payload, _ := json.Marshal(map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
 	out := &RecordedFinding{}
 	if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
@@ -382,8 +440,11 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 		assets = []int64{}
 	}
 	raw, _ := json.Marshal(assets)
-	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids)
-VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw)).Scan(&out.FindingID); err != nil {
+	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,dedupe_key)
+VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,'')) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw), identity).Scan(&out.FindingID); err != nil {
+		return nil, err
+	}
+	if _, err := storeRawPacketsTx(tx, out.FindingID, in); err != nil {
 		return nil, err
 	}
 	// 在**同一事务**里登记一条推送事件：提交即保证「漏洞落库」与「推送任务存在」
@@ -405,6 +466,192 @@ VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeI
 	var err error
 	out.Traffic, err = FindingTrafficTx(tx, out.FindingID)
 	return out, err
+}
+
+// findingClassKey folds the free-form vulnclass/name an LLM writes into a
+// stable family, so two workers describing the same weakness with different
+// wording still dedupe.
+func findingClassKey(vulnclass, name string) string {
+	text := strings.ToLower(vulnclass + " " + name)
+	has := func(terms ...string) bool {
+		for _, term := range terms {
+			if strings.Contains(text, term) {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	// Weak credentials and CSRF are checked before XSS: a name such as
+	// "pkxss 后台弱口令" contains the substring "xss" but is not XSS.
+	case has("weak password", "weak credential", "default credential", "弱口令"):
+		return "weak-password"
+	case has("csrf", "cross-site request forgery", "跨站请求伪造"):
+		return "csrf"
+	case has("sql injection", "sqli", "sql 注入", "sql注入"):
+		return "sqli"
+	case has("command injection", "rce", "命令注入", "命令执行", "代码执行"):
+		return "rce"
+	case has("file inclusion", "lfi", "文件包含"):
+		return "lfi"
+	case has("path traversal", "directory traversal", "路径穿越", "目录穿越", "目录遍历"):
+		return "traversal"
+	case has("upload", "文件上传"):
+		return "upload"
+	case has("ssrf", "服务端请求伪造"):
+		return "ssrf"
+	case has("xxe", "xml external"):
+		return "xxe"
+	case has("idor", "越权", "insecure direct object"):
+		return "idor"
+	case has("xss", "跨站脚本"):
+		return "xss"
+	case has("sensitive information", "information disclosure", "信息泄露", "敏感信息"):
+		return "info-disclosure"
+	}
+	return ""
+}
+
+// agentFindingTargetKey identifies the verified location from captured traffic:
+// host + path + parameter names + method. Payload values are deliberately
+// excluded so a second worker proving the same sink with a different payload
+// merges into the existing finding instead of creating a duplicate.
+func agentFindingTargetKey(prepared []PreparedTrafficEvidence) string {
+	pick := func(p PreparedTrafficEvidence) string {
+		u, err := url.Parse(p.Snapshot.URL)
+		if err != nil || u.Host == "" {
+			return ""
+		}
+		target := strings.ToLower(u.Scheme + "://" + u.Host + u.Path)
+		keys := make([]string, 0, 4)
+		for key := range u.Query() {
+			keys = append(keys, strings.ToLower(key))
+		}
+		sort.Strings(keys)
+		if len(keys) > 0 {
+			target += "?" + strings.Join(keys, "&")
+		}
+		if method := strings.ToUpper(strings.TrimSpace(p.Snapshot.Method)); method != "" {
+			target += "#" + method
+		}
+		return target
+	}
+	for _, p := range prepared {
+		if p.Ref.Role == "proof" {
+			if target := pick(p); target != "" {
+				return target
+			}
+		}
+	}
+	for _, p := range prepared {
+		if target := pick(p); target != "" {
+			return target
+		}
+	}
+	return ""
+}
+
+func normalizeIdentityText(s string) string {
+	var b strings.Builder
+	dash := false
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r > 0x7f {
+			b.WriteRune(r)
+			dash = false
+			continue
+		}
+		if !dash {
+			b.WriteByte('-')
+			dash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if len(out) > 96 {
+		out = out[:96]
+	}
+	return out
+}
+
+// agentFindingIdentity returns the dedupe key for an agent-recorded finding.
+// A finding is keyed by task + weakness family + verified location; without
+// packets it falls back to the normalized name within the same family.
+func agentFindingIdentity(in RecordFindingInput, prepared []PreparedTrafficEvidence) string {
+	if in.TaskID <= 0 {
+		return ""
+	}
+	class := findingClassKey(in.VulnClass, in.Name)
+	if class == "" {
+		return ""
+	}
+	target := agentFindingTargetKey(prepared)
+	if target == "" {
+		target = normalizeIdentityText(in.Name)
+	}
+	if target == "" {
+		return ""
+	}
+	return fmt.Sprintf("agent:%d:%s:%s", in.TaskID, class, target)
+}
+
+func severityWeight(sev string) int {
+	switch strings.ToLower(strings.TrimSpace(sev)) {
+	case SeverityCritical:
+		return 4
+	case SeverityHigh:
+		return 3
+	case SeverityMedium:
+		return 2
+	case SeverityLow:
+		return 1
+	}
+	return 0
+}
+
+// mergeAgentFindingTx folds a repeated observation into the existing finding:
+// the richest text wins, the highest severity wins, the triage status is left
+// untouched, and newly verified packets are appended to the binding list.
+func mergeAgentFindingTx(ctx context.Context, tx *sql.Tx, findingID, nodeID int64, in RecordFindingInput, prepared []PreparedTrafficEvidence) (*RecordedFinding, error) {
+	var name, severity, summary, evidence string
+	if err := tx.QueryRowContext(ctx, `SELECT name, severity, summary, evidence FROM findings WHERE id=$1`, findingID).
+		Scan(&name, &severity, &summary, &evidence); err != nil {
+		return nil, err
+	}
+	if len(in.Name) > len(name) {
+		name = in.Name
+	}
+	if severityWeight(in.Severity) > severityWeight(severity) {
+		severity = in.Severity
+	}
+	changed := false
+	if len(in.Summary) > len(summary) {
+		summary = in.Summary
+		changed = true
+	}
+	if len(in.Evidence) > len(evidence) {
+		evidence = in.Evidence
+		changed = true
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE findings SET name=$2, severity=$3, summary=$4, evidence=$5 WHERE id=$1`,
+		findingID, name, severity, summary, evidence); err != nil {
+		return nil, err
+	}
+	stored, err := storeRawPacketsTx(tx, findingID, in)
+	if err != nil {
+		return nil, err
+	}
+	if changed || stored {
+		if err := bumpEvidenceVersionTx(tx, findingID); err != nil {
+			return nil, err
+		}
+	}
+	if err := AddFindingTrafficTx(tx, findingID, prepared); err != nil {
+		return nil, err
+	}
+	traffic, err := FindingTrafficTx(tx, findingID)
+	if err != nil {
+		return nil, err
+	}
+	return &RecordedFinding{FindingID: findingID, NodeID: nodeID, Traffic: traffic}, nil
 }
 
 // RecordFinding is the atomic legacy/no-recorder path used by tools and tests.
@@ -454,6 +701,7 @@ func (s *ExplorationStore) PopulateFindingTrafficIDs(nodes []*Node) error {
 }
 
 func (d *DB) SetFindingReportVersionByNodeID(ctx context.Context, nodeID int64, report string, version *int64) (n int64, err error) {
+	report = safePacketText(report, 0)
 	err = d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
 		var id int64
 		if err := tx.QueryRow(`SELECT id FROM findings WHERE node_id=$1`, nodeID).Scan(&id); err != nil {

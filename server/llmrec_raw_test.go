@@ -64,6 +64,10 @@ func TestRecorderPersistsRawWireBodies(t *testing.T) {
 		t.Fatalf("NewProvider: %v", err)
 	}
 	const session = "exp999999-rawtest"
+	// The recorder takes task_id from the session string, so this test's call is
+	// metered against the nonexistent task 999999. llm_usage is a ledger with no
+	// foreign keys by design, so no task delete will ever reap this row.
+	const sessionTaskID = "999999"
 	rec := llmrec.Wrap(inner, pg, cfg.Model, "raw-test-profile", "", "", func() bool { return true })
 
 	// Clean up whatever this test writes, whether or not it passes. Must be a
@@ -72,6 +76,9 @@ func TestRecorderPersistsRawWireBodies(t *testing.T) {
 	defer func() {
 		if _, err := pg.Exec(`DELETE FROM llm_records WHERE session_id = $1`, session); err != nil {
 			t.Logf("cleanup: %v", err)
+		}
+		if _, err := pg.Exec(`DELETE FROM llm_usage WHERE task_id = $1`, sessionTaskID); err != nil {
+			t.Logf("usage cleanup: %v", err)
 		}
 	}()
 

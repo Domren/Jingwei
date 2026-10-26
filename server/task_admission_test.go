@@ -650,6 +650,9 @@ func TestTaskLLMResolutionReportsDatabaseFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The pool is about to close, so no t.Cleanup can reach the database again —
+	// drop the fixture now. The handler fails on the closed pool either way.
+	purgeTaskNow(t, m.pg, mustTaskID(t, task.ID))
 	if err := m.pg.Close(); err != nil {
 		t.Fatal(err)
 	}

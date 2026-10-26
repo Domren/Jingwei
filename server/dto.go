@@ -325,6 +325,9 @@ type FindingDTO struct {
 	Summary   string `json:"summary"`
 	Evidence  string `json:"evidence"`
 	Report    string `json:"report,omitempty"` // 详细报告(Markdown);仅详情接口返回,列表为空
+	// 原始 HTTP 报文(PoC 原文);非 HTTP 漏洞或未采集时为空。
+	HTTPRequest  string `json:"http_request,omitempty"`
+	HTTPResponse string `json:"http_response,omitempty"`
 
 	IntentID        string            `json:"intent_id,omitempty"`
 	ParamID         string            `json:"param_id,omitempty"`
@@ -455,14 +458,15 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 		FindingID:    i64s(f.ID),
 		TrafficCount: f.TrafficCount, EvidenceVersion: f.EvidenceVersion, ReportEvidenceVersion: f.ReportEvidenceVersion,
 		ReportStale: f.Report != "" && f.EvidenceVersion != f.ReportEvidenceVersion, TrafficBindings: f.TrafficBindings,
-		VulnClass: f.VulnClass,
-		Name:      f.Name,
-		Severity:  f.Severity,
-		Status:    status,
-		Summary:   f.Summary,
-		Evidence:  f.Evidence,
-		Report:    f.Report,
-		TS:        rfc3339(f.CreatedAt),
+		VulnClass:   f.VulnClass,
+		Name:        f.Name,
+		Severity:    f.Severity,
+		Status:      status,
+		Summary:     f.Summary,
+		Evidence:    f.Evidence,
+		Report:      f.Report,
+		HTTPRequest: f.HTTPRequest, HTTPResponse: f.HTTPResponse,
+		TS: rfc3339(f.CreatedAt),
 	}
 	if f.ExportCaseID > 0 {
 		d.ID = "case:" + i64s(f.ExportCaseID)

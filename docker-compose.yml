@@ -34,12 +34,40 @@ services:
       ARTEX_LLM_MODEL: ${ARTEX_LLM_MODEL:-}
       ARTEX_LLM_BASE_URL: ${ARTEX_LLM_BASE_URL:-}
       ARTEX_LLM_PROXY: ${ARTEX_LLM_PROXY:-}
+      JAVA_CHAINS_URL: ${JAVA_CHAINS_URL:-http://java-chains:8011}
+      JAVA_CHAINS_PASS: ${JAVA_CHAINS_PASS:-}
+      JAVA_CHAINS_MCP_TOKEN: ${JAVA_CHAINS_MCP_TOKEN:-}
+      JAVA_CHAINS_CALLBACK_BIND: ${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}
+      JAVA_CHAINS_CALLBACK_HOST: ${JAVA_CHAINS_CALLBACK_HOST:-127.0.0.1}
     ports:
       - "9790:8787"
       - "127.0.0.1:9791:8788"
     volumes:
       - ./data:/app/data
       - ./skills:/app/skills
+    restart: unless-stopped
+
+  # 可选的反序列化验证 sidecar。默认不启动：
+  #   docker compose --profile java-chains up -d java-chains
+  # 不挂载卷，保留镜像内置的 chains-config / 插件；需要持久化时见 deploy/JAVA_CHAINS.md。
+  java-chains:
+    profiles: ["java-chains"]
+    image: ${JAVA_CHAINS_IMAGE:-javachains/javachains:2.0.0-beta7}
+    environment:
+      CHAINS_AUTH: "true"
+      CHAINS_PASS: ${JAVA_CHAINS_PASS:-}
+      CHAINS_SHOW_PUBLIC_IP: "false"
+    ports:
+      - "127.0.0.1:${JAVA_CHAINS_WEB_PORT:-9792}:8011"
+      # 回调端口默认只绑定本机；远端目标需要把 JAVA_CHAINS_CALLBACK_BIND 改为 0.0.0.0
+      # 或指定网卡地址，并在测试结束后关闭/回收。
+      - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:58080:58080"
+      - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:50389:50389"
+      - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:50388:50388"
+      - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:13999:13999"
+      - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:3308:3308"
+      - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:50000:50000"
+      - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:11527:11527"
     restart: unless-stopped
 
 volumes:

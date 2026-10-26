@@ -28,9 +28,96 @@ func caseTestDB(t *testing.T) (*DB, *Task, []int64) {
 		}
 		ids = append(ids, id)
 	}
-	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM findings WHERE task_id=$1`, task.ID); _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() { purgeTaskNow(t, d, task.ID) })
 	return d, task, ids
 }
+
+// preserveSetting puts settings keys back the way the database had them.
+// Restoring the value a read defaulted to would create a row that never existed,
+// and the next reader could not tell a test fixture from an operator's choice, so
+// absent keys are deleted again.
+func preserveSetting(t *testing.T, d *DB, keys ...string) {
+	t.Helper()
+	type previous struct {
+		key    string
+		value  string
+		exists bool
+	}
+	var saved []previous
+	for _, key := range keys {
+		value, exists, err := d.GetSetting(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		saved = append(saved, previous{key, value, exists})
+	}
+	t.Cleanup(func() {
+		for _, p := range saved {
+			if p.exists {
+				_ = d.SetSetting(p.key, p.value)
+				continue
+			}
+			_, _ = d.Exec(`DELETE FROM settings WHERE key=$1`, p.key)
+		}
+	})
+}
+
+// purgeDetachedFindings deletes findings a test never attached to a task, together
+// with the push events recorded for them. notification_events has no foreign key,
+// so deleting the finding alone leaves the event row behind.
+func purgeDetachedFindings(t *testing.T, d *DB, findingIDs ...int64) {
+	t.Helper()
+	if len(findingIDs) == 0 {
+		return
+	}
+	if _, err := d.Exec(`DELETE FROM notification_events WHERE finding_id = ANY($1::bigint[])`, findingIDs); err != nil {
+		t.Logf("清理推送事件失败: %v", err)
+	}
+	if _, err := d.Exec(`DELETE FROM findings WHERE id = ANY($1::bigint[])`, findingIDs); err != nil {
+		t.Logf("清理漏洞失败: %v", err)
+	}
+}
+
+// purgeTaskNow removes a fixture task's cases plus its findings. Cases are
+// not reachable from a task delete (their member and event rows carry no
+// ON DELETE), and findings outlive the tasks row with task_id nulled, so both
+// have to be swept explicitly or the suite leaves case history behind.
+//
+// Every statement declares exactly the arguments it is given: passing more makes
+// pgx fail with "mismatched param and argument count", and an empty array with no
+// cast fails with "could not determine data type".
+func purgeTaskNow(t *testing.T, d *DB, taskID int64, findingIDs ...int64) {
+	t.Helper()
+	if findingIDs == nil {
+		findingIDs = []int64{}
+	}
+	const ownedCases = `SELECT id FROM finding_cases WHERE task_id=$1 OR origin_task_id=$1`
+	for _, step := range []struct {
+		query string
+		args  []any
+	}{
+		// The event payload keeps the task id even after the finding row was
+		// deleted inside the test, so the join alone would miss those events.
+		{`DELETE FROM notification_events WHERE finding_id IN (SELECT f.id FROM findings f WHERE f.task_id=$1 OR f.id = ANY($2::bigint[]))
+OR snapshot->>'task_id' = $3`, []any{taskID, findingIDs, fmt.Sprint(taskID)}},
+		// A retest conversation is only SET NULL by a task delete, so it has to go
+		// while the finding it belongs to still names the task.
+		{`DELETE FROM conversations WHERE id IN (SELECT r.conversation_id FROM finding_retests r WHERE r.conversation_id IS NOT NULL AND (r.finding_id IN (SELECT f.id FROM findings f WHERE f.task_id=$1 OR f.id = ANY($2::bigint[]))))`, []any{taskID, findingIDs}},
+		{`DELETE FROM finding_case_members WHERE case_id IN (` + ownedCases + `)`, []any{taskID}},
+		{`DELETE FROM finding_case_events WHERE case_id IN (` + ownedCases + `)`, []any{taskID}},
+		{`DELETE FROM finding_case_review_runs WHERE task_id=$1`, []any{taskID}},
+		{`DELETE FROM finding_cases WHERE task_id=$1 OR origin_task_id=$1`, []any{taskID}},
+		{`DELETE FROM findings WHERE id = ANY($1::bigint[])`, []any{findingIDs}},
+	} {
+		if _, err := d.Exec(step.query, step.args...); err != nil {
+			t.Logf("清理用例夹具失败(task=%d): %v", taskID, err)
+		}
+	}
+	if _, err := d.DeleteTaskCascade(taskID, true, true); err != nil {
+		t.Logf("清理任务夹具失败(task=%d): %v", taskID, err)
+	}
+}
+
 func TestFindingCaseMergePreservesRecordsAndVersions(t *testing.T) {
 	d, task, ids := caseTestDB(t)
 	ctx := context.Background()
@@ -109,7 +196,7 @@ func TestFindingCaseScopeSuggestionsAndDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(other.ID)
+	defer purgeTaskNow(t, d, other.ID)
 	fid, err := d.AddFinding(other.ID, 0, "IDOR", "other", "high", "same", "poc", "worker", nil)
 	if err != nil {
 		t.Fatal(err)

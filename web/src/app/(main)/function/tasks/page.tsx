@@ -626,49 +626,23 @@ export default function TasksPage() {
     [load],
   );
 
-  // deleteTasks 逐个删除所选任务:后端没有批量接口,且单次删除会连带清理资产/流量/文件,
-  // 串行执行以免一次性打爆后端;成功的从选中集移除,失败的保留以便重试。
+  // deleteTasks 一次请求删除所选任务:后端按任务逐个做运行时收尾（取消 Agent、等待静默、
+  // 清流量/文件），所以整批只发一次；失败的任务在响应里单独返回，保留勾选以便重试。
   const deleteTasks = React.useCallback(
-    async (ids: string[], options: DeleteTaskOptions, onProgress: (done: number) => void) => {
-      const total: DeleteCounts = {
-        assets_deleted: 0,
-        assets_detached: 0,
-        traffic_deleted: 0,
-        files_deleted: false,
-        findings_deleted: 0,
-        llm_records_deleted: 0,
-      };
-      const deleted: string[] = [];
-      const failed: { id: string; message: string }[] = [];
-      const warnings: string[] = [];
-
-      for (const id of ids) {
-        try {
-          const r = await api.deleteTask(id, options);
-          total.assets_deleted += r.assets_deleted;
-          total.assets_detached += r.assets_detached;
-          total.traffic_deleted += r.traffic_deleted;
-          total.files_deleted = total.files_deleted || r.files_deleted;
-          total.findings_deleted += r.findings_deleted;
-          total.llm_records_deleted += r.llm_records_deleted;
-          if (r.cleanup_warning) warnings.push(`#${id}：${r.cleanup_warning}`);
-          deleted.push(id);
-        } catch (e) {
-          failed.push({ id, message: (e as Error).message });
-        }
-        onProgress(deleted.length + failed.length);
-      }
-
-      if (deleted.length > 0) {
+    async (ids: string[], options: DeleteTaskOptions) => {
+      const result = await api.deleteTasksBatch(ids, options);
+      const succeeded = result.items.filter((item) => item.ok);
+      const failed = result.items.filter((item) => !item.ok);
+      if (succeeded.length > 0) {
         setSelectedIds((prev) => {
           const next = new Set(prev);
-          for (const id of deleted) next.delete(id);
+          for (const item of succeeded) next.delete(item.deleted);
           return next;
         });
-        const details = deleteDetails(total);
-        const summary = `已删除 ${deleted.length} 个任务` + (details.length > 0 ? `（${details.join("，")}）` : "");
-        if (warnings.length > 0) {
-          toast.warning(`${summary}；部分外部数据清理未完成：${warnings.join("；")}`);
+        const details = deleteDetails(result);
+        const summary = `已删除 ${result.deleted} 个任务` + (details.length > 0 ? `（${details.join("，")}）` : "");
+        if (result.cleanup_warnings && result.cleanup_warnings.length > 0) {
+          toast.warning(`${summary}；部分外部数据清理未完成：${result.cleanup_warnings.join("；")}`);
         } else {
           toast.success(summary);
         }
@@ -676,7 +650,7 @@ export default function TasksPage() {
       if (failed.length > 0) {
         const head = failed
           .slice(0, 3)
-          .map((f) => `#${f.id}（${f.message}）`)
+          .map((f) => `#${f.deleted}（${f.error}）`)
           .join("；");
         toast.error(`${failed.length} 个任务删除失败：${head}${failed.length > 3 ? " 等" : ""}`);
       }
@@ -2241,9 +2215,9 @@ function DeleteTaskDialog({
   );
 }
 
-// BulkDeleteTasksDialog deletes every checked task with one shared set of cleanup options.
-// The backend has no batch endpoint, so deletion runs one task at a time (see deleteTasks)
-// and the button shows live progress.
+// BulkDeleteTasksDialog deletes every checked task with one shared set of cleanup
+// options. The backend walks the ids one by one and reports each outcome, so one busy
+// task cannot abort the rest (see deleteTasksBatch).
 // MoveTasksCategoryDialog confirms a target before applying, so a mis-click on a
 // large selection cannot silently re-file every task. UNCATEGORIZED_VALUE stands
 // in for "no category" because Select rejects an empty string value.
@@ -2324,28 +2298,25 @@ function BulkDeleteTasksDialog({
   onDelete,
 }: {
   ids: string[];
-  onDelete: (ids: string[], options: DeleteTaskOptions, onProgress: (done: number) => void) => Promise<void>;
+  onDelete: (ids: string[], options: DeleteTaskOptions) => Promise<void>;
 }) {
   const [open, setOpen] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
-  const [done, setDone] = React.useState(0);
   const [options, setOptions] = React.useState<DeleteTaskOptions>(emptyDeleteOptions);
 
   const handleOpenChange = (next: boolean) => {
     if (deleting) return;
     setOpen(next);
-    if (next) {
-      setOptions(emptyDeleteOptions());
-      setDone(0);
-    }
+    if (next) setOptions(emptyDeleteOptions());
   };
 
   const handleDelete = async () => {
     setDeleting(true);
-    setDone(0);
     try {
-      await onDelete(ids, options, setDone);
+      await onDelete(ids, options);
       setOpen(false);
+    } catch (e) {
+      toast.error(`批量删除失败：${(e as Error).message}`);
     } finally {
       setDeleting(false);
     }
@@ -2385,7 +2356,7 @@ function BulkDeleteTasksDialog({
             }}
           >
             {deleting && <Spinner data-icon="inline-start" />}
-            {deleting ? `删除中 ${done}/${ids.length}` : `删除 ${ids.length} 个任务`}
+            {deleting ? "删除中…" : `删除 ${ids.length} 个任务`}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

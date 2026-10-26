@@ -90,7 +90,7 @@ func TestIntelligenceAssetAndFactWriteback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(task.ID)
+	defer deleteTaskFixture(t, d, task.ID)
 	ts := NewToolSet(d.Exploration(task.ExplorationID), "qa")
 	ts.SetTaskID(task.ID)
 	ts.SetAssetStore(d.Assets(), d.Companies())

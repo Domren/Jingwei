@@ -13,6 +13,7 @@ import {
   InfoIcon,
   SearchIcon,
   ShieldAlertIcon,
+  Trash2Icon,
   TriangleAlertIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -21,6 +22,17 @@ import { FindingCaseList } from "@/components/finding-case-list";
 import { FindingRetestDialog } from "@/components/finding-retest-dialog";
 import { StatusBadge } from "@/components/status-badge";
 import { TablePagination } from "@/components/table-pagination";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -51,6 +63,7 @@ import type {
   FindingGroup,
   FindingStats,
   FindingStatus,
+  FindingSystemGroup,
   Severity,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -70,8 +83,8 @@ import {
 
 const FINDING_LIST_PREFERENCE_KEY = "artex_finding_list_preferences";
 
-// 列表视图:flat = 跨任务平铺大表(默认);grouped = 按任务分组折叠;
-// asset = 左侧资产树 + 右侧该子树下的发现。
+// 列表视图:grouped = 按任务 → 系统两级折叠(默认);cases = 按漏洞案例;
+// flat = 跨任务平铺大表;asset = 左侧资产树 + 右侧该子树下的发现。
 type FindingView = "cases" | "flat" | "grouped" | "asset";
 
 const FINDING_VIEWS: FindingView[] = ["cases", "flat", "grouped", "asset"];
@@ -119,8 +132,36 @@ interface FlatFindingsState {
 const EMPTY_FLAT_STATE: FlatFindingsState = { caseRows: [], items: [], total: 0, loaded: false, loading: false };
 
 function findingGroupKey(group: FindingGroup) {
-  return group.task_id === null ? UNASSIGNED_TASK : String(group.task_id);
+  if (group.task_id !== null) return String(group.task_id);
+  if (group.scan_task_id != null) return `scan:${group.scan_task_id}`;
+  return UNASSIGNED_TASK;
 }
+
+// 漏扫分组 key 形如 scan:21;系统桶/明细请求改用 scan_task_id 筛选。
+function findingGroupScanTaskId(groupKey: string): string | undefined {
+  return groupKey.startsWith("scan:") ? groupKey.slice("scan:".length) : undefined;
+}
+
+// 系统行的复合 key(任务 + 系统)。系统 key 自带冒号(host:port),用 NUL 分隔
+// 避免和 IPv6 里的 "::" 混淆。
+function findingSystemRowKey(taskKey: string, systemKey: string) {
+  return `${taskKey}\u0000${systemKey}`;
+}
+
+function splitFindingSystemRowKey(key: string): [string, string] {
+  const idx = key.indexOf("\u0000");
+  return idx < 0 ? [key, ""] : [key.slice(0, idx), key.slice(idx + 1)];
+}
+
+// 分组视图中每个已展开任务组的系统桶缓存。
+interface GroupSystemsState {
+  items: FindingSystemGroup[];
+  total: number;
+  loaded: boolean;
+  loading: boolean;
+}
+
+const EMPTY_GROUP_SYSTEMS: GroupSystemsState = { items: [], total: 0, loaded: false, loading: false };
 
 const EMPTY_STATS: FindingStats = {
   total: 0,
@@ -134,7 +175,7 @@ const EMPTY_STATS: FindingStats = {
 };
 
 export default function FindingsPage() {
-  const [view, setView] = React.useState<FindingView>("cases");
+  const [view, setView] = React.useState<FindingView>("grouped");
   const [severity, setSeverity] = React.useState<"all" | Severity>("all");
   const [status, setStatus] = React.useState<"all" | FindingStatus>("all");
   const [vulnclass, setVulnclass] = React.useState<string>("all");
@@ -151,6 +192,9 @@ export default function FindingsPage() {
   const [groups, setGroups] = React.useState<FindingGroup[]>([]);
   const [groupTotal, setGroupTotal] = React.useState(0);
   const [expandedGroups, setExpandedGroups] = React.useState<Set<string>>(() => new Set());
+  const [expandedSystems, setExpandedSystems] = React.useState<Set<string>>(() => new Set());
+  const [groupSystems, setGroupSystems] = React.useState<Record<string, GroupSystemsState>>({});
+  // groupFindings 的 key 是「任务 + NUL + 系统」的复合 key,每个系统各自分页。
   const [groupFindings, setGroupFindings] = React.useState<Record<string, GroupFindingsState>>({});
   const [total, setTotal] = React.useState(0);
   const [stats, setStats] = React.useState<FindingStats>(EMPTY_STATS);
@@ -266,10 +310,13 @@ export default function FindingsPage() {
   // 导出弹窗状态:范围(当前筛选/全部/选中) × 格式(md 单文件/md 分文件 zip/csv/json)。
   const [exportOpen, setExportOpen] = React.useState(false);
   const [exportScope, setExportScope] = React.useState<"filtered" | "all" | "selected">("filtered");
-  const [exportFormat, setExportFormat] = React.useState<"md-single" | "md-zip" | "csv" | "json">("md-single");
+  const [exportFormat, setExportFormat] = React.useState<"docx" | "md-single" | "md-zip" | "html" | "csv" | "json">("docx");
   const [includeOriginals, setIncludeOriginals] = React.useState(false);
   const [reviewing, setReviewing] = React.useState(false);
   const [exporting, setExporting] = React.useState(false);
+  // 批量删除勾选的漏洞:确认弹窗 + 提交中状态(禁用重复提交)。
+  const [bulkDeleteOpen, setBulkDeleteOpen] = React.useState(false);
+  const [bulkDeleting, setBulkDeleting] = React.useState(false);
 
   const toggleSelected = React.useCallback((id: string, checked: boolean) => {
     setSelectedIds((prev) => {
@@ -316,7 +363,7 @@ export default function FindingsPage() {
         includeOriginals,
       });
       setExportOpen(false);
-      toast.success("已开始下载导出文件");
+      toast.success("已下载导出文件，并保存到工作区 reports/ 目录");
     } catch (e) {
       toast.error(`导出失败：${(e as Error).message}`);
     } finally {
@@ -328,12 +375,17 @@ export default function FindingsPage() {
   const assetTreeRequest = React.useRef(0);
   const groupRequests = React.useRef<Record<string, number>>({});
   const groupsRequest = React.useRef(0);
+  const systemRequests = React.useRef<Record<string, number>>({});
   const flatStateRef = React.useRef(flat);
   const expandedGroupsRef = React.useRef(expandedGroups);
+  const expandedSystemsRef = React.useRef(expandedSystems);
+  const groupSystemsRef = React.useRef(groupSystems);
   const groupFindingsRef = React.useRef(groupFindings);
   const visibleGroupKeysRef = React.useRef<Set<string>>(new Set());
   flatStateRef.current = flat;
   expandedGroupsRef.current = expandedGroups;
+  expandedSystemsRef.current = expandedSystems;
+  groupSystemsRef.current = groupSystems;
   groupFindingsRef.current = groupFindings;
   visibleGroupKeysRef.current = new Set(groups.map(findingGroupKey));
 
@@ -425,8 +477,54 @@ export default function FindingsPage() {
     }
   }, [filterFingerprint, page, pageSize, severity, status, vulnclass, task, query, sort]);
 
+  // loadSystems 拉取某个任务下的系统桶;系统数量通常远小于漏洞数,一次取够。
+  const loadSystems = React.useCallback(
+    async (taskKey: string) => {
+      const request = (systemRequests.current[taskKey] ?? 0) + 1;
+      const requestFilter = filterFingerprint;
+      if (activeFilterFingerprint.current !== requestFilter) return;
+      systemRequests.current[taskKey] = request;
+      setGroupSystems((current) => ({
+        ...current,
+        [taskKey]: {
+          items: current[taskKey]?.items ?? [],
+          total: current[taskKey]?.total ?? 0,
+          loaded: current[taskKey]?.loaded ?? false,
+          loading: true,
+        },
+      }));
+      try {
+        const scanTaskId = findingGroupScanTaskId(taskKey);
+        const result = await api.findingSystems({
+          page: 1,
+          pageSize: 200,
+          severity,
+          status,
+          vulnclass,
+          task: scanTaskId ? undefined : taskKey,
+          scanTaskId,
+          query,
+          sort,
+        });
+        if (systemRequests.current[taskKey] !== request || activeFilterFingerprint.current !== requestFilter) return;
+        setGroupSystems((current) => ({
+          ...current,
+          [taskKey]: { items: result.items, total: result.total, loaded: true, loading: false },
+        }));
+      } catch {
+        if (systemRequests.current[taskKey] !== request || activeFilterFingerprint.current !== requestFilter) return;
+        setGroupSystems((current) => ({
+          ...current,
+          [taskKey]: { ...(current[taskKey] ?? EMPTY_GROUP_SYSTEMS), loading: false },
+        }));
+      }
+    },
+    [filterFingerprint, severity, status, vulnclass, query, sort],
+  );
+
   const loadGroup = React.useCallback(
-    async (key: string, groupPage: number, groupPageSize: number) => {
+    async (taskKey: string, systemKey: string, groupPage: number, groupPageSize: number) => {
+      const key = findingSystemRowKey(taskKey, systemKey);
       const request = (groupRequests.current[key] ?? 0) + 1;
       const requestFilter = filterFingerprint;
       if (activeFilterFingerprint.current !== requestFilter) return;
@@ -444,6 +542,7 @@ export default function FindingsPage() {
         },
       }));
       try {
+        const scanTaskId = findingGroupScanTaskId(taskKey);
         const result = await api.findingCases(
           {
             page: groupPage,
@@ -451,7 +550,9 @@ export default function FindingsPage() {
             severity,
             status,
             vulnclass,
-            task: key,
+            task: scanTaskId ? undefined : taskKey,
+            scanTaskId,
+            system: systemKey,
             query,
             sort,
           },
@@ -495,7 +596,10 @@ export default function FindingsPage() {
     for (const [key, state] of Object.entries(groupFindings)) {
       if (!state.loaded || state.loading) continue;
       const lastPage = Math.max(1, Math.ceil(state.total / state.pageSize));
-      if (state.page > lastPage) void loadGroup(key, lastPage, state.pageSize);
+      if (state.page > lastPage) {
+        const [taskKey, systemKey] = splitFindingSystemRowKey(key);
+        void loadGroup(taskKey, systemKey, lastPage, state.pageSize);
+      }
     }
   }, [groupFindings, loadGroup]);
 
@@ -506,12 +610,28 @@ export default function FindingsPage() {
       if (opening) next.add(key);
       else next.delete(key);
       setExpandedGroups(next);
-      const state = groupFindings[key];
-      if (opening && !state?.loaded && !state?.loading) {
-        void loadGroup(key, state?.page ?? 1, state?.pageSize ?? 10);
+      const systems = groupSystems[key];
+      if (opening && !systems?.loaded && !systems?.loading) {
+        void loadSystems(key);
       }
     },
-    [expandedGroups, groupFindings, loadGroup],
+    [expandedGroups, groupSystems, loadSystems],
+  );
+
+  const toggleSystem = React.useCallback(
+    (taskKey: string, systemKey: string) => {
+      const key = findingSystemRowKey(taskKey, systemKey);
+      const opening = !expandedSystems.has(key);
+      const next = new Set(expandedSystems);
+      if (opening) next.add(key);
+      else next.delete(key);
+      setExpandedSystems(next);
+      const state = groupFindings[key];
+      if (opening && !state?.loaded && !state?.loading) {
+        void loadGroup(taskKey, systemKey, state?.page ?? 1, state?.pageSize ?? 10);
+      }
+    },
+    [expandedSystems, groupFindings, loadGroup],
   );
 
   // 行内改动后刷新当前视图:平铺视图重拉当前页,分组视图刷组头 + 该发现所在的组。
@@ -529,15 +649,34 @@ export default function FindingsPage() {
         return;
       }
       void refreshGroups();
-      const key = finding.task_id ?? UNASSIGNED_TASK;
-      const state = groupFindingsRef.current[key];
-      if (state?.loaded) {
-        const nextTotal = Math.max(0, state.total - (removed ? 1 : 0));
-        const lastPage = Math.max(1, Math.ceil(nextTotal / state.pageSize));
-        void loadGroup(key, Math.min(state.page, lastPage), state.pageSize);
+      if (finding.task_id) {
+        const taskKey = finding.task_id;
+        if (expandedGroupsRef.current.has(taskKey)) void loadSystems(taskKey);
+        for (const [rowKey, state] of Object.entries(groupFindingsRef.current)) {
+          const [task, system] = splitFindingSystemRowKey(rowKey);
+          if (task !== taskKey || !state.loaded) continue;
+          const nextTotal = Math.max(0, state.total - (removed ? 1 : 0));
+          const lastPage = Math.max(1, Math.ceil(nextTotal / state.pageSize));
+          void loadGroup(task, system, Math.min(state.page, lastPage), state.pageSize);
+        }
+      } else {
+        // 漏扫发现没有 Agent task_id(来源在 scan_task_results),前端 DTO 也
+        // 不带 scan_task_id;刷新所有已展开组,避免把改动落到错误的系统桶。
+        for (const key of expandedGroupsRef.current) {
+          if (!visibleGroupKeysRef.current.has(key)) continue;
+          if (groupSystemsRef.current[key]?.loaded) void loadSystems(key);
+        }
+        for (const [rowKey, state] of Object.entries(groupFindingsRef.current)) {
+          if (!state.loaded) continue;
+          const [task, system] = splitFindingSystemRowKey(rowKey);
+          if (!visibleGroupKeysRef.current.has(task)) continue;
+          const nextTotal = Math.max(0, state.total - (removed ? 1 : 0));
+          const lastPage = Math.max(1, Math.ceil(nextTotal / state.pageSize));
+          void loadGroup(task, system, Math.min(state.page, lastPage), state.pageSize);
+        }
       }
     },
-    [loadAssetTree, loadFlat, loadGroup, refreshGroups, view],
+    [loadAssetTree, loadFlat, loadGroup, loadSystems, refreshGroups, view],
   );
 
   // Reset every view's pagination and expansion when a shared finding filter changes.
@@ -546,6 +685,8 @@ export default function FindingsPage() {
     setPage(1);
     setExpanded(null);
     setExpandedGroups(new Set());
+    setExpandedSystems(new Set());
+    setGroupSystems({});
     setGroupFindings({});
     setFlatPage(1);
     setFlat(EMPTY_FLAT_STATE);
@@ -582,15 +723,21 @@ export default function FindingsPage() {
       void refreshGroups();
       for (const key of expandedGroupsRef.current) {
         if (!visibleGroupKeysRef.current.has(key)) continue;
-        const state = groupFindingsRef.current[key];
-        if (state?.loaded && !state.loading) void loadGroup(key, state.page, state.pageSize);
+        const systems = groupSystemsRef.current[key];
+        if (systems?.loaded && !systems.loading) void loadSystems(key);
+      }
+      for (const rowKey of expandedSystemsRef.current) {
+        const [taskKey, systemKey] = splitFindingSystemRowKey(rowKey);
+        if (!visibleGroupKeysRef.current.has(taskKey)) continue;
+        const state = groupFindingsRef.current[rowKey];
+        if (state?.loaded && !state.loading) void loadGroup(taskKey, systemKey, state.page, state.pageSize);
       }
     };
     refresh();
     if (view === "asset") return;
     const timer = setInterval(refresh, 5000);
     return () => clearInterval(timer);
-  }, [activeRetestFingerprint, loadFlat, loadGroup, preferencesHydrated, refreshGroups, view]);
+  }, [activeRetestFingerprint, loadFlat, loadGroup, loadSystems, preferencesHydrated, refreshGroups, view]);
 
   React.useEffect(() => {
     const lastPage = Math.max(1, Math.ceil(groupTotal / pageSize));
@@ -767,6 +914,41 @@ export default function FindingsPage() {
     [refreshAfterMutation, setFindings],
   );
 
+  // deleteSelectedFindings 批量删除勾选的漏洞:后端一个事务删完(含来源探索节点),
+  // 前端清空勾选并按当前视图重拉列表与统计。案例视图自带轮询,无需额外刷新。
+  const deleteSelectedFindings = React.useCallback(async () => {
+    const ids = [...selectedIds];
+    if (ids.length === 0 || bulkDeleting) return;
+    setBulkDeleting(true);
+    try {
+      const res = await api.deleteFindingsBatch(ids);
+      setSelectedIds(new Set());
+      setBulkDeleteOpen(false);
+      toast.success(`已删除 ${res.deleted} 条漏洞`);
+      api
+        .findingStats()
+        .then(setStats)
+        .catch(() => {
+          // The deletion stands even if the aggregate refresh fails.
+        });
+      if (view === "flat" || view === "asset") void loadFlat();
+      if (view === "asset") void loadAssetTree();
+      if (view === "grouped") {
+        void refreshGroups();
+        for (const key of expandedGroupsRef.current) void loadSystems(key);
+        for (const rowKey of expandedSystemsRef.current) {
+          const [taskKey, systemKey] = splitFindingSystemRowKey(rowKey);
+          const state = groupFindingsRef.current[rowKey];
+          if (state?.loaded) void loadGroup(taskKey, systemKey, state.page, state.pageSize);
+        }
+      }
+    } catch (e) {
+      toast.error(`批量删除失败：${(e as Error).message}`);
+    } finally {
+      setBulkDeleting(false);
+    }
+  }, [bulkDeleting, loadAssetTree, loadFlat, loadGroup, loadSystems, refreshGroups, selectedIds, view]);
+
   const openDeepen = React.useCallback((f: Finding) => {
     setDeepenFinding(f);
     setDeepenDescription("");
@@ -873,7 +1055,7 @@ export default function FindingsPage() {
           <TabsList>
             <TabsTrigger value="cases">按漏洞</TabsTrigger>
             <TabsTrigger value="flat">原始上报</TabsTrigger>
-            <TabsTrigger value="grouped">按任务分组</TabsTrigger>
+            <TabsTrigger value="grouped">按任务/系统</TabsTrigger>
             <TabsTrigger value="asset">按资产</TabsTrigger>
           </TabsList>
         </Tabs>
@@ -1020,6 +1202,37 @@ export default function FindingsPage() {
             >
               {reviewing ? <Spinner /> : null}整理所选（{selectedIds.size}）
             </Button>
+            {selectedIds.size > 0 && (
+              <AlertDialog open={bulkDeleteOpen} onOpenChange={setBulkDeleteOpen}>
+                <AlertDialogTrigger asChild>
+                  <Button size="sm" variant="outline" className="text-destructive hover:text-destructive">
+                    <Trash2Icon /> 删除所选
+                  </Button>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>确认删除所选 {selectedIds.size} 条漏洞？</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      这些漏洞将被永久删除，同时从发现列表、任务发现 Tab、探索图与所属漏洞案例中移除，此操作不可撤销。
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel disabled={bulkDeleting}>取消</AlertDialogCancel>
+                    <AlertDialogAction
+                      variant="destructive"
+                      disabled={bulkDeleting}
+                      onClick={(event) => {
+                        event.preventDefault();
+                        void deleteSelectedFindings();
+                      }}
+                    >
+                      {bulkDeleting && <Spinner data-icon="inline-start" />}
+                      {bulkDeleting ? "删除中…" : `删除 ${selectedIds.size} 条`}
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            )}
             <Button size="sm" variant="outline" onClick={openExport}>
               <DownloadIcon /> 导出
             </Button>
@@ -1095,15 +1308,7 @@ export default function FindingsPage() {
             {groups.map((group) => {
               const key = findingGroupKey(group);
               const groupOpen = expandedGroups.has(key);
-              const state = groupFindings[key] ?? {
-                caseRows: [],
-                items: [],
-                total: group.count,
-                page: 1,
-                pageSize: 10,
-                loaded: false,
-                loading: false,
-              };
+              const systems = groupSystems[key] ?? EMPTY_GROUP_SYSTEMS;
               return (
                 <Card key={key} className="gap-0 py-0">
                   <CardHeader className="px-4 py-3">
@@ -1122,14 +1327,19 @@ export default function FindingsPage() {
                         />
                         <div className="flex min-w-0 flex-col gap-1">
                           <CardTitle className="truncate text-sm">
-                            {group.task_id === null
-                              ? "未关联 / 任务已删除"
-                              : group.task_name
+                            {group.task_id !== null
+                              ? group.task_name
                                 ? `${group.task_name}（任务 #${group.task_id}）`
-                                : `任务 #${group.task_id}`}
+                                : `任务 #${group.task_id}`
+                              : group.scan_task_id != null
+                                ? group.scan_task_name
+                                  ? `${group.scan_task_name}（漏扫任务 #${group.scan_task_id}）`
+                                  : `漏扫任务 #${group.scan_task_id}`
+                                : "未关联 / 任务已删除"}
                           </CardTitle>
                           <CardDescription className="truncate" title={group.task_description}>
-                            {group.task_description || "来源任务不可用"}
+                            {group.task_description ||
+                              (group.scan_task_id != null ? "无 LLM 自动化漏洞扫描" : "来源任务不可用")}
                           </CardDescription>
                         </div>
                       </button>
@@ -1146,7 +1356,7 @@ export default function FindingsPage() {
                           );
                         })}
                         <span className="text-xs tabular-nums text-muted-foreground">
-                          {fmtTime(group.last_found_at)}
+                          {group.count} 条 · {fmtTime(group.last_found_at)}
                         </span>
                         {group.task_id !== null && (
                           <Button size="icon-sm" variant="ghost" asChild>
@@ -1158,31 +1368,123 @@ export default function FindingsPage() {
                             </Link>
                           </Button>
                         )}
+                        {group.task_id === null && group.scan_task_id != null && (
+                          <Button size="icon-sm" variant="ghost" asChild>
+                            <Link href="/function/scans" aria-label={`查看漏扫任务 #${group.scan_task_id}`}>
+                              <ArrowUpRightIcon />
+                            </Link>
+                          </Button>
+                        )}
                       </div>
                     </div>
                   </CardHeader>
                   {groupOpen && (
                     <CardContent className="px-0">
-                      {state.loading && !state.loaded ? (
-                        <div className="flex min-h-36 items-center justify-center">
+                      {systems.loading && !systems.loaded ? (
+                        <div className="flex min-h-24 items-center justify-center border-t">
                           <Spinner />
+                        </div>
+                      ) : systems.items.length === 0 ? (
+                        <div className="border-t px-4 py-6 text-center text-sm text-muted-foreground">
+                          该任务下没有匹配的系统。
                         </div>
                       ) : (
                         <>
-                          <FindingsTable
-                            items={state.items}
-                            caseRows={state.caseRows}
-                            presentation="task"
-                            selectAllLabel="选择本组当前页全部"
-                            {...rowProps}
-                          />
-                          <TablePagination
-                            page={state.page}
-                            pageSize={state.pageSize}
-                            total={state.total}
-                            onPageChange={(nextPage) => void loadGroup(key, nextPage, state.pageSize)}
-                            onPageSizeChange={(nextSize) => void loadGroup(key, 1, nextSize)}
-                          />
+                          <div className="flex items-center justify-between border-t px-4 py-2 text-xs text-muted-foreground">
+                            <span>按系统（host:port）</span>
+                            <span className="tabular-nums">
+                              {systems.items.length}
+                              {systems.total > systems.items.length ? ` / ${systems.total}` : ""} 个系统
+                            </span>
+                          </div>
+                          {systems.items.map((system) => {
+                            const rowKey = findingSystemRowKey(key, system.system);
+                            const systemOpen = expandedSystems.has(rowKey);
+                            const state = groupFindings[rowKey] ?? {
+                              caseRows: [],
+                              items: [],
+                              total: system.count,
+                              page: 1,
+                              pageSize: 10,
+                              loaded: false,
+                              loading: false,
+                            };
+                            return (
+                              <div key={rowKey} className="border-t">
+                                <button
+                                  type="button"
+                                  className="flex w-full min-w-0 flex-wrap items-center gap-2 px-4 py-2.5 pl-10 text-left hover:bg-muted/40"
+                                  aria-expanded={systemOpen}
+                                  onClick={() => toggleSystem(key, system.system)}
+                                >
+                                  <ChevronRightIcon
+                                    className={cn(
+                                      "size-4 shrink-0 text-muted-foreground transition-transform",
+                                      systemOpen && "rotate-90",
+                                    )}
+                                  />
+                                  <span className="truncate font-mono text-sm" title={system.label}>
+                                    {system.label}
+                                  </span>
+                                  {system.service && (
+                                    <span className="rounded border px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
+                                      {system.service}
+                                    </span>
+                                  )}
+                                  <span className="ml-auto inline-flex items-center gap-2">
+                                    {SEVERITIES.map((level) => {
+                                      const count = system[level];
+                                      if (count === 0) return null;
+                                      return (
+                                        <span key={level} className="inline-flex items-center gap-1">
+                                          <StatusBadge domain="severity" value={level} dot />
+                                          <span className="text-xs tabular-nums text-muted-foreground">{count}</span>
+                                        </span>
+                                      );
+                                    })}
+                                    <span className="text-xs tabular-nums text-muted-foreground">
+                                      {system.count} 条 · {fmtTime(system.last_found_at)}
+                                    </span>
+                                  </span>
+                                </button>
+                                {systemOpen && (
+                                  <div className="bg-muted/20">
+                                    {state.loading && !state.loaded ? (
+                                      <div className="flex min-h-24 items-center justify-center">
+                                        <Spinner />
+                                      </div>
+                                    ) : (
+                                      <>
+                                        <FindingsTable
+                                          items={state.items}
+                                          caseRows={state.caseRows}
+                                          presentation="task"
+                                          selectAllLabel="选择本系统当前页全部"
+                                          {...rowProps}
+                                        />
+                                        <TablePagination
+                                          page={state.page}
+                                          pageSize={state.pageSize}
+                                          total={state.total}
+                                          onPageChange={(nextPage) =>
+                                            void loadGroup(key, system.system, nextPage, state.pageSize)
+                                          }
+                                          onPageSizeChange={(nextSize) =>
+                                            void loadGroup(key, system.system, 1, nextSize)
+                                          }
+                                        />
+                                      </>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                          {systems.total > systems.items.length && (
+                            <div className="border-t px-4 py-2 text-xs text-muted-foreground">
+                              仅显示前 {systems.items.length} 个系统，请用检索或筛选缩小范围。
+                            </div>
+                          )}
                         </>
                       )}
                     </CardContent>
@@ -1324,6 +1626,12 @@ export default function FindingsPage() {
                 </label>
               </div>
               <RadioGroup value={exportFormat} onValueChange={(v) => setExportFormat(v as typeof exportFormat)}>
+                <label htmlFor="export-format-docx" className="flex items-center gap-2 text-sm">
+                  <RadioGroupItem id="export-format-docx" value="docx" /> Word 报告（.docx，封面/目录/章节分页，含真实报文）
+                </label>
+                <label htmlFor="export-format-html" className="flex items-center gap-2 text-sm">
+                  <RadioGroupItem id="export-format-html" value="html" /> HTML 分页报告（封面/目录/章节页，可打印 PDF）
+                </label>
                 <label htmlFor="export-format-md-single" className="flex items-center gap-2 text-sm">
                   <RadioGroupItem id="export-format-md-single" value="md-single" /> Markdown 汇总报告（单个 .md 文件）
                 </label>

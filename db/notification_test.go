@@ -527,7 +527,6 @@ func TestSetFindingStatusWithNotifyOnlyEmitsOnRealChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(tk.ID)
 	es := d.Exploration(tk.ExplorationID)
 	f, err := es.RecordFinding(ctx, RecordFindingInput{
 		TaskID: tk.ID, Worker: "test", VulnClass: "SQL注入", Name: "状态变更用例",
@@ -536,7 +535,7 @@ func TestSetFindingStatusWithNotifyOnlyEmitsOnRealChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { d.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, f.FindingID) })
+	defer func() { purgeTaskNow(t, d, tk.ID, f.FindingID) }()
 
 	// 落库时已登记一条 finding_created 事件，先把它数出来作为基线。
 	var base int
@@ -815,7 +814,6 @@ func TestFinishFindingRetestEmitsStatusChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(tk.ID)
 	es := d.Exploration(tk.ExplorationID)
 	f, err := es.RecordFinding(ctx, RecordFindingInput{
 		TaskID: tk.ID, Worker: "test", VulnClass: "SQL注入", Name: "复测目标",
@@ -824,7 +822,7 @@ func TestFinishFindingRetestEmitsStatusChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { d.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, f.FindingID) })
+	defer func() { purgeTaskNow(t, d, tk.ID, f.FindingID) }()
 
 	// 建一条复测记录并直接推到完成态。
 	rt, _, _, err := d.CreateFindingRetest(ctx, f.FindingID, "复核")

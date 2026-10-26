@@ -138,6 +138,12 @@ func (d *DB) BuildFindingAssetTree(f FindingFilter) (*FindingAssetTree, error) {
 func (d *DB) buildFindingAssetTree(f FindingFilter, maxNodes int) (*FindingAssetTree, error) {
 	f.AssetScope = ""
 	f.assetIDs, f.assetNone, f.assetMiss = nil, false, false
+	if f.System != "" {
+		var err error
+		if f, err = d.applySystemScope(f); err != nil {
+			return nil, err
+		}
+	}
 	where, args := f.where()
 
 	rows, err := d.Query(`SELECT COALESCE(f.severity,''), f.created_at,

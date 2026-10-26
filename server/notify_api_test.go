@@ -62,7 +62,7 @@ func newNotifyFixture(t *testing.T) *notifyFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { pg.Exec(`DELETE FROM tasks WHERE id=$1`, taskID) })
+	purgeTaskFixture(t, pg, taskID)
 
 	var mark int64
 	if err := pg.QueryRow(`SELECT COALESCE(max(id),0) FROM notification_events`).Scan(&mark); err != nil {
@@ -86,6 +86,7 @@ func newNotifyFixture(t *testing.T) *notifyFixture {
 		}
 	})
 	// 总开关必须是开的（其它用例可能关过它）。
+	preserveSetting(t, pg, settingNotifyEnabled)
 	if err := pg.SetBool(settingNotifyEnabled, true); err != nil {
 		t.Fatal(err)
 	}

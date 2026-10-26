@@ -537,6 +537,9 @@ type steerHooks struct {
 	// limit 是空转续跑的次数上限，由 Engine.emptyTurnNudgeLimit() 从「空响应重试
 	// 次数」解析而来。<=0 = 不介入(用户显式关掉了这层)。
 	limit int
+	// stagnant 检测「同一工具+参数返回完全相同结果」的重复调用，以及结束时反复
+	// 相同的正文。nil = 不启用。per-intent 新建，不跨意图共享状态。
+	stagnant *stagnationDetector
 	// label 形如 "worker-1 · #42"，只用于日志。
 	label string
 }
@@ -580,16 +583,26 @@ func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (
 		return true, "【规划者实时纠偏】" + msg +
 			"\n（这是规划者对本意图的即时指令；本次工具调用未执行，请据此调整下一步。若与你当前打算冲突，以此为准。）", nil
 	}
+	var updated []byte
 	if h.inner != nil {
-		return h.inner.PreToolUse(ctx, name, input)
+		blocked, msg, up := h.inner.PreToolUse(ctx, name, input)
+		if blocked {
+			return true, msg, nil
+		}
+		updated = up
 	}
-	return false, "", nil
+	if msg, stalled := h.stagnant.checkCall(name, input); stalled {
+		log.Printf("[work %s] 停滞检测：%s 使用相同参数已连续返回相同结果，拦截本次调用", h.label, name)
+		return true, msg, nil
+	}
+	return false, "", updated
 }
 
 func (h steerHooks) PostToolUse(ctx context.Context, name string, input, result []byte, isErr bool) {
 	if h.inner != nil {
 		h.inner.PostToolUse(ctx, name, input, result, isErr)
 	}
+	h.stagnant.observeResult(name, input, result, isErr)
 }
 
 // Stop 在 guard 原有语义之上补一层「空转回合」续跑:模型只输出了思考、既没给正文
@@ -606,8 +619,23 @@ func (h steerHooks) Stop(ctx context.Context, messages []llm.Message) (bool, []s
 		prevent, blocking, msg = h.inner.Stop(ctx, messages)
 	}
 	// inner 已经决定硬停、或已经要注入自己的续跑消息 → 尊重它，不再叠加。
+	if prevent || len(blocking) > 0 {
+		return prevent, blocking, msg
+	}
+	// 结束时正文连续同质 → 先续跑一次要求换路径，超过上限硬停。limit<=0 表示用户
+	// 显式关掉了「续跑」这层(与空转续跑共用同一旋钮)，此时不介入。
+	if h.limit > 0 && h.stagnant != nil {
+		if nudge, hard := h.stagnant.checkStop(messages); nudge != "" {
+			if hard {
+				log.Printf("[work %s] 停滞检测：回复连续同质且已续跑 %d 次，硬停止", h.label, stagnationNudgeLimit)
+				return true, nil, nudge
+			}
+			log.Printf("[work %s] 停滞检测：回复连续同质，注入续跑指令", h.label)
+			return false, []string{nudge}, ""
+		}
+	}
 	// limit<=0 = 用户把「空响应重试次数」配成了 -1，即显式关掉这层。
-	if prevent || len(blocking) > 0 || h.nudges == nil || h.limit <= 0 || !isThinkingOnlyTurn(messages) {
+	if h.nudges == nil || h.limit <= 0 || !isThinkingOnlyTurn(messages) {
 		return prevent, blocking, msg
 	}
 	n := h.nudges.Add(1)
@@ -1007,11 +1035,12 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。
 	hooks := steerHooks{
-		inner:  t.Guard.Hooks(),
-		drain:  func() (string, bool) { return e.drainSteer(iid) },
-		nudges: &atomic.Int64{},
-		limit:  e.emptyTurnNudgeLimit(),
-		label:  label,
+		inner:    t.Guard.Hooks(),
+		drain:    func() (string, bool) { return e.drainSteer(iid) },
+		nudges:   &atomic.Int64{},
+		limit:    e.emptyTurnNudgeLimit(),
+		stagnant: newStagnationDetector(),
+		label:    label,
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)

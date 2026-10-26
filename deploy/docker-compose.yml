@@ -17,7 +17,7 @@ services:
     restart: unless-stopped
 
   jingwei:
-    image: ${JINGWEI_IMAGE:-ghcr.io/domren/jingwei:1.0.0}
+    image: ${JINGWEI_IMAGE:-ghcr.io/domren/jingwei:1.1.0}
     depends_on:
       postgres:
         condition: service_healthy
@@ -29,6 +29,12 @@ services:
       ARTEX_LLM_MODEL: ${ARTEX_LLM_MODEL:-}
       ARTEX_LLM_BASE_URL: ${ARTEX_LLM_BASE_URL:-}
       ARTEX_LLM_PROXY: ${ARTEX_LLM_PROXY:-}
+      ARTEX_LLM_CALL_TIMEOUT: ${ARTEX_LLM_CALL_TIMEOUT:-}
+      JAVA_CHAINS_URL: ${JAVA_CHAINS_URL:-http://java-chains:8011}
+      JAVA_CHAINS_PASS: ${JAVA_CHAINS_PASS:-}
+      JAVA_CHAINS_MCP_TOKEN: ${JAVA_CHAINS_MCP_TOKEN:-}
+      JAVA_CHAINS_CALLBACK_BIND: ${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}
+      JAVA_CHAINS_CALLBACK_HOST: ${JAVA_CHAINS_CALLBACK_HOST:-127.0.0.1}
     ports:
       - "${JINGWEI_WEB_PORT:-9790}:8787"
       - "127.0.0.1:${JINGWEI_PROXY_PORT:-9791}:8788"
@@ -40,6 +46,25 @@ services:
       timeout: 3s
       retries: 12
       start_period: 20s
+    restart: unless-stopped
+
+  # 可选的反序列化验证 sidecar，默认不启动；见 deploy/JAVA_CHAINS.md。
+  java-chains:
+    profiles: ["java-chains"]
+    image: ${JAVA_CHAINS_IMAGE:-javachains/javachains:2.0.0-beta7}
+    environment:
+      CHAINS_AUTH: "true"
+      CHAINS_PASS: ${JAVA_CHAINS_PASS:-}
+      CHAINS_SHOW_PUBLIC_IP: "false"
+    ports:
+      - "127.0.0.1:${JAVA_CHAINS_WEB_PORT:-9792}:8011"
+      - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:58080:58080"
+      - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:50389:50389"
+      - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:50388:50388"
+      - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:13999:13999"
+      - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:3308:3308"
+      - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:50000:50000"
+      - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:11527:11527"
     restart: unless-stopped
 
 volumes:

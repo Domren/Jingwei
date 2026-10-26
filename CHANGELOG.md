@@ -2,6 +2,62 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.1.0] - 2026-10-26
+
+### 自动化漏扫引擎（不依赖 LLM）
+
+- 新增 `scanner` 扫描内核与 `/api/scans` 任务体系：端口探测（top100/自定义范围）、Web 指纹识别、nuclei 模板并发执行、结果直接落为漏洞发现。
+- 集成 FLUX 指纹库 25,136 条规则（`scanner/fpdata`，含 `NOTICE.md` 署名），指纹识别与 nuclei 标签联动筛选模板。
+- 新增「自动化漏扫」前端页面：任务创建、实时进度、发现列表与报告导出。
+- 扫描完成后自动串联后续动作：漏洞复核、深度利用、WAF 绕过、可选 WebShell 注入（`server/scan_auto.go`）。
+- 注入类判定改为专项验证器自证：集成 sqlmap（SQL 注入）与 dalfox（XSS）替代 POC  matcher 的启发式判定。
+- 时间盲注增加止损：目标被慢查询拖住时按响应预算中止并给出「不可判定」结论，不再误报为漏洞或超时挂死。
+- 修复全量模式静默截断模板的覆盖缺陷：模板库超过 10,000 条启用 POC 时，旧实现按 id 截断，恰好丢弃后期补测导入的靶场专用模板（含 DVWA 全部 13 条认证 POC），且日志无任何痕迹；现改为按危险等级优先加载并显式记录被舍弃数量（`db.ListEnabledPOCContents`）。
+
+### 原始报文与可复现性
+
+- 新增流量采集层（`db/finding_traffic.go`、`traffic`）：每条漏洞发现绑定完整原始请求/响应报文，多步 POC 记录整条报文链而非最后一步。
+- 非 HTTP 协议按协议本身出证：MySQL/Redis/SSH 等给出原始字节交互（`scanner/protocol_packet.go`），带十六进制视图与可直接复现的监听/连接方式，不再包装成 HTTP 请求。
+- PoC 展示改为纯原始报文，移除 curl 命令形式。
+- 报告新增 DOCX / HTML 导出（`report/findings_docx.go`、`findings_html.go`），按发现分页、内嵌验证步骤与报文。
+
+### 判定、去重与分组
+
+- 新增 `verdict` 反证判定：对命中结果做二次反证，区分确认/误报并回写发现状态。
+- 新增 `dedupe_key` 去重，同一漏洞在多轮扫描/多模板命中不再重复堆积。
+- 漏洞列表支持按任务、按系统（资产主体）分组展示。
+
+### 深度利用
+
+- 新增一级栏目「深度利用」及 exploit / verify / waf-bypass / webshell / resources / intranet 六个二级页面。
+- 新增深度利用 HTTP 内核（`scanner/deepuse.go`）、数据表与任务框架，并把深度能力作为工具暴露给 LLM 探索路径。
+
+### Java 反序列化（java-chains）
+
+- 新增 java-chains 可选 sidecar 与 MCP 注册链路：`scanner/javachains.go`、`server/java_chains.go`、`server/java_chains_deep.go`。
+- 深度任务自动识别反序列化入口并调用 java-chains 回写证据；新增 `skills/java-chains/SKILL.md`、`deploy/JAVA_CHAINS.md` 与 `deploy/java-chains-setup.sh`。
+
+### 内网测绘与资源台账
+
+- 新增内网两阶段能力（`db/intranet.go`、`server/intranet*.go`）与会话/隧道入口。
+- 新增受管资源台账与端口审计（`db/managed_resources.go`、`server/resources.go`、`server/resource_tools.go`）。
+
+### Guard 与安全边界
+
+- 新增工具调用 Guard：目标范围限制（`guard/scope.go`）、出站控制（`guard/egress.go`）、内容抽取与不可信标记（`guard/extract.go`、`agent/untrusted.go`）、密钥脱敏（`server/guard_secrets.go`）。
+- 新增 worker 痕迹清理规约（`agent/cleanup.go`），利用结束后不在目标上遗留测试文件/WebShell。
+
+### LLM 稳定性
+
+- LLM 连接池健康重试（`llmpool`）、单次调用超时（`agent/calltimeout.go`）、任务停滞检测与自动暂停（`server/stagnation.go`）。
+- 每轮 LLM 调用按模型计量并实时可查（`/api/llm/records/by-model`），便于判断任务是否仍在推进。
+
+### 批量操作与测试隔离
+
+- 发现、任务、资产、公司（资产主体）四类列表补齐批量删除，后端改为单次请求的批量接口。
+- 测试进程强制使用独立测试库（`ARTEX_PG_DSN`），不再接管生产任务；清理测试夹具泄漏与全局状态污染。
+- 新增 `tools/audit_docx.py`（校验导出报告的报文绑定完整度）与 `tools/coverage.py`（漏洞覆盖对账）。
+
 ## [1.0.0] - 2026-10-22
 
 ### 品牌与界面

@@ -35,17 +35,17 @@ func TestIntelligenceProvenanceDedupAndDirectContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	first, err := d.CreateTask("intelligence source", "test", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(first.ID)
+	defer purgeTaskNow(t, d, first.ID)
 	second, err := d.CreateTask("intelligence unrelated", "test", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(second.ID)
+	defer purgeTaskNow(t, d, second.ID)
 	node, err := d.Exploration(first.ExplorationID).AddIntent(map[string]any{"summary": "read fixture"}, 5, nil, "qa")
 	if err != nil {
 		t.Fatal(err)
@@ -126,12 +126,12 @@ func TestIntelligenceSensitiveDataListIncludesContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	task, err := d.CreateTask("direct sensitive data display", "local fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(task.ID)
+	defer purgeTaskNow(t, d, task.ID)
 	in := IntelligenceInput{Kind: "sensitive_data", Title: "fixture dataset", Content: "qa@example.invalid", Evidence: "/tmp/qa-users.json", Confidence: "observed"}
 	_, err = d.RecordIntelligence(t.Context(), task.ID, 0, "qa", in)
 	if err != nil {
@@ -148,12 +148,12 @@ func TestIntelligenceSourceSessionUsesGraphProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	task, err := d.CreateTask("source navigation", "local fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(task.ID)
+	defer purgeTaskNow(t, d, task.ID)
 	store := d.Exploration(task.ExplorationID)
 	intent, err := store.AddIntent(map[string]any{"summary": "origin worker"}, 5, nil, "qa")
 	if err != nil {

@@ -18,10 +18,10 @@ func TestIntelligenceHTTPSettingsAndScope(t *testing.T) {
 	if s.settingsPayload()[db.SettingTaskIntelligence] != false {
 		t.Fatal("default must be off")
 	}
+	preserveSetting(t, s.m.pg, db.SettingTaskIntelligence)
 	if r := request("PUT", "/api/settings", `{"task_intelligence_enabled":true}`); r.Code != 200 {
 		t.Fatal(r.Code, r.Body)
 	}
-	defer s.m.pg.SetBool(db.SettingTaskIntelligence, false)
 	if !s.m.pg.GetBool(db.SettingTaskIntelligence, false) {
 		t.Fatal("setting not persisted")
 	}

@@ -643,7 +643,8 @@ func TestProfileDeleteRestoresQuotaBlockedIntentWhenFallbackAvailable(t *testing
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer m.Close()
+	// 关闭必须晚于所有 t.Cleanup（LIFO 中它最先注册 → 最后执行），否则夹具删除会打到已关闭的连接池上静默失败。
+	t.Cleanup(func() { _ = m.Close() })
 
 	profileID, err := m.pg.SaveProfile(&db.LLMProfile{
 		Name:   fmt.Sprintf("delete-quota-fallback-%d", time.Now().UnixNano()),

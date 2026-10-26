@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -45,9 +46,10 @@ func TestFindingGroupsReturnsTaskBucketsAndNormalizesPagination(t *testing.T) {
 	marker := fmt.Sprintf("__server_finding_groups_%d__", time.Now().UnixNano())
 	createdTaskIDs := []int64{}
 	defer func() {
+		_, _ = m.pg.Exec(`DELETE FROM notification_events WHERE finding_id IN (SELECT id FROM findings WHERE vulnclass=$1)`, marker)
 		_, _ = m.pg.Exec(`DELETE FROM findings WHERE vulnclass=$1`, marker)
 		for _, taskID := range createdTaskIDs {
-			_ = m.pg.DeleteTask(taskID)
+			purgeTaskNow(t, m.pg, taskID)
 		}
 	}()
 
@@ -146,6 +148,230 @@ func TestFindingGroupsReturnsTaskBucketsAndNormalizesPagination(t *testing.T) {
 	}
 }
 
+func TestFindingSystemsEndpointGroupsByHostPort(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer m.Close()
+	marker := fmt.Sprintf("__server_finding_systems_%d__", time.Now().UnixNano())
+	task, err := m.CreateTask("finding systems", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID := mustTaskID(t, task.ID)
+	defer purgeTaskNow(t, m.pg, taskID)
+	defer m.pg.Exec(`DELETE FROM findings WHERE vulnclass=$1`, marker) //nolint:errcheck
+
+	var assetID int64
+	if err := m.pg.QueryRow(`INSERT INTO assets(type, ip, port, service_type, url)
+VALUES ('service','10.99.7.7',8080,'http','http://10.99.7.7:8080/') RETURNING id`).Scan(&assetID); err != nil {
+		t.Fatal(err)
+	}
+	defer m.pg.Exec(`DELETE FROM assets WHERE id=$1`, assetID) //nolint:errcheck
+	if _, err := m.pg.AddFinding(taskID, 0, marker, "", db.SeverityCritical, "linked", "", "test", []int64{assetID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.pg.AddFinding(taskID, 0, marker, "", db.SeverityLow, "orphan", "", "test", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{m: m}
+	request := httptest.NewRequest(http.MethodGet,
+		"/api/exploration/findings/systems?vulnclass="+marker+"&task_id="+strconv.FormatInt(taskID, 10), nil)
+	recorder := httptest.NewRecorder()
+	s.findingSystems(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("systems status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var page struct {
+		Items        []db.FindingSystemGroup `json:"items"`
+		Total        int                     `json:"total"`
+		FindingTotal int                     `json:"finding_total"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 2 || page.FindingTotal != 2 || len(page.Items) != 2 {
+		t.Fatalf("unexpected system page: %+v", page)
+	}
+	byKey := map[string]db.FindingSystemGroup{}
+	for _, g := range page.Items {
+		byKey[g.System] = g
+	}
+	if g, ok := byKey["svc:10.99.7.7:8080"]; !ok || g.Count != 1 || g.Critical != 1 {
+		t.Fatalf("host:port bucket mismatch: %+v", page.Items)
+	}
+	if g, ok := byKey[db.FindingUnassignedSystem]; !ok || g.Count != 1 {
+		t.Fatalf("unassigned bucket mismatch: %+v", page.Items)
+	}
+
+	// The system filter on the shared findings list resolves to the same bucket.
+	request = httptest.NewRequest(http.MethodGet,
+		"/api/exploration/findings?vulnclass="+marker+"&system="+url.QueryEscape("svc:10.99.7.7:8080")+"&page=1&limit=10", nil)
+	recorder = httptest.NewRecorder()
+	s.findings(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("filtered findings status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var list struct {
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if list.Total != 1 {
+		t.Fatalf("system filter total=%d, want 1", list.Total)
+	}
+}
+
+func TestFindingGroupsAttributeScanFindingsAndFilterByScanTask(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer m.Close()
+	marker := fmt.Sprintf("__server_scan_finding_groups_%d__", time.Now().UnixNano())
+	agentTask, err := m.CreateTask("scan group agent task", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentTaskID := mustTaskID(t, agentTask.ID)
+	defer purgeTaskNow(t, m.pg, agentTaskID)
+
+	var scan1, scan2 int64
+	if err := m.pg.QueryRow(`INSERT INTO scan_tasks(name, targets, status)
+VALUES ('漏扫第一轮', '["192.0.2.4"]'::jsonb, 'done') RETURNING id`).Scan(&scan1); err != nil {
+		t.Fatal(err)
+	}
+	defer m.pg.Exec(`DELETE FROM scan_tasks WHERE id=$1`, scan1) //nolint:errcheck
+	if err := m.pg.QueryRow(`INSERT INTO scan_tasks(name, targets, status)
+VALUES ('漏扫第二轮', '["192.0.2.4"]'::jsonb, 'done') RETURNING id`).Scan(&scan2); err != nil {
+		t.Fatal(err)
+	}
+	defer m.pg.Exec(`DELETE FROM scan_tasks WHERE id=$1`, scan2)       //nolint:errcheck
+	defer m.pg.Exec(`DELETE FROM findings WHERE vulnclass=$1`, marker) //nolint:errcheck
+
+	addFinding := func(severity string) int64 {
+		id, err := m.pg.AddFinding(0, 0, marker, "", severity, "scan finding", "", "scanner", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	link := func(scanID, findingID int64) {
+		if _, err := m.pg.Exec(`INSERT INTO scan_task_results(scan_task_id, finding_id, template_id, name, severity, host, matched_at)
+VALUES ($1,$2,'t','n','high','192.0.2.4',$3)`, scanID, findingID,
+			fmt.Sprintf("http://192.0.2.4/f/%d", findingID)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	findingA := addFinding(db.SeverityCritical)
+	link(scan1, findingA)
+	link(scan2, findingA)
+	findingB := addFinding(db.SeverityHigh)
+	link(scan2, findingB)
+	_ = addFinding(db.SeverityLow) // 既无 Agent 任务也无漏扫来源
+	findingD, err := m.pg.AddFinding(agentTaskID, 0, marker, "", db.SeverityMedium, "agent finding", "", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link(scan2, findingD) // Agent 任务优先于漏扫归属
+
+	s := &Server{m: m}
+	recorder := httptest.NewRecorder()
+	s.findingGroups(recorder, httptest.NewRequest(http.MethodGet,
+		"/api/exploration/findings/groups?vulnclass="+marker+"&page=1&limit=20", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("groups status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var page struct {
+		Items        []db.FindingGroup `json:"items"`
+		Total        int               `json:"total"`
+		FindingTotal int               `json:"finding_total"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 4 || page.FindingTotal != 4 {
+		t.Fatalf("unexpected scan group totals: %+v", page)
+	}
+	scan1Group, scan2Group := db.FindingGroup{}, db.FindingGroup{}
+	for _, group := range page.Items {
+		if group.ScanTaskID != nil && *group.ScanTaskID == scan1 {
+			scan1Group = group
+		}
+		if group.ScanTaskID != nil && *group.ScanTaskID == scan2 {
+			scan2Group = group
+		}
+	}
+	if scan1Group.ScanTaskName != "漏扫第一轮" || scan1Group.TaskID != nil || scan1Group.Count != 1 || scan1Group.Critical != 1 {
+		t.Fatalf("scan1 group mismatch: %+v", scan1Group)
+	}
+	if scan2Group.ScanTaskName != "漏扫第二轮" || scan2Group.TaskID != nil || scan2Group.Count != 1 || scan2Group.High != 1 {
+		t.Fatalf("scan2 group mismatch: %+v", scan2Group)
+	}
+
+	// 按漏扫任务筛选:两轮都命中的 finding 仍算这一轮的结果,Agent 任务优先归属。
+	recorder = httptest.NewRecorder()
+	s.findingGroups(recorder, httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/api/exploration/findings/groups?vulnclass=%s&scan_task_id=%d&page=1&limit=20", marker, scan2), nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("scan-filtered groups status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	page = struct {
+		Items        []db.FindingGroup `json:"items"`
+		Total        int               `json:"total"`
+		FindingTotal int               `json:"finding_total"`
+	}{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 2 || page.FindingTotal != 3 {
+		t.Fatalf("scan filter groups=%+v", page)
+	}
+	var filteredScanCount, filteredAgentCount int
+	for _, group := range page.Items {
+		if group.ScanTaskID != nil && *group.ScanTaskID == scan2 {
+			filteredScanCount = group.Count
+		}
+		if group.TaskID != nil && *group.TaskID == agentTaskID {
+			filteredAgentCount = group.Count
+		}
+	}
+	if filteredScanCount != 2 || filteredAgentCount != 1 {
+		t.Fatalf("scan filter attribution scan=%d agent=%d items=%+v", filteredScanCount, filteredAgentCount, page.Items)
+	}
+
+	// 导出同样按 scan_task_id 取到该轮命中并去重关联的全部 finding。
+	exported, err := m.pg.ListFindingsForExport(db.FindingFilter{VulnClass: marker, ScanTaskID: strconv.FormatInt(scan2, 10)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exported) != 3 {
+		t.Fatalf("exported %d findings, want 3: %+v", len(exported), exported)
+	}
+
+	// 「未关联」不再吞掉漏扫发现。
+	recorder = httptest.NewRecorder()
+	s.findingGroups(recorder, httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/api/exploration/findings/groups?vulnclass=%s&task_id=%s&page=1&limit=20", marker, db.FindingUnassignedTask), nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unassigned groups status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	page = struct {
+		Items        []db.FindingGroup `json:"items"`
+		Total        int               `json:"total"`
+		FindingTotal int               `json:"finding_total"`
+	}{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || page.FindingTotal != 1 || page.Items[0].TaskID != nil || page.Items[0].ScanTaskID != nil {
+		t.Fatalf("unassigned scan bucket mismatch: %+v", page)
+	}
+}
+
 func TestDeepenFindingCreatesAuditedIntentAndRevivesTask(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
@@ -163,7 +389,7 @@ func TestDeepenFindingCreatesAuditedIntentAndRevivesTask(t *testing.T) {
 		t.Fatal(err)
 	}
 	taskID, _ := strconv.ParseInt(task.ID, 10, 64)
-	defer m.pg.DeleteTask(taskID)
+	defer purgeTaskNow(t, m.pg, taskID)
 	findingID, err := m.pg.AddFinding(taskID, findingNodeID, "test", "source", db.SeverityHigh, "source", "", "worker", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -286,10 +512,6 @@ func TestDeepenAdmissionFailureDiscardsFollowUpIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	taskID, _ := strconv.ParseInt(task.ID, 10, 64)
-	defer func() {
-		_, _ = m.pg.Exec(`UPDATE tasks SET deleted_at=NULL WHERE id=$1`, taskID)
-		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
-	}()
 	findingNodeID, err := task.Store.AddNode(db.KindFinding, map[string]any{"summary": "source"}, 5, "confirmed", "worker", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -298,6 +520,12 @@ func TestDeepenAdmissionFailureDiscardsFollowUpIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		_, _ = m.pg.Exec(`UPDATE tasks SET deleted_at=NULL WHERE id=$1`, taskID)
+		// The test deletes the task on purpose, which leaves the finding behind
+		// with task_id NULL — name it so the purge can still find it.
+		purgeTaskNow(t, m.pg, taskID, findingID)
+	}()
 	before, err := task.Store.ListByKind(db.KindIntent, 1000)
 	if err != nil {
 		t.Fatal(err)

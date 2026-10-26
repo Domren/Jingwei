@@ -29,11 +29,12 @@ func evidenceFixture(t *testing.T) (*Store, db.RecordFindingInput, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { pg.Close() })
+	capturedSince := time.Now().UTC()
 	task, err := pg.CreateTask("evidence integration "+t.Name(), "local fixtures", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { pg.DeleteFindingsByTask(task.ID); pg.DeleteTask(task.ID) })
+	t.Cleanup(func() { purgeEvidenceFixture(t, pg, task.ID, capturedSince) })
 	dir := t.TempDir()
 	tr, err := traffic.Open(filepath.Join(dir, "traffic"), ":0")
 	if err != nil {
@@ -43,6 +44,43 @@ func evidenceFixture(t *testing.T) (*Store, db.RecordFindingInput, string) {
 	store := New(pg, tr, filepath.Join(dir, "evidence"))
 	in := db.RecordFindingInput{TaskID: task.ID, ExplorationID: task.ExplorationID, Worker: "test", VulnClass: "TEST", Name: "Evidence fixture", Severity: "low", Summary: "local test"}
 	return store, in, dir
+}
+
+// purgeEvidenceFixture removes a fixture task and everything that outlives it by
+// design: findings keep their row when the task goes (task_id falls back to NULL)
+// and traffic snapshots have no FK at all, so a plain DeleteTask leaves test
+// evidence behind in whichever database the suite points at.
+//
+// capturedSince is the moment the fixture opened its pool: a snapshot has no task
+// column, so the only handle on the ones a test captured and never bound is the
+// time it was written.
+func purgeEvidenceFixture(t *testing.T, pg *db.DB, taskID int64, capturedSince time.Time) {
+	t.Helper()
+	var snapshotIDs []string
+	if err := pg.QueryRow(`SELECT COALESCE(array_agg(DISTINCT b.snapshot_id), '{}'::text[])::text[]
+FROM finding_traffic_bindings b JOIN findings f ON f.id=b.finding_id WHERE f.task_id=$1`, taskID).Scan(&snapshotIDs); err != nil {
+		t.Logf("读取夹具快照失败(task=%d): %v", taskID, err)
+	}
+	// The event payload keeps the task id even after the test deleted the finding
+	// itself, so the join alone would miss those events.
+	if _, err := pg.Exec(`DELETE FROM notification_events
+WHERE finding_id IN (SELECT id FROM findings WHERE task_id=$1) OR snapshot->>'task_id' = $2`,
+		taskID, fmt.Sprint(taskID)); err != nil {
+		t.Logf("清理夹具推送事件失败(task=%d): %v", taskID, err)
+	}
+	// llm_records is created lazily (only a booting server ensures it), so asking
+	// the cascade to clean it would abort the whole delete on a fresh test database.
+	if _, err := pg.DeleteTaskCascade(taskID, true, true); err != nil {
+		t.Logf("清理任务夹具失败(task=%d): %v", taskID, err)
+	}
+	// Bindings are gone with the findings, so a snapshot still bound belongs to
+	// another task's evidence and must stay.
+	if _, err := pg.Exec(`DELETE FROM traffic_evidence_snapshots s
+WHERE (s.id = ANY($1::text[]) OR s.created_at >= $2)
+  AND NOT EXISTS (SELECT 1 FROM finding_traffic_bindings b WHERE b.snapshot_id = s.id)`,
+		snapshotIDs, capturedSince); err != nil {
+		t.Logf("清理夹具快照失败(task=%d): %v", taskID, err)
+	}
 }
 
 func seedExchange(t *testing.T, s *Store, id string, body []byte, spill bool) {
@@ -329,5 +367,64 @@ func TestEvidenceGCGraceAndActiveRestore(t *testing.T) {
 	bad.URL = "http://tampered.local/"
 	if err = s.InstallSnapshots(ctx, []db.TrafficEvidenceSnapshot{bad}, archive); err == nil {
 		t.Fatal("accepted tampered snapshot")
+	}
+}
+
+func TestSaveRawExchangesPersistsReproductionSequence(t *testing.T) {
+	s, in, _ := evidenceFixture(t)
+	ctx := context.Background()
+	rec, err := s.Record(ctx, in, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exchanges := []RawExchange{
+		{
+			Request:  "POST /exploit HTTP/1.1\r\nHost: fixture.local\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nx=1",
+			Response: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nqueued",
+			Role:     "supporting",
+			Note:     "exploit request",
+		},
+		{
+			Request:  "GET /proof HTTP/1.1\r\nHost: fixture.local\r\n\r\n",
+			Response: "HTTP/1.1 200 OK\r\n\r\nsecret",
+			Role:     "proof",
+			Note:     "proof request",
+		},
+	}
+	if err = s.SaveRawExchanges(ctx, rec.FindingID, exchanges); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SaveRawExchanges(ctx, rec.FindingID, exchanges); err != nil {
+		t.Fatal(err)
+	}
+	ft, err := s.DB.GetFindingTraffic(ctx, rec.FindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ft.Bindings) != 2 {
+		t.Fatalf("want 2 deduplicated bindings, got %d", len(ft.Bindings))
+	}
+	for _, b := range ft.Bindings {
+		if b.Snapshot.Method == "GET" && b.Snapshot.URL != "http://fixture.local/proof" {
+			t.Fatalf("URL not parsed: %#v", b.Snapshot)
+		}
+		if b.Snapshot.Status != 200 || b.Snapshot.ContentType == "" && b.Snapshot.Method == "POST" {
+			t.Fatalf("status/content-type not parsed: %#v", b.Snapshot)
+		}
+		f, _, err := s.OpenBody(b.Snapshot, "response")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(f)
+		f.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Role == "proof" && !bytes.Contains(body, []byte("secret")) {
+			t.Fatalf("proof body missing: %q", body)
+		}
+		if b.Role == "supporting" && !bytes.Contains(body, []byte("queued")) {
+			t.Fatalf("supporting body missing: %q", body)
+		}
 	}
 }

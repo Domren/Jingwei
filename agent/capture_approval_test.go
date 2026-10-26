@@ -14,6 +14,45 @@ import (
 	"github.com/Autumn-27/norma/tool"
 )
 
+// preserveNewSettings deletes settings keys the database did not hold when the
+// test started, so it has to be registered before any cleanup that writes
+// settings. The interceptor can store a key but never forget one, so "restore what
+// I read" would persist every read default as if an operator had chosen it.
+func preserveNewSettings(t *testing.T, d *db.DB) {
+	t.Helper()
+	list := func() map[string]bool {
+		out := map[string]bool{}
+		rows, err := d.Query(`SELECT key FROM settings`)
+		if err != nil {
+			return out
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var key string
+			if err := rows.Scan(&key); err != nil {
+				return out
+			}
+			out[key] = true
+		}
+		return out
+	}
+	before := list()
+	t.Cleanup(func() {
+		var added []string
+		for key := range list() {
+			if !before[key] {
+				added = append(added, key)
+			}
+		}
+		if len(added) == 0 {
+			return
+		}
+		if _, err := d.Exec(`DELETE FROM settings WHERE key = ANY($1::text[])`, added); err != nil {
+			t.Logf("清理测试写入的设置失败: %v", err)
+		}
+	})
+}
+
 // Exercise the actual SDK event -> hook -> execution -> result path. No real
 // model or command is used; the probe tool only returns a fixed string.
 func TestCaptureApprovalLifecycle(t *testing.T) {
@@ -26,6 +65,7 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.Close() })
+	preserveNewSettings(t, d)
 	ic := intercept.New(d)
 	priorTools, err := ic.GetEnabledTools()
 	if err != nil {
@@ -36,7 +76,7 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 	if err := ic.SetEnabledTools([]string{"ApprovalAuditProbe"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := ic.SetJudgeConfig(intercept.JudgeConfig{Enabled: true, AskTimeoutSeconds: 1, AskTimeoutAction: "allow"}); err != nil {
+	if err := ic.SetJudgeConfig(intercept.JudgeConfig{Enabled: true, FailAction: "allow", AskTimeoutSeconds: 1, AskTimeoutAction: "allow"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -122,7 +162,12 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 				// intentionally omit the bulky replay context from the audit row.
 				wantUserMessage = ""
 			}
-			if detail.Status != tc.status || detail.DecisionSource != "model" || a == nil || a.ExecutionStatus != tc.execution || a.ToolUseID != "probe-call" || a.UserMessage != wantUserMessage || a.InitialAction != initialAction || a.ModelFallback != (tc.action == "invalid") || a.ProfileID != 7 {
+			wantSource := "model"
+			if tc.manual {
+				// 人工裁决行记 manual，规则命中记 rule；只有模型判定的行才是 model。
+				wantSource = "manual"
+			}
+			if detail.Status != tc.status || detail.DecisionSource != wantSource || a == nil || a.ExecutionStatus != tc.execution || a.ToolUseID != "probe-call" || a.UserMessage != wantUserMessage || a.InitialAction != initialAction || a.ModelFallback != (tc.action == "invalid") || a.ProfileID != 7 {
 				t.Fatalf("unexpected review: row=%+v audit=%+v", detail.InterceptApprovalRow, a)
 			}
 			if initialAction == "allow" && (len(a.Context) != 0 || a.UserTruncated || a.ContextTruncated) {

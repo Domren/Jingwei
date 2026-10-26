@@ -92,7 +92,7 @@ func TestDeleteCompanyRefreshesLiveTaskCompanyIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) }()
+	defer purgeTaskNow(t, m.pg, mustTaskID(t, task.ID))
 
 	s := &Server{m: m}
 	req := httptest.NewRequest(http.MethodDelete, "/api/companies/1", bytes.NewBufferString(`{}`))

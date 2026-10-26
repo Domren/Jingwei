@@ -10,6 +10,8 @@
 package llmpool
 
 import (
+	"regexp"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -36,6 +38,11 @@ func (s State) Open() bool { return time.Now().Before(s.OpenUntil) }
 // 5xx / network) that trip the breaker. Deterministic failures (no credit, bad
 // key) trip on the first regardless. Overridable via Registry.SetPolicy.
 const softTripAfter = 3
+
+// maxRetryWindow caps a provider-declared retry window. Servers over-promise
+// ("try again in a day"); past ten minutes the ladder plus a half-open probe is
+// the better answer than benching the profile on the provider's word.
+const maxRetryWindow = 10 * time.Minute
 
 // Registry holds the circuit-breaker state of every profile, keyed by profile id.
 // It is process-wide and outlives any single Pool instance, so rebuilding the pool
@@ -133,8 +140,11 @@ func (r *Registry) Pass(id int64) {
 
 // Trip records a failed call. hard=true marks a deterministic failure (no credit,
 // invalid key, missing model) which opens the breaker immediately; hard=false is a
-// transient one (429 / 5xx / network) that needs softTripAfter in a row. Returns
-// true when this call is what opened the breaker, so the caller can log it once.
+// transient one (429 / 5xx / network) that needs softTripAfter in a row. A failure
+// that carries the provider's own retry window keeps that profile out of rotation
+// for at least that long, so the next round does not walk straight back into the
+// limiter that just answered it. Returns true when this call is what opened the
+// breaker, so the caller can log it once.
 func (r *Registry) Trip(id int64, errMsg string, hard bool) (tripped bool) {
 	r.mu.Lock()
 	st := r.m[id]
@@ -145,12 +155,24 @@ func (r *Registry) Trip(id int64, errMsg string, hard bool) (tripped bool) {
 	st.Fails++
 	st.LastError = errMsg
 	st.LastAt = time.Now()
+	retry := providerRetryWindow(errMsg)
 	softTrip := r.tripAfter()
 	if hard || (softTrip > 0 && st.Fails >= softTrip) {
 		st.Trips++
-		st.OpenUntil = time.Now().Add(r.coolFor(st.Trips))
+		cool := r.coolFor(st.Trips)
+		if retry > cool {
+			cool = retry
+		}
+		st.OpenUntil = st.LastAt.Add(cool)
 		st.Fails = 0 // counted into this trip; start fresh for the half-open probe
 		tripped = true
+	} else if retry > 0 {
+		// Below the trip threshold, but the limiter already told us when to come
+		// back: benching the profile for that window costs one skipped request and
+		// saves the retry storm the fixed ladder would otherwise cause.
+		if until := st.LastAt.Add(retry); until.After(st.OpenUntil) {
+			st.OpenUntil = until
+		}
 	}
 	snap := *st
 	persist := r.persist
@@ -160,6 +182,25 @@ func (r *Registry) Trip(id int64, errMsg string, hard bool) (tripped bool) {
 	}
 	return tripped
 }
+
+// providerRetryWindow pulls the "back off for N seconds" the provider put in its
+// error text — Retry-After in seconds form, or a JSON retryAfterSeconds /
+// retry_after field. HTTP-date Retry-After and bogus values yield 0, so the
+// ladder decides. Capped: a server claiming "24 hours" must not bench a profile
+// past the point where an operator would rather see the half-open probe.
+func providerRetryWindow(errMsg string) time.Duration {
+	m := retryWindowRE.FindStringSubmatch(errMsg)
+	if m == nil {
+		return 0
+	}
+	secs, err := strconv.Atoi(m[1])
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return min(time.Duration(secs)*time.Second, maxRetryWindow)
+}
+
+var retryWindowRE = regexp.MustCompile(`(?i)retry[-_ ]?(?:after|request)[-_ ]?(?:seconds?)?["']?\s*[:=]\s*["']?(\d+)`)
 
 // Reset clears one profile's state — the UI's "立即恢复" action.
 func (r *Registry) Reset(id int64) {

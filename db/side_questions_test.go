@@ -318,13 +318,14 @@ func TestSideClearLateWritersAndDeletedParent(t *testing.T) {
 }
 
 func TestSideTaskArchiveVersions(t *testing.T) {
-	for _, version := range []int{1, 2, 3} {
+	// side_question_* 表从 format v3 起进入归档，v1/v2 是必须继续能恢复的旧包。
+	for _, version := range []int{TaskArchiveLegacyFormatVersion, 2, 3, TaskArchiveFormatVersion} {
 		t.Run(fmt.Sprint(version), func(t *testing.T) {
 			d, err := Open(testDSN(t))
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer d.Close()
+			t.Cleanup(func() { _ = d.Close() })
 			if err := d.EnsureLLMRecordsTable(); err != nil {
 				t.Fatal(err)
 			}
@@ -383,7 +384,7 @@ func TestSideTaskArchiveVersions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if archive.FormatVersion != 3 || archive.DataCounts["side_question_sessions"] != 2 || archive.DataCounts["side_question_requests"] != 2 {
+			if archive.FormatVersion != TaskArchiveFormatVersion || archive.DataCounts["side_question_sessions"] != 2 || archive.DataCounts["side_question_requests"] != 2 {
 				t.Fatalf("missing side archive: %+v", archive.DataCounts)
 			}
 			if err = d.CompleteTaskArchive(job.ID, archive, "/tmp/side-fixture.tar.zst", "fixture", 1, 1); err != nil {

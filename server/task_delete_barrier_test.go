@@ -154,7 +154,7 @@ func TestAbortTaskDeleteUsesPersistedPauseAndQueueState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) }()
+	defer purgeTaskNow(t, m.pg, mustTaskID(t, task.ID))
 	s := &Server{m: m, engine: NewEngine(m)}
 
 	// An engine-only pause is not authoritative. The committed task is running,

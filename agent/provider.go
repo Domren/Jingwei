@@ -295,7 +295,14 @@ func (c Config) newProvider(client *http.Client, limiter *RequestLimiter) (llm.P
 	lc.EmptyResponseInterval = c.Retry.EmptyInterval
 	// Norma's limiter allows a full-window burst and excludes establishment
 	// retries. Enforce limits on HTTP attempts instead; do not also enable it.
-	return llm.NewProvider(lc)
+	prov, err := llm.NewProvider(lc)
+	if err != nil {
+		return nil, err
+	}
+	if d := llmCallTimeout(); d > 0 {
+		return &callTimeoutProvider{inner: prov, timeout: d}, nil
+	}
+	return prov, nil
 }
 
 // IsQuotaExhaustedMessage deliberately recognizes only explicit balance,

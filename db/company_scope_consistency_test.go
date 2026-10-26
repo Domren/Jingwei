@@ -10,7 +10,7 @@ import (
 
 func TestAssetUpsertWaitsForCompanyScopeMutation(t *testing.T) {
 	d, assets, companies := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	stamp := time.Now().UnixNano()
 	domain := fmt.Sprintf("scope-lock-%d.example", stamp)
@@ -90,7 +90,7 @@ func TestAssetUpsertWaitsForCompanyScopeMutation(t *testing.T) {
 
 func TestResolveAndRecomputeUseStableCompanyIDTieBreak(t *testing.T) {
 	d, assets, companies := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	stamp := time.Now().UnixNano()
 	first, _, err := companies.UpsertCompany(fmt.Sprintf("Tie Break First %d", stamp), "")
@@ -186,7 +186,7 @@ func TestCompanyScopeLimitsAndCheckedErrors(t *testing.T) {
 	}
 
 	d, _, companies := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	stamp := time.Now().UnixNano()
 	companyID, _, err := companies.UpsertCompany(fmt.Sprintf("Scope Limits %d", stamp), "")
 	if err != nil {

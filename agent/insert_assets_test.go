@@ -23,6 +23,23 @@ func testDB(t *testing.T) *db.DB {
 	return d
 }
 
+// deleteTaskFixture removes a fixture task plus the rows that outlive it by
+// design: findings keep their own row when the task goes (task_id falls back to
+// NULL) and the push events recorded with them have no FK at all, so a plain
+// DeleteTask leaves test findings behind in whichever database the suite points
+// at.
+func deleteTaskFixture(t *testing.T, d *db.DB, taskID int64) {
+	t.Helper()
+	if _, err := d.Exec(`DELETE FROM notification_events WHERE finding_id IN (SELECT id FROM findings WHERE task_id=$1)`, taskID); err != nil {
+		t.Logf("清理夹具推送事件失败(task=%d): %v", taskID, err)
+	}
+	// llm_records is created lazily (only a booting server ensures it), so asking
+	// the cascade to clean it would abort the whole delete on a fresh test database.
+	if _, err := d.DeleteTaskCascade(taskID, true, true); err != nil {
+		t.Logf("清理任务夹具失败(task=%d): %v", taskID, err)
+	}
+}
+
 // callInsertAssets calls the insert_assets tool with the given payload.
 func callInsertAssets(t *testing.T, ts *ToolSet, payload any) map[string]any {
 	t.Helper()

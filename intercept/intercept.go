@@ -71,6 +71,17 @@ func taskInfoFromCtx(ctx context.Context) (taskID, agentName string) {
 	return "", ""
 }
 
+// TaskIDFromContext returns the numeric task id carried by WithTaskContext, or 0
+// when the call is not part of a task run (chat, one-off runs).
+func TaskIDFromContext(ctx context.Context) int64 {
+	id, _ := taskInfoFromCtx(ctx)
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
 func taskEmitFromCtx(ctx context.Context) func(db.Activity) {
 	f, _ := ctx.Value(taskEmitCtxKey).(func(db.Activity))
 	return f

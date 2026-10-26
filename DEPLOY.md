@@ -1,6 +1,6 @@
 # Jingwei（精卫）Docker 部署指南
 
-适用版本：**v1.0.0** 及以后。Jingwei 1.0.0 只通过容器镜像分发，
+适用版本：**v1.1.0**。Jingwei 自 1.0.0 起只通过容器镜像分发，
 部署、升级和回滚都使用 Docker Compose。
 
 - 镜像：`ghcr.io/domren/jingwei`
@@ -26,7 +26,7 @@ LLM 不是启动必需项，但对话、任务执行和 Agent 自动规划需要
 ### 2.1 使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.0.0 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.1.0 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 ```
@@ -35,8 +35,8 @@ cp .env.example .env
 
 ```bash
 mkdir -p jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.0.0/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.0.0/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.1.0/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.1.0/deploy/.env.example
 ```
 
 两种方式得到的目录结构相同：
@@ -52,7 +52,7 @@ curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.0.0/deploy/
 镜像默认发布到 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.0.0
+docker pull ghcr.io/domren/jingwei:1.1.0
 ```
 
 维护者把 Package 可见性设为 **Public** 后，以上命令无需登录。
@@ -70,9 +70,9 @@ unset GHCR_TOKEN
 
 | 标签 | 说明 |
 | --- | --- |
-| `1.0.0` / `v1.0.0` | 固定版本，生产环境推荐 |
+| `1.1.0` / `v1.1.0` | 固定版本，生产环境推荐 |
 | `latest` | 最新正式版 |
-| `v1.0.0-amd64` / `v1.0.0-arm64` | 单架构中间镜像，一般不用 |
+| `v1.1.0-amd64` / `v1.1.0-arm64` | 单架构中间镜像，一般不用 |
 
 ## 4. 配置 `.env`
 
@@ -82,7 +82,7 @@ unset GHCR_TOKEN
 POSTGRES_USER=jingwei
 POSTGRES_PASSWORD=请替换为强随机密码
 POSTGRES_DB=jingwei
-JINGWEI_IMAGE=ghcr.io/domren/jingwei:1.0.0
+JINGWEI_IMAGE=ghcr.io/domren/jingwei:1.1.0
 JINGWEI_WEB_PORT=9790
 JINGWEI_PROXY_PORT=9791
 ```
@@ -99,6 +99,9 @@ JINGWEI_PROXY_PORT=9791
 - LLM 可先在 `.env` 填写，也可启动后进入「系统 → LLM」配置。
   使用 OpenAI 兼容服务时，通常填写 `OPENAI_API_KEY`、`ARTEX_LLM_BASE_URL` 和
   `ARTEX_LLM_MODEL`。
+- `ARTEX_LLM_CALL_TIMEOUT` 限制单次模型调用的总墙钟（含 SDK 重试与流式读取），默认 `15m`。
+  网关变慢时会出现「任务在跑、日志里持续出现 `单次调用超过硬性墙钟`、漏洞数为 0」，
+  此时调小为 `300s` 可让 worker 尽快放弃卡住的那一次并继续推进。
 - 如果需要限制访问来源，建议保持 `JINGWEI_PROXY_PORT` 只绑定 `127.0.0.1`，
   公网只开放反向代理端口。
 
@@ -114,7 +117,7 @@ curl -fsS http://127.0.0.1:9790/api/health
 期望健康检查返回：
 
 ```json
-{"ok":true,"service":"jingwei","version":"1.0.0"}
+{"ok":true,"service":"jingwei","version":"1.1.0"}
 ```
 
 浏览器访问 `http://<服务器IP>:9790`：
@@ -286,9 +289,9 @@ rm -rf server/webui/dist
 cp -r web/out server/webui/dist
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.0.0" -o dist/amd64/artex ./cmd/artex
+  -ldflags "-s -w -X main.version=1.1.0" -o dist/amd64/artex ./cmd/artex
 
-docker build --network=host --build-arg TARGETARCH=amd64 -t jingwei:1.0.0 .
+docker build --network=host --build-arg TARGETARCH=amd64 -t jingwei:1.1.0 .
 ```
 
 ARM64 构建时把 `GOARCH` 与 `TARGETARCH` 改为 `arm64`，并在对应架构的机器上
@@ -321,7 +324,7 @@ docker compose logs --tail=100 postgres
 
 ### 10.2 无法拉取 GHCR 镜像
 
-- 确认镜像版本存在：`docker manifest inspect ghcr.io/domren/jingwei:1.0.0`
+- 确认镜像版本存在：`docker manifest inspect ghcr.io/domren/jingwei:1.1.0`
 - 若 Package 是私有的，先按第 3 节登录；Token 需要 `read:packages`。
 - 确认 Docker 所在网络可以访问 `ghcr.io`。
 

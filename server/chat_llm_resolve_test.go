@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 
@@ -16,12 +17,20 @@ func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer m.Close()
+	// Row cleanup below runs in t.Cleanup, which fires after every deferred call.
+	// Closing through a defer would therefore shut the pool down first and every
+	// delete would fail against a closed DB, leaving its fixtures in the schema.
+	t.Cleanup(func() { _ = m.Close() })
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
 
-	// Start from a clean profile table; other tests in the shared DB may have left rows.
+	// The "nothing configured" branch needs an empty llm_profiles, but on a shared
+	// dev database that table holds the operator's live credentials — wiping it to
+	// satisfy one assertion destroys their configuration, so require an opt-in.
 	existing, _ := m.pg.ListProfiles()
+	if len(existing) > 0 && os.Getenv("ARTEX_TEST_ALLOW_DB_WIPE") != "1" {
+		t.Skipf("llm_profiles 已有 %d 条配置（可能是使用者真实凭据），拒绝清空；在专用库上跑本测试请设 ARTEX_TEST_ALLOW_DB_WIPE=1", len(existing))
+	}
 	for _, p := range existing {
 		if p.IsDefault {
 			// The active profile cannot be deleted directly; clear the flag first.
@@ -66,7 +75,9 @@ func TestResolveChatAgentHonoursConversationProfile(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer m.Close()
+	// Registered before the profile's own cleanup so, running last (LIFO), it closes
+	// the pool only after that delete has run.
+	t.Cleanup(func() { _ = m.Close() })
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
 

@@ -237,7 +237,7 @@ const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 **边发现边写回**（写进图才算数，脑子/文字里的不算；每得一个结果立刻写，别攒到最后被步数耗尽丢掉）。三种写回，别串图：
 - **新资产/资源 → insert_assets（资产图）**：子域 / service / endpoint / 指纹 / 凭据 等一切资产【本身】。**这里只登记资产；探索结论/判断不写这里，用 record_fact。**
 - **探索结论/事实 → record_fact（探索图，传 intent_id）**：都用它。**多个观察汇总成【一条】事实**（summary 一句总结 + detail写对总结的拓展，依靠真实的执行过程），不要一个属性一条、一意图通常只一条，拆碎会让图谱无限膨胀——**默认就写一条，能并进 detail 的都并进去**；仅当确有【彼此完全独立、无法归并】的结论时才用 facts 数组分条，这是极少数例外，不是常规。**只写增量**：只记这次【新得到】的，别把已有事实换措辞重记（只印证已有、无新增就不必记）。**只写真实看到的**：给 evidence（一行：命令+最能证明的一两行输出，简洁，细节在 detail）、标 confidence（observed=直接看到 / inferred=据现象推断）。
-- **确认漏洞 → report_finding（探索图，含 PoC，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 inferred 事实（嫌疑点+为何未触发）交规划者，别硬记成 finding。
+- **确认漏洞 → report_finding（探索图，含 PoC，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 inferred 事实（嫌疑点+为何未触发）交规划者，别硬记成 finding。**HTTP 漏洞必须用 traffic_refs 按复现顺序绑定本次真实抓到的报文**：先 traffic_search（指定 host）找出你亲手发过的请求，逐条 traffic_get 核实响应确实支持该结论，再按顺序传 ID——提交型/存储型/盲打型要把提交请求与触发危害的那一次 GET 一起给出。只写文字结论、不绑流量会被退回且不登记漏洞；确实从未向目标发出过可复现请求（仅读源码/配置得出）时才传 no_raw_capture=true 并在 evidence 说明原因。**SQLi/XSS 别停在自己试通一次或 POC 命中**：登记后立刻用 verify_sqli / verify_xss 复测该注入点并带上 finding_ids，由 sqlmap/dalfox 的结论定案、工具报文覆盖证据；本次意图剩余时间不够等它跑完就传 queue_only=true 先把专项任务排上队（结论与原始报文跑完自动回写），不许因为来不及就跳过复测；判未复现就撤销或降级，判 tool_uncovered / session_needed（宽字节、盲打/DOM 无回显、需要登录）则保留原判定并说明原因。**Redis/MySQL/SSH/memcached 等非 HTTP 协议漏洞：必须同时传 protocol（协议名）+ raw_request（本次真实发送的完整字节，逐字节保留 \r\n）+ raw_response（真实收到的字节）**，evidence 只写判定结论，不要把字节贴进 evidence——只有 raw_request/raw_response 里的数据会进报告的「原始协议报文」章节并供人工重放；缺字段的返回会带 missing_raw_packet 提示，此时立即用相同 vulnclass/name 再调一次补上字节（系统合并到同一条漏洞，不算重复）。
 
 
 完成本意图后用一句话总结你做了什么、写回了哪些事实。`
@@ -257,15 +257,17 @@ func workerTrafficBlock(recording bool) string {
 // artifactSpec is 段 [C]: the code-owned, non-editable tail appended to every
 // pentest agent's prompt — intermediate artifacts must land in the shared work
 // dir, never /tmp. Guaranteed present regardless of how the DB body is edited.
-func artifactSpec(dir string) string {
-	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本任务工作目录 " + dir + "**（相对路径即写在这里，也可用该绝对路径）——**不要写 /tmp、不要用其它绝对路径**。"
+func artifactSpec(dir, base string) string {
+	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本任务工作目录 " + dir + "**（相对路径即写在这里，也可用该绝对路径）——**不要写 /tmp、不要用其它绝对路径**。" +
+		"\n\n**脚本沉淀规约**：跑通的可复用脚本（验证脚本、PoC、批量工具）必须再复制一份到 " + filepath.Join(base, "scripts") + "/<任务编号或名称>/ 下，工作区「脚本」入口会直接列出，便于复用与审计。"
 }
 
 // workerArtifactSpec is the worker's 段 [C]: its per-intent run dir is pre-created
 // by the engine (ensureRunDir), so it just writes relative paths there — no manual
 // mkdir, no cross-worker name collisions.
-func workerArtifactSpec(runDir string) string {
-	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。"
+func workerArtifactSpec(runDir, base string) string {
+	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。" +
+		"\n\n**脚本沉淀规约**：跑通的可复用脚本必须再复制一份到 " + filepath.Join(base, "scripts") + "/<任务编号或名称>/ 下，工作区「脚本」入口会直接列出。"
 }
 
 // ensureRunDir builds and creates an agent's working directory under base:
@@ -290,7 +292,7 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
+	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir, dataDir) + untrustedDataRules() + cleanupRules()
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:

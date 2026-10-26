@@ -1,7 +1,9 @@
 package traffic
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -101,10 +103,61 @@ func TestRecordKeepsBodiesInIndex(t *testing.T) {
 			t.Fatalf("请求原文缺少 %q，实际：\n%s", want, req)
 		}
 	}
-	for _, want := range []string{"HTTP 200", `"token":"abc123"`, "内网测试账号"} {
+	for _, want := range []string{"HTTP/1.1 200 OK", `"token":"abc123"`, "内网测试账号"} {
 		if !strings.Contains(resp, want) {
 			t.Fatalf("响应原文缺少 %q，实际：\n%s", want, resp)
 		}
+	}
+}
+
+// TestRecordWritesRealResponseStatusLine guards the report requirement that
+// exported evidence carries a real status line, not a bare "HTTP 302".
+func TestRecordWritesRealResponseStatusLine(t *testing.T) {
+	tr, _ := openTraffic(t)
+	f := newFlow("api.example.com", "GET", "/moved", nil, []byte("moved"))
+	f.Response.StatusCode = 302
+	tr.record(f)
+
+	_, resp, err := tr.Get(onlyExchangeID(t, tr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(resp, "HTTP/1.1 302 Found\n") {
+		t.Fatalf("响应状态行不正确：\n%s", resp)
+	}
+}
+
+// TestLegacyResponseStatusLineUpgradedOnRead keeps historical captures usable
+// after the status-line fix: readers restore "HTTP 200" to "HTTP/1.1 200 OK".
+func TestLegacyResponseStatusLineUpgradedOnRead(t *testing.T) {
+	tr, _ := openTraffic(t)
+	f := newFlow("api.example.com", "GET", "/legacy", nil, []byte("ok"))
+	f.Response.StatusCode = 301
+	tr.record(f)
+	id := onlyExchangeID(t, tr)
+	if _, err := tr.DB().Exec(`UPDATE exchange_bodies SET resp_head=? WHERE id=?`, "HTTP 301\nLocation: /new", id); err != nil {
+		t.Fatal(err)
+	}
+
+	_, resp, err := tr.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(resp, "HTTP/1.1 301 Moved Permanently\n") {
+		t.Fatalf("Get 未升级旧状态行：\n%s", resp)
+	}
+
+	var head string
+	err = tr.ReadEvidence(context.Background(), []string{id}, func(e EvidenceExchange) error {
+		head = e.RespHead
+		_, err := io.Copy(io.Discard, e.Response)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(head, "HTTP/1.1 301 Moved Permanently\n") {
+		t.Fatalf("ReadEvidence 未升级旧状态行：%q", head)
 	}
 }
 

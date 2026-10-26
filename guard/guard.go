@@ -1,16 +1,18 @@
-// Package guard implements the safety boundary layer (docs §11): an audit log,
+// Package guard implements the safety boundary layer (docs §11): deterministic
+// sensitive-egress and task-scope/asset checks (no LLM required), an audit log,
 // user-configured intercept-rule evaluation, and Observer/G5 failure attribution.
 // Every tool call passes through the PreToolUse hook before executing.
-// (The RoE authorization-scope mechanism was removed; a replacement may be added
-// later.) Destructive/exfil gating is no longer hard-coded here — it lives in the
-// DB intercept rules (seeded as ordinary [内置] rules, so users can disable or
-// delete them), evaluated via applyIntercept.
+// Deterministic gates run first; destructive/exfil gating beyond them lives in
+// the DB intercept rules (seeded as ordinary [内置] rules, so users can disable
+// or delete them), evaluated via applyIntercept.
 package guard
 
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +36,8 @@ type Guard struct {
 	attrib      map[string]int // failure attribution counts (Observer / G5)
 	reg         *hook.Registry
 	interceptor *intercept.Interceptor // optional; nil disables user-configured rules
+	egress      *EgressGuard           // optional; process-wide secret fingerprints
+	policy      TargetPolicy           // optional; task scope + asset block rules
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
@@ -53,6 +57,21 @@ func newGuard(ic *intercept.Interceptor) *Guard {
 
 // Hooks returns the hook registry to attach to an agent session.
 func (g *Guard) Hooks() *hook.Registry { return g.reg }
+
+// SetEgress installs the process-wide sensitive-egress fingerprints.
+func (g *Guard) SetEgress(e *EgressGuard) {
+	g.mu.Lock()
+	g.egress = e
+	g.mu.Unlock()
+}
+
+// SetTargetPolicy installs the deterministic target policy (task scope + asset
+// block rules). A nil policy disables target checks.
+func (g *Guard) SetTargetPolicy(p TargetPolicy) {
+	g.mu.Lock()
+	g.policy = p
+	g.mu.Unlock()
+}
 
 func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 	// Extract the shell-command surface for the audit log: Bash + the interactive-shell
@@ -74,8 +93,127 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 		_ = json.Unmarshal(ev.Input, &in)
 		cmd = in.Text
 	}
-	g.record(ev.ToolName, "allow", "", cmd)
+	// Deterministic gates run before the rule/judge layer and do not depend on an
+	// LLM: sensitive-egress first (hard block), then task scope + asset blocks.
+	if res, blocked := g.checkEgress(ev, cmd); blocked {
+		return res
+	}
+	res, blocked, recorded := g.checkTargets(ctx, ev, cmd)
+	if blocked {
+		return res
+	}
+	if !recorded {
+		g.record(ev.ToolName, "allow", "", cmd)
+	}
 	return g.applyIntercept(ctx, ev)
+}
+
+const (
+	// maxEgressScanBytes bounds the outbound text scanned per call; oversized
+	// inputs are checked head+tail so a secret cannot hide past the cap.
+	maxEgressScanBytes = 64 << 10
+)
+
+// egressCheckTool reports whether a non-shell tool sends caller-provided
+// content to a remote endpoint. Local metadata tools are excluded so a finding
+// note or asset record that happens to contain a secret is not mistaken for
+// exfiltration.
+func egressCheckTool(name string) bool {
+	if name == "WebFetch" || strings.HasPrefix(name, "mcp__") {
+		return true
+	}
+	switch name {
+	case "web_fetch", "http_request", "http_post",
+		"verify_vulnerability", "exploit_vulnerability", "test_waf_bypass", "inject_webshell",
+		"intranet_exec", "intranet_batch_exec", "intranet_upload", "intranet_tunnel":
+		return true
+	}
+	return false
+}
+
+func egressTexts(toolName string, input json.RawMessage, cmd string) []string {
+	text := ""
+	if cmd != "" {
+		text = cmd
+	} else if egressCheckTool(toolName) {
+		text = string(input)
+	} else {
+		return nil
+	}
+	if len(text) <= maxEgressScanBytes {
+		return []string{text}
+	}
+	half := maxEgressScanBytes / 2
+	return []string{text[:half], text[len(text)-half:]}
+}
+
+func (g *Guard) checkEgress(ev hook.Event, cmd string) (hook.Result, bool) {
+	texts := egressTexts(ev.ToolName, ev.Input, cmd)
+	if len(texts) == 0 {
+		return hook.Result{}, false
+	}
+	// References to platform credential files / env names are blocked even when
+	// their values are expanded at shell runtime and never appear in the input.
+	for _, text := range texts {
+		if ref := rePlatformSecretRef.FindString(text); ref != "" {
+			log.Printf("[guard][egress] tool=%s 引用平台敏感凭据(%s)，已拦截", ev.ToolName, ref)
+			return g.block(ev.ToolName, systemBlockMessage("操作引用了平台敏感凭据（"+ref+"），禁止读取或外发"), ""), true
+		}
+	}
+	g.mu.Lock()
+	eg := g.egress
+	g.mu.Unlock()
+	if eg == nil {
+		return hook.Result{}, false
+	}
+	for _, text := range texts {
+		if kind, hit := eg.Check(text); hit {
+			// Never log or audit the matched content — only the kind.
+			log.Printf("[guard][egress] tool=%s 检出平台敏感信息(%s)，已拦截", ev.ToolName, kind)
+			return g.block(ev.ToolName, systemBlockMessage("操作包含平台敏感信息（"+kind+"），禁止外发"), ""), true
+		}
+	}
+	return hook.Result{}, false
+}
+
+var rePlatformSecretRef = regexp.MustCompile(`(?i)(jwt\.key|/proc/(?:self|[0-9]+)/environ|\b(?:ANTHROPIC_API_KEY|OPENAI_API_KEY|ARTEX_PG_DSN|JAVA_CHAINS_MCP_TOKEN|JAVA_CHAINS_PASS)\b)`)
+
+// checkTargets enforces the deterministic scope/asset policy. The third return
+// value reports that an audit entry was already written (warn mode), so the
+// caller skips the plain allow record.
+func (g *Guard) checkTargets(ctx context.Context, ev hook.Event, cmd string) (hook.Result, bool, bool) {
+	g.mu.Lock()
+	pol := g.policy
+	g.mu.Unlock()
+	if pol == nil {
+		return hook.Result{}, false, false
+	}
+	mode := strings.ToLower(strings.TrimSpace(pol.Mode()))
+	if mode == "" {
+		mode = "warn"
+	}
+	if mode == "off" {
+		return hook.Result{}, false, false
+	}
+	urls, hosts := ExtractTargets(ev.ToolName, ev.Input, cmd)
+	if len(urls) == 0 && len(hosts) == 0 {
+		return hook.Result{}, false, false
+	}
+	verdict, reason := pol.Check(intercept.TaskIDFromContext(ctx), urls, hosts)
+	if verdict != ScopeOut {
+		return hook.Result{}, false, false
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "目标不在任务授权范围内"
+	}
+	if mode != "strict" {
+		// warn: keep the current behavior (allow) but make the violation visible.
+		g.record(ev.ToolName, "allow", "范围告警(仅记录): "+reason, cmd)
+		log.Printf("[guard][target] %s", reason)
+		return hook.Result{}, false, true
+	}
+	return g.block(ev.ToolName, systemBlockMessage(reason+"。请勿改换写法重试，先补齐授权范围或调整禁令"), cmd), true, true
 }
 
 // applyIntercept evaluates user-configured intercept rules against the tool call.

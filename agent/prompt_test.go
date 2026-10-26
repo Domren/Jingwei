@@ -63,6 +63,17 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	if !strings.Contains(recording, "中间产物输出规约") {
 		t.Fatalf("worker missing artifact tail: %q", recording)
 	}
+	// Write-side proof leaves shells and forged accounts on the target unless the
+	// executor is told to revert them inside the same intent.
+	if !strings.Contains(recording, "只清理本次自己创建的东西") {
+		t.Fatalf("worker missing cleanup tail: %q", recording)
+	}
+	// L6 "reverted" an upload with an HTTP DELETE that removed nothing and then
+	// reported the finding clean, so the tail must name a working channel and
+	// demand proof the artifact is gone.
+	if !strings.Contains(recording, "目标真正会执行的通道") || !strings.Contains(recording, "撤销后必须证明") {
+		t.Fatalf("worker cleanup tail misses revert verification: %q", recording)
+	}
 	// Egress proxy set but capture OFF (no CA): the ProxyAddr template branch still
 	// renders, but the trafficTool block must NOT — those tools are not registered.
 	egressOnly := workerSystem("127.0.0.1:8080", "", "/data", "/data")

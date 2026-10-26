@@ -30,7 +30,7 @@ func deleteAsset(d *DB, id int64) {
 
 func TestUpsertRootDomain(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	id1, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "roottest.io", ICP: "A12345", TaskID: 1})
 	if err != nil {
@@ -64,7 +64,7 @@ func TestUpsertRootDomain(t *testing.T) {
 
 func TestUpsertRootDomainEmpty(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	_, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: ""})
 	if err == nil {
@@ -78,7 +78,7 @@ func TestUpsertRootDomainEmpty(t *testing.T) {
 
 func TestUpsertIP(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	id1, err := av2.UpsertIP(UpsertIPReq{
 		IP:        "192.168.10.5",
@@ -120,7 +120,7 @@ func TestUpsertIP(t *testing.T) {
 
 func TestUpsertIPBoundDomains(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	id, err := av2.UpsertIP(UpsertIPReq{
 		IP:           "10.1.2.3",
@@ -152,7 +152,7 @@ func TestUpsertIPBoundDomains(t *testing.T) {
 
 func TestAppendIPPort(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	id, err := av2.UpsertIP(UpsertIPReq{IP: "10.9.8.7"})
 	if err != nil {
@@ -180,7 +180,7 @@ func TestAppendIPPort(t *testing.T) {
 
 func TestUpsertSubdomain(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	id, err := av2.UpsertSubdomain(UpsertSubdomainReq{
 		Domain:      "sub.subdtest.com",
@@ -222,7 +222,7 @@ func TestUpsertSubdomain(t *testing.T) {
 
 func TestUpsertSubdomainDedup(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	id1, err := av2.UpsertSubdomain(UpsertSubdomainReq{Domain: "dedup.subdtest2.net", RecordType: "A", RecordValue: []string{"5.5.5.5"}})
 	if err != nil {
@@ -245,7 +245,7 @@ func TestUpsertSubdomainDedup(t *testing.T) {
 
 func TestUpsertAppByBundle(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	id1, err := av2.UpsertApp(UpsertAppReq{Name: "MyApp", BundleID: "com.example.myapp", Category: "tools"})
 	if err != nil {
@@ -265,7 +265,7 @@ func TestUpsertAppByBundle(t *testing.T) {
 
 func TestUpsertAppByName(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	id1, err := av2.UpsertApp(UpsertAppReq{Name: "UniqueAppNoBundle", Category: "utility"})
 	if err != nil {
@@ -288,7 +288,7 @@ func TestUpsertAppByName(t *testing.T) {
 
 func TestUpsertHTTPService(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	sc := 200
 	cl := int64(1024)
@@ -337,7 +337,7 @@ func TestUpsertHTTPService(t *testing.T) {
 
 func TestUpsertHTTPServiceAuthAppend(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	auth1 := []map[string]any{{"type": "basic", "username": "admin", "password": "pass"}}
 	id1, err := av2.UpsertHTTPService(UpsertHTTPServiceReq{
@@ -377,7 +377,7 @@ func TestUpsertHTTPServiceAuthAppend(t *testing.T) {
 
 func TestUpsertOtherService(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	id1, err := av2.UpsertOtherService(UpsertOtherServiceReq{
 		IP:          "172.16.0.1",
@@ -417,7 +417,7 @@ func TestUpsertOtherService(t *testing.T) {
 
 func TestUpsertOtherServiceAuthAppend(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	auth1 := []map[string]any{{"username": "admin", "password": "secret"}}
 	id1, err := av2.UpsertOtherService(UpsertOtherServiceReq{
@@ -449,13 +449,48 @@ func TestUpsertOtherServiceAuthAppend(t *testing.T) {
 	}
 }
 
+func TestUpsertOtherServiceExtraMerge(t *testing.T) {
+	d, av2, _ := testSetup(t)
+	t.Cleanup(func() { _ = d.Close() })
+
+	id1, err := av2.UpsertOtherService(UpsertOtherServiceReq{
+		IP:          "10.6.6.6",
+		Port:        22,
+		ServiceName: "ssh",
+		Extra:       map[string]any{"banner": "SSH-2.0-OpenSSH_9.6", "source": "scan"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM assets WHERE (type = 'service' AND ip = '10.6.6.6') OR (type = 'ip' AND ip = '10.6.6.6')`)
+
+	id2, err := av2.UpsertOtherService(UpsertOtherServiceReq{
+		IP:          "10.6.6.6",
+		Port:        22,
+		ServiceName: "ssh",
+		Extra:       map[string]any{"tls": true},
+	})
+	if err != nil || id2 != id1 {
+		t.Fatalf("dedup or error: %v, ids %d vs %d", err, id2, id1)
+	}
+
+	var banner string
+	var tls bool
+	if err := d.QueryRow(`SELECT COALESCE(extra->>'banner',''), COALESCE((extra->>'tls')::boolean,false) FROM assets WHERE id=$1`, id1).Scan(&banner, &tls); err != nil {
+		t.Fatal(err)
+	}
+	if banner != "SSH-2.0-OpenSSH_9.6" || !tls {
+		t.Fatalf("extra merge failed: banner=%q tls=%v", banner, tls)
+	}
+}
+
 // =====================================================================
 // Endpoint
 // =====================================================================
 
 func TestUpsertEndpoint(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	params1 := []map[string]any{{"location": "query", "name": "id", "value": "1"}}
 	id1, err := av2.UpsertEndpoint(UpsertEndpointReq{
@@ -497,7 +532,7 @@ func TestUpsertEndpoint(t *testing.T) {
 
 func TestUpsertEndpointRequiredFields(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	_, err := av2.UpsertEndpoint(UpsertEndpointReq{URL: "", Method: "GET"})
 	if err == nil {
@@ -516,7 +551,7 @@ func TestUpsertEndpointRequiredFields(t *testing.T) {
 
 func TestQueryByType(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	id, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "querytest.example.net"})
 	if err != nil {
@@ -542,7 +577,7 @@ func TestQueryByType(t *testing.T) {
 // TestDeleteByTaskID: 独有资产被删,与其他任务共享的资产仅解除关联(保留),host 反查正确。
 func TestDeleteByTaskID(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	const taskA = int64(90001)
 	const taskB = int64(90002)
@@ -594,7 +629,7 @@ func TestDeleteByTaskID(t *testing.T) {
 
 func TestQueryByTask(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	const taskID = int64(99999)
 	id, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "taskquery.net", TaskID: taskID})
@@ -643,7 +678,7 @@ func TestQueryByTask(t *testing.T) {
 // 任务资产列表按页取,不再被固定条数截断:60 条资产用 25/页要能完整翻出来。
 func TestQueryByTaskPaging(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	const taskID = int64(99998)
 	const n = 60
@@ -687,7 +722,7 @@ func TestQueryByTaskPaging(t *testing.T) {
 
 func TestQueryByCompany(t *testing.T) {
 	d, av2, cs := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	companyID, _, err := cs.UpsertCompany("QueryByCompanyCorp", "")
 	if err != nil {
@@ -742,7 +777,7 @@ func TestQueryByCompany(t *testing.T) {
 // 企业资产列表同样按页取,不被固定条数截断。
 func TestQueryByCompanyPaging(t *testing.T) {
 	d, av2, cs := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	companyID, _, err := cs.UpsertCompany("QueryByCompanyPagingCorp", "")
 	if err != nil {
@@ -795,7 +830,7 @@ func TestQueryByCompanyPaging(t *testing.T) {
 
 func TestCountsByType(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	id, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "counttest.example.biz"})
 	if err != nil {
@@ -818,7 +853,7 @@ func TestCountsByType(t *testing.T) {
 
 func TestCompanyAttributionAtInsertTime(t *testing.T) {
 	d, av2, cs := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	companyID, _, err := cs.UpsertCompany("InsertAttrCorp", "")
 	if err != nil {
@@ -902,7 +937,7 @@ func TestNormalizeURL(t *testing.T) {
 
 func TestAssetPaginationUsesStableIDTieBreaker(t *testing.T) {
 	d, assets, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	stamp := time.Now().UnixNano()
 	taskID := stamp
@@ -954,7 +989,7 @@ func TestAssetPaginationUsesStableIDTieBreaker(t *testing.T) {
 // refuse a non-address, and the message must tell the caller how to fix it.
 func TestAssetIPRejectsHostname(t *testing.T) {
 	d, av2, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	hostname := "d63cd476.cdn.ucloud.com.cn"
 	cases := []struct {
@@ -993,6 +1028,9 @@ func TestAssetIPRejectsHostname(t *testing.T) {
 		t.Fatalf("empty ip rejected: %v", err)
 	}
 	deleteAsset(d, id)
+	// Registering a service also registers its host, so the returned row is not
+	// the only one this upsert wrote.
+	d.Exec(`DELETE FROM assets WHERE domain='ip-guard.example.com'`)
 	id, err = av2.UpsertIP(UpsertIPReq{IP: "203.0.113.7"})
 	if err != nil {
 		t.Fatalf("valid ip rejected: %v", err)
@@ -1008,7 +1046,7 @@ func TestAssetIPRejectsHostname(t *testing.T) {
 // are excluded. Direct source tasks' scope is included.
 func TestQueryDSLInScopeMembership(t *testing.T) {
 	d, assets, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	task, err := d.CreateTask("scope membership", "goal", nil, 0, 0)
 	if err != nil {
@@ -1025,11 +1063,11 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 	}
 
 	stamp := time.Now().UnixNano()
-	root := fmt.Sprintf("sc%d.invalid", stamp)           // in-scope root domain (task)
-	srcRoot := fmt.Sprintf("src%d.invalid", stamp)       // in-scope via source task
-	out := fmt.Sprintf("out%d.invalid", stamp)           // out of every scope
-	marker := fmt.Sprintf("mk%d", stamp)                 // bare-text token present in all rows
-	foreignTask := stamp + 777                           // asset produced by an unrelated task
+	root := fmt.Sprintf("sc%d.invalid", stamp)     // in-scope root domain (task)
+	srcRoot := fmt.Sprintf("src%d.invalid", stamp) // in-scope via source task
+	out := fmt.Sprintf("out%d.invalid", stamp)     // out of every scope
+	marker := fmt.Sprintf("mk%d", stamp)           // bare-text token present in all rows
+	foreignTask := stamp + 777                     // asset produced by an unrelated task
 
 	// Scope: task owns root; source task owns srcRoot; task owns an IP /24.
 	for _, sc := range []struct {
@@ -1057,7 +1095,7 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 		{"subdomain", "api." + root, root, "", "", "", marker},                        // under task root
 		{"service", "www." + root, root, "https://www." + root + "/", "", "", marker}, // service under task root
 		{"endpoint", "www." + root, root, "https://www." + root + "/a?" + marker + "=1", "GET", "", ""},
-		{"subdomain", "dev." + srcRoot, srcRoot, "", "", "", marker}, // under source-task root
+		{"subdomain", "dev." + srcRoot, srcRoot, "", "", "", marker},                                      // under source-task root
 		{"endpoint", "198.51.100.9", "198.51.100.9", "http://198.51.100.9:8080/" + marker, "GET", "", ""}, // IP-literal host, ip col empty
 		{"subdomain", "x." + out, out, "", "", "", marker},                                                // out of scope
 	}

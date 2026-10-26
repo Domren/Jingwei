@@ -21,6 +21,7 @@ func retestDB(t *testing.T) (*DB, int64) {
 	}
 	t.Cleanup(func() {
 		_, _ = d.Exec(`DELETE FROM conversations WHERE id IN (SELECT conversation_id FROM finding_retests WHERE finding_id=$1)`, fid)
+		purgeDetachedFindings(t, d, fid)
 		_, _ = d.DeleteFinding(fid)
 		d.Close()
 	})

@@ -112,7 +112,7 @@ func (d *DB) FindingCaseEvents(id int64) ([]FindingCaseEvent, error) {
 }
 func (d *DB) ListFindingCases(filter FindingFilter, page, size int) ([]FindingCaseRow, int, error) {
 	var err error
-	filter, err = d.applyAssetScope(filter)
+	filter, err = d.applyFindingScopes(filter)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -626,7 +626,7 @@ func (d *DB) FindingCaseListContexts(ids []int64) (map[int64]FindingCaseListCont
 	return result, rows.Err()
 }
 func (d *DB) MatchingFindingReportCount(filter FindingFilter) (int, error) {
-	filter, err := d.applyAssetScope(filter)
+	filter, err := d.applyFindingScopes(filter)
 	if err != nil {
 		return 0, err
 	}

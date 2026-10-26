@@ -16,12 +16,19 @@ LLM 驱动的全链自动化红队渗透平台 · Docker 分发版
 
 ---
 
-## Jingwei 1.0.0
+## Jingwei 1.1.0
 
 - **品牌化**：控制台、登录/初始化页、侧栏、报告、通知、页脚与后端服务名统一为「精卫 Jingwei」。
 - **POC 模板库**：nuclei 模板的搜索、筛选、统计、详情、上传、启停与批量执行；镜像内置 nuclei 3.11.1。
+- **自动化漏扫**：不配置 LLM 也能跑——端口探测 + 25,136 条 FLUX 指纹 + nuclei 命中直接生成漏洞发现，
+  SQL 注入与 XSS 由镜像内置的 sqlmap / dalfox 专项验证器复核。
+- **可复现报文**：每条发现绑定完整原始请求/响应报文，多步 POC 保存整条报文链；非 HTTP 协议
+  （Redis RESP、MySQL 握手、SSH banner）按协议本身出十六进制字节，可直接复现验证。
+- **深度利用**：exploit / verify / waf-bypass / webshell / resources / intranet 六个子页，
+  Java 反序列化走可选 java-chains sidecar + MCP。
+- **安全边界**：工具调用统一经 Guard 做目标范围与出站限制、密钥脱敏与痕迹清理，判定结果带反证去重。
 - **全链自动化**：planner / worker / main-agent 协作，探索图 + 资产图双图驱动任务推进。
-- **完整工作台**：任务与计划任务、发现与报告、资产与 ScopeSentry 同步、流量录制、工具执行、LLM 记录。
+- **完整工作台**：任务与计划任务、发现与报告（DOCX/HTML 导出）、资产与 ScopeSentry 同步、流量录制、工具执行、LLM 记录。
 - **人在环路**：拦截规则、审批记录、旁路问答与通知推送。
 - **Docker 分发**：`linux/amd64` / `linux/arm64` 多架构镜像，Compose 一键部署，升级只换镜像。
 
@@ -54,7 +61,7 @@ LLM 驱动的全链自动化红队渗透平台 · Docker 分发版
 
 ## 快速开始（Docker）
 
-> 1.0.0 起仅通过 Docker 镜像分发，不再提供预编译二进制或页面一键换装。
+> 自 1.0.0 起仅通过 Docker 镜像分发，不再提供预编译二进制或页面一键换装。
 > 完整参数、备份恢复与故障排查见 [DEPLOY.md](DEPLOY.md)。
 
 **环境要求**：Docker Engine 24+、Docker Compose v2，`linux/amd64` 或 `linux/arm64`，
@@ -63,7 +70,7 @@ LLM 驱动的全链自动化红队渗透平台 · Docker 分发版
 ### 方式一：使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.0.0 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.1.0 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 # 编辑 .env：至少修改 POSTGRES_PASSWORD
@@ -75,8 +82,8 @@ docker compose up -d
 
 ```bash
 mkdir jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.0.0/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.0.0/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.1.0/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.1.0/deploy/.env.example
 # 编辑 .env 后启动
 docker compose pull
 docker compose up -d
@@ -90,7 +97,7 @@ docker compose up -d
 镜像发布在 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.0.0
+docker pull ghcr.io/domren/jingwei:1.1.0
 ```
 
 仓库维护者将 Package 设为公开后可直接拉取。若镜像仍为私有，请使用具备
@@ -108,7 +115,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u Domren --password-stdin
 | --- | :---: | --- |
 | `POSTGRES_PASSWORD` | 是 | 数据库密码，建议使用字母数字强随机值 |
 | `POSTGRES_USER` / `POSTGRES_DB` | 否 | 默认均为 `jingwei` |
-| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.0.0` |
+| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.1.0` |
 | `JINGWEI_WEB_PORT` | 否 | Web/API 宿主端口，默认 `9790` |
 | `JINGWEI_PROXY_PORT` | 否 | 流量代理宿主端口，默认 `9791`，仅绑定 `127.0.0.1` |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | 否 | 也可启动后在 UI 配置 |
@@ -183,11 +190,11 @@ cd web && npm ci && npm run build:static && cd ..
 # 2. 嵌入前端并编译 Linux 二进制
 rm -rf server/webui/dist && cp -r web/out server/webui/dist
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.0.0" -o dist/amd64/artex ./cmd/artex
+  -ldflags "-s -w -X main.version=1.1.0" -o dist/amd64/artex ./cmd/artex
 
 # 3. 构建运行镜像
 docker build --network=host --build-arg TARGETARCH=amd64 \
-  -t jingwei:1.0.0 .
+  -t jingwei:1.1.0 .
 ```
 
 本地开发运行后端与前端的方法见 [DEPLOY.md](DEPLOY.md#从源码开发)。

@@ -267,6 +267,59 @@ func (d *DB) POCTemplatesByIDs(ids []int64) ([]POCTemplate, error) {
 	return out, contentRows.Err()
 }
 
+// POCTemplatesByTemplateIDs loads enabled templates by their nuclei template_id.
+// The scan pipeline uses this to replay exactly the templates that matched
+// instead of re-fingerprinting the target.
+func (d *DB) POCTemplatesByTemplateIDs(templateIDs []string) ([]POCTemplate, error) {
+	ids := make([]string, 0, len(templateIDs))
+	seen := map[string]bool{}
+	for _, id := range templateIDs {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := d.Query(`SELECT `+pocCols+` FROM poc_templates WHERE template_id = ANY($1) AND enabled ORDER BY id`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []POCTemplate{}
+	for rows.Next() {
+		p, err := scanPOC(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	contentRows, err := d.Query(`SELECT id, content FROM poc_templates WHERE template_id = ANY($1) AND enabled`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer contentRows.Close()
+	bodies := map[int64]string{}
+	for contentRows.Next() {
+		var id int64
+		var content string
+		if err := contentRows.Scan(&id, &content); err != nil {
+			return nil, err
+		}
+		bodies[id] = content
+	}
+	for i := range out {
+		out[i].Content = bodies[out[i].ID]
+	}
+	return out, contentRows.Err()
+}
+
 func (d *DB) POCStats() (*POCStats, error) {
 	stats := &POCStats{BySeverity: map[string]int{}, Sources: []string{}}
 	if err := d.QueryRow(`SELECT count(*), count(*) FILTER (WHERE enabled) FROM poc_templates`).Scan(&stats.Total, &stats.Enabled); err != nil {

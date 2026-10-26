@@ -25,7 +25,7 @@ func TestReportFindingOptionalTrafficWithoutCapture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(task.ID)
+	defer deleteTaskFixture(t, d, task.ID)
 	ts := NewToolSet(nil, "")
 	ts.ts, ts.taskID = d.Exploration(task.ExplorationID), task.ID
 	ts.SetFindingRecorder(evidence.New(d, nil, t.TempDir()))
@@ -60,7 +60,7 @@ func TestReportFindingAtomicContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(task.ID)
+	defer deleteTaskFixture(t, d, task.ID)
 	ts := NewToolSet(nil, "")
 	ts.ts = d.Exploration(task.ExplorationID)
 	ts.taskID = task.ID
@@ -83,7 +83,15 @@ func TestReportFindingAtomicContract(t *testing.T) {
 		t.Fatal("notified before commit")
 	}
 	ts.SetFindingRecorder(nil)
-	got := call(`{"vulnclass":"TEST","summary":"legacy report","severity":"low"}`)
+	// An HTTP finding with no captured request cannot be replayed, so it is refused
+	// while the reporter is still untouched; no_raw_capture is the honest way out.
+	if got := call(`{"vulnclass":"TEST","summary":"no packets","severity":"low"}`); !strings.Contains(got, "逐字节重放") {
+		t.Fatal(got)
+	}
+	if notices != 0 || ts.writes.Findings != 0 {
+		t.Fatal("refused finding without packets was still recorded/notified")
+	}
+	got := call(`{"vulnclass":"TEST","summary":"legacy report","severity":"low","no_raw_capture":true}`)
 	lines := strings.SplitN(got, "\n", 2)
 	if len(lines) != 2 {
 		t.Fatal(got)
@@ -98,6 +106,11 @@ func TestReportFindingAtomicContract(t *testing.T) {
 	f, err := d.GetFinding(out.FindingID)
 	if err != nil || f == nil || f.NodeID == nil || *f.NodeID != out.NodeID {
 		t.Fatalf("wrong finding/node mapping: %+v %v", f, err)
+	}
+	// The report heading reads name first: an unnamed finding titles itself with its
+	// class rather than rendering an empty section.
+	if f.Name != "TEST" {
+		t.Fatalf("name fallback = %q, want the vulnclass", f.Name)
 	}
 	if got = call(`{"vulnclass":"TEST","summary":"no storage","severity":"low","traffic_refs":[{"traffic_id":"x"}]}`); !strings.Contains(got, "未登记") {
 		t.Fatal(got)

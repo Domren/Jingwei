@@ -813,7 +813,10 @@ type UpsertOtherServiceReq struct {
 	Port        int
 	ServiceName string
 	Auth        []map[string]any
-	TaskID      int64
+	// Extra carries passive fingerprint metadata (banner, TLS certificate,
+	// version...). Keys merge over the existing row on conflict.
+	Extra  map[string]any
+	TaskID int64
 }
 
 // UpsertOtherService inserts or merges a non-HTTP service asset.
@@ -865,6 +868,13 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 	if err != nil {
 		return 0, err
 	}
+	extraJSON, err := json.Marshal(req.Extra)
+	if err != nil {
+		return 0, err
+	}
+	if len(req.Extra) == 0 {
+		extraJSON = []byte("{}")
+	}
 
 	var domainVal, rootDomainVal, ipVal, csegVal any
 	if domain != "" {
@@ -884,9 +894,9 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 	err = s.tx.QueryRow(`
 INSERT INTO assets(
     type, service_type, service_name, domain, ip, port, root_domain,
-    c_segment, auth, company_id, company_source, task_ids
+    c_segment, auth, extra, company_id, company_source, task_ids
 )
-VALUES ('service', 'other', $1, $2, $3, $4, $5, $6::cidr, $7::jsonb[], $8, 'scope', $9::bigint[])
+VALUES ('service', 'other', $1, $2, $3, $4, $5, $6::cidr, $7::jsonb[], $8::jsonb, $9, 'scope', $10::bigint[])
 ON CONFLICT (COALESCE(domain,''), COALESCE(ip,''), port, service_name) WHERE type = 'service' AND service_type = 'other' DO UPDATE SET
     domain     = COALESCE(EXCLUDED.domain,     assets.domain),
     ip         = COALESCE(EXCLUDED.ip,         assets.ip),
@@ -897,6 +907,7 @@ ON CONFLICT (COALESCE(domain,''), COALESCE(ip,''), port, service_name) WHERE typ
             FROM unnest(assets.auth || EXCLUDED.auth) AS elem
         )
     ),
+    extra      = COALESCE(assets.extra, '{}'::jsonb) || EXCLUDED.extra,
     task_ids   = (SELECT ARRAY(SELECT DISTINCT unnest(assets.task_ids || EXCLUDED.task_ids))),
     company_id = CASE
         WHEN assets.company_source = 'explicit' AND assets.company_id IS NOT NULL THEN assets.company_id
@@ -910,7 +921,7 @@ ON CONFLICT (COALESCE(domain,''), COALESCE(ip,''), port, service_name) WHERE typ
     last_seen  = now()
 RETURNING id`,
 		serviceName, domainVal, ipVal, req.Port, rootDomainVal,
-		csegVal, authJSON, companyID, taskIDs,
+		csegVal, authJSON, string(extraJSON), companyID, taskIDs,
 	).Scan(&id)
 	if err != nil {
 		return 0, err
@@ -937,7 +948,9 @@ RETURNING id`,
 // root_domain and (when it's a real subdomain, not the apex or an IP) subdomain
 // asset — so those asset types stay populated and can anchor task scope. Best-effort.
 func (s *AssetStore) linkHostAssets(domain, rootDomain string, taskID int64) {
-	if rootDomain != "" {
+	// IP hosts are already represented by the ip asset; never fabricate a
+	// root_domain row whose domain is "127.0.0.1".
+	if rootDomain != "" && net.ParseIP(rootDomain) == nil {
 		_, _ = s.UpsertRootDomain(UpsertRootDomainReq{Domain: rootDomain, TaskID: taskID})
 	}
 	if domain != "" && domain != rootDomain && net.ParseIP(domain) == nil {

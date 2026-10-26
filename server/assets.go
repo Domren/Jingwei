@@ -290,6 +290,66 @@ func (s *Server) deleteCompany(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"deleted": 1, "assets_deleted": assetsDeleted})
 }
 
+// maxCompanyDeleteBatch caps one batch request: the delete holds the company scope
+// advisory lock and re-evaluates ownership for every asset afterwards, so an
+// accidental "select everything" must not queue an unbounded rebuild.
+const maxCompanyDeleteBatch = 200
+
+// deleteCompaniesBatch removes the listed companies in one transaction, optionally
+// taking their assets with them. ids that no longer exist are skipped, so a stale
+// selection re-submitted after someone else deleted the row still succeeds.
+func (s *Server) deleteCompaniesBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs          []int64 `json:"ids"`
+		DeleteAssets bool    `json:"delete_assets"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	ids, err := normalizeCompanyIDs(req.IDs)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if s.companyStore() == nil {
+		writeErr(w, 503, "database unavailable")
+		return
+	}
+	deleted, assetsDeleted, err := s.m.DeleteCompaniesWithAssets(ids, req.DeleteAssets)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"deleted":        deleted,
+		"assets_deleted": assetsDeleted,
+		"requested":      len(ids),
+	})
+}
+
+func normalizeCompanyIDs(ids []int64) ([]int64, error) {
+	if len(ids) == 0 {
+		return nil, errors.New("ids 不能为空")
+	}
+	if len(ids) > maxCompanyDeleteBatch {
+		return nil, fmt.Errorf("一次最多删除 %d 个企业", maxCompanyDeleteBatch)
+	}
+	out := make([]int64, 0, len(ids))
+	seen := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			return nil, fmt.Errorf("企业 id %d 无效", id)
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out, nil
+}
+
 // =====================================================================
 // POST /api/companies/reattribute
 // =====================================================================
@@ -417,29 +477,65 @@ func (s *Server) assetCounts(w http.ResponseWriter, r *http.Request) {
 // DELETE /api/assets
 // =====================================================================
 
+// maxAssetDeleteBatch caps how many assets one DELETE /api/assets request may name.
+const maxAssetDeleteBatch = 500
+
 func (s *Server) deleteAssets(w http.ResponseWriter, r *http.Request) {
+	const maxAssetDeleteBodyBytes = 2 << 20
+	var req struct {
+		IDs []int64 `json:"ids"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxAssetDeleteBodyBytes)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "请求正文过大")
+		} else {
+			writeErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		}
+		return
+	}
+	ids, err := normalizeAssetIDs(req.IDs)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	as := s.assetStore()
 	if as == nil {
 		writeErr(w, 503, "database unavailable")
 		return
 	}
-	var req struct {
-		IDs []int64 `json:"ids"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, 400, "invalid JSON: "+err.Error())
-		return
-	}
-	if len(req.IDs) == 0 {
-		writeErr(w, 400, "ids required")
-		return
-	}
-	deleted, err := as.DeleteByIDs(req.IDs)
+	deleted, err := as.DeleteByIDs(ids)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"deleted": deleted})
+	writeJSON(w, 200, map[string]any{"deleted": deleted, "requested": len(ids)})
+}
+
+// normalizeAssetIDs rejects empty/oversized/non-positive id lists and drops
+// duplicates. The cap keeps a mistyped "select everything" from turning into one
+// enormous IN (...) list held in a single delete statement.
+func normalizeAssetIDs(ids []int64) ([]int64, error) {
+	if len(ids) == 0 {
+		return nil, errors.New("ids 不能为空")
+	}
+	if len(ids) > maxAssetDeleteBatch {
+		return nil, fmt.Errorf("一次最多删除 %d 条资产", maxAssetDeleteBatch)
+	}
+	out := make([]int64, 0, len(ids))
+	seen := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			return nil, fmt.Errorf("资产 id %d 无效", id)
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out, nil
 }
 
 // =====================================================================

@@ -2,8 +2,10 @@
 
 import * as React from "react";
 import {
+  CodeIcon,
   DownloadIcon,
   FileIcon,
+  FileTextIcon,
   FolderIcon,
   FolderPlusIcon,
   HardDriveIcon,
@@ -192,6 +194,12 @@ export default function WorkspacePage() {
           ))}
         </div>
         <div className="flex items-center gap-2">
+          <Button variant="secondary" size="sm" onClick={() => load("reports")} title="所有导出的报告都保存在这里">
+            <FileTextIcon /> 报告
+          </Button>
+          <Button variant="secondary" size="sm" onClick={() => load("scripts")} title="Agent 生成的脚本统一放在这里">
+            <CodeIcon /> 脚本
+          </Button>
           <Button variant="outline" size="sm" onClick={() => setMkdirOpen(true)}>
             <FolderPlusIcon /> 新建文件夹
           </Button>

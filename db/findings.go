@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +23,8 @@ type DBFinding struct {
 	EvidenceVersion       int64
 	ReportEvidenceVersion int64
 	TrafficBindings       []FindingTrafficBinding // populated only for export
+	EvidencePackets       []FindingEvidencePacket // hydrated raw exchanges, populated only for export
+	EvidencePacketOmitted int                     // exchanges merged or dropped so the report stays readable
 
 	ID              int64
 	TaskID          *int64
@@ -35,9 +38,41 @@ type DBFinding struct {
 	AssetIDs        []int64
 	Status          string
 	Report          string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
+	HTTPRequest     string // 原始 HTTP 请求报文;扫描/深度利用/自定义请求产生
+	HTTPResponse    string // 原始 HTTP 响应报文
 	CreatedAt       time.Time
 	TaskDescription string // populated via LEFT JOIN on tasks
+	// ScanTaskID/ScanTaskName 是无 LLM 漏扫来源(f.task_id 为空时按最早一轮归属);
+	// 导出报告时用于按漏扫任务分组,而不是落到「未关联任务」。
+	ScanTaskID   *int64
+	ScanTaskName string
 }
+
+// FindingEvidencePacket is a hydrated raw exchange bound to a finding. It is a
+// transient export view: the heads come from the snapshot row and the bodies
+// from the evidence blob store.
+type FindingEvidencePacket struct {
+	BindingID    int64
+	Role         string
+	Note         string
+	Snapshot     TrafficEvidenceSnapshot
+	HTTPRequest  string
+	HTTPResponse string
+	Primary      bool
+	// Repeated counts the extra bindings merged into this exchange because they
+	// captured the same step in later rounds; the report says so instead of
+	// silently hiding them.
+	Repeated int
+}
+
+// AutoReportMarker marks a report generated deterministically from evidence
+// without an LLM. Such reports may be regenerated/overwritten; a report without
+// the marker is treated as user/LLM-authored and is never replaced automatically.
+const AutoReportMarker = "<!-- jingwei:auto-report -->"
+
+// IsAutoReport reports whether a report was produced by the deterministic
+// template rather than by an LLM or a human.
+func IsAutoReport(report string) bool { return strings.Contains(report, AutoReportMarker) }
 
 // Finding triage states (findings.status).
 const (
@@ -83,6 +118,16 @@ func ValidSeverity(s string) bool {
 // nodeID may be 0 (stored as NULL). name may be "" (frontend falls back to
 // vulnclass). Returns the new finding id.
 func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64) (int64, error) {
+	id, _, err := d.UpsertFinding(taskID, nodeID, vulnclass, name, severity, summary, evidence, worker, assetIDs, "")
+	return id, err
+}
+
+// UpsertFinding inserts a finding, or merges it into the row carrying the same
+// dedupeKey. A non-empty key is the canonical identity of a machine-produced
+// finding (template + origin + path), so repeated scans update evidence instead
+// of piling up duplicates. The existing triage status is never overwritten.
+// Returns created=false when an existing row was updated.
+func (d *DB) UpsertFinding(taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64, dedupeKey string) (id int64, created bool, err error) {
 	aidsJSON, _ := json.Marshal(assetIDs)
 	if assetIDs == nil {
 		aidsJSON = []byte("[]")
@@ -94,13 +139,77 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 	if nodeID > 0 {
 		nid = &nodeID
 	}
-	var id int64
-	err := d.QueryRow(
-		`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON),
-	).Scan(&id)
-	return id, err
+	dedupeKey = strings.TrimSpace(dedupeKey)
+	if dedupeKey == "" {
+		err = d.QueryRow(
+			`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+			tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON),
+		).Scan(&id)
+		return id, err == nil, err
+	}
+	err = d.QueryRow(
+		`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids, dedupe_key)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		 ON CONFLICT (dedupe_key) DO UPDATE SET
+		     name      = CASE WHEN EXCLUDED.name <> '' THEN EXCLUDED.name ELSE findings.name END,
+		     severity  = CASE WHEN EXCLUDED.severity <> '' THEN EXCLUDED.severity ELSE findings.severity END,
+		     summary   = EXCLUDED.summary,
+		     evidence  = EXCLUDED.evidence,
+		     worker    = EXCLUDED.worker,
+		     asset_ids = EXCLUDED.asset_ids
+		 RETURNING id, (xmax = 0)`,
+		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON), dedupeKey,
+	).Scan(&id, &created)
+	return id, created, err
+}
+
+// ConfirmFinding appends a verification note to the finding evidence and moves
+// it to confirmed through SetFindingStatusTx, so status-change notifications
+// fire exactly as they do for a manual triage update. The note is only
+// appended once per caller-supplied chunk; pass "" to change status only.
+func (d *DB) ConfirmFinding(ctx context.Context, id int64, note string) (from string, found bool, changed bool, err error) {
+	return d.setFindingVerdict(ctx, id, note, FindingConfirmed)
+}
+
+// ReopenFinding sends a finding back to 待处理 with the reason recorded. It is
+// the mirror image of ConfirmFinding: when a specialized tool (sqlmap, dalfox)
+// cannot reproduce what a POC template had asserted, the finding must leave the
+// confirmed set instead of keeping a verdict the platform now doubts.
+func (d *DB) ReopenFinding(ctx context.Context, id int64, note string) (from string, found bool, changed bool, err error) {
+	return d.setFindingVerdict(ctx, id, note, FindingPending)
+}
+
+func (d *DB) setFindingVerdict(ctx context.Context, id int64, note, to string) (from string, found bool, changed bool, err error) {
+	note = strings.TrimSpace(note)
+	err = d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		if err := LockFindingEvidenceTx(tx, id, nil); err != nil {
+			if errors.Is(err, ErrFindingNotFound) {
+				return nil
+			}
+			return err
+		}
+		found = true
+		if note != "" {
+			var existing string
+			if err := tx.QueryRowContext(ctx, `SELECT evidence FROM findings WHERE id=$1`, id).Scan(&existing); err != nil {
+				return err
+			}
+			if !strings.Contains(existing, note) {
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE findings SET evidence = CASE WHEN evidence = '' THEN $2 ELSE evidence || E'\n\n' || $2 END WHERE id=$1`,
+					id, note); err != nil {
+					return err
+				}
+				if err := bumpEvidenceVersionTx(tx, id); err != nil {
+					return err
+				}
+			}
+		}
+		from, _, changed, _, err = SetFindingStatusTx(ctx, tx, id, to)
+		return err
+	})
+	return from, found, changed, err
 }
 
 // findingSelectCols is the column list (with task_description join) every finding
@@ -157,16 +266,24 @@ type FindingFilter struct {
 	Status    string // pending | false_positive | ignored | resolved
 	VulnClass string
 	TaskID    string // 任务 id(字符串形式;空/非法 = 不按任务筛选)
-	Query     string // 名称/类型/摘要/证据/报告正文的模糊检索关键词
-	Sort      string // "severity" | "time"
+	// ScanTaskID 按无 LLM 漏扫任务筛选:命中的 finding 通过 scan_task_results
+	// 关联(一条 finding 可被多轮扫描重复命中)。空/非法 = 不按漏扫任务筛选。
+	ScanTaskID string
+	Query      string // 名称/类型/摘要/证据/报告正文的模糊检索关键词
+	Sort       string // "severity" | "time"
 	// AssetScope 是资产树的节点 key(a:<id> / c:<id> / r:<domain> / __none__),
 	// 选中一个节点等于选中它的整棵子树。空 = 不按资产筛选。
 	AssetScope string
+	// System 是系统(host:port / host / __none__)的 key,对应「按任务 → 系统」
+	// 视图的叶子;空 = 不按系统筛选。
+	System string
 
-	// 下面三个由 applyAssetScope 从 AssetScope 解析而来,调用方不用设置。
-	assetIDs  []int64 // 子树里所有资产 id
-	assetNone bool    // 只要「未关联资产」的发现
-	assetMiss bool    // 选中的节点在当前筛选下不存在 → 结果恒空
+	// 下面几个由 applyAssetScope / applySystemScope 解析而来,调用方不用设置。
+	assetIDs     []int64 // 子树里所有资产 id
+	assetNone    bool    // 只要「未关联资产」的发现
+	assetMiss    bool    // 选中的节点在当前筛选下不存在 → 结果恒空
+	systemIDs    []int64 // 主系统命中的发现 id
+	systemFilter bool    // System 已解析(即使命中为空也要过滤)
 }
 
 // FindingUnassignedTask is the task filter sentinel for findings whose task is
@@ -192,10 +309,21 @@ func (f FindingFilter) where() (string, []any) {
 	add("vulnclass", f.VulnClass)
 	// task_id 是 bigint 列,按整数比较(不能走上面的文本 add);空/非法值忽略。
 	if f.TaskID == FindingUnassignedTask {
-		conds = append(conds, "(f.task_id IS NULL OR t.id IS NULL)")
+		// 「未关联」只收既没有 Agent 任务、也没有漏扫任务来源的 finding;
+		// 漏扫发现有自己的任务分组,不能混进这个桶。
+		conds = append(conds, `((f.task_id IS NULL AND NOT EXISTS (
+			SELECT 1 FROM scan_task_results sr WHERE sr.finding_id = f.id
+		)) OR (f.task_id IS NOT NULL AND t.id IS NULL))`)
 	} else if tid, err := strconv.ParseInt(f.TaskID, 10, 64); err == nil && tid > 0 {
 		args = append(args, tid)
 		conds = append(conds, fmt.Sprintf("f.task_id = $%d", len(args)))
+	}
+	if sid, err := strconv.ParseInt(strings.TrimSpace(f.ScanTaskID), 10, 64); err == nil && sid > 0 {
+		args = append(args, sid)
+		conds = append(conds, fmt.Sprintf(`EXISTS (
+			SELECT 1 FROM scan_task_results sr
+			WHERE sr.finding_id = f.id AND sr.scan_task_id = $%d
+		)`, len(args)))
 	}
 	// 资产筛选:asset_ids 是 jsonb 数组,@> ANY(...) 能走 idx_findings_asset_ids。
 	switch {
@@ -215,6 +343,15 @@ func (f FindingFilter) where() (string, []any) {
 	case len(f.assetIDs) > 0:
 		args = append(args, assetIDContainments(f.assetIDs))
 		conds = append(conds, fmt.Sprintf("f.asset_ids @> ANY($%d::jsonb[])", len(args)))
+	}
+	// 系统筛选解析成精确的发现 id 集合(主系统规则见 finding_systems.go)。
+	if f.systemFilter {
+		if len(f.systemIDs) == 0 {
+			conds = append(conds, "FALSE")
+		} else {
+			args = append(args, f.systemIDs)
+			conds = append(conds, fmt.Sprintf("f.id = ANY($%d::bigint[])", len(args)))
+		}
 	}
 	if query := strings.TrimSpace(f.Query); query != "" {
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(query)
@@ -243,7 +380,7 @@ func (d *DB) ListFindingsPage(f FindingFilter, page, pageSize int) ([]*DBFinding
 	if pageSize <= 0 {
 		pageSize = 20
 	}
-	f, err := d.applyAssetScope(f)
+	f, err := d.applyFindingScopes(f)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -288,6 +425,8 @@ type FindingGroup struct {
 	TaskName        string    `json:"task_name"` // 可选任务名称;空=未命名
 	TaskDescription string    `json:"task_description"`
 	TaskStatus      string    `json:"task_status"`
+	ScanTaskID      *int64    `json:"scan_task_id"`
+	ScanTaskName    string    `json:"scan_task_name"`
 	Count           int       `json:"count"`
 	Critical        int       `json:"critical"`
 	High            int       `json:"high"`
@@ -299,6 +438,9 @@ type FindingGroup struct {
 // ListFindingGroups returns a page of task groups matching the same filters as
 // ListFindingsPage. The group count and finding count are independent totals so
 // clients can page groups without losing the exact export/selection count.
+// Findings without an Agent task are attributed to the earliest scan task that
+// linked them (scan_task_results), so one finding is listed under exactly one
+// group while a scan_task_id filter can still export every finding that scan hit.
 func (d *DB) ListFindingGroups(f FindingFilter, page, pageSize int) ([]FindingGroup, int, int, error) {
 	if page <= 0 {
 		page = 1
@@ -306,13 +448,26 @@ func (d *DB) ListFindingGroups(f FindingFilter, page, pageSize int) ([]FindingGr
 	if pageSize <= 0 {
 		pageSize = 10
 	}
-	f, err := d.applyAssetScope(f)
+	f, err := d.applyFindingScopes(f)
 	if err != nil {
 		return nil, 0, 0, err
 	}
 	where, args := f.where()
-	grouped := ` FROM findings f LEFT JOIN tasks t ON f.task_id=t.id` + where +
-		` GROUP BY t.id, t.name, t.description, t.status, t.paused, t.queued`
+	scanPick := ""
+	if sid, err := strconv.ParseInt(strings.TrimSpace(f.ScanTaskID), 10, 64); err == nil && sid > 0 {
+		scanPick = fmt.Sprintf(" AND st.id = %d", sid)
+	}
+	scanJoin := ` LEFT JOIN LATERAL (
+		SELECT st.id, st.name, st.status
+		FROM scan_task_results r
+		JOIN scan_tasks st ON st.id = r.scan_task_id
+		WHERE f.task_id IS NULL AND r.finding_id = f.id` + scanPick + `
+		ORDER BY st.id
+		LIMIT 1
+	) st ON true`
+	groupBy := ` GROUP BY t.id, t.name, t.description, t.status, t.paused, t.queued,
+		st.id, st.name, st.status`
+	grouped := ` FROM findings f LEFT JOIN tasks t ON f.task_id=t.id` + scanJoin + where + groupBy
 
 	var groupTotal, findingTotal int
 	countQuery := `SELECT COUNT(*), COALESCE(SUM(finding_count),0) FROM (` +
@@ -324,9 +479,9 @@ func (d *DB) ListFindingGroups(f FindingFilter, page, pageSize int) ([]FindingGr
 		return []FindingGroup{}, groupTotal, findingTotal, nil
 	}
 
-	order := "MAX(f.created_at) DESC, t.id DESC NULLS LAST"
+	order := "MAX(f.created_at) DESC, t.id DESC NULLS LAST, st.id DESC NULLS LAST"
 	if f.Sort == "severity" {
-		order = `MAX(CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END) DESC, MAX(f.created_at) DESC, t.id DESC NULLS LAST`
+		order = `MAX(CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END) DESC, MAX(f.created_at) DESC, t.id DESC NULLS LAST, st.id DESC NULLS LAST`
 	}
 	pageArgs := append(append([]any{}, args...), pageSize, (page-1)*pageSize)
 	query := fmt.Sprintf(`SELECT t.id, COALESCE(t.name,''), COALESCE(t.description,''), COALESCE(
@@ -336,6 +491,7 @@ func (d *DB) ListFindingGroups(f FindingFilter, page, pageSize int) ([]FindingGr
 			WHEN t.paused THEN 'paused'
 			ELSE t.status
 		END, ''),
+		st.id, COALESCE(st.name,''), COALESCE(st.status,''),
 		COUNT(*),
 		COUNT(*) FILTER (WHERE f.severity='critical'),
 		COUNT(*) FILTER (WHERE f.severity='high'),
@@ -351,14 +507,21 @@ func (d *DB) ListFindingGroups(f FindingFilter, page, pageSize int) ([]FindingGr
 	groups := []FindingGroup{}
 	for rows.Next() {
 		var group FindingGroup
-		var taskID sql.NullInt64
-		if err := rows.Scan(&taskID, &group.TaskName, &group.TaskDescription, &group.TaskStatus, &group.Count,
-			&group.Critical, &group.High, &group.Medium, &group.Low, &group.LastFoundAt); err != nil {
+		var taskID, scanTaskID sql.NullInt64
+		var scanStatus string
+		if err := rows.Scan(&taskID, &group.TaskName, &group.TaskDescription, &group.TaskStatus,
+			&scanTaskID, &group.ScanTaskName, &scanStatus,
+			&group.Count, &group.Critical, &group.High, &group.Medium, &group.Low, &group.LastFoundAt); err != nil {
 			return nil, 0, 0, err
 		}
 		if taskID.Valid {
 			id := taskID.Int64
 			group.TaskID = &id
+		}
+		if scanTaskID.Valid {
+			id := scanTaskID.Int64
+			group.ScanTaskID = &id
+			group.TaskStatus = scanStatus
 		}
 		groups = append(groups, group)
 	}
@@ -474,10 +637,20 @@ RETURNING id, created_at`, s.expID, audit.NodeID, utf8Clean(audit.Worker), utf8C
 // 再按时间倒序,与「导出汇总报告」的分组顺序一致。
 func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, error) {
 	const order = `ORDER BY CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, f.created_at DESC`
-	cols := findingSelectCols + `, COALESCE(f.report, '')`
+	cols := findingSelectCols + `, COALESCE(f.report, ''), COALESCE(f.http_request, ''), COALESCE(f.http_response, ''), st.id, COALESCE(st.name, '')`
+	scanJoin := func(pick string) string {
+		return ` LEFT JOIN LATERAL (
+			SELECT st.id, st.name
+			FROM scan_task_results r
+			JOIN scan_tasks st ON st.id = r.scan_task_id
+			WHERE f.task_id IS NULL AND r.finding_id = f.id` + pick + `
+			ORDER BY st.id LIMIT 1
+		) st ON true`
+	}
 
 	var q string
 	var args []any
+	scanPick := ""
 	if len(ids) > 0 {
 		ph := make([]string, len(ids))
 		for i, id := range ids {
@@ -486,18 +659,22 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		}
 		q = `SELECT ` + cols + `
 			FROM findings f
-			LEFT JOIN tasks t ON f.task_id = t.id
+			LEFT JOIN tasks t ON f.task_id = t.id` + scanJoin(scanPick) + `
 			WHERE f.id IN (` + strings.Join(ph, ",") + `)
 			` + order
 	} else {
-		scoped, err := d.applyAssetScope(f)
+		scoped, err := d.applyFindingScopes(f)
 		if err != nil {
 			return nil, err
 		}
 		where, wargs := scoped.where()
+		if sid, err := strconv.ParseInt(strings.TrimSpace(scoped.ScanTaskID), 10, 64); err == nil && sid > 0 {
+			// 按漏扫任务导出时,报告里的「所属任务」必须是这一轮,而不是最早一轮。
+			scanPick = fmt.Sprintf(" AND st.id = %d", sid)
+		}
 		q = `SELECT ` + cols + `
 			FROM findings f
-			LEFT JOIN tasks t ON f.task_id = t.id` + where + `
+			LEFT JOIN tasks t ON f.task_id = t.id` + scanJoin(scanPick) + where + `
 			` + order
 		args = wargs
 	}
@@ -514,7 +691,8 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report); err != nil {
+			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report,
+			&f.HTTPRequest, &f.HTTPResponse, &f.ScanTaskID, &f.ScanTaskName); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -638,13 +816,14 @@ func (d *DB) FindingStats() (*FindingStats, error) {
 func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 	f := &DBFinding{}
 	var aidsJSON string
-	err := d.QueryRow(`SELECT `+findingSelectCols+`, COALESCE(f.report, '')
+	err := d.QueryRow(`SELECT `+findingSelectCols+`, COALESCE(f.report, ''), COALESCE(f.http_request, ''), COALESCE(f.http_response, '')
 		FROM findings f
 		LEFT JOIN tasks t ON f.task_id = t.id
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report)
+		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report,
+		&f.HTTPRequest, &f.HTTPResponse)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -683,6 +862,58 @@ func (d *DB) DeleteFinding(id int64) (n int64, err error) {
 	return
 }
 
+// DeleteFindings removes many findings with the same cleanup as DeleteFinding, in
+// one transaction: either every listed finding (plus its exploration node) is gone
+// or nothing changed. Ids are locked in ascending order so concurrent batches taken
+// in different submission orders cannot deadlock each other. Ids that no longer
+// exist are skipped, and the return value counts only the rows actually deleted.
+func (d *DB) DeleteFindings(ids []int64) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	unique := slices.Sorted(slices.Values(ids))
+	unique = slices.Compact(unique)
+	var deleted int64
+	err := d.WithEvidenceTx(context.Background(), func(tx *sql.Tx) error {
+		var nodeIDs []int64
+		for _, id := range unique {
+			if err := LockFindingEvidenceTx(tx, id, nil); err != nil {
+				if errors.Is(err, ErrFindingNotFound) {
+					continue
+				}
+				return err
+			}
+			var nodeID sql.NullInt64
+			if err := tx.QueryRow(`DELETE FROM findings WHERE id=$1 RETURNING node_id`, id).Scan(&nodeID); err != nil {
+				return err
+			}
+			if nodeID.Valid {
+				nodeIDs = append(nodeIDs, nodeID.Int64)
+			}
+			deleted++
+		}
+		if len(nodeIDs) > 0 {
+			placeholders := make([]string, len(nodeIDs))
+			args := make([]any, len(nodeIDs))
+			for i, nodeID := range nodeIDs {
+				placeholders[i] = "$" + strconv.Itoa(i+1)
+				args[i] = nodeID
+			}
+			if _, err := tx.Exec(
+				"DELETE FROM exploration_nodes WHERE kind='finding' AND id IN ("+strings.Join(placeholders, ",")+")",
+				args...,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
 // DeleteFindingsByTask removes all findings rows of a task. The originating
 // exploration finding nodes are cascade-deleted separately when the task's
 // exploration subgraph is dropped. Returns rows deleted.
@@ -712,6 +943,40 @@ func (d *DB) SetFindingStatus(id int64, status string) (int64, error) {
 // can address the finding it just created. Returns rows affected (0 when no row).
 func (d *DB) SetFindingReportByNodeID(nodeID int64, report string) (int64, error) {
 	return d.SetFindingReportVersionByNodeID(context.Background(), nodeID, report, nil)
+}
+
+// SetFindingHTTPArtifactsAndAutoReport stores the captured raw HTTP exchange and
+// installs the deterministic report. A report authored by an LLM/human (no
+// AutoReportMarker) is preserved; only empty or previously auto-generated reports
+// are refreshed. Raw fields are only replaced when non-empty.
+func (d *DB) SetFindingHTTPArtifactsAndAutoReport(id int64, request, response, report string) error {
+	if id <= 0 {
+		return nil
+	}
+	// 扫描到的报文可能带非 UTF-8 字节（GBK 页面、MySQL/Redis 等二进制协议响应），
+	// Postgres 会直接拒绝整行写入并丢掉这条发现，所以入库前统一过一遍文本安全。
+	request = safePacketText(request, maxRawPacketRequest)
+	response = safePacketText(response, maxRawPacketResponse)
+	report = safePacketText(report, 0)
+	_, err := d.Exec(`UPDATE findings SET
+		http_request  = CASE WHEN $2 <> '' THEN $2 ELSE http_request END,
+		http_response = CASE WHEN $3 <> '' THEN $3 ELSE http_response END,
+		report = CASE WHEN report = '' OR position($4 in report) > 0 THEN $5 ELSE report END,
+		report_evidence_version = CASE WHEN report = '' OR position($4 in report) > 0 THEN evidence_version ELSE report_evidence_version END
+		WHERE id=$1`, id, request, response, AutoReportMarker, report)
+	return err
+}
+
+// SetFindingAutoReport installs a deterministic report but never replaces a
+// report authored by an LLM/human.
+func (d *DB) SetFindingAutoReport(id int64, report string) error {
+	if id <= 0 {
+		return nil
+	}
+	report = safePacketText(report, 0)
+	_, err := d.Exec(`UPDATE findings SET report=$2, report_evidence_version=evidence_version
+		WHERE id=$1 AND (report = '' OR position($3 in report) > 0)`, id, report, AutoReportMarker)
+	return err
 }
 
 // setFindingCol updates one text column on the standalone finding row AND mirrors

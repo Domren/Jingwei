@@ -156,6 +156,28 @@ ORDER BY is_default DESC, priority DESC, id ASC`)
 	return out, rows.Err()
 }
 
+// ProfileAPIKeys returns every stored LLM API key, including inactive and
+// pool-excluded profiles. Used only to fingerprint platform secrets for the
+// egress guard; never expose this list over the API.
+func (d *DB) ProfileAPIKeys() ([]string, error) {
+	rows, err := d.Query(`SELECT api_key FROM llm_profiles WHERE COALESCE(api_key,'') <> ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		if k != "" {
+			out = append(out, k)
+		}
+	}
+	return out, rows.Err()
+}
+
 // SaveProfile inserts (id==0) or updates a profile. Empty apiKey on update keeps existing.
 func (d *DB) SaveProfile(p *LLMProfile) (int64, error) {
 	hint := p.APIKeyHint
@@ -815,7 +837,7 @@ type MCPServer struct {
 	Env       json.RawMessage `json:"env"`
 	URL       string          `json:"url,omitempty"`
 	Enabled   bool            `json:"enabled"`
-	Insecure  bool            `json:"insecure"` // http: skip TLS cert verification (self-signed servers, issue #108)
+	Insecure  bool            `json:"insecure"`        // http: skip TLS cert verification (self-signed servers, issue #108)
 	Tools     []string        `json:"tools,omitempty"` // cached tool names (mcp_tools_cache)
 }
 
@@ -925,6 +947,23 @@ func (d *DB) SaveMCP(m *MCPServer) (int64, error) {
 	_, err := d.Exec(`UPDATE mcp_servers SET name=$1,transport=$2,command=NULLIF($3,''),args=$4,env=$5,url=NULLIF($6,''),enabled=$7,insecure=$8 WHERE id=$9`,
 		m.Name, m.Transport, m.Command, args, env, m.URL, m.Enabled, m.Insecure, m.ID)
 	return m.ID, err
+}
+
+// UpsertJavaChainsMCP registers/updates the java-chains Streamable HTTP MCP used
+// by the java-chains skill. On update only the endpoint and header are refreshed
+// (token rotation), so a user who disabled the server keeps it disabled.
+func (d *DB) UpsertJavaChainsMCP(url, token string) error {
+	env, err := json.Marshal(map[string]string{"X-Api-Token": token})
+	if err != nil {
+		return err
+	}
+	_, err = d.Exec(`
+INSERT INTO mcp_servers(name, transport, args, env, url, enabled)
+VALUES ('JavaChains', 'http', '[]', $1, $2, true)
+ON CONFLICT (name) DO UPDATE
+SET transport=EXCLUDED.transport, env=EXCLUDED.env, url=EXCLUDED.url`,
+		string(env), url)
+	return err
 }
 
 func (d *DB) DeleteMCP(id int64) error {

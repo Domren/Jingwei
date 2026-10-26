@@ -13,7 +13,7 @@ func TestLLMRecordsMigrateAddsRawColumnsToOldTable(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	if err := d.EnsureLLMRecordsTable(); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -32,11 +32,14 @@ func TestLLMRecordsMigrateAddsRawColumnsToOldTable(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 
+	// An install shares the database with the live schema, so the probe must stay
+	// inside the search_path schema the test created; counting by table name alone
+	// also picks up public.llm_records and reports the migration as failed.
 	for _, col := range []string{"raw_request", "raw_response"} {
 		var n int
 		if err := tx.QueryRow(
 			`SELECT count(*) FROM information_schema.columns
-			 WHERE table_name='llm_records' AND column_name=$1`, col).Scan(&n); err != nil {
+			 WHERE table_schema=current_schema() AND table_name='llm_records' AND column_name=$1`, col).Scan(&n); err != nil {
 			t.Fatalf("inspect %s: %v", col, err)
 		}
 		if n != 1 {

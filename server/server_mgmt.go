@@ -130,6 +130,16 @@ func (s *Server) abortTaskDelete(taskID string) {
 	s.engine.AbortDelete(taskID, keepPaused)
 }
 
+// taskDeleteHTTPError reports a deletion the server refused before touching
+// PostgreSQL. The batch route folds it into that task's entry instead of aborting
+// the remaining ids.
+type taskDeleteHTTPError struct {
+	status int
+	msg    string
+}
+
+func (e *taskDeleteHTTPError) Error() string { return e.msg }
+
 func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 	id, ok := canonicalTaskID(r.PathValue("id"))
 	if !ok {
@@ -141,9 +151,32 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid JSON: "+err.Error())
 		return
 	}
-	if !s.beginTaskDelete(id) {
-		writeErr(w, http.StatusConflict, "任务正在删除")
+	result, err := s.deleteTask(r.Context(), id, opts)
+	if err != nil {
+		var committed *taskDeleteCommittedError
+		if errors.As(err, &committed) {
+			writeCommittedTaskDelete(w, result, err)
+			return
+		}
+		var refused *taskDeleteHTTPError
+		if errors.As(err, &refused) {
+			writeErr(w, refused.status, refused.msg)
+			return
+		}
+		writeErr(w, 500, err.Error())
 		return
+	}
+	writeJSON(w, 200, result)
+}
+
+// deleteTask carries one task deletion end to end: the delete barrier, the agent
+// quiesce, the PostgreSQL cascade, then runtime teardown. Everything before the
+// database write is reversible, so a failure restores the barrier; a
+// *taskDeleteCommittedError means the row is gone and the caller must still treat
+// the task as deleted.
+func (s *Server) deleteTask(ctx context.Context, id string, opts DeleteTaskOptions) (DeleteTaskResult, error) {
+	if !s.beginTaskDelete(id) {
+		return DeleteTaskResult{}, &taskDeleteHTTPError{http.StatusConflict, "任务正在删除"}
 	}
 	deleted := false
 	defer func() {
@@ -155,33 +188,19 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 	// Main-agent runs use a separate context from planner/workers. Cancel it, then
 	// wait until both execution domains have returned before removing transcripts.
 	s.cancelTaskChat(id, agent.AbortTaskDeleted)
-	drainCtx, cancelDrain := context.WithTimeout(r.Context(), taskDeleteDrainTimeout)
+	drainCtx, cancelDrain := context.WithTimeout(ctx, taskDeleteDrainTimeout)
 	defer cancelDrain()
 	if err := s.waitTaskQuiescent(drainCtx, id); err != nil {
-		writeErr(w, http.StatusConflict, "任务仍有运行中的 Agent，删除已取消")
-		return
+		return DeleteTaskResult{}, &taskDeleteHTTPError{http.StatusConflict, "任务仍有运行中的 Agent，删除已取消"}
 	}
 
 	if err := s.drainTaskSideQuestions(drainCtx, id); err != nil {
-		writeErr(w, http.StatusConflict, err.Error())
-		return
+		return DeleteTaskResult{}, &taskDeleteHTTPError{http.StatusConflict, err.Error()}
 	}
 	result, err := s.m.DeleteTask(id, opts)
-	if err != nil {
-		var committed *taskDeleteCommittedError
-		if errors.As(err, &committed) {
-			// PostgreSQL is already gone. Complete runtime teardown and return the
-			// auditable counts together with the post-commit cleanup warning.
-			s.engine.StopTask(id)
-			s.taskAgentMu.Lock()
-			delete(s.taskAgents, id)
-			s.taskAgentMu.Unlock()
-			deleted = true
-			writeCommittedTaskDelete(w, result, err)
-			return
-		}
-		writeErr(w, 500, err.Error())
-		return
+	var committed *taskDeleteCommittedError
+	if err != nil && !errors.As(err, &committed) {
+		return DeleteTaskResult{}, err
 	}
 	// Manager has removed the task from the registry, so no new API operation can
 	// resolve it. Now stop and join every task-owned Engine goroutine and clear its
@@ -191,7 +210,118 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 	delete(s.taskAgents, id)
 	s.taskAgentMu.Unlock()
 	deleted = true
-	writeJSON(w, 200, result)
+	if err != nil {
+		result.CleanupWarning = err.Error()
+	}
+	return result, err
+}
+
+// maxTaskDeleteBatch caps one request: deleting a task tears down its agents,
+// traffic and files, so oversized selections are rejected rather than queued.
+const maxTaskDeleteBatch = 100
+
+// deleteTaskBatchItem mirrors the single-task response, plus the per-task outcome
+// so a partially failed batch stays auditable.
+type deleteTaskBatchItem struct {
+	DeleteTaskResult
+	OK     bool   `json:"ok"`
+	Error  string `json:"error,omitempty"`
+	Status int    `json:"status,omitempty"`
+}
+
+type deleteTasksBatchResult struct {
+	Items   []deleteTaskBatchItem `json:"items"`
+	Deleted int                   `json:"deleted"`
+	Failed  int                   `json:"failed"`
+
+	AssetsDeleted     int64    `json:"assets_deleted"`
+	AssetsDetached    int64    `json:"assets_detached"`
+	TrafficDeleted    int64    `json:"traffic_deleted"`
+	FilesDeleted      bool     `json:"files_deleted"`
+	FindingsDeleted   int64    `json:"findings_deleted"`
+	LLMRecordsDeleted int64    `json:"llm_records_deleted"`
+	CleanupWarnings   []string `json:"cleanup_warnings,omitempty"`
+}
+
+// deleteTasksBatch deletes the listed tasks under one shared set of cleanup
+// options. Deletion stays sequential — every task must quiesce its own agents
+// before the next starts — and one refusal never aborts the rest.
+func (s *Server) deleteTasksBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs []string `json:"ids"`
+		DeleteTaskOptions
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	ids, err := normalizeTaskDeleteIDs(req.IDs)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	out := deleteTasksBatchResult{Items: make([]deleteTaskBatchItem, 0, len(ids))}
+	for _, id := range ids {
+		result, deleteErr := s.deleteTask(r.Context(), id, req.DeleteTaskOptions)
+		var committed *taskDeleteCommittedError
+		switch {
+		case deleteErr == nil:
+			out.accumulate(result)
+			out.Items = append(out.Items, deleteTaskBatchItem{DeleteTaskResult: result, OK: true})
+		case errors.As(deleteErr, &committed):
+			// PostgreSQL already dropped the row, so the task counts as deleted and
+			// only the external cleanup is short.
+			out.accumulate(result)
+			out.CleanupWarnings = append(out.CleanupWarnings, fmt.Sprintf("#%s：%s", id, deleteErr.Error()))
+			out.Items = append(out.Items, deleteTaskBatchItem{
+				DeleteTaskResult: result, OK: true, Error: deleteErr.Error(),
+			})
+		default:
+			var refused *taskDeleteHTTPError
+			status, msg := http.StatusInternalServerError, deleteErr.Error()
+			if errors.As(deleteErr, &refused) {
+				status, msg = refused.status, refused.msg
+			}
+			out.Failed++
+			out.Items = append(out.Items, deleteTaskBatchItem{
+				DeleteTaskResult: DeleteTaskResult{Deleted: id}, Error: msg, Status: status,
+			})
+		}
+	}
+	writeJSON(w, 200, out)
+}
+
+func (out *deleteTasksBatchResult) accumulate(result DeleteTaskResult) {
+	out.Deleted++
+	out.AssetsDeleted += result.AssetsDeleted
+	out.AssetsDetached += result.AssetsDetached
+	out.TrafficDeleted += result.TrafficDeleted
+	out.FindingsDeleted += result.FindingsDeleted
+	out.LLMRecordsDeleted += result.LLMRecordsDeleted
+	out.FilesDeleted = out.FilesDeleted || result.FilesDeleted
+}
+
+func normalizeTaskDeleteIDs(ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, errors.New("ids 不能为空")
+	}
+	if len(ids) > maxTaskDeleteBatch {
+		return nil, fmt.Errorf("一次最多删除 %d 个任务", maxTaskDeleteBatch)
+	}
+	seen := make(map[string]bool, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, raw := range ids {
+		id, ok := canonicalTaskID(raw)
+		if !ok {
+			return nil, fmt.Errorf("任务 id %q 无效", raw)
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out, nil
 }
 
 func writeCommittedTaskDelete(w http.ResponseWriter, result DeleteTaskResult, err error) {
@@ -833,6 +963,20 @@ func (s *Server) pgResetTool(w http.ResponseWriter, r *http.Request) {
 		}
 		schema, _ := json.Marshal(t.InputSchema())
 		if err := pg.UpsertToolForce(t.Name(), t.Description(), schema, autoAgents); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return
+	}
+	// deep tools default-bind to auto/pentest/worker.
+	deepAgents, _ := json.Marshal(deepToolBindings)
+	for _, t := range s.deepTools() {
+		if t.Name() != key {
+			continue
+		}
+		schema, _ := json.Marshal(t.InputSchema())
+		if err := pg.UpsertToolForce(t.Name(), t.Description(), schema, deepAgents); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}

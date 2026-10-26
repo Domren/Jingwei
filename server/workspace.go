@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -287,4 +289,65 @@ func sanitizeFilename(name string) string {
 	name = strings.ReplaceAll(name, "\n", "")
 	name = strings.ReplaceAll(name, "\r", "")
 	return name
+}
+
+// saveWorkspaceExport persists an exported report under reports/<date>/ inside
+// the shared workspace and returns its workspace-relative path. A failed save
+// never blocks the download itself; callers log and continue.
+func (s *Server) saveWorkspaceExport(name string, write func(*os.File) error) (string, error) {
+	date := time.Now().Format("2006-01-02")
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	// O_EXCL 保证并发/同毫秒导出不会互相覆盖;冲突时追加 -1、-2…
+	for attempt := 0; attempt < 1000; attempt++ {
+		candidate := name
+		if attempt > 0 {
+			candidate = fmt.Sprintf("%s-%d%s", stem, attempt, ext)
+		}
+		rel := filepath.ToSlash(filepath.Join("reports", date, candidate))
+		abs, ok := s.wsResolve(rel)
+		if !ok {
+			return "", fmt.Errorf("非法导出路径 %q", rel)
+		}
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			return "", err
+		}
+		f, err := os.OpenFile(abs, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if os.IsExist(err) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		writeErr := write(f)
+		closeErr := f.Close()
+		if writeErr != nil {
+			_ = os.Remove(abs)
+			return "", writeErr
+		}
+		if closeErr != nil {
+			return "", closeErr
+		}
+		return rel, nil
+	}
+	return "", fmt.Errorf("无法为导出文件分配唯一名称 %q", name)
+}
+
+func (s *Server) saveWorkspaceExportBytes(name string, data []byte) (string, error) {
+	return s.saveWorkspaceExport(name, func(f *os.File) error {
+		_, err := f.Write(data)
+		return err
+	})
+}
+
+func (s *Server) saveWorkspaceExportFile(name, src string) (string, error) {
+	return s.saveWorkspaceExport(name, func(f *os.File) error {
+		in, err := os.Open(src)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		_, err = io.Copy(f, in)
+		return err
+	})
 }

@@ -54,6 +54,34 @@ function FieldRow({ label, children }: { label: string; children: React.ReactNod
   );
 }
 
+// HTTPMessageBlock renders one raw HTTP message (request or response) as a
+// copyable code block. Empty payloads are omitted by the caller.
+function HTTPMessageBlock({ title, text }: { title: string; text?: string }) {
+  if (!text) return null;
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs font-medium text-muted-foreground">{title}</span>
+        <CopyButton text={text} successMessage={`已复制${title}`} />
+      </div>
+      <pre className="max-h-[42vh] overflow-auto rounded-md bg-muted px-3 py-2 font-mono text-xs whitespace-pre-wrap">
+        {text}
+      </pre>
+    </div>
+  );
+}
+
+// withoutCurlCommands hides the scanner's curl one-liner when the raw packets
+// are already shown above it; a curl string cannot be replayed byte-for-byte.
+function withoutCurlCommands(text: string) {
+  return text
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*(curl|复现命令)/.test(line))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function FindingDetailInner() {
   const searchParams = useSearchParams();
   const id = searchParams.get("id") ?? "";
@@ -183,17 +211,40 @@ function FindingDetailInner() {
               </Card>
               <FindingRetestPanel key={`retest:${id}`} findingId={id} readOnly={finding.inherited} onCompleted={load} />
               <Card>
-                <CardHeader>
+                <CardHeader className="flex-row items-center justify-between gap-2">
                   <CardTitle className="text-sm">证据 / PoC</CardTitle>
+                  {finding.http_request && finding.http_response ? (
+                    <CopyButton
+                      text={`${finding.http_request}\r\n\r\n${finding.http_response}`}
+                      successMessage="已复制完整请求/响应报文"
+                    />
+                  ) : null}
                 </CardHeader>
-                <CardContent>
-                  {finding.evidence ? (
-                    <pre className="max-h-[46vh] overflow-auto rounded-md bg-muted px-3 py-2 font-mono text-xs whitespace-pre-wrap">
-                      {finding.evidence}
-                    </pre>
+                <CardContent className="space-y-4">
+                  {finding.http_request || finding.http_response ? (
+                    <>
+                      <HTTPMessageBlock title="HTTP 请求报文" text={finding.http_request} />
+                      <HTTPMessageBlock title="HTTP 响应报文" text={finding.http_response} />
+                    </>
                   ) : (
-                    <p className="text-sm text-muted-foreground">（无证据）</p>
+                    <Alert>
+                      <AlertDescription>
+                        未采集到原始 HTTP 请求/响应报文；该漏洞可能为 TCP/非 HTTP 类型，或执行器未返回报文。请结合下方文字证据复现。
+                      </AlertDescription>
+                    </Alert>
                   )}
+                  <div className="space-y-2">
+                    <span className="text-xs font-medium text-muted-foreground">文字证据 / 命令输出</span>
+                    {finding.evidence ? (
+                      <pre className="max-h-[46vh] overflow-auto rounded-md bg-muted px-3 py-2 font-mono text-xs whitespace-pre-wrap">
+                        {finding.http_request || finding.http_response
+                          ? withoutCurlCommands(finding.evidence)
+                          : finding.evidence}
+                      </pre>
+                    ) : (
+                      <p className="text-sm text-muted-foreground">（无证据）</p>
+                    )}
+                  </div>
                 </CardContent>
               </Card>
               <FindingTrafficPanel

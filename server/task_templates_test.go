@@ -19,7 +19,8 @@ func TestTaskTemplateHTTPCRUD(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer m.Close()
+	// 关闭必须晚于所有 t.Cleanup（LIFO 中它最先注册 → 最后执行），否则夹具删除会打到已关闭的连接池上静默失败。
+	t.Cleanup(func() { _ = m.Close() })
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
 	h := s.Handler()
 	token, err := signJWT(s.jwtKey)
@@ -89,7 +90,8 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer m.Close()
+	// 关闭必须晚于所有 t.Cleanup（LIFO 中它最先注册 → 最后执行），否则夹具删除会打到已关闭的连接池上静默失败。
+	t.Cleanup(func() { _ = m.Close() })
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
 	conversation, err := m.pg.CreateConversation("mainagent", "pin through http", nil)
 	if err != nil {

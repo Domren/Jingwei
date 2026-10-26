@@ -27,7 +27,8 @@ func callReadJSON(t *testing.T, tool actool.CoreTool, input string) any {
 
 func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 	d := testDB(t)
-	defer d.Close()
+	// 关闭必须晚于所有 t.Cleanup（LIFO 中它最先注册 → 最后执行），否则夹具删除会打到已关闭的连接池上静默失败。
+	t.Cleanup(func() { _ = d.Close() })
 
 	companies := d.Companies()
 	companyID, _, err := companies.UpsertCompany(fmt.Sprintf("overview-scope-%d", time.Now().UnixNano()), "")
@@ -65,7 +66,7 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() { deleteTaskFixture(t, d, task.ID) })
 
 	tools := NewToolSet(d.Exploration(task.ExplorationID), "planner")
 	tools.SetTaskID(task.ID)
@@ -82,26 +83,38 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 	if !ok {
 		t.Fatalf("coverage missing: %#v", overview["coverage"])
 	}
-	scopeRows, ok := coverage["scope"].([]map[string]any)
-	if !ok || len(scopeRows) != 1 {
-		t.Fatalf("task scope missing: %#v", coverage["scope"])
+	// graph_overview 每轮都要进上下文，早已不再平铺 scope 行；企业关联是否落到任务范围，
+	// 看归属重算写进 task_scope 的 company 引用——服务端与 Guard 策略用的就是这份数据。
+	// 范围规则本身留在 company_scope，靠它把企业资产归因到任务（上面的 linkedAssets 已验证）。
+	scopeRows, err := assets.ListTaskScopeWithSources(task.ID)
+	if err != nil || len(scopeRows) == 0 {
+		t.Fatalf("company scope not expanded into task scope: rows=%+v err=%v", scopeRows, err)
 	}
-	companyScope, ok := scopeRows[0]["company_scope"].([]map[string]any)
-	if !ok || len(companyScope) != len(inputs) {
-		t.Fatalf("company scope not expanded: %#v", scopeRows[0])
+	var companyRows int
+	for _, row := range scopeRows {
+		if row.Kind != "company" || row.CompanyID == nil || *row.CompanyID != companyID {
+			continue
+		}
+		if row.CompanyName != companiesName(t, companies, companyID) {
+			t.Errorf("task scope company name %q want %q", row.CompanyName, companiesName(t, companies, companyID))
+		}
+		companyRows++
 	}
-	kinds := make(map[string]string, len(companyScope))
-	for _, rule := range companyScope {
-		kinds[fmt.Sprint(rule["kind"])] = fmt.Sprint(rule["value"])
+	if companyRows != 1 {
+		t.Fatalf("company reference missing from task scope: %+v", scopeRows)
+	}
+	rules, err := companies.GetScope(companyID)
+	if err != nil || len(rules) != len(inputs) {
+		t.Fatalf("company scope rules: rules=%+v err=%v", rules, err)
+	}
+	raw := make(map[string]string, len(rules))
+	for _, rule := range rules {
+		raw[rule.Kind] = rule.Raw
 	}
 	for _, input := range inputs {
-		if kinds[input.Kind] != input.Value {
-			t.Errorf("scope %s=%q want %q", input.Kind, kinds[input.Kind], input.Value)
+		if raw[input.Kind] != input.Value {
+			t.Errorf("company scope %s=%q want %q", input.Kind, raw[input.Kind], input.Value)
 		}
-	}
-	keywords, ok := scopeRows[0]["company_keywords"].([]string)
-	if !ok || len(keywords) != 1 || keywords[0] != keyword {
-		t.Fatalf("company keywords missing: %#v", scopeRows[0]["company_keywords"])
 	}
 	if hc, _ := coverage["host_count"].(int); hc < 1 {
 		t.Fatalf("company asset host not counted in agent context: %#v", coverage["host_count"])
@@ -142,7 +155,7 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(disabledTask.ID) })
+	t.Cleanup(func() { deleteTaskFixture(t, d, disabledTask.ID) })
 	disabledTools := NewToolSet(d.Exploration(disabledTask.ExplorationID), "planner")
 	disabledTools.SetTaskID(disabledTask.ID)
 	disabledTools.SetCoverageEnabled(false)
@@ -185,7 +198,7 @@ func companiesName(t *testing.T, companies *db.CompanyStore, companyID int64) st
 
 func TestBlackboardToolsReadDirectSources(t *testing.T) {
 	d := testDB(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	grand, err := d.CreateTask("grand", "grand goal", nil, 0, 0)
 	if err != nil {
@@ -200,9 +213,9 @@ func TestBlackboardToolsReadDirectSources(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = d.DeleteTask(current.ID)
-		_ = d.DeleteTask(source.ID)
-		_ = d.DeleteTask(grand.ID)
+		deleteTaskFixture(t, d, current.ID)
+		deleteTaskFixture(t, d, source.ID)
+		deleteTaskFixture(t, d, grand.ID)
 	})
 
 	grandStore := d.Exploration(grand.ExplorationID)
@@ -369,13 +382,13 @@ func TestBlackboardToolsReadDirectSources(t *testing.T) {
 // model which ids it deferred, after de-duplicating and dropping invalid ids.
 func TestGetWorkerTraceStepIDsDegradeGracefully(t *testing.T) {
 	d := testDB(t)
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	task, err := d.CreateTask("trace-cap", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() { deleteTaskFixture(t, d, task.ID) })
 	store := d.Exploration(task.ExplorationID)
 	intent, err := store.AddIntent(map[string]any{"summary": "cap work"}, 1, nil, "planner")
 	if err != nil {

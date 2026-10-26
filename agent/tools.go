@@ -267,6 +267,97 @@ func pidList(raw []json.RawMessage) []int64 {
 	return out
 }
 
+// unescapeRawPacket turns the literal two-character escape sequences models emit
+// for wire bytes ("\r\n" typed as backslash-r-backslash-n) back into real bytes,
+// but only when the payload carries no actual control bytes at all — so a capture
+// that already contains CRLF is never rewritten.
+func unescapeRawPacket(s string) string {
+	if s == "" || strings.ContainsAny(s, "\r\n") {
+		return s
+	}
+	if !strings.Contains(s, `\r`) && !strings.Contains(s, `\n`) && !strings.Contains(s, `\t`) {
+		return s
+	}
+	return strings.NewReplacer(`\r\n`, "\r\n", `\n`, "\n", `\r`, "\r", `\t`, "\t").Replace(s)
+}
+
+// rawProtocolPacket normalises the optional protocol/raw-byte parameters of
+// report_finding. An empty protocol means HTTP, so the report keeps using the
+// "原始 HTTP 报文" wording even when the bytes came from the agent rather than the
+// proxy; anything else names the protocol the capture belongs to. The protocol
+// label survives even without bytes, so a non-HTTP finding is never reported as
+// HTTP-by-default with missing packets.
+func rawProtocolPacket(protocol, req, resp string) (string, string, string) {
+	p := strings.ToLower(strings.TrimSpace(protocol))
+	switch {
+	case p == "http" || p == "https" || strings.HasPrefix(p, "http/"):
+		return "", req, resp
+	case p != "":
+		return p, req, resp
+	case req == "" && resp == "":
+		return "", req, resp
+	case looksLikeHTTP(req, resp):
+		return "", req, resp
+	default:
+		return "tcp", req, resp
+	}
+}
+
+func looksLikeHTTP(req, resp string) bool {
+	for _, s := range []string{req, resp} {
+		head := s
+		if i := strings.IndexByte(s, '\n'); i >= 0 {
+			head = s[:i]
+		}
+		head = strings.TrimRight(head, "\r")
+		if strings.HasPrefix(head, "HTTP/") {
+			return true
+		}
+		for _, m := range []string{"GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "PATCH ", "OPTIONS ", "TRACE ", "CONNECT "} {
+			if strings.HasPrefix(head, m) && strings.Contains(head, "HTTP/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// rawProtocolMarkers name protocols the HTTP proxy cannot capture. Tokens are
+// deliberately protocol-specific so an HTTP finding that merely mentions
+// "redis" in prose is not reclassified.
+var rawProtocolMarkers = []struct {
+	proto  string
+	tokens []string
+}{
+	{"redis", []string{"redis_version", "+pong", "-noauth", "-err unknown command", "*1\r\n$4\r\n", `$4\r\nping`}},
+	{"mysql", []string{"caching_sha2_password", "mysql_native_password", "mysql handshake", "protocol 10"}},
+	{"ssh", []string{"ssh-2.0", "ssh-1.99", "ssh-2.0.0"}},
+	{"memcached", []string{"stat version", "stat pid", "stat udp_number"}},
+	{"mongodb", []string{"op_msg", "op_query", "mongod"}},
+	{"postgresql", []string{"postgres protocol", "startup packet", "sf02d"}},
+	{"ftp", []string{"ftp server", "220 welcome"}},
+	{"smtp", []string{"smtp", "220 mail"}},
+	{"ldap", []string{"ber encoding", "ldap bind request"}},
+}
+
+// detectRawProtocol infers the protocol of a payloadless finding from its text,
+// so an agent that pastes RESP/MySQL bytes into evidence instead of using
+// raw_request/raw_response is corrected rather than silently filed as HTTP.
+func detectRawProtocol(text string) string {
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "http/1.1") || strings.Contains(lower, "http/2") {
+		return ""
+	}
+	for _, m := range rawProtocolMarkers {
+		for _, tok := range m.tokens {
+			if strings.Contains(lower, tok) {
+				return m.proto
+			}
+		}
+	}
+	return ""
+}
+
 func obj(props map[string]any, required ...string) map[string]any {
 	m := map[string]any{"type": "object", "properties": props}
 	if len(required) > 0 {
@@ -1222,16 +1313,24 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 // --- worker write tools ---
 
 func (t *ToolSet) addFinding() actool.CoreTool {
-	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
+	return writeTool("report_finding", "记录确认的漏洞。HTTP 漏洞的 evidence 用原始 HTTP 请求/响应报文（请求行、Host、关键请求头、响应状态行与关键响应片段）说明复现与验证结论，并配合 traffic_refs 绑定已采集的真实流量；非 HTTP 协议（Redis/MySQL/SSH 等）用 protocol 写明协议名，并把实际收发字节放进 raw_request/raw_response，evidence 写协议层结论。任何情况都不要用 curl 命令或口头描述代替报文。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
 		"vulnclass": str("漏洞类别"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
 		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
-		"evidence":         str("证据/PoC 文本"),
+		"evidence":         str("证据文本：判定依据与结论。HTTP(S) 漏洞写关键请求行/头与响应状态行、响应片段（真实报文由 traffic_refs 绑定）；非 HTTP 协议写命令与协议层结论。真实收发的完整字节放 raw_request/raw_response，不要贴在这里；任何情况都不要写 curl 命令"),
+		"protocol":         str("非 HTTP 协议漏洞必填：协议名（如 redis、mysql、ssh、memcached、tcp）。HTTP(S) 漏洞省略；填写后报告按该协议展示「原始协议报文」，同时必须提供 raw_request/raw_response"),
+		"raw_request":      map[string]any{"type": "string", "description": "protocol 非空时必填：本次实际发送给目标的完整原始字节（真实 CRLF，JSON 里写成单反斜杠转义 \"\\r\\n\"，不要写双反斜杠 \\\\r\\\\n 字面量），例如 \"PING\\r\\n\"；报告把它作为可重放的请求数据；HTTP 漏洞用 traffic_refs 绑定真实流量，不要手写请求行"},
+		"raw_response":     map[string]any{"type": "string", "description": "protocol 非空时必填：与 raw_request 同一次交互中目标真实返回的原始字节（含协议前缀/状态行与换行，原样保留）；不得虚构，只写实际收到的内容"},
 		"evidence_hint_id": idp("可选：本任务中对应此漏洞的提示节点 ID，自动携带其结构化 traffic_refs；不能引用继承提示或其他漏洞的提示"),
-		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
+		"no_raw_capture":   map[string]any{"type": "boolean", "description": "仅在确实无法取得可重放报文/字节时传 true（例如结论只来自源码阅读、配置或命令输出，本次没有实际向目标发送过可复现的请求），并在 evidence 说明原因；默认省略。未传时 HTTP 漏洞缺 traffic_refs、非 HTTP 漏洞缺 raw_request/raw_response 会被退回要求补齐"},
+		"traffic_refs": map[string]any{"type": "array", "description": "HTTP/HTTPS 漏洞必填：先 traffic_search 检索、traffic_get 逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID（提交链路要带上展示/触发危害的那一次 GET）。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测；确实无法取得报文时改传 no_raw_capture=true。TCP 等非 HTTP 漏洞用 raw_request/raw_response，此处省略或传 []。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
 			"items": obj(map[string]any{"traffic_id": str("traffic_search 返回的真实流量 ID"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("该流量如何支持漏洞结论")}, "traffic_id")},
 	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
+			Protocol                                     string            `json:"protocol"`
+			RawRequest                                   string            `json:"raw_request"`
+			RawResponse                                  string            `json:"raw_response"`
+			NoRawCapture                                 bool              `json:"no_raw_capture"`
 			IntentID                                     json.RawMessage   `json:"intent_id"`
 			AssetIDs                                     []json.RawMessage `json:"asset_ids"`
 			TrafficRefs                                  []db.TrafficRef   `json:"traffic_refs"`
@@ -1258,7 +1357,31 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		proto, rawReq, rawResp := rawProtocolPacket(a.Protocol, unescapeRawPacket(a.RawRequest), unescapeRawPacket(a.RawResponse))
+		if proto == "" && rawReq == "" && rawResp == "" && len(refs) == 0 {
+			proto = detectRawProtocol(a.Evidence + "\n" + a.Summary + "\n" + a.Name)
+		}
+		if proto != "" && rawReq == "" && rawResp == "" && !a.NoRawCapture {
+			return actool.Errorf(fmt.Sprintf("已识别为 %s 协议漏洞，但本次没有 raw_request/raw_response，报告将无法逐字节重放。请保持 vulnclass/name/severity/summary/evidence 完全不变，重新调用 report_finding 并补上 protocol=%q、raw_request=本次真实发送的完整字节（逐字符保留 \\r\\n，例如 \"PING\\r\\n\")、raw_response=真实收到的完整字节（含 RESP 的 + - : $ * 前缀）。字节确实无法取得时传 no_raw_capture=true。本次调用未登记漏洞，不会产生重复记录。", strings.ToUpper(proto), proto)), nil
+		}
+		// An HTTP finding with no captured request is not reproducible: the report
+		// can only show prose. Reject it at the moment the worker still knows which
+		// traffic ids its own probes produced, with no_raw_capture as the honest
+		// escape hatch for conclusions never exercised against the target.
+		if proto == "" && len(refs) == 0 && !a.NoRawCapture && findingTrafficBindingEnabled() {
+			return actool.Errorf("HTTP 漏洞必须能让人逐字节重放，本次没有携带任何流量证据（traffic_refs 与 evidence_hint_id 均为空）。请保持 vulnclass/name/severity/summary/evidence 不变：先用 traffic_search（指定 host）找出你本次真实发送的请求，用 traffic_get 核实响应确实支持该结论，再按复现顺序传 traffic_refs——存储型/盲打型要把提交请求和触发危害的那一次 GET 一起给出。代为上报（没有 traffic_search）时，直接把执行者报告中已给出的真实流量 ID 填进 traffic_refs，或用 evidence_hint_id 引用带引用的提示节点，不要丢弃引用后只交文字。只有从未实际发送过可复现请求（仅读源码/配置得出、目标不可达等）时才传 no_raw_capture=true，并在 evidence 写明原因。本次调用未登记漏洞，不会产生重复记录。"), nil
+		}
+		name := strings.TrimSpace(a.Name)
+		if name == "" {
+			// The report heading reads name first, so an unnamed finding titles itself
+			// with its class instead of printing an empty section.
+			name = strings.TrimSpace(a.VulnClass)
+		}
+		evidence := a.Evidence
+		if proto != "" && !strings.Contains(evidence, "类型:") {
+			evidence = "类型: " + proto + "\n" + evidence
+		}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: name, Severity: a.Severity, Summary: a.Summary, Evidence: evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), Protocol: proto, RawRequest: rawReq, RawResponse: rawResp}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1290,7 +1413,10 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			EvidenceStatus string `json:"evidence_status"`
 			EvidenceNote   string `json:"evidence_note,omitempty"`
 		}{RecordedFinding: recorded, EvidenceStatus: "bound"}
-		if len(recorded.Traffic.Bindings) == 0 {
+		if proto != "" && rawReq == "" && rawResp == "" {
+			result.EvidenceStatus = "missing_raw_packet"
+			result.EvidenceNote = fmt.Sprintf("漏洞已登记，但按你的声明没有可重放的 %s 原始字节，报告的「原始协议报文」章节会标注为未采集，无法逐字节重放。后续同一漏洞若能取得字节，用相同 vulnclass/name 再次调用 report_finding 并带上 raw_request/raw_response（会合并到 finding_id=%d，不算重复）。", strings.ToUpper(proto), recorded.FindingID)
+		} else if len(recorded.Traffic.Bindings) == 0 {
 			result.EvidenceStatus = "not_bound"
 			result.EvidenceNote = "漏洞已保存，未绑定流量。TCP/无包情形可正常继续；若已有核实的 HTTP 流量，请用可用的 bind_finding_traffic 或漏洞页面补绑，再完成证据交接。不要重复创建漏洞。"
 			if !findingTrafficBindingEnabled() {
@@ -1360,6 +1486,7 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 	return t.writeExpTool("record_fact", "把探索【事实/结论】写入探索图，连到产生它的意图（intent_id）。用于记录探索结果——包括指纹/枚举等【正向结论】，和'端口关闭'/'参数不可注入'/'未发现登录入口'等【否定结论】。\n"+
 		"⚠️一次探索的多个观察要【汇总成一条事实】，不要拆成多条，可以合并成一条事实的就尽量用一条事实表示：summary=对本次结论的总结性一句话，detail=相关细节（可含多个具体项）。例：指纹意图→一条事实 {summary:'识别了 X 站点的技术栈与响应特征', detail:'nginx 1.25 / Vue3 / 200 / title=.. / body_len=..'}，而不是状态码、指纹、标题各记一条。一条意图通常只产出一条事实，拆太碎会让图谱无限膨胀。\n"+
 		"★facts 数组用于一次写多条【彼此不同】的结论（每条可省略 intent_id，默认用顶层 intent_id）。返回 ids 数组，与 facts 等长同序。\n"+
+		"⚠️**确认的漏洞（SQLi/XSS/RCE/LFI 之外，也包括弱口令、敏感信息泄露、越权、文件上传等）必须用 report_finding 登记 finding 并附真实流量证据；不要只把它写成 record_fact。**record_fact 只用于过程性观察与否定结论。\n"+
 		"⚠️只写你在工具输出里【真实看到】的结论，不要脑补。evidence 与 confidence 用来防止不准确的结论污染图谱：\n"+
 		"  · evidence=支撑本结论的【一行】关键证据（命令+最能证明的那一两行输出），**务必简洁**——细节已在 detail，这里不要再粘大段输出。\n"+
 		"  · confidence=observed（输出里直接看到）| inferred（据现象推断）。\n"+

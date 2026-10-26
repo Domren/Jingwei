@@ -8,6 +8,8 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
@@ -15,6 +17,39 @@ import (
 	"github.com/Autumn-27/norma/skill"
 	actool "github.com/Autumn-27/norma/tool"
 )
+
+// mcpDialCooldown is how long a failed MCP connect keeps other agent sessions
+// from re-dialling the same endpoint. Agent sessions are created per intent, so
+// without this a stopped sidecar (java-chains) logs one DNS failure per intent
+// and adds connect latency to every one of them.
+const mcpDialCooldown = 30 * time.Second
+
+// mcpDialAttemptWindow is how long a claimed dial stays exclusive before another
+// session may take it over, so a session that dies mid-connect cannot bench the
+// server forever.
+const mcpDialAttemptWindow = 10 * time.Second
+
+var mcpDials sync.Map // server name -> time.Time (earliest next dial)
+
+// mcpClaimDial reports whether this session may dial name now. Concurrent agent
+// sessions start per intent, so without the claim every one of them would dial a
+// stopped sidecar and log the identical DNS failure in the same instant.
+func mcpClaimDial(name string) bool {
+	now := time.Now()
+	next := now.Add(mcpDialAttemptWindow)
+	v, loaded := mcpDials.LoadOrStore(name, next)
+	if !loaded {
+		return true
+	}
+	if until, isTime := v.(time.Time); !isTime || now.Before(until) {
+		return false
+	}
+	return mcpDials.CompareAndSwap(name, v, next)
+}
+
+func mcpMarkDown(name string) { mcpDials.Store(name, time.Now().Add(mcpDialCooldown)) }
+
+func mcpMarkUp(name string) { mcpDials.Delete(name) }
 
 // wireAgentAugment connects the PG agent_visibility table into the agent runtime:
 // an agent's visible skills are loaded from the filesystem and packed into one
@@ -84,11 +119,18 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 				if !directVisible && !skillGated {
 					continue // neither directly visible nor referenced by a visible skill
 				}
-				cl, err := connectMCP(ctx, m)
-				if err != nil {
-					log.Printf("[mcp] %s 连接失败: %v", m.Name, err)
+				if !mcpClaimDial(m.Name) {
+					// Already reported down; this agent started before the server
+					// recovered. Reconnecting per intent only spams the log.
 					continue
 				}
+				cl, err := connectMCP(ctx, m)
+				if err != nil {
+					log.Printf("[mcp] %s 连接失败: %v（%s 内其他会话不再重试，启动服务后可在下一轮生效）", m.Name, err, mcpDialCooldown)
+					mcpMarkDown(m.Name)
+					continue
+				}
+				mcpMarkUp(m.Name)
 				closers = append(closers, cl)
 				ts, err := cl.Tools(ctx)
 				if err != nil {
@@ -211,7 +253,7 @@ func seedPrompts(pg *db.DB) {
 // flag and, if kept, wrapped so the model sees the DB-overridden description/schema
 // and缺省入参 get injected. MCP/skill/host tools have no row and pass through.
 func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
-	agent.FindingTrafficBindingEnabled = func() bool { return pg.GetBool(settingAgentTrafficBinding, false) }
+	agent.FindingTrafficBindingEnabled = func() bool { return pg.GetBool(settingAgentTrafficBinding, true) }
 	agent.IntelligenceEnabled = func() bool { return pg.GetBool(db.SettingTaskIntelligence, false) }
 	agent.IntelligenceRecord = func(ctx context.Context, taskID, nodeID int64, worker string, input db.IntelligenceInput) (int64, error) {
 		if !pg.GetBool(db.SettingTaskIntelligence, false) {

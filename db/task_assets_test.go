@@ -12,7 +12,7 @@ func TestRegisterTaskAssetScopesCreatesAssetsAndPersistsTextScope(t *testing.T) 
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	task, err := d.CreateTask("manual scope registration", "goal", nil, 0, 0)
 	if err != nil {
@@ -91,7 +91,7 @@ func TestTaskAssetAttachDetachPreservesGlobalAssetAndAnchors(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	task, err := d.CreateTask("asset editing", "goal", nil, 0, 0)
 	if err != nil {
@@ -144,7 +144,7 @@ func TestIntentAssetsIncludesDirectSourceProvenance(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	source, err := d.CreateTask("source assets", "goal", nil, 0, 0)
 	if err != nil {
@@ -154,7 +154,7 @@ func TestIntentAssetsIncludesDirectSourceProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(current.ID); _ = d.DeleteTask(source.ID) })
+	t.Cleanup(func() { purgeTaskNow(t, d, current.ID); purgeTaskNow(t, d, source.ID) })
 
 	assetID, err := d.Assets().UpsertHTTPService(UpsertHTTPServiceReq{
 		URL: fmt.Sprintf("https://intent-%d.example.test", time.Now().UnixNano()), TaskID: source.ID,

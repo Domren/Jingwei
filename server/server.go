@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -39,10 +40,13 @@ var BuildVersion = "dev"
 // Server exposes the ARTEX backend over a JSON HTTP API for the shadcn/ui
 // frontend.
 type Server struct {
-	scheduleMu sync.Mutex
-	m          *Manager
-	engine     *Engine
-	ctx        context.Context
+	scheduleMu  sync.Mutex
+	m           *Manager
+	engine      *Engine
+	ctx         context.Context
+	scanMgr     *scanManager
+	deepMgr     *deepManager
+	resourceMgr *resourceManager
 
 	skillDir  string // root directory for skill subdirectories
 	jwtKey    []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
@@ -158,6 +162,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+	s.resourceMgr = newResourceManager(s)
 	s.initSideQuestions()
 	if m.pg != nil {
 		if err := s.basicAuth.load(m.pg); err != nil {
@@ -167,6 +172,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()
+	// Fingerprint platform secrets (JWT key, PG DSN, LLM keys, web-search keys,
+	// java-chains credentials) for the deterministic tool-egress guard.
+	s.refreshGuardSecrets()
 	// Every task uses a stable task router. An empty explicit chain is resolved by
 	// that router through Agent bindings and then the global provider, so adding a
 	// first chain to a running task takes effect on its very next LLM call.
@@ -243,6 +251,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
 		go newNotifier(s).Run(s.ctx)
+		seedJavaChainsMCP(m.pg) // JAVA_CHAINS_MCP_TOKEN 存在时注册 java-chains MCP
 		// Fill the tool cache for any enabled MCP that has none yet (notably the
 		// seeded browser MCP on first run). Async so it never blocks startup.
 		go s.discoverEmptyMCPsOnStartup()
@@ -270,6 +279,11 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if m.pg != nil {
 		s.seedCredentialProcessor()
 		go s.runCredentialProcessor()
+		s.scanMgr = newScanManager(s)
+		s.scanMgr.start(ctx)
+		s.deepMgr = newDeepManager(s)
+		s.deepMgr.start(ctx)
+		s.resourceMgr.start(ctx)
 	}
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
 	return s
@@ -443,6 +457,9 @@ func maxTokensResolver(cfg agent.Config) func() int {
 // applyLLM (re)builds the planner/worker/main-agent from cfg and installs them on
 // the running engine as the GLOBAL active pair. Safe to call at runtime (UI configures LLM).
 func (s *Server) applyLLM(cfg agent.Config) error {
+	// Key/model/backend edits can add or rotate secrets; refresh the egress
+	// fingerprints before any rebuilt agent can run.
+	s.refreshGuardSecrets()
 	var prov llm.Provider
 	// A persisted active profile must use the same cached provider as task chains
 	// and Agent bindings, otherwise each path owns a separate rate limiter.
@@ -746,6 +763,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/tasks/{id}/intercept-rules/{rid}", s.taskInterceptDeleteRule)
 	mux.HandleFunc("POST /api/tasks/{id}/intercept-rules/{rid}/toggle", s.taskInterceptToggleRule)
 	mux.HandleFunc("POST /api/tasks/control/batch", s.controlTasksBatch)
+	mux.HandleFunc("POST /api/tasks/delete/batch", s.deleteTasksBatch)
 	mux.HandleFunc("GET /api/task-archives", s.listTaskArchives)
 	mux.HandleFunc("GET /api/task-archives/{id}", s.getTaskArchive)
 	mux.HandleFunc("POST /api/tasks/{id}/archive", s.queueTaskArchive)
@@ -804,12 +822,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/companies", s.createCompany)
 	mux.HandleFunc("GET /api/companies/{id}", s.getCompany)
 	mux.HandleFunc("DELETE /api/companies/{id}", s.deleteCompany)
+	mux.HandleFunc("POST /api/companies/delete/batch", s.deleteCompaniesBatch)
 	mux.HandleFunc("POST /api/companies/{id}/scope", s.addCompanyScope)
 	mux.HandleFunc("POST /api/companies/reattribute", s.reattribute)
 
 	mux.HandleFunc("GET /api/exploration/frontier", s.frontier)
 	mux.HandleFunc("GET /api/exploration/findings", s.findings)
 	mux.HandleFunc("GET /api/exploration/findings/groups", s.findingGroups)
+	mux.HandleFunc("GET /api/exploration/findings/systems", s.findingSystems)
 	mux.HandleFunc("GET /api/exploration/finding-cases", s.listFindingCases)
 	mux.HandleFunc("POST /api/exploration/finding-cases", s.mergeFindingCase)
 	mux.HandleFunc("GET /api/exploration/finding-cases/{id}", s.getFindingCase)
@@ -832,6 +852,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/exploration/findings/{id}/retests", s.startFindingRetest)
 	mux.HandleFunc("PATCH /api/exploration/findings/{id}", s.patchFinding)
 	mux.HandleFunc("DELETE /api/exploration/findings/{id}", s.deleteFinding)
+	mux.HandleFunc("POST /api/exploration/findings/delete/batch", s.deleteFindingsBatch)
 	mux.HandleFunc("GET /api/exploration/intents", s.intents)
 	mux.HandleFunc("GET /api/exploration/graph", s.explorationGraph)
 	mux.HandleFunc("GET /api/exploration/nodes", s.explorationNodes)
@@ -866,6 +887,36 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/pocs/{id}", s.pgGetPOC)
 	mux.HandleFunc("PATCH /api/pocs/{id}", s.pgUpdatePOC)
 	mux.HandleFunc("DELETE /api/pocs/{id}", s.pgDeletePOC)
+
+	// 无 LLM 自动化漏扫：资产发现 → 指纹 → POC 匹配 → nuclei
+	mux.HandleFunc("GET /api/scans", s.listScanTasks)
+	mux.HandleFunc("POST /api/scans", s.createScanTask)
+	mux.HandleFunc("GET /api/scans/{id}", s.getScanTask)
+	mux.HandleFunc("DELETE /api/scans/{id}", s.deleteScanTask)
+	mux.HandleFunc("POST /api/scans/{id}/cancel", s.cancelScanTask)
+	mux.HandleFunc("POST /api/scans/{id}/rerun", s.rerunScanTask)
+	mux.HandleFunc("GET /api/scans/{id}/assets", s.listScanTaskAssets)
+	mux.HandleFunc("GET /api/scans/{id}/results", s.listScanTaskResults)
+	mux.HandleFunc("GET /api/scans/{id}/auto", s.getScanAuto)
+
+	// 深度利用：漏洞验证 / 漏洞利用 / WAF 绕过 / Webshell 注入 / Webshell 管理
+	mux.HandleFunc("GET /api/deep/tasks", s.listDeepTasks)
+	mux.HandleFunc("POST /api/deep/tasks", s.createDeepTask)
+	mux.HandleFunc("GET /api/deep/tasks/{id}", s.getDeepTask)
+	mux.HandleFunc("DELETE /api/deep/tasks/{id}", s.deleteDeepTask)
+	mux.HandleFunc("POST /api/deep/tasks/{id}/cancel", s.cancelDeepTask)
+	mux.HandleFunc("GET /api/deep/webshells", s.listWebshells)
+	mux.HandleFunc("POST /api/deep/webshells", s.createWebshell)
+	mux.HandleFunc("PUT /api/deep/webshells/{id}", s.updateWebshell)
+	mux.HandleFunc("DELETE /api/deep/webshells/{id}", s.deleteWebshell)
+	mux.HandleFunc("POST /api/deep/webshells/{id}/check", s.checkWebshell)
+	mux.HandleFunc("POST /api/deep/webshells/{id}/exec", s.execWebshellCommand)
+	mux.HandleFunc("GET /api/deep/java-chains/status", s.javaChainsStatus)
+	// 内网两阶段 MVP：会话 / 隧道 / 范围审批 / 任务交接（与 agent 工具共用数据）
+	s.registerIntranet(mux)
+	mux.HandleFunc("GET /api/managed-resources", s.listManagedResources)
+	mux.HandleFunc("POST /api/managed-resources/{id}/release", s.releaseManagedResource)
+	mux.HandleFunc("GET /api/managed-resources/audit", s.auditLocalPortsHandler)
 	mux.HandleFunc("GET /api/llm/records", s.pgListLLMRecords)
 	mux.HandleFunc("DELETE /api/llm/records", s.pgDeleteLLMRecords)
 	mux.HandleFunc("GET /api/llm/records/tasks", s.pgLLMTasks)
@@ -1843,6 +1894,26 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 	dto := taskDTO(t, s.resolvedTaskStatus(t))
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
+	if metrics, err := s.m.PG().TaskListMetricsAll(); err == nil {
+		metric := metrics[t.ExpID]
+		dto.Tokens = tokenTotalDTO(metric.Tokens)
+		dto.LastActivity = metric.LastActivity
+		if live := s.engine.LastActivity(t.ID); live > dto.LastActivity {
+			dto.LastActivity = live
+		}
+		dto.GoalsTotal = metric.Goals.Total
+		dto.GoalsMet = metric.Goals.Met
+		dto.InFlight = metric.RunningIntents
+		dto.Findings = FindingSeverityDTO{
+			Critical: metric.Findings.Critical,
+			High:     metric.Findings.High,
+			Medium:   metric.Findings.Medium,
+			Low:      metric.Findings.Low,
+		}
+	}
+	if distinct, err := s.m.PG().DistinctFindingStatsByTask(); err == nil {
+		dto.DistinctFindings = distinct[t.ID]
+	}
 	writeJSON(w, 200, dto)
 }
 
@@ -2186,6 +2257,20 @@ func (s *Server) getFinding(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "finding not found")
 		return
 	}
+	// 保证「发现」详情页每个漏洞都有详细报告：无 LLM/未生成报告时使用确定性模板，
+	// 并在 LLM 报告遗漏原始报文时补充 PoC。生成的模板报告回写一次，避免详情页
+	// 一边显示完整报告、一边提示「报告待更新」。
+	completed := report.CompleteFindingReport(f)
+	if completed != f.Report && db.IsAutoReport(completed) {
+		f.Report = completed
+		if err := s.m.pg.SetFindingAutoReport(f.ID, completed); err != nil {
+			log.Printf("[finding] 回写自动报告失败 #%d: %v", f.ID, err)
+		} else {
+			f.ReportEvidenceVersion = f.EvidenceVersion
+		}
+	} else {
+		f.Report = completed
+	}
 	assets := s.resolveAssetIDs(f.AssetIDs)
 	dto := findingFromDB(f, assets)
 	cid, err := s.m.pg.FindingCaseID(f.ID)
@@ -2217,9 +2302,11 @@ func (s *Server) getFinding(w http.ResponseWriter, r *http.Request) {
 //
 //	scope   = filtered（沿用页面筛选）| all（全部）| selected（勾选的 ids）
 //	format  = md-single（整合一份 .md）| md-zip（一漏洞一 .md,打包 zip）
-//	          | csv | json
+//	          | docx（分页 Word 报告）| html（分页打印版报告）| csv | json
 //	ids     = 逗号分隔的 finding id（scope=selected 时必填）
 //	筛选参数 severity/status/vulnclass/task_id/q/sort 与列表接口一致（scope=filtered 用）。
+//
+// 每次导出的文件同时落一份到工作区 reports/ 下，响应头 X-Workspace-Path 给出相对路径。
 func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	scope := q.Get("scope")
@@ -2274,7 +2361,8 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer os.RemoveAll(stage)
-	if err = s.evidenceStore().StageFindingsExport(r.Context(), fs, stage, format == "md-zip"); err != nil {
+	needsBodies := format == "md-zip" || format == "md-single" || format == "html" || format == "docx"
+	if err = s.evidenceStore().StageFindingsExport(r.Context(), fs, stage, needsBodies); err != nil {
 		evidenceError(w, err)
 		return
 	}
@@ -2285,17 +2373,62 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if needsBodies {
+		// 缺失的原始报文用已绑定的流量证据补齐（真实抓包字节，不合成）。
+		hydrateFindingRawHTTP(fs, stage)
+	}
+	// 空报告用确定性模板兜底；已有报告中缺失原始 HTTP 报文时补到 POC。
+	for _, f := range fs {
+		f.Report = report.CompleteFindingReport(f)
+	}
 	now := time.Now()
-	stamp := now.Format("20060102-150405")
+	// 毫秒后缀避免同一秒内多次导出(例如两个漏扫任务接连导出)互相覆盖。
+	// Go 的时间布局只有小数点后的 0 才会解析成毫秒。
+	stamp := now.Format("20060102-150405.000")
+	scopeLabel := exportScopeLabel(scope, len(fs))
+	if sid, err := strconv.ParseInt(strings.TrimSpace(filter.ScanTaskID), 10, 64); err == nil && sid > 0 {
+		if st, err := s.m.pg.GetScanTask(sid); err == nil && st != nil && strings.TrimSpace(st.Name) != "" {
+			scopeLabel = fmt.Sprintf("%s（%d 条）", strings.TrimSpace(st.Name), len(fs))
+		}
+	}
 	setDownload := func(contentType, filename string) {
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	}
+	announce := func(filename, rel string, err error) {
+		if err != nil {
+			log.Printf("[export] 报告保存到工作区失败 %s: %v", filename, err)
+			return
+		}
+		w.Header().Set("X-Workspace-Path", rel)
+	}
 
 	switch format {
 	case "md-single":
-		setDownload("text/markdown; charset=utf-8", "findings-"+stamp+".md")
-		_, _ = w.Write([]byte(report.FindingsMarkdown(fs, now)))
+		data := []byte(report.FindingsMarkdown(fs, now))
+		name := "findings-" + stamp + ".md"
+		setDownload("text/markdown; charset=utf-8", name)
+		rel, saveErr := s.saveWorkspaceExportBytes(name, data)
+		announce(name, rel, saveErr)
+		_, _ = w.Write(data)
+	case "html":
+		data := report.FindingsHTML(fs, report.FindingsHTMLOptions{GeneratedAt: now, ScopeLabel: scopeLabel})
+		name := "findings-" + stamp + ".html"
+		setDownload("text/html; charset=utf-8", name)
+		rel, saveErr := s.saveWorkspaceExportBytes(name, data)
+		announce(name, rel, saveErr)
+		_, _ = w.Write(data)
+	case "docx":
+		data, err := report.FindingsDOCX(fs, report.FindingsDOCXOptions{GeneratedAt: now, ScopeLabel: scopeLabel})
+		if err != nil {
+			writeErr(w, 500, "生成 DOCX 报告失败: "+err.Error())
+			return
+		}
+		name := "findings-" + stamp + ".docx"
+		setDownload("application/vnd.openxmlformats-officedocument.wordprocessingml.document", name)
+		rel, saveErr := s.saveWorkspaceExportBytes(name, data)
+		announce(name, rel, saveErr)
+		_, _ = w.Write(data)
 	case "md-zip":
 		path := filepath.Join(stage, "findings.zip")
 		if err := buildFindingsEvidenceZip(path, fs, stage, now); err != nil {
@@ -2308,11 +2441,18 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer file.Close()
-		setDownload("application/zip", "findings-"+stamp+".zip")
+		name := "findings-" + stamp + ".zip"
+		setDownload("application/zip", name)
+		rel, saveErr := s.saveWorkspaceExportFile(name, path)
+		announce(name, rel, saveErr)
 		http.ServeContent(w, r, "findings.zip", now, file)
 	case "csv":
-		setDownload("text/csv; charset=utf-8", "findings-"+stamp+".csv")
-		_, _ = w.Write(report.FindingsCSV(fs))
+		data := report.FindingsCSV(fs)
+		name := "findings-" + stamp + ".csv"
+		setDownload("text/csv; charset=utf-8", name)
+		rel, saveErr := s.saveWorkspaceExportBytes(name, data)
+		announce(name, rel, saveErr)
+		_, _ = w.Write(data)
 	case "json":
 		assets := s.resolveFindingAssets(fs)
 		out := make([]FindingDTO, 0, len(fs))
@@ -2323,12 +2463,32 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 			}
 			out = append(out, findingFromDB(f, assets))
 		}
-		setDownload("application/json; charset=utf-8", "findings-"+stamp+".json")
-		enc := json.NewEncoder(w)
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(out)
+		if err := enc.Encode(out); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		name := "findings-" + stamp + ".json"
+		setDownload("application/json; charset=utf-8", name)
+		rel, saveErr := s.saveWorkspaceExportBytes(name, buf.Bytes())
+		announce(name, rel, saveErr)
+		_, _ = w.Write(buf.Bytes())
 	default:
 		writeErr(w, 400, "bad format: "+format)
+	}
+}
+
+// exportScopeLabel names the export range shown on the report cover page.
+func exportScopeLabel(scope string, n int) string {
+	switch scope {
+	case "all":
+		return "全部发现"
+	case "selected":
+		return fmt.Sprintf("勾选的 %d 条发现", n)
+	default:
+		return fmt.Sprintf("筛选结果（%d 条）", n)
 	}
 }
 
@@ -2500,6 +2660,60 @@ func (s *Server) deleteFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"deleted": true, "id": id})
+}
+
+// maxFindingDeleteBatch caps one batch request so a mistaken "select everything"
+// cannot lock a huge slice of the findings table in a single transaction.
+const maxFindingDeleteBatch = 500
+
+// deleteFindingsBatch removes the listed findings in one transaction. ids are the
+// standalone findings-table ids (DTO finding_id), the same handles the single
+// delete route takes.
+func (s *Server) deleteFindingsBatch(w http.ResponseWriter, r *http.Request) {
+	store := s.pg(w)
+	if store == nil {
+		return
+	}
+	var req struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	ids, err := normalizeFindingIDs(req.IDs)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	deleted, err := store.DeleteFindings(ids)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": deleted, "requested": len(ids)})
+}
+
+func normalizeFindingIDs(ids []int64) ([]int64, error) {
+	if len(ids) == 0 {
+		return nil, errors.New("ids 不能为空")
+	}
+	if len(ids) > maxFindingDeleteBatch {
+		return nil, fmt.Errorf("一次最多删除 %d 条漏洞", maxFindingDeleteBatch)
+	}
+	out := make([]int64, 0, len(ids))
+	seen := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			return nil, fmt.Errorf("漏洞 id %d 无效", id)
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out, nil
 }
 
 func (s *Server) intents(w http.ResponseWriter, r *http.Request) {
@@ -3428,7 +3642,7 @@ func (s *Server) settingsPayload() map[string]any {
 	}
 	return map[string]any{
 		"traffic_capture":           s.m.TrafficEnabled(),
-		"agent_traffic_binding":     s.m.pg.GetBool(settingAgentTrafficBinding, false),
+		"agent_traffic_binding":     s.m.pg.GetBool(settingAgentTrafficBinding, true),
 		"task_intelligence_enabled": s.m.pg.GetBool(db.SettingTaskIntelligence, false),
 		db.SettingCredentialAgent:   s.m.pg.GetBool(db.SettingCredentialAgent, false),
 		db.SettingCredentialTraffic: s.m.pg.GetBool(db.SettingCredentialAgent, false) && s.m.pg.GetBool(db.SettingCredentialTraffic, false),
@@ -3458,7 +3672,17 @@ func (s *Server) settingsPayload() map[string]any {
 		"notify_enabled":             s.m.pg.GetBool(settingNotifyEnabled, true),
 		"notify_public_base_url":     notifyPublicBaseURL(s.m.pg),
 		"notify_digest_interval_min": notifyDigestIntervalMin(s.m.pg),
+		// 确定性目标防护(范围/资产拦截)的运行时模式；敏感信息外防始终开启。
+		"guard_enforcement": s.guardEnforcement(),
 	}
+}
+
+// guardEnforcement returns the effective deterministic-guard mode for the API.
+func (s *Server) guardEnforcement() string {
+	if s == nil || s.m == nil || s.m.guardPolicy == nil {
+		return "strict"
+	}
+	return s.m.guardPolicy.Mode()
 }
 
 // notifyPublicBaseURL 读推送回链用的外部地址。
@@ -3533,10 +3757,23 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		NotifyEnabled    *bool   `json:"notify_enabled"`
 		NotifyBaseURL    *string `json:"notify_public_base_url"`
 		NotifyDigestMins *int    `json:"notify_digest_interval_min"`
+		// 运行时目标防护模式:off|warn|strict。每 5 秒重新读取，无需重建 agent。
+		GuardEnforcement *string `json:"guard_enforcement"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	if req.GuardEnforcement != nil {
+		mode := normalizeGuardMode(*req.GuardEnforcement, "")
+		if mode == "" {
+			writeErr(w, 400, "guard_enforcement 必须是 off、warn 或 strict")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingGuardEnforcement, mode); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
 	}
 	if req.ConstraintsInjectPlanner != nil {
 		if err := s.m.pg.SetBool(settingConstraintsInjectPlanner, *req.ConstraintsInjectPlanner); err != nil {
@@ -3687,6 +3924,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
+		// The guard's egress fingerprints must track rotated/removed search keys
+		// even when no LLM is configured (applyLLM below is skipped then).
+		s.refreshGuardSecrets()
 		changed = true
 	}
 	if changed {
@@ -4044,6 +4284,7 @@ func cors(next http.Handler) http.Handler {
 		}
 		w.Header().Add("Vary", "Origin")
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Disposition, X-Workspace-Path")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(204)

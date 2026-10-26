@@ -79,12 +79,12 @@ func FindingsMarkdown(fs []*db.DBFinding, generatedAt time.Time) string {
 		if s := strings.TrimSpace(f.Summary); s != "" {
 			fmt.Fprintf(&b, "%s\n\n", s)
 		}
-		if e := strings.TrimSpace(f.Evidence); e != "" {
+		if e := strings.TrimSpace(sanitizeEvidence(f.Evidence)); e != "" {
 			fmt.Fprintf(&b, "**证据：**\n\n```\n%s\n```\n\n", e)
 		}
-		if rep := strings.TrimSpace(f.Report); rep != "" {
+		if rep := strings.TrimSpace(CompleteFindingReport(f)); rep != "" {
 			b.WriteString("**详细报告：**\n\n")
-			b.WriteString(rep)
+			b.WriteString(stripCurlArtifacts(rep, curlOmittedNote))
 			b.WriteString("\n\n")
 		}
 		b.WriteString(findingTrafficMarkdown(f, false))
@@ -110,12 +110,12 @@ func SingleFindingMarkdown(f *db.DBFinding, generatedAt time.Time) string {
 	if s := strings.TrimSpace(f.Summary); s != "" {
 		fmt.Fprintf(&b, "## 概述\n\n%s\n\n", s)
 	}
-	if e := strings.TrimSpace(f.Evidence); e != "" {
+	if e := strings.TrimSpace(sanitizeEvidence(f.Evidence)); e != "" {
 		fmt.Fprintf(&b, "## 证据\n\n```\n%s\n```\n\n", e)
 	}
-	if rep := strings.TrimSpace(f.Report); rep != "" {
+	if rep := strings.TrimSpace(CompleteFindingReport(f)); rep != "" {
 		b.WriteString("## 详细报告\n\n")
-		b.WriteString(rep)
+		b.WriteString(stripCurlArtifacts(rep, curlOmittedNote))
 		b.WriteString("\n")
 	}
 	b.WriteString(findingTrafficMarkdown(f, true))

@@ -76,6 +76,7 @@ func (t *Traffic) readEvidence(id string, consume func(EvidenceExchange) error) 
 		if err != nil {
 			return err
 		}
+		e.RespHead = normalizeResponseStatusLine(e.RespHead)
 		return consume(e)
 	}
 	if err != nil {
@@ -101,6 +102,7 @@ func (t *Traffic) readEvidence(id string, consume func(EvidenceExchange) error) 
 		e.Response = f
 		e.RespHash = respBlob.String
 	}
+	e.RespHead = normalizeResponseStatusLine(e.RespHead)
 	return consume(e)
 }
 

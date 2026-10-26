@@ -2,6 +2,7 @@
 package evidence
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -13,10 +14,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/artex/traffic"
 )
 
@@ -28,6 +31,115 @@ type Store struct {
 
 func New(pg *db.DB, tr *traffic.Traffic, dir string) *Store {
 	return &Store{DB: pg, Traffic: tr, Dir: dir}
+}
+
+// RawExchange is an unredacted request/response pair captured by a scanner
+// outside the traffic store. SaveRawExchanges splits, hashes and persists the
+// wire bytes so the finding keeps a replayable reproduction sequence.
+type RawExchange struct {
+	Request  string
+	Response string
+	Role     string
+	Note     string
+}
+
+func splitRawPacket(raw string) (head, body string) {
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	raw = strings.TrimLeft(raw, "\n")
+	if i := strings.Index(raw, "\n\n"); i >= 0 {
+		head, body = raw[:i], raw[i+2:]
+	} else {
+		head = raw
+	}
+	return strings.TrimRight(head, "\n"), body
+}
+
+func packetFirstLine(head string) string {
+	for _, line := range strings.Split(head, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+func packetHeader(head, name string) string {
+	name = strings.ToLower(name) + ":"
+	for _, line := range strings.Split(head, "\n") {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), name) {
+			return strings.TrimSpace(strings.TrimSpace(line)[len(name):])
+		}
+	}
+	return ""
+}
+
+// SaveRawExchanges appends a scanner's reproduction sequence to a finding.
+// Snapshots are content addressed, so re-running the same scan is idempotent.
+func (s *Store) SaveRawExchanges(ctx context.Context, findingID int64, exchanges []RawExchange) error {
+	if findingID <= 0 || len(exchanges) == 0 {
+		return nil
+	}
+	prepared := make([]db.PreparedTrafficEvidence, 0, len(exchanges))
+	for _, ex := range exchanges {
+		reqHead, reqBody := splitRawPacket(ex.Request)
+		respHead, respBody := splitRawPacket(ex.Response)
+		if reqHead == "" {
+			continue
+		}
+		reqHash, err := s.writeBody(bytes.NewReader([]byte(reqBody)), int64(len(reqBody)), "")
+		if err != nil {
+			return err
+		}
+		respHash, err := s.writeBody(bytes.NewReader([]byte(respBody)), int64(len(respBody)), "")
+		if err != nil {
+			return err
+		}
+		method, target := "GET", ""
+		if fields := strings.Fields(packetFirstLine(reqHead)); len(fields) >= 2 {
+			method, target = fields[0], fields[1]
+		}
+		u := target
+		if strings.HasPrefix(target, "/") {
+			if host := packetHeader(reqHead, "host"); host != "" {
+				u = "http://" + host + target
+			}
+		}
+		status := 0
+		if fields := strings.Fields(packetFirstLine(respHead)); len(fields) >= 2 {
+			status, _ = strconv.Atoi(fields[1])
+		}
+		role := strings.TrimSpace(ex.Role)
+		if role == "" {
+			role = "supporting"
+		}
+		snap := db.TrafficEvidenceSnapshot{
+			CapturedAt:  time.Now().Unix(),
+			URL:         u,
+			Method:      method,
+			Status:      status,
+			ContentType: packetHeader(respHead, "content-type"),
+			ReqHead:     reqHead,
+			RespHead:    respHead,
+			ReqHash:     reqHash,
+			RespHash:    respHash,
+			ReqLen:      int64(len(reqBody)),
+			RespLen:     int64(len(respBody)),
+		}.Normalize()
+		snap.ID = db.TrafficSnapshotID(snap)
+		prepared = append(prepared, db.PreparedTrafficEvidence{
+			Ref:      db.TrafficRef{Role: role, Note: strings.TrimSpace(ex.Note)},
+			Snapshot: snap,
+		})
+	}
+	if len(prepared) == 0 {
+		return nil
+	}
+	return s.DB.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		if err := db.LockFindingEvidenceTx(tx, findingID, nil); err != nil {
+			return err
+		}
+		return db.AddFindingTrafficTx(tx, findingID, prepared)
+	})
 }
 
 func hashPath(dir, hash string) (string, error) {
@@ -191,6 +303,24 @@ func (s *Store) Record(ctx context.Context, in db.RecordFindingInput, refs []db.
 		out, err = db.RecordFindingTx(ctx, tx, in, prepared)
 		return err
 	})
+	if err == nil && out != nil {
+		// 先落一份无 LLM 的确定性报告；报告 Agent 若启用，会在随后用更完整的
+		// 证据覆盖它。写入失败不影响漏洞本身。
+		auto := report.BuildFindingReport(report.FindingReportInput{
+			FindingID:   out.FindingID,
+			Name:        in.Name,
+			VulnClass:   in.VulnClass,
+			Severity:    in.Severity,
+			Status:      db.FindingPending,
+			Summary:     in.Summary,
+			Evidence:    in.Evidence,
+			Source:      "Agent 上报（" + in.Worker + "）",
+			GeneratedAt: time.Now(),
+		})
+		if reportErr := s.DB.SetFindingAutoReport(out.FindingID, auto); reportErr != nil {
+			log.Printf("[evidence] 生成自动报告失败 finding=%d: %v", out.FindingID, reportErr)
+		}
+	}
 	return
 }
 

@@ -67,6 +67,8 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 		out = historicalFindingCaseTools(out)
 	}
 	out, def.FindingGuidance = findingWorkflowTools(agentKey, out)
+	out, injectionGuidance := injectionVerifyWorkflow(out)
+	def.FindingGuidance += injectionGuidance
 	out, def.CaseGuidance = findingCaseWorkflow(agentKey, out)
 	out, def.IntelligenceGuidance = intelligenceWorkflow(ctx, out)
 	if agentKey == "reporter" && isFindingCaseReview(ctx) {

@@ -66,6 +66,7 @@ func newRetestServer(t *testing.T) (*Server, int64) {
 		waitRetestIdle(t, s)
 		agent.ToolAugment, agent.ToolResolve, agent.PromptOverride = oldAugment, oldResolve, oldPrompt
 		_, _ = pg.Exec(`DELETE FROM conversations WHERE id IN (SELECT conversation_id FROM finding_retests WHERE finding_id=$1)`, fid)
+		_, _ = pg.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, fid)
 		_, _ = pg.DeleteFinding(fid)
 		pg.Close()
 	})
@@ -316,6 +317,7 @@ func TestRetestValidationSeedingAndScope(t *testing.T) {
 	if err := s.m.pg.QueryRow(`SELECT count(*) FROM agent_triggers WHERE agent_key=$1`, db.FindingRetestAgentKey).Scan(&triggers); err != nil || triggers != 0 {
 		t.Fatal("unexpected automatic trigger", triggers, err)
 	}
+	preservePrompt(t, s.m.pg, a.ID)
 	if _, err := s.m.pg.SavePrompt(a.ID, "customized retest prompt", "test", "test"); err != nil {
 		t.Fatal(err)
 	}
@@ -326,5 +328,4 @@ func TestRetestValidationSeedingAndScope(t *testing.T) {
 	if err := s.m.pg.QueryRow(`SELECT p.template_text FROM agent_prompts p JOIN agents a ON a.current_prompt_id=p.id WHERE a.key=$1`, a.Key).Scan(&prompt); err != nil || prompt != "customized retest prompt" {
 		t.Fatal("seed overwrote prompt", prompt, err)
 	}
-	_, _ = s.m.pg.SavePrompt(a.ID, agent.RetesterDefaultPrompt, "restore", "test")
 }

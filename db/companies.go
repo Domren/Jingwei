@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
@@ -254,6 +255,63 @@ func (s *CompanyStore) DeleteCompanyWithAssets(id int64, deleteAssets bool) (ass
 		return 0, err
 	}
 	return assetsDeleted, nil
+}
+
+// DeleteCompaniesWithAssets removes several companies in one transaction, applying
+// the same steps a single delete does: optional asset removal, the company row, then
+// one ownership re-evaluation covering the whole batch. Ids are taken in ascending
+// order so two batches submitted in different orders cannot deadlock each other, and
+// ids that no longer exist are skipped — only companies actually removed are counted.
+func (s *CompanyStore) DeleteCompaniesWithAssets(ids []int64, deleteAssets bool) (deleted, assetsDeleted int64, err error) {
+	if len(ids) == 0 {
+		return 0, 0, nil
+	}
+	unique := slices.Sorted(slices.Values(ids))
+	unique = slices.Compact(unique)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := lockCompanyScopeMutation(tx); err != nil {
+		return 0, 0, err
+	}
+	for _, id := range unique {
+		if deleteAssets {
+			res, err := tx.Exec(`DELETE FROM assets WHERE company_id = $1`, id)
+			if err != nil {
+				return 0, 0, err
+			}
+			if n, err := res.RowsAffected(); err != nil {
+				return 0, 0, err
+			} else {
+				assetsDeleted += n
+			}
+		}
+		res, err := tx.Exec(`DELETE FROM companies WHERE id = $1`, id)
+		if err != nil {
+			return 0, 0, err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return 0, 0, err
+		} else {
+			deleted += n
+		}
+	}
+	if deleted == 0 {
+		return 0, 0, nil
+	}
+	// This path has no per-request warning channel, so the log is the only place
+	// the operator can learn about unparseable ip rows here.
+	warning, err := recomputeAttributionTx(tx)
+	if err != nil {
+		return 0, 0, err
+	}
+	logAttributionWarning(warning)
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return deleted, assetsDeleted, nil
 }
 
 // ListCompanies returns all companies with scope and asset count.

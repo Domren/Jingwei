@@ -33,10 +33,13 @@ func findingFilterFromQuery(q url.Values) db.FindingFilter {
 		Status:    normFilter(q.Get("status")),
 		VulnClass: normFilter(q.Get("vulnclass")),
 		// task_id(独立于会切到「按任务节点」分支的 task 参数):全局表按任务筛选。
-		TaskID:     normFilter(q.Get("task_id")),
+		TaskID: normFilter(q.Get("task_id")),
+		// scan_task_id:无 LLM 漏扫任务;按 scan_task_results 关联筛选。
+		ScanTaskID: normFilter(q.Get("scan_task_id")),
 		Query:      q.Get("q"),
 		Sort:       q.Get("sort"),
 		AssetScope: strings.TrimSpace(q.Get("asset_scope")),
+		System:     strings.TrimSpace(q.Get("system")),
 	}
 }
 
@@ -76,6 +79,26 @@ func (s *Server) findingGroups(w http.ResponseWriter, r *http.Request) {
 				groups[i].TaskStatus = s.resolvedTaskStatus(task)
 			}
 		}
+	}
+	writeJSON(w, 200, map[string]any{
+		"items":         groups,
+		"total":         total,
+		"finding_total": findingTotal,
+		"page":          page,
+		"page_size":     limit,
+	})
+}
+
+// findingSystems serves the「按任务 → 系统」view's system buckets. The task scope
+// is the regular task_id filter, so expanding a task group is one request.
+func (s *Server) findingSystems(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	page := findingPaginationParam(q.Get("page"), 1, 0)
+	limit := findingPaginationParam(q.Get("limit"), 50, 200)
+	groups, total, findingTotal, err := s.m.pg.ListFindingSystemGroups(findingFilterFromQuery(q), page, limit)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
 	}
 	writeJSON(w, 200, map[string]any{
 		"items":         groups,

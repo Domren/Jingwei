@@ -69,7 +69,7 @@ func TestOpenSeed(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	wantAgents := len(builtinAgents)
 	var agents int
@@ -104,7 +104,7 @@ WHERE a.key = 'planner'`).Scan(&plannerVars); err != nil {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d2.Close()
+	t.Cleanup(func() { _ = d2.Close() })
 	if err := d2.QueryRow(`SELECT count(*) FROM agents WHERE builtin`).Scan(&agents); err != nil {
 		t.Fatal(err)
 	}

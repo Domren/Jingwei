@@ -1155,6 +1155,14 @@ CREATE TABLE IF NOT EXISTS findings (
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
+-- 原始 HTTP 请求/响应报文(PoC 原文)；由 nuclei -irr 或深度利用记录写入。
+-- 非 HTTP 漏洞或未采集时为空字符串，与「空报告」区分开。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS http_request  TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS http_response TEXT NOT NULL DEFAULT '';
+-- Canonical dedupe key (template + origin + path) for findings produced by
+-- scans and deep exploitation. NULL means "do not dedupe" (manual findings).
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_dedupe_key ON findings(dedupe_key);
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DESC);
@@ -1606,3 +1614,271 @@ CREATE INDEX IF NOT EXISTS idx_poc_templates_tags ON poc_templates USING gin(tag
 DROP TRIGGER IF EXISTS trg_poc_templates_upd ON poc_templates;
 CREATE TRIGGER trg_poc_templates_upd BEFORE UPDATE ON poc_templates
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- =====================================================================
+-- Jingwei additions: LLM-free automated scan tasks
+-- 目标解析 → 端口/服务发现 → HTTP 指纹 → POC 匹配 → nuclei 扫描。
+-- 不依赖 LLM；发现的 Web 资产写入全局资产库，命中结果可写入 findings。
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS scan_tasks (
+    id              BIGSERIAL PRIMARY KEY,
+    name            TEXT NOT NULL DEFAULT '',
+    targets         JSONB NOT NULL DEFAULT '[]',
+    mode            TEXT NOT NULL DEFAULT 'auto',
+    poc_ids         JSONB NOT NULL DEFAULT '[]',
+    ports           TEXT NOT NULL DEFAULT 'top100',
+    min_severity    TEXT NOT NULL DEFAULT '',
+    fingerprint     BOOLEAN NOT NULL DEFAULT true,
+    create_findings BOOLEAN NOT NULL DEFAULT true,
+    rate_limit      INTEGER NOT NULL DEFAULT 50,
+    concurrency     INTEGER NOT NULL DEFAULT 25,
+    timeout_seconds INTEGER NOT NULL DEFAULT 600,
+    status          TEXT NOT NULL DEFAULT 'queued',
+    stage           TEXT NOT NULL DEFAULT 'queued',
+    progress        JSONB NOT NULL DEFAULT '{}',
+    summary         JSONB NOT NULL DEFAULT '{}',
+    log             TEXT NOT NULL DEFAULT '',
+    error           TEXT NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at      TIMESTAMPTZ,
+    finished_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_scan_tasks_created ON scan_tasks(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_tasks_status ON scan_tasks(status, id);
+
+-- 漏扫可选：命中后尝试 Webshell 注入。参数（上传/落地路径、类型、密码）存 JSONB。
+ALTER TABLE scan_tasks ADD COLUMN IF NOT EXISTS webshell_inject BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE scan_tasks ADD COLUMN IF NOT EXISTS webshell_params JSONB NOT NULL DEFAULT '{}';
+
+CREATE TABLE IF NOT EXISTS scan_task_assets (
+    scan_task_id BIGINT NOT NULL REFERENCES scan_tasks(id) ON DELETE CASCADE,
+    asset_id     BIGINT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    asset_type   TEXT NOT NULL DEFAULT 'service',
+    host         TEXT NOT NULL DEFAULT '',
+    url          TEXT NOT NULL DEFAULT '',
+    note         TEXT NOT NULL DEFAULT '',
+    status_code  INTEGER,
+    page_title   TEXT NOT NULL DEFAULT '',
+    technologies JSONB NOT NULL DEFAULT '[]',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (scan_task_id, asset_id)
+);
+CREATE INDEX IF NOT EXISTS idx_scan_task_assets_task ON scan_task_assets(scan_task_id);
+
+CREATE TABLE IF NOT EXISTS scan_task_results (
+    id           BIGSERIAL PRIMARY KEY,
+    scan_task_id BIGINT NOT NULL REFERENCES scan_tasks(id) ON DELETE CASCADE,
+    finding_id   BIGINT REFERENCES findings(id) ON DELETE SET NULL,
+    template_id  TEXT NOT NULL DEFAULT '',
+    name         TEXT NOT NULL DEFAULT '',
+    severity     TEXT NOT NULL DEFAULT '',
+    host         TEXT NOT NULL DEFAULT '',
+    matched_at   TEXT NOT NULL DEFAULT '',
+    type         TEXT NOT NULL DEFAULT '',
+    curl_command TEXT NOT NULL DEFAULT '',
+    extracted    JSONB NOT NULL DEFAULT '[]',
+    raw          JSONB NOT NULL DEFAULT '{}',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (scan_task_id, template_id, matched_at)
+);
+CREATE INDEX IF NOT EXISTS idx_scan_task_results_task ON scan_task_results(scan_task_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_task_results_finding ON scan_task_results(finding_id) WHERE finding_id IS NOT NULL;
+
+-- 运行中的任务在进程重启后不会自动续跑：启动时标记为 failed，避免半截状态卡住。
+ALTER TABLE scan_tasks ADD COLUMN IF NOT EXISTS log TEXT NOT NULL DEFAULT '';
+
+-- =====================================================================
+-- Jingwei additions: 深度利用（漏洞验证 / 漏洞利用 / WAF 绕过 / Webshell）
+-- 全部走异步任务模型，任务与产物分表存储，页面按任务维度回看。
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS deep_tasks (
+    id              BIGSERIAL PRIMARY KEY,
+    name            TEXT NOT NULL DEFAULT '',
+    kind            TEXT NOT NULL DEFAULT 'verify',
+    target          TEXT NOT NULL DEFAULT '',
+    params          JSONB NOT NULL DEFAULT '{}',
+    status          TEXT NOT NULL DEFAULT 'queued',
+    stage           TEXT NOT NULL DEFAULT 'queued',
+    progress        JSONB NOT NULL DEFAULT '{}',
+    summary         JSONB NOT NULL DEFAULT '{}',
+    log             TEXT NOT NULL DEFAULT '',
+    error           TEXT NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at      TIMESTAMPTZ,
+    finished_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_deep_tasks_created ON deep_tasks(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_deep_tasks_status ON deep_tasks(status, id);
+CREATE INDEX IF NOT EXISTS idx_deep_tasks_kind ON deep_tasks(kind, id DESC);
+
+-- 自动利用流水线：深度任务可回指发起它的漏扫任务，并标记为自动创建。
+ALTER TABLE deep_tasks ADD COLUMN IF NOT EXISTS scan_task_id BIGINT REFERENCES scan_tasks(id) ON DELETE CASCADE;
+ALTER TABLE deep_tasks ADD COLUMN IF NOT EXISTS auto_run BOOLEAN NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS idx_deep_tasks_scan ON deep_tasks(scan_task_id, id);
+
+CREATE TABLE IF NOT EXISTS exploit_records (
+    id           BIGSERIAL PRIMARY KEY,
+    task_id      BIGINT REFERENCES deep_tasks(id) ON DELETE CASCADE,
+    mode         TEXT NOT NULL DEFAULT 'verify',
+    template_id  TEXT NOT NULL DEFAULT '',
+    name         TEXT NOT NULL DEFAULT '',
+    severity     TEXT NOT NULL DEFAULT '',
+    target       TEXT NOT NULL DEFAULT '',
+    verdict      TEXT NOT NULL DEFAULT '',
+    status_code  INTEGER,
+    request      TEXT NOT NULL DEFAULT '',
+    response     TEXT NOT NULL DEFAULT '',
+    extracted    JSONB NOT NULL DEFAULT '[]',
+    curl_command TEXT NOT NULL DEFAULT '',
+    evidence     TEXT NOT NULL DEFAULT '',
+    elapsed_ms   INTEGER NOT NULL DEFAULT 0,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_exploit_records_task ON exploit_records(task_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_exploit_records_target ON exploit_records(target);
+
+CREATE TABLE IF NOT EXISTS waf_bypass_results (
+    id           BIGSERIAL PRIMARY KEY,
+    task_id      BIGINT REFERENCES deep_tasks(id) ON DELETE CASCADE,
+    target       TEXT NOT NULL DEFAULT '',
+    waf_detected BOOLEAN NOT NULL DEFAULT false,
+    waf_vendor   TEXT NOT NULL DEFAULT '',
+    variant      TEXT NOT NULL DEFAULT '',
+    variant_desc TEXT NOT NULL DEFAULT '',
+    method       TEXT NOT NULL DEFAULT '',
+    path         TEXT NOT NULL DEFAULT '',
+    status_code  INTEGER,
+    resp_length  INTEGER NOT NULL DEFAULT 0,
+    verdict      TEXT NOT NULL DEFAULT '',
+    note         TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_waf_bypass_results_task ON waf_bypass_results(task_id, id);
+
+CREATE TABLE IF NOT EXISTS webshells (
+    id            BIGSERIAL PRIMARY KEY,
+    name          TEXT NOT NULL DEFAULT '',
+    url           TEXT NOT NULL DEFAULT '',
+    shell_type    TEXT NOT NULL DEFAULT 'php',
+    password      TEXT NOT NULL DEFAULT '',
+    target        TEXT NOT NULL DEFAULT '',
+    source        TEXT NOT NULL DEFAULT 'manual',
+    task_id       BIGINT REFERENCES deep_tasks(id) ON DELETE SET NULL,
+    status        TEXT NOT NULL DEFAULT 'unknown',
+    note          TEXT NOT NULL DEFAULT '',
+    last_checked  TIMESTAMPTZ,
+    last_output   TEXT NOT NULL DEFAULT '',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_webshells_created ON webshells(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_webshells_target ON webshells(target);
+DROP TRIGGER IF EXISTS trg_webshells_upd ON webshells;
+CREATE TRIGGER trg_webshells_upd BEFORE UPDATE ON webshells
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 受管资源台账：JNDI/回调端口、Webshell、隧道等由平台主动创建的资源，
+-- 记录归属、TTL 与释放状态，供端口审计和自动清理使用。status：
+-- active 使用中 / released 已主动释放 / expired TTL 到期自动回收。
+CREATE TABLE IF NOT EXISTS managed_resources (
+    id          BIGSERIAL PRIMARY KEY,
+    kind        TEXT NOT NULL DEFAULT '',
+    name        TEXT NOT NULL DEFAULT '',
+    endpoint    TEXT NOT NULL DEFAULT '',
+    target      TEXT NOT NULL DEFAULT '',
+    owner       TEXT NOT NULL DEFAULT '',
+    task_id     BIGINT,
+    status      TEXT NOT NULL DEFAULT 'active',
+    expires_at  TIMESTAMPTZ,
+    released_at TIMESTAMPTZ,
+    metadata    JSONB NOT NULL DEFAULT '{}',
+    note        TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_managed_resources_status ON managed_resources(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_managed_resources_task ON managed_resources(task_id);
+CREATE INDEX IF NOT EXISTS idx_managed_resources_kind ON managed_resources(kind, id DESC);
+-- 同一类资源同一端点同时只允许一条活动记录：重复发布会刷新 TTL/归属而不是堆叠。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_resources_active_endpoint
+    ON managed_resources(kind, endpoint) WHERE status = 'active';
+DROP TRIGGER IF EXISTS trg_managed_resources_upd ON managed_resources;
+CREATE TRIGGER trg_managed_resources_upd BEFORE UPDATE ON managed_resources
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 内网两阶段 MVP：逻辑会话(webshell 复用) → 隧道生命周期 → 范围审批 → 任务交接。
+-- 会话不驻留进程：每次 exec 通过已登记 webshell 执行，cwd 在平台侧维护。
+CREATE TABLE IF NOT EXISTS intranet_sessions (
+    id          BIGSERIAL PRIMARY KEY,
+    name        TEXT NOT NULL DEFAULT '',
+    webshell_id BIGINT REFERENCES webshells(id) ON DELETE SET NULL,
+    task_id     BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+    host        TEXT NOT NULL DEFAULT '',
+    cwd         TEXT NOT NULL DEFAULT '/',
+    status      TEXT NOT NULL DEFAULT 'active',
+    last_seen   TIMESTAMPTZ,
+    metadata    JSONB NOT NULL DEFAULT '{}',
+    note        TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_intranet_sessions_status ON intranet_sessions(status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_intranet_sessions_task ON intranet_sessions(task_id);
+DROP TRIGGER IF EXISTS trg_intranet_sessions_upd ON intranet_sessions;
+CREATE TRIGGER trg_intranet_sessions_upd BEFORE UPDATE ON intranet_sessions
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE IF NOT EXISTS intranet_session_events (
+    id         BIGSERIAL PRIMARY KEY,
+    session_id BIGINT NOT NULL REFERENCES intranet_sessions(id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL DEFAULT 'exec',
+    command    TEXT NOT NULL DEFAULT '',
+    output     TEXT NOT NULL DEFAULT '',
+    is_error   BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_intranet_events_session ON intranet_session_events(session_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS intranet_tunnels (
+    id               BIGSERIAL PRIMARY KEY,
+    name             TEXT NOT NULL DEFAULT '',
+    session_id       BIGINT REFERENCES intranet_sessions(id) ON DELETE SET NULL,
+    task_id          BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+    kind             TEXT NOT NULL DEFAULT 'socks5',
+    listen_host      TEXT NOT NULL DEFAULT '127.0.0.1',
+    listen_port      INTEGER NOT NULL DEFAULT 0,
+    remote_host      TEXT NOT NULL DEFAULT '',
+    remote_port      INTEGER NOT NULL DEFAULT 0,
+    status           TEXT NOT NULL DEFAULT 'planned',
+    deploy_command   TEXT NOT NULL DEFAULT '',
+    verify_command   TEXT NOT NULL DEFAULT '',
+    teardown_command TEXT NOT NULL DEFAULT '',
+    pid              INTEGER,
+    evidence         TEXT NOT NULL DEFAULT '',
+    note             TEXT NOT NULL DEFAULT '',
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_intranet_tunnels_status ON intranet_tunnels(status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_intranet_tunnels_task ON intranet_tunnels(task_id);
+DROP TRIGGER IF EXISTS trg_intranet_tunnels_upd ON intranet_tunnels;
+CREATE TRIGGER trg_intranet_tunnels_upd BEFORE UPDATE ON intranet_tunnels
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 内网新目标的授权申请：人工在 UI 批准后才写入 task_scope；agent 只可提交申请。
+CREATE TABLE IF NOT EXISTS intranet_scope_requests (
+    id           BIGSERIAL PRIMARY KEY,
+    task_id      BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    host         TEXT NOT NULL,
+    port         INTEGER NOT NULL DEFAULT 0,
+    reason       TEXT NOT NULL DEFAULT '',
+    session_id   BIGINT REFERENCES intranet_sessions(id) ON DELETE SET NULL,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    decided_note TEXT NOT NULL DEFAULT '',
+    decided_at   TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_intranet_scope_status ON intranet_scope_requests(status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_intranet_scope_task ON intranet_scope_requests(task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_intranet_scope_pending_unique
+    ON intranet_scope_requests(task_id, host, port) WHERE status = 'pending';

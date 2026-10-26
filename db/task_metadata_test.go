@@ -11,7 +11,7 @@ func TestTaskPinOrderingAndRename(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	suffix := time.Now().UnixNano()
 	first, err := d.CreateTask(fmt.Sprintf("task-pin-first-%d", suffix), "goal", nil, 0, 0)
@@ -73,7 +73,7 @@ func TestDeleteConversationsReturnsExistingIDs(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	first, err := d.CreateConversation("mainagent", "batch-delete-first", nil)
 	if err != nil {

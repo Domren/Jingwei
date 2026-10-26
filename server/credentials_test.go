@@ -77,6 +77,11 @@ func TestCredentialProcessingFlowBindingAndScopes(t *testing.T) {
 	s.llmOn = true
 	s.llmProv = llmrec.Wrap(mock, s.m.pg, "fixture", "fixture", "", "", func() bool { return false })
 	s.llmCfg.Model = "fixture"
+	// The fake call above still writes a metering row, and llm_usage has no foreign
+	// keys by design, so purging the fixture task would leave it behind.
+	defer func() {
+		_, _ = s.m.pg.Exec(`DELETE FROM llm_usage WHERE task_id = $1 AND model = $2`, fmt.Sprint(taskID), "fixture")
+	}()
 	first, err := s.m.pg.ClaimCredentialJob(t.Context(), false, taskID)
 	if err != nil || first == nil {
 		t.Fatal(err)

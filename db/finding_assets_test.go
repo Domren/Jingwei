@@ -53,13 +53,13 @@ func TestBuildFindingAssetTree(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	tk, err := d.CreateTask("资产树测试", "目标", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(tk.ID)
+	defer purgeTaskNow(t, d, tk.ID)
 
 	const root = "tree-test.example"
 	const sub = "api.tree-test.example"
@@ -159,13 +159,13 @@ func TestFindingAssetScopeFilter(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	tk, err := d.CreateTask("资产筛选测试", "目标", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(tk.ID)
+	defer purgeTaskNow(t, d, tk.ID)
 
 	const root = "scope-test.example"
 	const sub = "api.scope-test.example"

@@ -11,16 +11,8 @@ func TestCredentialSwitchDependencyAndLeases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Close()
-	oldRecording := d.GetBool(SettingTaskIntelligence, false)
-	oldAgent, oldBinding := d.GetBool(SettingCredentialAgent, false), d.GetBool(SettingCredentialTraffic, false)
-	defer func() {
-		_ = d.SetBool(SettingTaskIntelligence, oldRecording)
-		_ = d.SetCredentialAgentSettings(t.Context(), &oldAgent, nil)
-		if oldAgent {
-			_ = d.SetCredentialAgentSettings(t.Context(), nil, &oldBinding)
-		}
-	}()
+	t.Cleanup(func() { _ = d.Close() })
+	preserveSetting(t, d, SettingTaskIntelligence, SettingCredentialAgent, SettingCredentialTraffic)
 	off, on := false, true
 	_ = d.SetIntelligenceSettings(t.Context(), &off, nil, nil)
 	if err = d.SetCredentialAgentSettings(t.Context(), &on, nil); err == nil {
@@ -49,7 +41,7 @@ func TestCredentialSwitchDependencyAndLeases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(task.ID)
+	defer purgeTaskNow(t, d, task.ID)
 	in := testIntelligenceInput()
 	in.Status = "verified"
 	item, err := d.RecordIntelligence(t.Context(), task.ID, 0, "qa", in)

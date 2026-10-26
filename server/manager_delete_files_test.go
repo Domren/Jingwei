@@ -17,7 +17,8 @@ func TestSeedAssociatesTargetAssetWithTask(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer m.Close()
+	// 关闭必须晚于所有 t.Cleanup（LIFO 中它最先注册 → 最后执行），否则夹具删除会打到已关闭的连接池上静默失败。
+	t.Cleanup(func() { _ = m.Close() })
 	task, err := m.CreateTask("seed ownership", "seed ownership", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)

@@ -77,14 +77,15 @@ func (c *ChatAgent) SetGuard(g *guard.Guard) { c.guard = g }
 // chatWorkDirSpec returns a working-directory notice appended to every chat
 // agent's system prompt. Mirrors artifactSpec but without pentest-specific
 // wording ("payload", "抓响应体") that would be odd in a general assistant.
-func chatWorkDirSpec(workDir string) string {
-	return "\n\n**文件输出规约**：需要写文件时，一律写到工作目录 " + workDir + "（这是默认 CWD，相对路径即落在这里，也可用该绝对路径）——不要写 /tmp 或其他绝对路径。"
+func chatWorkDirSpec(workDir, base string) string {
+	return "\n\n**文件输出规约**：需要写文件时，一律写到工作目录 " + workDir + "（这是默认 CWD，相对路径即落在这里，也可用该绝对路径）——不要写 /tmp 或其他绝对路径。" +
+		"\n\n**脚本沉淀规约**：可复用的脚本在跑通后复制一份到 " + filepath.Join(base, "scripts") + "/ 下（按用途建子目录），工作区「脚本」入口会直接列出。"
 }
 
 // chatSystem renders the DB-managed prompt body for agentKey. Custom agents have
 // no per-key in-code default, so DefaultAssistantPrompt is the render fallback.
 func chatSystem(agentKey, dataDir, workDir string) string {
-	return renderSystem(agentKey, DefaultAssistantPrompt, chatVars{DataDir: dataDir, Now: nowStr()}) + chatWorkDirSpec(workDir)
+	return renderSystem(agentKey, DefaultAssistantPrompt, chatVars{DataDir: dataDir, Now: nowStr()}) + chatWorkDirSpec(workDir, dataDir) + untrustedDataRules()
 }
 
 // chatVars carries the runtime variables a custom agent's prompt may reference.

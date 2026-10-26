@@ -17,7 +17,7 @@ func TestPoolProfilesOrder(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	mk := func(name string, priority int, exclude bool, key string) int64 {
 		id, err := d.SaveProfile(&LLMProfile{
@@ -69,7 +69,7 @@ func TestConfigStores(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	// LLM profile: save, active, key never serialized
 	pid, err := d.SaveProfile(&LLMProfile{Name: "t-default", Format: "openai", Model: "gpt-x", APIKey: "secret123"})
@@ -77,6 +77,21 @@ func TestConfigStores(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, pid)
+	// SetActiveProfile clears is_default for every other row, so on a shared dev
+	// database this test would strand the operator's own active profile: remember it
+	// and put it back. Registered after the delete so LIFO order restores the flag
+	// first — otherwise deleting the still-active fixture would fail.
+	prevActive, err := d.ActiveProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if prevActive != nil {
+			_ = d.SetActiveProfile(prevActive.ID)
+			return
+		}
+		_, _ = d.Exec(`UPDATE llm_profiles SET is_default=false WHERE id=$1`, pid)
+	}()
 	if err := d.SetActiveProfile(pid); err != nil {
 		t.Fatal(err)
 	}

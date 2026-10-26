@@ -10,7 +10,7 @@ func TestTokenStatsBySessionUsesCompleteIntentHistory(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	expID, err := d.CreateExploration("token sessions", "aggregate complete session history")
 	if err != nil {

@@ -27,6 +27,26 @@ RUN curl -fsSL "https://github.com/projectdiscovery/nuclei/releases/download/v${
     && chmod +x /usr/local/bin/nuclei \
     && rm -f /tmp/nuclei.zip \
     && nuclei -version
+# sqlmap / dalfox：SQL 注入与 XSS 的专项验证器（Jingwei 二开新增）。深度任务的
+# sqli_probe / xss_probe 用它们替代 POC 模板下结论，镜像缺件时任务会直接报「未安装」。
+# sqlmap 走 pip（基础镜像就是 python，pypi 可达）；dalfox 官方只发二进制包。
+RUN pip3 install --no-cache-dir sqlmap \
+    && sqlmap --version >/dev/null \
+    && pip3 cache purge
+ARG DALFOX_VERSION=3.2.4
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) arch="x86_64" ;; \
+      arm64) arch="arm64" ;; \
+      *) echo "dalfox 不支持架构 ${TARGETARCH}" && exit 1 ;; \
+    esac; \
+    url="https://github.com/hahwul/dalfox/releases/download/v${DALFOX_VERSION}/dalfox-v${DALFOX_VERSION}-linux-${arch}.tar.gz"; \
+    curl -fsSL "$url" -o /tmp/dalfox.tgz \
+      || curl -fsSL "https://gh-proxy.com/$url" -o /tmp/dalfox.tgz; \
+    tar -xzf /tmp/dalfox.tgz -C /tmp; \
+    install -m 0755 "/tmp/dalfox-v${DALFOX_VERSION}-linux-${arch}/dalfox" /usr/local/bin/dalfox; \
+    rm -rf /tmp/dalfox.tgz "/tmp/dalfox-v${DALFOX_VERSION}-linux-${arch}"; \
+    dalfox --version
 # 预装 Playwright MCP 与 CLI（全局），运行时不再 npx 联网下载。
 # @playwright/mcp：browser MCP 直接 `npx @playwright/mcp`（已全局装好，无需 -y/@latest）。
 # @playwright/cli：提供 playwright-cli，装完顺带 --help 验证可执行。
@@ -39,6 +59,16 @@ RUN export PLAYWRIGHT_DOWNLOAD_HOST="${PLAYWRIGHT_DOWNLOAD_HOST}" \
     && playwright-cli --help \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
+# @playwright/cli 内置的 playwright-core 可能比全局 playwright 旧一个版本，
+# 会按自己的 revision 找浏览器；复用已安装的 Chromium，避免再下载一份。
+RUN set -eux; \
+    root="$(npm root -g)"; \
+    rev="$(node -p "require('$root/@playwright/cli/node_modules/playwright-core/browsers.json').browsers.find(b => b.name === 'chromium').revision")"; \
+    installed="$(find /root/.cache/ms-playwright -maxdepth 1 -type d -name 'chromium-*' | sort -V | tail -1)"; \
+    target="/root/.cache/ms-playwright/chromium-${rev}"; \
+    if [ ! -x "$target/chrome-linux64/chrome" ] && [ ! -x "$target/chrome-linux/chrome" ] && [ -n "$installed" ]; then \
+      ln -sfn "$installed" "$target"; \
+    fi
 WORKDIR /app
 # 预编译好的对应架构二进制（dist/amd64/artex 或 dist/arm64/artex）
 COPY dist/${TARGETARCH}/artex /app/artex

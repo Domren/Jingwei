@@ -13,7 +13,7 @@ func TestTaskLLMProfileMutationsLockTaskBeforeProfile(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	suffix := time.Now().UnixNano()
 	first, err := d.SaveProfile(&LLMProfile{
@@ -112,7 +112,7 @@ func TestDeleteProfileLocksNonTaskReferencesBeforeProfile(t *testing.T) {
 		if err != nil {
 			t.Skipf("postgres unavailable (%v) - skipping", err)
 		}
-		defer d.Close()
+		t.Cleanup(func() { _ = d.Close() })
 
 		suffix := time.Now().UnixNano()
 		profileID, err := d.SaveProfile(&LLMProfile{
@@ -169,7 +169,7 @@ func TestDeleteProfileLocksNonTaskReferencesBeforeProfile(t *testing.T) {
 		if err != nil {
 			t.Skipf("postgres unavailable (%v) - skipping", err)
 		}
-		defer d.Close()
+		t.Cleanup(func() { _ = d.Close() })
 
 		suffix := time.Now().UnixNano()
 		profileID, err := d.SaveProfile(&LLMProfile{
@@ -225,7 +225,7 @@ func TestNonTaskProfileMutationsLockReferenceBeforeProfile(t *testing.T) {
 		if err != nil {
 			t.Skipf("postgres unavailable (%v) - skipping", err)
 		}
-		defer d.Close()
+		t.Cleanup(func() { _ = d.Close() })
 
 		suffix := time.Now().UnixNano()
 		profileID, err := d.SaveProfile(&LLMProfile{
@@ -273,7 +273,7 @@ func TestNonTaskProfileMutationsLockReferenceBeforeProfile(t *testing.T) {
 		if err != nil {
 			t.Skipf("postgres unavailable (%v) - skipping", err)
 		}
-		defer d.Close()
+		t.Cleanup(func() { _ = d.Close() })
 
 		suffix := time.Now().UnixNano()
 		profileID, err := d.SaveProfile(&LLMProfile{
@@ -323,7 +323,7 @@ func TestCreateConversationAndDeleteProfileDoNotDeadlock(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	suffix := time.Now().UnixNano()
 	profileID, err := d.SaveProfile(&LLMProfile{
@@ -403,7 +403,7 @@ func TestDeleteProfileRetriesReferenceCommittedAfterInitialScan(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	suffix := time.Now().UnixNano()
 	profileID, err := d.SaveProfile(&LLMProfile{

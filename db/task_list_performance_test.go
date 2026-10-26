@@ -11,7 +11,7 @@ func TestListTasksBulkHydratesTaskContext(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	stamp := time.Now().UnixNano()
 	profileID, err := d.SaveProfile(&LLMProfile{
@@ -72,7 +72,7 @@ func TestTaskListMetricsAll(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 
 	task, err := d.CreateTask("task-list-metrics", "goal", nil, 0, 0)
 	if err != nil {

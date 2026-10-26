@@ -163,8 +163,9 @@ function AssetsContent() {
   const [deleteOpen, setDeleteOpen] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
 
-  // company delete
-  const [companyDeleteTarget, setCompanyDeleteTarget] = React.useState<Company | null>(null);
+  // company selection & delete
+  const [companySelected, setCompanySelected] = React.useState<Set<number>>(new Set());
+  const [companyDeleteTargets, setCompanyDeleteTargets] = React.useState<Company[]>([]);
   const [companyDeleteAssets, setCompanyDeleteAssets] = React.useState(false);
   const [companyDeleting, setCompanyDeleting] = React.useState(false);
 
@@ -172,7 +173,19 @@ function AssetsContent() {
   const loadMeta = React.useCallback(() => {
     api
       .companies()
-      .then(setCompanies)
+      .then((list) => {
+        setCompanies(list);
+        // A company deleted elsewhere must not stay selected, or the batch would
+        // report a deletion that never happened.
+        setCompanySelected((prev) => {
+          const alive = new Set(list.map((c) => c.id));
+          const next = new Set<number>();
+          prev.forEach((id) => {
+            if (alive.has(id)) next.add(id);
+          });
+          return next.size === prev.size ? prev : next;
+        });
+      })
       .catch(() => {
         /* Keep the last successful company snapshot on a transient failure. */
       });
@@ -189,6 +202,7 @@ function AssetsContent() {
     loadMeta();
     setRefreshKey((k) => k + 1);
     setSelected(new Set());
+    setCompanySelected(new Set());
   }, [loadMeta]);
 
   const toggleSelect = (id: number) => {
@@ -222,6 +236,30 @@ function AssetsContent() {
     setDeleteOpen(true);
   };
 
+  const toggleCompanySelect = (id: number) => {
+    setCompanySelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleCompanySelectAll = (ids: number[]) => {
+    setCompanySelected((prev) => {
+      const allSelected = ids.length > 0 && ids.every((id) => prev.has(id));
+      return allSelected ? new Set<number>() : new Set(ids);
+    });
+  };
+
+  // Header checkbox state for the 企业 table, which is never paginated: every row
+  // is on screen, so "all" means the whole list.
+  const companySelectAllState = (): boolean | "indeterminate" => {
+    if (companies.length === 0 || companySelected.size === 0) return false;
+    if (companySelected.size >= companies.length) return true;
+    return "indeterminate";
+  };
+
   const confirmDelete = async () => {
     setDeleting(true);
     try {
@@ -238,21 +276,23 @@ function AssetsContent() {
   };
 
   const confirmDeleteCompany = async () => {
-    if (!companyDeleteTarget) return;
+    const ids = companyDeleteTargets.map((c) => c.id);
+    if (ids.length === 0) return;
     setCompanyDeleting(true);
     try {
-      const res = await api.deleteCompany(companyDeleteTarget.id, companyDeleteAssets);
-      const msg =
-        companyDeleteAssets && res.assets_deleted > 0
-          ? `已删除企业，同时删除 ${res.assets_deleted} 条资产`
-          : "已删除企业";
-      toast.success(msg);
+      const res = await api.deleteCompaniesBatch(ids, companyDeleteAssets);
+      const parts = [
+        res.deleted > 1 ? `已删除 ${res.deleted} 个企业` : "已删除企业",
+        companyDeleteAssets && res.assets_deleted > 0 ? `同时删除 ${res.assets_deleted} 条资产` : "",
+        res.deleted < res.requested ? `${res.requested - res.deleted} 个企业已不存在` : "",
+      ].filter(Boolean);
+      toast.success(parts.join("，"));
       refresh();
     } catch (e) {
       toast.error("删除失败：" + String((e as Error)?.message ?? e));
     } finally {
       setCompanyDeleting(false);
-      setCompanyDeleteTarget(null);
+      setCompanyDeleteTargets([]);
       setCompanyDeleteAssets(false);
     }
   };
@@ -398,6 +438,15 @@ function AssetsContent() {
               <Trash2Icon className="size-3.5" /> 删除已选 ({selected.size})
             </Button>
           )}
+          {tab === "company" && companySelected.size > 0 ? (
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={() => setCompanyDeleteTargets(companies.filter((c) => companySelected.has(c.id)))}
+            >
+              <Trash2Icon className="size-3.5" /> 删除已选 ({companySelected.size})
+            </Button>
+          ) : null}
           <Button variant="outline" size="sm" onClick={refresh} disabled={loading}>
             <RefreshCwIcon className={cn("size-4", loading && "animate-spin")} /> 刷新
           </Button>
@@ -425,6 +474,13 @@ function AssetsContent() {
               <Table>
                 <TableHeader className="sticky top-0 z-10 bg-card">
                   <TableRow>
+                    <TableHead className="w-8">
+                      <Checkbox
+                        checked={companySelectAllState()}
+                        onCheckedChange={() => toggleCompanySelectAll(companies.map((c) => c.id))}
+                        aria-label="全选企业"
+                      />
+                    </TableHead>
                     <TableHead>企业</TableHead>
                     <TableHead className="w-24 text-right">资产数</TableHead>
                     <TableHead>资产范围</TableHead>
@@ -433,7 +489,14 @@ function AssetsContent() {
                 </TableHeader>
                 <TableBody>
                   {companies.map((c) => (
-                    <TableRow key={c.id}>
+                    <TableRow key={c.id} className={companySelected.has(c.id) ? "bg-muted/40" : undefined}>
+                      <TableCell className="w-8 pr-0">
+                        <Checkbox
+                          checked={companySelected.has(c.id)}
+                          onCheckedChange={() => toggleCompanySelect(c.id)}
+                          aria-label={`选择企业 ${c.name}`}
+                        />
+                      </TableCell>
                       <TableCell>
                         <div className="flex items-center gap-2">
                           <CompanyAvatar name={c.name} logo={c.logo} />
@@ -463,7 +526,7 @@ function AssetsContent() {
                             size="icon"
                             className="size-7 text-muted-foreground hover:text-destructive"
                             onClick={() => {
-                              setCompanyDeleteTarget(c);
+                              setCompanyDeleteTargets([c]);
                               setCompanyDeleteAssets(false);
                             }}
                             aria-label={`删除企业 ${c.name}`}
@@ -476,7 +539,7 @@ function AssetsContent() {
                   ))}
                   {companies.length === 0 && (
                     <TableRow>
-                      <TableCell colSpan={4} className="py-10 text-center text-sm text-muted-foreground">
+                      <TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">
                         还没有企业。点击右上角「新增企业」并填写资产范围，系统会自动认领命中的资产。
                       </TableCell>
                     </TableRow>
@@ -831,20 +894,37 @@ function AssetsContent() {
       </AlertDialog>
 
       <AlertDialog
-        open={!!companyDeleteTarget}
+        open={companyDeleteTargets.length > 0}
         onOpenChange={(o) => {
           if (!o) {
-            setCompanyDeleteTarget(null);
+            setCompanyDeleteTargets([]);
             setCompanyDeleteAssets(false);
           }
         }}
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>删除企业 · {companyDeleteTarget?.name}</AlertDialogTitle>
+            <AlertDialogTitle>
+              {companyDeleteTargets.length > 1
+                ? `删除 ${companyDeleteTargets.length} 个企业`
+                : `删除企业 · ${companyDeleteTargets[0]?.name}`}
+            </AlertDialogTitle>
             <AlertDialogDescription asChild>
               <div className="space-y-3">
-                <p>此操作将永久删除该企业及其资产范围配置，不可撤销。</p>
+                <p>
+                  此操作将永久删除
+                  <span className="font-semibold tabular-nums"> {companyDeleteTargets.length} </span>
+                  个企业及其资产范围配置，不可撤销。
+                </p>
+                {companyDeleteTargets.length > 1 ? (
+                  <p className="text-xs text-muted-foreground">
+                    {companyDeleteTargets
+                      .slice(0, 8)
+                      .map((c) => c.name)
+                      .join("、")}
+                    {companyDeleteTargets.length > 8 ? ` 等 ${companyDeleteTargets.length} 个企业` : ""}
+                  </p>
+                ) : null}
                 <label
                   htmlFor="delete-assets-opt"
                   className="flex cursor-pointer items-center gap-2.5 rounded-md border p-3 hover:bg-muted/50"
@@ -855,7 +935,7 @@ function AssetsContent() {
                     onCheckedChange={(v) => setCompanyDeleteAssets(!!v)}
                   />
                   <span className="text-sm leading-snug">
-                    同时删除该企业下的所有资产
+                    同时删除{companyDeleteTargets.length > 1 ? "这些" : "该"}企业下的所有资产
                     <span className="block text-xs text-muted-foreground">不勾选则保留资产，仅取消归属关系</span>
                   </span>
                 </label>

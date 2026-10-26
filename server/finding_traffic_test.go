@@ -36,7 +36,8 @@ func trafficEvidenceServer(t *testing.T) (*Server, *db.RecordedFinding, func(str
 		t.Fatal(err)
 	}
 	tid, _ := strconv.ParseInt(task.ID, 10, 64)
-	t.Cleanup(func() { m.pg.Exec(`DELETE FROM task_archives WHERE task_id=$1`, tid); m.pg.DeleteTask(tid) })
+	sealEvidenceSince(t, m.pg, time.Now().UTC())
+	purgeTaskFixture(t, m.pg, tid)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
@@ -84,8 +85,7 @@ func TestFindingTrafficToolUpgradePreservesCustomization(t *testing.T) {
 	if err != nil || worker == nil {
 		t.Fatal("missing worker", err)
 	}
-	oldPrompt, _ := pg.CurrentPrompt(worker.ID)
-	t.Cleanup(func() { pg.SavePrompt(worker.ID, oldPrompt, "restore test fixture", "test") })
+	preservePrompt(t, pg, worker.ID)
 	if _, err := pg.SavePrompt(worker.ID, "USER CUSTOM PROMPT", "test", "test"); err != nil {
 		t.Fatal(err)
 	}
@@ -103,6 +103,7 @@ func TestFindingTrafficToolUpgradePreservesCustomization(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	preserveSetting(t, pg, "finding_traffic_tools_v1")
 	if err := pg.SetSetting("finding_traffic_tools_v1", "false"); err != nil {
 		t.Fatal(err)
 	}
@@ -230,6 +231,64 @@ func TestFindingTrafficAPIAndExport(t *testing.T) {
 	if binaries != 3 || !linked {
 		t.Fatalf("missing attachments/links: %d %v", binaries, linked)
 	}
+	// HTML 导出：分页结构 + 从已绑定流量补齐真实报文 + 落盘到工作区 reports/。
+	htmlURL := fmt.Sprintf("/api/exploration/findings/export?format=html&scope=selected&ids=%d", f.FindingID)
+	w = req("GET", htmlURL, "")
+	if w.Code != 200 || !strings.Contains(w.Header().Get("Content-Type"), "text/html") {
+		t.Fatal(w.Code, w.Body)
+	}
+	htmlOut := w.Body.String()
+	for _, want := range []string{`<section class="cover">`, "page-break-after:always", "POST / HTTP/1.1", "HTTP/1.1 200 OK"} {
+		if !strings.Contains(htmlOut, want) {
+			t.Fatalf("html export missing %q", want)
+		}
+	}
+	relPath := w.Header().Get("X-Workspace-Path")
+	if !strings.HasPrefix(relPath, "reports/") {
+		t.Fatalf("workspace path = %q", relPath)
+	}
+	if _, err := os.Stat(filepath.Join(s.m.dir, filepath.FromSlash(relPath))); err != nil {
+		t.Fatalf("export not saved to workspace: %v", err)
+	}
+	docxURL := fmt.Sprintf("/api/exploration/findings/export?format=docx&scope=selected&ids=%d", f.FindingID)
+	w = req("GET", docxURL, "")
+	if w.Code != 200 || !strings.Contains(w.Header().Get("Content-Type"), "wordprocessingml.document") {
+		t.Fatal(w.Code, w.Body)
+	}
+	docxPath := w.Header().Get("X-Workspace-Path")
+	if !strings.HasPrefix(docxPath, "reports/") || !strings.HasSuffix(docxPath, ".docx") {
+		t.Fatalf("docx workspace path = %q", docxPath)
+	}
+	if saved, err := os.ReadFile(filepath.Join(s.m.dir, filepath.FromSlash(docxPath))); err != nil {
+		t.Fatalf("docx not saved to workspace: %v", err)
+	} else if !bytes.Equal(saved, w.Body.Bytes()) {
+		t.Fatal("saved docx differs from download")
+	}
+	docxZip, err := zip.NewReader(bytes.NewReader(w.Body.Bytes()), int64(w.Body.Len()))
+	if err != nil {
+		t.Fatalf("docx is not a zip: %v", err)
+	}
+	docxDoc := ""
+	for _, entry := range docxZip.File {
+		if entry.Name != "word/document.xml" {
+			continue
+		}
+		rc, err := entry.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		docxDoc = string(raw)
+	}
+	for _, want := range []string{"POST / HTTP/1.1", "HTTP/1.1 200 OK", `w:br w:type="page"`} {
+		if !strings.Contains(docxDoc, want) {
+			t.Fatalf("docx export missing %q", want)
+		}
+	}
 	// Reports can use snapshots with capture stopped and original rows gone.
 	result, err := s.toolGetFindingTraffic().Call(context.Background(), json.RawMessage(fmt.Sprintf(`{"finding_id":"%d"}`, f.FindingID)), nil)
 	if err != nil || !strings.Contains(result.Flatten(), "proof note") {
@@ -266,11 +325,13 @@ func TestFindingTrafficArchiveV3RoundTripAndRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	sid, _ := strconv.ParseInt(sharedTask.ID, 10, 64)
-	defer s.m.pg.DeleteTask(sid)
 	shared, err := s.evidenceStore().Record(ctx, db.RecordFindingInput{TaskID: sid, ExplorationID: sharedTask.ExpID, Summary: "shared", Severity: "low"}, []db.TrafficRef{{TrafficID: "original"}})
 	if err != nil {
+		purgeTaskNow(t, s.m.pg, sid)
 		t.Fatal(err)
 	}
+	// Registered after the fixture's own cleanup, so it still has an open pool.
+	purgeTaskFixture(t, s.m.pg, sid, shared.FindingID)
 	if _, err = s.m.traffic.DeleteHost("evidence.local"); err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +492,7 @@ func TestFindingTrafficUTF8SegmentsAndInheritedWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	cid, _ := strconv.ParseInt(child.ID, 10, 64)
-	defer s.m.pg.DeleteTask(cid)
+	purgeTaskFixture(t, s.m.pg, cid)
 	base := fmt.Sprintf("/api/exploration/findings/%d/traffic", f.FindingID)
 	suffix := "?context_task=" + child.ID
 	if w := req("GET", base+suffix, ""); w.Code != 200 {
@@ -472,5 +533,129 @@ func TestFindingTrafficUTF8SegmentsAndInheritedWrites(t *testing.T) {
 		if !strings.Contains(w.Body.String(), fmt.Sprint(list.Bindings[0].ID)) {
 			t.Fatal("export omitted evidence ID", format)
 		}
+	}
+}
+
+// preservePrompt leaves an agent's prompt history exactly as the test found it.
+// SavePrompt only ever appends a version, so a test that "restores" the old text
+// adds two rows of its own to the version list a real operator would read.
+func preservePrompt(t *testing.T, pg *db.DB, agentID int64) {
+	t.Helper()
+	var highest, current int64
+	if err := pg.QueryRow(`SELECT COALESCE(max(id),0) FROM agent_prompts WHERE agent_id=$1`, agentID).Scan(&highest); err != nil {
+		t.Fatal(err)
+	}
+	// -1 stands in for "no prompt yet"; NULLIF puts the column back that way.
+	if err := pg.QueryRow(`SELECT COALESCE(current_prompt_id,-1) FROM agents WHERE id=$1`, agentID).Scan(&current); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pg.Exec(`UPDATE agents SET current_prompt_id=NULLIF($2,-1) WHERE id=$1`, agentID, current)
+		if _, err := pg.Exec(`DELETE FROM agent_prompts WHERE agent_id=$1 AND id>$2`, agentID, highest); err != nil {
+			t.Logf("清理提示词版本失败(agent=%d): %v", agentID, err)
+		}
+	})
+}
+
+// preserveSetting puts a settings key back the way the database had it. Seed
+// markers left at "false" survive the test and make the running app re-apply its
+// seeders on every boot — a behaviour change the test never asked for.
+func preserveSetting(t *testing.T, pg *db.DB, key string) {
+	t.Helper()
+	old, exists, err := pg.GetSetting(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if exists {
+			_ = pg.SetSetting(key, old)
+			return
+		}
+		_, _ = pg.Exec(`DELETE FROM settings WHERE key=$1`, key)
+	})
+}
+
+// sealEvidenceSince drops evidence snapshots a test captured and no finding kept
+// bound. A snapshot has no task column, so the fixture start time is the only
+// handle on it; rows another task's finding still binds stay. Registered before
+// purgeTaskFixture so it runs after that sweep has removed this task's bindings.
+func sealEvidenceSince(t *testing.T, pg *db.DB, since time.Time) {
+	t.Helper()
+	t.Cleanup(func() {
+		if _, err := pg.Exec(`DELETE FROM traffic_evidence_snapshots s
+WHERE s.created_at >= $1 AND NOT EXISTS (SELECT 1 FROM finding_traffic_bindings b WHERE b.snapshot_id = s.id)`, since); err != nil {
+			t.Logf("清理夹具快照失败(since=%s): %v", since.Format(time.RFC3339Nano), err)
+		}
+	})
+}
+
+// purgeTaskFixture removes everything one test task wrote. Deleting only the
+// tasks row is not enough: findings survive it (task_id falls back to NULL by
+// design), and so do the push events recorded alongside them, so a suite run
+// leaves "test" rows behind in whichever database it points at.
+//
+// purgeNow runs at the moment it is called — tests that close their pool with a
+// plain `defer` must use `defer purgeNow(...)`, because deferred calls run before
+// any t.Cleanup. purgeTaskFixture is for tests whose cleanup is t.Cleanup-based.
+func purgeTaskFixture(t *testing.T, pg *db.DB, taskID int64, findingIDs ...int64) {
+	t.Helper()
+	t.Cleanup(func() { purgeTaskNow(t, pg, taskID, findingIDs...) })
+}
+
+// findingIDs names findings a test detached from its task on purpose (a plain
+// DeleteTask leaves them behind with task_id NULL); they are deleted too.
+func purgeTaskNow(t *testing.T, pg *db.DB, taskID int64, findingIDs ...int64) {
+	t.Helper()
+	if findingIDs == nil {
+		findingIDs = []int64{}
+	}
+	const (
+		ownedFindings = `f.task_id=$1 OR f.id = ANY($2::bigint[])`
+		ownedCases    = `SELECT id FROM finding_cases WHERE task_id=$1 OR origin_task_id=$1`
+	)
+	// Each step carries its own arguments: a statement passed more placeholders
+	// than it declares fails with "mismatched param and argument count", and an
+	// untyped empty array fails with "could not determine data type".
+	type sweepStep struct {
+		query string
+		args  []any
+	}
+	var snapshotIDs []string
+	if err := pg.QueryRow(`SELECT COALESCE(array_agg(DISTINCT b.snapshot_id), '{}'::text[])::text[]
+FROM finding_traffic_bindings b JOIN findings f ON f.id=b.finding_id WHERE `+ownedFindings,
+		taskID, findingIDs).Scan(&snapshotIDs); err != nil {
+		t.Logf("读取夹具快照失败(task=%d): %v", taskID, err)
+	}
+	for _, step := range []sweepStep{
+		// The payload carries the task even after the finding row is gone, so
+		// events recorded for a finding the test deleted itself are still findable.
+		{`DELETE FROM notification_events WHERE finding_id IN (SELECT f.id FROM findings f WHERE ` + ownedFindings + `)
+OR snapshot->>'task_id' = $3`, []any{taskID, findingIDs, strconv.FormatInt(taskID, 10)}},
+		// members/events point at a case with no ON DELETE clause, so a case can
+		// only go after its own rows are removed. origin_task_id has no FK, so it
+		// still names the task after a mid-test delete nulled task_id.
+		{`DELETE FROM finding_case_members WHERE case_id IN (` + ownedCases + `)`, []any{taskID}},
+		{`DELETE FROM finding_case_events WHERE case_id IN (` + ownedCases + `)`, []any{taskID}},
+		{`DELETE FROM finding_case_review_runs WHERE task_id=$1`, []any{taskID}},
+		{`DELETE FROM finding_cases WHERE task_id=$1 OR origin_task_id=$1`, []any{taskID}},
+		{`DELETE FROM findings WHERE id = ANY($1::bigint[])`, []any{findingIDs}},
+	} {
+		if _, err := pg.Exec(step.query, step.args...); err != nil {
+			t.Logf("清理任务夹具失败(task=%d): %v", taskID, err)
+		}
+	}
+	// llm_records is created lazily (only a booting server ensures it), so asking
+	// the cascade to clean it would abort the whole delete on a fresh test database.
+	if _, err := pg.DeleteTaskCascade(taskID, true, true); err != nil {
+		t.Logf("清理任务夹具失败(task=%d): %v", taskID, err)
+	}
+	// Bindings went away with the findings, so a snapshot still bound belongs
+	// to another task's evidence and must stay.
+	if len(snapshotIDs) == 0 {
+		return
+	}
+	if _, err := pg.Exec(`DELETE FROM traffic_evidence_snapshots s
+WHERE s.id = ANY($1::text[]) AND NOT EXISTS (SELECT 1 FROM finding_traffic_bindings b WHERE b.snapshot_id = s.id)`, snapshotIDs); err != nil {
+		t.Logf("清理夹具快照失败(task=%d): %v", taskID, err)
 	}
 }

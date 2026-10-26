@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -257,6 +258,72 @@ WHERE ts.task_id=$1 ORDER BY ts.id`, taskID)
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// CompanyScopeHosts returns the domain/IP candidates of a company's assets for
+// the runtime scope guard. limit <= 0 is capped at 20000 rows; truncated says
+// more rows exist. The query is read-only and only used to expand kind=company
+// scope into host-matchable rules.
+func (s *AssetStore) CompanyScopeHosts(companyID int64, limit int) (domains, ips []string, truncated bool, err error) {
+	if companyID <= 0 {
+		return nil, nil, false, nil
+	}
+	if limit <= 0 {
+		limit = 20000
+	}
+	rows, err := s.db.Query(`
+SELECT COALESCE(domain,''), COALESCE(root_domain,''), COALESCE(ip,''), COALESCE(url,'')
+FROM assets
+WHERE company_id = $1
+  AND (COALESCE(domain,'') <> '' OR COALESCE(root_domain,'') <> ''
+       OR COALESCE(ip,'') <> '' OR COALESCE(url,'') <> '')
+LIMIT $2`, companyID, limit+1)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	defer rows.Close()
+	seenD := map[string]bool{}
+	seenI := map[string]bool{}
+	n := 0
+	for rows.Next() {
+		var domain, root, ip, rawURL string
+		if err := rows.Scan(&domain, &root, &ip, &rawURL); err != nil {
+			return nil, nil, false, err
+		}
+		n++
+		if n > limit {
+			truncated = true
+			break
+		}
+		addD := func(v string) {
+			v = DomainKey(v)
+			if v != "" && net.ParseIP(v) == nil && !seenD[v] {
+				seenD[v] = true
+				domains = append(domains, v)
+			}
+		}
+		addD(domain)
+		addD(root)
+		if v := strings.TrimSpace(ip); v != "" && net.ParseIP(v) != nil && !seenI[v] {
+			seenI[v] = true
+			ips = append(ips, v)
+		}
+		if rawURL = strings.TrimSpace(rawURL); rawURL != "" {
+			if u, err := url.Parse(rawURL); err == nil {
+				if h := DomainKey(u.Hostname()); h != "" {
+					if net.ParseIP(h) != nil {
+						if !seenI[h] {
+							seenI[h] = true
+							ips = append(ips, h)
+						}
+					} else {
+						addD(h)
+					}
+				}
+			}
+		}
+	}
+	return domains, ips, truncated, rows.Err()
 }
 
 // CoverageAsset is one in-scope asset (used for the untested backlog sample).

@@ -41,6 +41,7 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools := append(s.m.HostTools(), s.orchestrationTools()...)
 	tools = append(tools, s.findingRetestTools()...)
 	tools = append(tools, s.platformTools()...) // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
+	tools = append(tools, s.deepTools()...)     // 验证/利用/WAF/Webshell 能力(给 LLM agent 调用)
 	custom, err := s.customTools()
 	if err != nil {
 		log.Printf("[custom-tool] 加载失败: %v", err)
@@ -425,7 +426,7 @@ func (s *Server) toolGetTaskNodeDetail() actool.CoreTool {
 // task-agnostic, so this host tool needs no task_id / exploration store.
 func (s *Server) toolUpdateFindingReport() actool.CoreTool {
 	return wrTool("update_finding_report",
-		"为已登记的漏洞写入/更新【详细报告】(Markdown 全文,整段覆盖旧内容)。finding_id 传 report_finding 返回的那个 id(\"finding recorded: <id>\" 里的数字)。报告建议包含:漏洞概述、影响与危害、复现步骤、证据/PoC、修复建议。",
+		"为已登记的漏洞写入/更新【详细报告】(Markdown 全文,整段覆盖旧内容)。finding_id 传 report_finding 返回的那个 id(\"finding recorded: <id>\" 里的数字)。报告必须包含:漏洞概述、影响与危害、受影响范围、复现步骤、证据、POC(原始 HTTP 请求报文与响应报文原文;非 HTTP 漏洞给出完整命令和输出)、参数与数据来源(参数名/位置/值/来源)、根因分析、修复建议。",
 		objSchema(map[string]any{
 			"finding_id":       map[string]any{"type": "integer", "description": "目标漏洞 id(report_finding 返回的 id)"},
 			"report":           strParam("详细报告全文,Markdown 格式"),
@@ -495,6 +496,7 @@ func (s *Server) seedOrchestrationTools() {
 		schema, _ := json.Marshal(t.InputSchema())
 		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, autoAgents)
 	}
+	s.seedDeepTools()
 	s.refreshBuiltinToolSchemas()
 	s.seedAutoDefaultBindings()
 	s.seedPlannerDefaultBindings()
@@ -510,6 +512,7 @@ func (s *Server) seedOrchestrationTools() {
 	s.reseedWorkerPrompt()            // worker 提示词:加否定结论证据门槛(一次性)
 	s.seedReporterAgent()             // 预置「报告撰写」agent + 工具绑定 + finding 触发器(一次性)
 	s.upgradeReporterTriggerMessage() // 老库补迁移:让 reporter 回传 evidence_version(一次性)
+	s.upgradeReporterReportTemplate() // 老库补迁移:报告模板加入原始 HTTP/参数来源(一次性)
 	s.seedFindingTrafficTools()       // 增加可选证据参数及只读证据工具，保留用户配置
 	s.seedFindingWorkflowTools()
 	s.seedFindingCaseTools()
@@ -524,11 +527,12 @@ func (s *Server) seedOrchestrationTools() {
 // reaches an old DB otherwise. Preserves each tool's agent binding + enabled flag.
 // Bump the flag whenever these tools' schemas/descriptions change in code.
 func (s *Server) refreshBuiltinToolSchemas() {
-	const flag = "tool_schema_refresh_v7_list_facts_paging"
+	const flag = "tool_schema_refresh_v9_probe_queue_only"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
 	tools := append(s.orchestrationTools(), s.platformTools()...)
+	tools = append(tools, s.deepTools()...)
 	for _, t := range tools {
 		schema, _ := json.Marshal(t.InputSchema())
 		if err := s.m.pg.RefreshToolDefaults(t.Name(), t.Description(), schema); err != nil {
@@ -542,7 +546,10 @@ func (s *Server) refreshBuiltinToolSchemas() {
 	//     SeedTool 首插入only，旧库已 seed 的 schema 否则收不到这个新参数。
 	//   - list_facts：改为分页，新增 limit/before/q 入参；旧库已 seed 的空 schema 否则
 	//     在工具管理页显示「无参数」，模型也拿不到这几个参数说明。
-	refreshBuiltin := map[string]bool{"goal_met": true, "insert_assets": true, "list_facts": true}
+	// report_finding：HTTP 漏洞现在必须自带真实报文（或显式声明 no_raw_capture），
+	// 旧库 seed 的描述还写着「用 evidence 提供命令输出、日志等可验证证据」，模型会照旧
+	// 只交文字结论；traffic_refs 的说明也从「可选」改为「必填」，不刷进 DB 行就永远到不了模型。
+	refreshBuiltin := map[string]bool{"goal_met": true, "insert_assets": true, "list_facts": true, "report_finding": true}
 	for _, sd := range agent.BuiltinToolSeeds() {
 		if !refreshBuiltin[sd.Key] {
 			continue
@@ -667,10 +674,14 @@ func (s *Server) reseedPlannerPrompt() {
 // reseedWorkerPrompt 把 worker 提示词刷成【当前代码默认】——默认正文 record_fact 段删掉了「否定类结论
 // 写观察+试探性读法」整句、并把 confidence(observed/inferred)与「是否穷尽本意图手段」解耦(这些易误导规划者),
 // 同时把 facts 数组分条收紧为「彼此完全独立、无法归并」的极少数例外。bump flag 至 v3 让存量旧库再刷一次。
+// v5 追加 report_finding 两条硬门槛：HTTP 漏洞必须绑真实报文（或显式声明无法取得），SQLi/XSS 必须用
+// verify_sqli / verify_xss 复测定案——此前 worker 全程只手工试 payload，专项工具形同虚设。
+// v6：专项复测加上「来不及等完就 queue_only=true 先排队」——L5 的 9 条 SQLi 发现在截止前两分钟批量登记、
+// 一条都没进 sqlmap，就是因为等结果会吃掉本意图剩余步数，模型索性跳过复测。
 // SeedPromptIfEmpty 首插入only,旧库已有版本收不到,故用版本管理【追加一个新版本】并切过去,旧版本仍保留在历史里可找回。
 // settings flag 守卫 → 只做一次。全新库无需处理。与 reseedGoalsPrompt 完全同构。
 func (s *Server) reseedWorkerPrompt() {
-	const flag = "worker_prompt_compact_v4"
+	const flag = "worker_prompt_compact_v6"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -709,6 +720,35 @@ const reporterToolCallMessage = "上面刚有一个漏洞被 report_finding 登�
 const reporterToolCallMessageV1 = "上面刚有一个漏洞被 report_finding 登记。请从触发上下文里取出 finding_id" +
 	"（工具返回 \"finding recorded: <id>\" 里的数字）与任务 id，按你的职责撰写该漏洞的详细报告，" +
 	"最后调用 update_finding_report(finding_id, report) 保存。"
+
+// upgradeReporterReportTemplate refreshes the seeded reporter prompt so existing
+// installations get the raw-HTTP/parameter-provenance template. Only the
+// untouched legacy default (identified by its old section heading) is replaced;
+// user-edited prompts are left alone.
+func (s *Server) upgradeReporterReportTemplate() {
+	const flag = "reporter_prompt_http_poc_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }()
+	a, err := s.m.pg.GetAgentByKey("reporter")
+	if err != nil || a == nil {
+		return
+	}
+	cur, err := s.m.pg.CurrentPrompt(a.ID)
+	if err != nil {
+		log.Printf("[reporter] 读取提示词失败: %v", err)
+		return
+	}
+	if !strings.Contains(cur, "报告结构（Markdown，按需裁剪") {
+		return // 用户改过或已是新版本，不覆盖
+	}
+	if _, err := s.m.pg.ResetPromptToDefault(a.ID, agent.ReporterDefaultPrompt); err != nil {
+		log.Printf("[reporter] 升级报告模板失败: %v", err)
+		return
+	}
+	log.Printf("[reporter] 报告模板已升级：强制原始 HTTP 报文与参数来源")
+}
 
 // upgradeReporterTriggerMessage 把老库里仍是默认文案的 reporter 触发消息刷成新版本。
 // seedReporterAgent 受 reporter_agent_seed_v1 守卫且只在新建 agent 时写触发器，所以

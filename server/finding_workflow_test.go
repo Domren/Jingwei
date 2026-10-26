@@ -41,18 +41,22 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 	s, initial, request := trafficEvidenceServer(t)
 	pg := s.m.pg
 	ctx := context.Background()
+	preserveSetting(t, pg, settingAgentTrafficBinding)
 	if _, err := pg.Exec(`DELETE FROM settings WHERE key=$1`, settingAgentTrafficBinding); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { pg.SetBool(settingAgentTrafficBinding, false) })
-	if s.settingsPayload()[settingAgentTrafficBinding] != false {
-		t.Fatal("missing setting must default off")
+	if s.settingsPayload()[settingAgentTrafficBinding] != true {
+		t.Fatal("missing setting must default on (reports require real packets)")
 	}
 	seedServerEvidenceFlow(t, s, "handoff-proof", []byte("verified local proof"))
 	seedServerEvidenceFlow(t, s, "handoff-baseline", []byte("local baseline"))
 	seedServerEvidenceFlow(t, s, "handoff-verification", []byte{0, 1, 255})
 	// Manual binding is independent of the Agent switch.
 	if r := request("POST", fmt.Sprintf("/api/exploration/findings/%d/traffic", initial.FindingID), `{"traffic_refs":[{"traffic_id":"handoff-proof"}]}`); r.Code != 200 {
+		t.Fatal(r.Code, r.Body)
+	}
+	// 默认开启；显式关闭后 Agent 自动绑定应被拒绝，人工绑定仍可用。
+	if r := request("PUT", "/api/settings", `{"agent_traffic_binding":false}`); r.Code != 200 {
 		t.Fatal(r.Code, r.Body)
 	}
 	bind := s.toolBindFindingTraffic()
@@ -155,7 +159,7 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 	}
 	childID, _ := strconv.ParseInt(child.ID, 10, 64)
 	childRow, _ := pg.GetTask(childID)
-	t.Cleanup(func() { pg.DeleteTask(childRow.ID) })
+	purgeTaskFixture(t, pg, childRow.ID)
 	childCtx := agent.WithRunInfo(ctx, agent.RunInfo{TaskID: childRow.ID})
 	workflowCall(t, childCtx, bind, input, true)
 	workflowCall(t, childCtx, s.toolGetFindingTraffic(), map[string]any{"finding_id": recorded.FindingID}, false)
@@ -224,6 +228,7 @@ func TestFindingWorkflowMigrationPreservesUserConfiguration(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	preserveSetting(t, pg, "finding_workflow_tools_v2_reporter")
 	if err := pg.SetSetting("finding_workflow_tools_v2_reporter", "false"); err != nil {
 		t.Fatal(err)
 	}
@@ -266,10 +271,16 @@ func TestFindingWorkflowReporterBindsBeforeWritingReport(t *testing.T) {
 	s, f, request := trafficEvidenceServer(t)
 	pg := s.m.pg
 	ctx := context.Background()
+	preserveSetting(t, pg, settingAgentTrafficBinding)
 	if err := pg.SetBool(settingAgentTrafficBinding, true); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { pg.SetBool(settingAgentTrafficBinding, false); s.m.SetTrafficEnabled(false) })
+	captureOn := pg.GetBool(settingTrafficCapture, false)
+	t.Cleanup(func() {
+		if err := s.m.SetTrafficEnabled(captureOn); err != nil {
+			t.Errorf("restore traffic capture (%v): %v", captureOn, err)
+		}
+	})
 	if err := s.m.SetTrafficEnabled(true); err != nil {
 		t.Fatal(err)
 	}

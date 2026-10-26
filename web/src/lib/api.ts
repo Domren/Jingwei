@@ -30,10 +30,14 @@ import type {
   CoverageGraphData,
   CredentialTrafficDetail,
   DailyTokenBucket,
+  DeepTask,
+  DeepTaskInput,
   DeleteTaskOptions,
   DeleteTaskResult,
+  DeleteTasksBatchResult,
   Edge,
   EvidenceBodyPreview,
+  ExploitRecord,
   ExplorationNodePage,
   ExplorationNodeQuery,
   Finding,
@@ -47,6 +51,7 @@ import type {
   FindingQuery,
   FindingRetest,
   FindingStats,
+  FindingSystemsPage,
   FindingStatus,
   FindingsPage,
   FindingTraffic,
@@ -58,6 +63,18 @@ import type {
   InterceptDetail,
   InterceptPending,
   InterceptRule,
+  IntranetBatchItem,
+  IntranetExecResult,
+  IntranetHandoffInput,
+  IntranetProbeInfo,
+  IntranetScopeRequest,
+  IntranetScopeRequestInput,
+  IntranetSession,
+  IntranetSessionEvent,
+  IntranetSessionInput,
+  IntranetTunnel,
+  IntranetTunnelInput,
+  JavaChainsStatus,
   JudgeConfig,
   JudgeUsage,
   LLMPoolStatus,
@@ -67,6 +84,7 @@ import type {
   LLMRetryOverride,
   LLMRetryPolicy,
   LLMTask,
+  ManagedResource,
   MCPServer,
   MCPTool,
   MissingSkill,
@@ -78,8 +96,14 @@ import type {
   POCRunResponse,
   POCStats,
   POCTemplate,
+  PortAuditResult,
   PromptVar,
   PromptVersion,
+  ScanAsset,
+  ScanAutoResult,
+  ScanResult,
+  ScanTask,
+  ScanTaskInput,
   SessionTokenUsage,
   Settings,
   Severity,
@@ -114,6 +138,9 @@ import type {
   UpdateCheck,
   UpdateSettings,
   UsageStats,
+  WAFBypassResult,
+  Webshell,
+  WebshellInput,
   WorkspaceFile,
   WorkspaceListing,
 } from "@/lib/types";
@@ -240,9 +267,11 @@ function findingFilterParams(q: Omit<FindingQuery, "page" | "pageSize">): URLSea
   if (q.status && q.status !== "all") p.set("status", q.status);
   if (q.vulnclass && q.vulnclass !== "all") p.set("vulnclass", q.vulnclass);
   if (q.task && q.task !== "all") p.set("task_id", q.task);
+  if (q.scanTaskId) p.set("scan_task_id", q.scanTaskId);
   if (q.query?.trim()) p.set("q", q.query.trim());
   if (q.sort) p.set("sort", q.sort);
   if (q.assetScope) p.set("asset_scope", q.assetScope);
+  if (q.system) p.set("system", q.system);
   return p;
 }
 
@@ -380,6 +409,9 @@ export const api = {
       active_llm_profile_id: activeLLMProfileId ?? null,
     }),
   deleteTask: (id: string, options: DeleteTaskOptions) => del<DeleteTaskResult>(`/tasks/${id}`, options),
+  // 批量删除一次请求完成，后端逐个任务做运行时收尾；失败的任务在 items 里单独报告。
+  deleteTasksBatch: (ids: string[], options: DeleteTaskOptions) =>
+    post<DeleteTasksBatchResult>("/tasks/delete/batch", { ids, ...options }),
   controlTask: (id: string, action: "pause" | "resume") =>
     post<{ id: string; paused: boolean; queued: boolean; status: string }>(`/tasks/${id}/control`, { action }),
   controlTasksBatch: (taskIds: string[], action: "pause" | "resume") =>
@@ -598,10 +630,13 @@ export const api = {
       reason,
       reset: true,
     }),
-  deleteCompany: (id: number, deleteAssets = false) =>
-    http<{ deleted: number; assets_deleted: number }>(`/companies/${id}`, {
-      method: "DELETE",
-      body: JSON.stringify({ delete_assets: deleteAssets }),
+  // One request for the whole selection: the backend deletes the list in a single
+  // transaction and re-evaluates asset ownership once. ids missing server-side are
+  // skipped, so `deleted` can be lower than the number submitted.
+  deleteCompaniesBatch: (ids: number[], deleteAssets = false) =>
+    post<{ deleted: number; assets_deleted: number; requested: number }>("/companies/delete/batch", {
+      ids,
+      delete_assets: deleteAssets,
     }),
 
   // ---- exploration (per task) ----
@@ -618,6 +653,14 @@ export const api = {
     p.set("page", String(q.page));
     p.set("limit", String(q.pageSize));
     return get<FindingGroupsPage>(`/exploration/findings/groups?${p.toString()}`);
+  },
+  // findingSystems 取某个任务(或当前筛选)下按系统(host:port)聚合的漏洞数量,
+  // 供「按任务 → 系统」视图展开任务组时使用。
+  findingSystems: (q: FindingQuery) => {
+    const p = findingFilterParams(q);
+    p.set("page", String(q.page));
+    p.set("limit", String(q.pageSize));
+    return get<FindingSystemsPage>(`/exploration/findings/systems?${p.toString()}`);
   },
   // findingAssetTree 取「按资产」视图的左侧树:只含有发现的资产及其祖先,
   // 节点带子树聚合计数。不分页——树是导航结构,一次取完。
@@ -664,13 +707,13 @@ export const api = {
   // exportFindings 触发发现页导出并下载文件。scope=selected 时传 ids(finding_id 列表);
   // scope=filtered 时传当前筛选(沿用 FindingQuery 的筛选字段);scope=all 忽略筛选。
   exportFindings: async (opts: {
-    format: "md-single" | "md-zip" | "csv" | "json";
+    format: "docx" | "md-single" | "md-zip" | "html" | "csv" | "json";
     scope: "filtered" | "all" | "selected";
     filters?: Omit<FindingQuery, "page" | "pageSize">;
     ids?: string[];
     includeOriginals?: boolean;
     consolidated?: boolean;
-  }) => {
+  }): Promise<{ filename: string; workspacePath: string }> => {
     const p = new URLSearchParams({ format: opts.format, scope: opts.scope });
     p.set("mode", opts.consolidated === false ? "raw" : "consolidated");
     p.set("include_originals", String(opts.includeOriginals ?? false));
@@ -689,6 +732,7 @@ export const api = {
     const disp = r.headers.get("Content-Disposition") ?? "";
     const m = disp.match(/filename="?([^"]+)"?/);
     const filename = m?.[1] ?? `findings-export`;
+    const workspacePath = r.headers.get("X-Workspace-Path") ?? "";
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -697,6 +741,7 @@ export const api = {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+    return { filename, workspacePath };
   },
   getFinding: (id: string, contextTaskId?: string) =>
     get<Finding>(
@@ -780,6 +825,11 @@ export const api = {
   ) => patch<Finding>(`/exploration/findings/${id}`, fields),
   // 删除漏洞:移除 findings 记录 + 来源探索节点(从发现列表/任务发现 Tab/探索图一并消失)。
   deleteFinding: (id: string) => del<{ deleted: boolean; id: number }>(`/exploration/findings/${id}`),
+  // 批量删除:一次事务删掉勾选的全部漏洞，deleted 为实际删除条数（已消失的会被跳过）。
+  deleteFindingsBatch: (ids: string[]) =>
+    post<{ deleted: number; requested: number }>("/exploration/findings/delete/batch", {
+      ids: ids.map(Number),
+    }),
   findingRetests: (id: string) =>
     get<{ retests: FindingRetest[] }>(`/exploration/findings/${encodeURIComponent(id)}/retests`).then((r) =>
       arr(r.retests),
@@ -1430,13 +1480,162 @@ export const api = {
   },
   poc: (id: number) => get<POCTemplate>(`/pocs/${id}`),
   pocStats: () => get<POCStats>("/pocs/stats"),
-  createPoc: (input: { content: string; source?: string; source_url?: string }) =>
-    post<POCTemplate>("/pocs", input),
+  createPoc: (input: { content: string; source?: string; source_url?: string }) => post<POCTemplate>("/pocs", input),
   updatePoc: (id: number, input: { name?: string; severity?: string; description?: string; enabled?: boolean }) =>
     patch<POCTemplate>(`/pocs/${id}`, input),
   deletePoc: (id: number) => del<{ deleted: number }>(`/pocs/${id}`),
   runPocs: (input: { ids: number[]; targets: string[]; timeout_seconds?: number }) =>
     post<POCRunResponse>("/pocs/run", input),
+
+  // ---- LLM-free automated scanning ----
+  scans: (params?: { limit?: number; offset?: number }) => {
+    const sp = new URLSearchParams();
+    sp.set("limit", String(params?.limit ?? 50));
+    sp.set("offset", String(params?.offset ?? 0));
+    return get<{ scans: ScanTask[]; total: number }>(`/scans?${sp}`);
+  },
+  scan: (id: number) => get<ScanTask>(`/scans/${id}`),
+  createScan: (input: ScanTaskInput) => post<ScanTask>("/scans", input),
+  cancelScan: (id: number) => post<{ canceled: boolean }>(`/scans/${id}/cancel`, {}),
+  rerunScan: (id: number) => post<ScanTask>(`/scans/${id}/rerun`, {}),
+  deleteScan: (id: number) => del<{ deleted: number }>(`/scans/${id}`),
+  scanAssets: (id: number) => get<{ assets: ScanAsset[] }>(`/scans/${id}/assets`),
+  scanResults: (id: number) => get<{ results: ScanResult[] }>(`/scans/${id}/results`),
+  scanAuto: (id: number) => get<ScanAutoResult>(`/scans/${id}/auto`),
+
+  // ---- Deep exploitation ----
+  deepTasks: (params?: { kind?: string; limit?: number; offset?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.kind) sp.set("kind", params.kind);
+    sp.set("limit", String(params?.limit ?? 50));
+    sp.set("offset", String(params?.offset ?? 0));
+    return get<{ tasks: DeepTask[]; total: number }>(`/deep/tasks?${sp}`);
+  },
+  deepTask: (id: number) =>
+    get<{ task: DeepTask; records?: ExploitRecord[]; waf_results?: WAFBypassResult[] }>(`/deep/tasks/${id}`),
+  createDeepTask: (input: DeepTaskInput) => post<DeepTask>("/deep/tasks", input),
+  cancelDeepTask: (id: number) => post<{ ok: boolean }>(`/deep/tasks/${id}/cancel`, {}),
+  deleteDeepTask: (id: number) => del<{ ok: boolean }>(`/deep/tasks/${id}`),
+  javaChainsStatus: () => get<JavaChainsStatus>("/deep/java-chains/status"),
+
+  webshells: (params?: { target?: string; limit?: number; offset?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.target) sp.set("target", params.target);
+    sp.set("limit", String(params?.limit ?? 50));
+    sp.set("offset", String(params?.offset ?? 0));
+    return get<{ webshells: Webshell[]; total: number }>(`/deep/webshells?${sp}`);
+  },
+  createWebshell: (input: WebshellInput) => post<Webshell>("/deep/webshells", input),
+  updateWebshell: (id: number, input: WebshellInput) => put<Webshell>(`/deep/webshells/${id}`, input),
+  deleteWebshell: (id: number) => del<{ ok: boolean }>(`/deep/webshells/${id}`),
+  checkWebshell: (id: number) =>
+    post<{ alive: boolean; status: string; note: string }>(`/deep/webshells/${id}/check`, {}),
+  execWebshell: (id: number, command: string) => post<{ output: string }>(`/deep/webshells/${id}/exec`, { command }),
+
+  // ---- 内网两阶段：会话 / 隧道 / 范围审批 / 交接 ----
+  intranetSessions: (params?: { status?: string; task_id?: number; limit?: number; offset?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.status) sp.set("status", params.status);
+    if (params?.task_id) sp.set("task_id", String(params.task_id));
+    sp.set("limit", String(params?.limit ?? 100));
+    sp.set("offset", String(params?.offset ?? 0));
+    return get<{ sessions: IntranetSession[]; total: number }>(`/intranet/sessions?${sp}`);
+  },
+  intranetSession: (id: number) =>
+    get<{ session: IntranetSession; events?: IntranetSessionEvent[] }>(`/intranet/sessions/${id}`),
+  createIntranetSession: (input: IntranetSessionInput) =>
+    post<{ session: IntranetSession; probe?: IntranetProbeInfo; probe_error?: string }>("/intranet/sessions", input),
+  updateIntranetSession: (id: number, input: { cwd?: string; status?: string; note?: string; task_id?: number }) =>
+    patch<{ session: IntranetSession }>(`/intranet/sessions/${id}`, input),
+  deleteIntranetSession: (id: number) => del<{ ok: boolean }>(`/intranet/sessions/${id}`),
+  intranetSessionEvents: (id: number, limit = 100) =>
+    get<{ events: IntranetSessionEvent[] }>(`/intranet/sessions/${id}/events?limit=${limit}`),
+  intranetExec: (id: number, command: string, timeoutSeconds?: number) =>
+    post<{ result: IntranetExecResult; session: IntranetSession }>(`/intranet/sessions/${id}/exec`, {
+      command,
+      timeout_seconds: timeoutSeconds,
+    }),
+  intranetUpload: (id: number, path: string, contentBase64: string) =>
+    post<{ result: IntranetExecResult; session: IntranetSession }>(`/intranet/sessions/${id}/upload`, {
+      path,
+      content_base64: contentBase64,
+    }),
+  intranetDownload: (id: number, path: string, maxBytes?: number) =>
+    post<{
+      result: IntranetExecResult;
+      size: number;
+      total: number;
+      truncated: boolean;
+      content_base64: string;
+      session: IntranetSession;
+    }>(`/intranet/sessions/${id}/download`, { path, max_bytes: maxBytes }),
+  intranetBatchExec: (sessionIds: number[], command: string, taskId?: number, timeoutSeconds?: number) =>
+    post<{ results: IntranetBatchItem[]; total: number }>("/intranet/sessions/batch-exec", {
+      session_ids: sessionIds,
+      command,
+      task_id: taskId,
+      timeout_seconds: timeoutSeconds,
+    }),
+
+  intranetTunnels: (params?: {
+    status?: string;
+    task_id?: number;
+    session_id?: number;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const sp = new URLSearchParams();
+    if (params?.status) sp.set("status", params.status);
+    if (params?.task_id) sp.set("task_id", String(params.task_id));
+    if (params?.session_id) sp.set("session_id", String(params.session_id));
+    sp.set("limit", String(params?.limit ?? 100));
+    sp.set("offset", String(params?.offset ?? 0));
+    return get<{ tunnels: IntranetTunnel[]; total: number }>(`/intranet/tunnels?${sp}`);
+  },
+  createIntranetTunnel: (input: IntranetTunnelInput) => post<{ tunnel: IntranetTunnel }>("/intranet/tunnels", input),
+  intranetTunnel: (id: number) => get<{ tunnel: IntranetTunnel }>(`/intranet/tunnels/${id}`),
+  deleteIntranetTunnel: (id: number) => del<{ ok: boolean }>(`/intranet/tunnels/${id}`),
+  intranetTunnelProbe: (id: number) =>
+    post<{ probe?: IntranetProbeInfo; result: IntranetExecResult }>(`/intranet/tunnels/${id}/probe`, {}),
+  intranetTunnelPlan: (
+    id: number,
+    input?: { deploy_command?: string; verify_command?: string; teardown_command?: string },
+  ) => post<{ tunnel: IntranetTunnel; probe?: IntranetProbeInfo }>(`/intranet/tunnels/${id}/plan`, input ?? {}),
+  intranetTunnelDeploy: (id: number, input?: { ttl_seconds?: number; timeout_seconds?: number }) =>
+    post<{ tunnel: IntranetTunnel; result: IntranetExecResult }>(`/intranet/tunnels/${id}/deploy`, input ?? {}),
+  intranetTunnelVerify: (id: number) =>
+    post<{ tunnel: IntranetTunnel; result: IntranetExecResult }>(`/intranet/tunnels/${id}/verify`, {}),
+  intranetTunnelTeardown: (id: number) => post<{ tunnel: IntranetTunnel }>(`/intranet/tunnels/${id}/teardown`, {}),
+
+  intranetScopeRequests: (params?: { status?: string; task_id?: number; limit?: number; offset?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.status) sp.set("status", params.status);
+    if (params?.task_id) sp.set("task_id", String(params.task_id));
+    sp.set("limit", String(params?.limit ?? 100));
+    sp.set("offset", String(params?.offset ?? 0));
+    return get<{ requests: IntranetScopeRequest[]; total: number }>(`/intranet/scope-requests?${sp}`);
+  },
+  createIntranetScopeRequest: (input: IntranetScopeRequestInput) =>
+    post<{ request: IntranetScopeRequest; created: boolean }>("/intranet/scope-requests", input),
+  approveIntranetScopeRequest: (id: number, note = "") =>
+    post<{ request: IntranetScopeRequest }>(`/intranet/scope-requests/${id}/approve`, { note }),
+  rejectIntranetScopeRequest: (id: number, note = "") =>
+    post<{ request: IntranetScopeRequest }>(`/intranet/scope-requests/${id}/reject`, { note }),
+  intranetHandoff: (input: IntranetHandoffInput) =>
+    post<{ task: Task; warnings?: string[] }>("/intranet/handoff", input),
+
+  // ---- Managed resources & port audit ----
+  managedResources: (params?: { kind?: string; status?: string; limit?: number; offset?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.kind) sp.set("kind", params.kind);
+    if (params?.status) sp.set("status", params.status);
+    sp.set("limit", String(params?.limit ?? 100));
+    sp.set("offset", String(params?.offset ?? 0));
+    return get<{ resources: ManagedResource[]; total: number }>(`/managed-resources?${sp}`);
+  },
+  releaseManagedResource: (id: number) =>
+    post<{ released: boolean; resource?: ManagedResource }>(`/managed-resources/${id}/release`, {}),
+  auditLocalPorts: () => get<PortAuditResult>("/managed-resources/audit"),
 
   // ---- LLM records ----
   llmRecords: (params?: { model?: string; session?: string; task?: string; page?: number; size?: number }) => {

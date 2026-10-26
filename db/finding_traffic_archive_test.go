@@ -19,7 +19,7 @@ func TestFindingTrafficLegacyArchiveDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	if err = d.EnsureLLMRecordsTable(); err != nil {
 		t.Fatal(err)
 	}
@@ -32,11 +32,16 @@ func TestFindingTrafficLegacyArchiveDefaults(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID); d.DeleteTask(task.ID) }()
+			var findingID int64
+			defer func() {
+				_, _ = d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID)
+				purgeTaskNow(t, d, task.ID, findingID)
+			}()
 			f, err := d.Exploration(task.ExplorationID).RecordFinding(t.Context(), RecordFindingInput{TaskID: task.ID, ExplorationID: task.ExplorationID, Summary: "legacy", Severity: "low"})
 			if err != nil {
 				t.Fatal(err)
 			}
+			findingID = f.FindingID
 			if err = d.SetPaused(task.ID, true); err != nil {
 				t.Fatal(err)
 			}

@@ -125,7 +125,7 @@ func TestTaskArchiveDatabaseRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	if err := d.EnsureLLMRecordsTable(); err != nil {
 		t.Fatal(err)
 	}
@@ -162,8 +162,11 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 		_, _ = d.Exec(`DELETE FROM llm_usage WHERE task_id=$1 OR exploration_id=$2`, fmt.Sprint(task.ID), task.ExplorationID)
 		_, _ = d.Exec(`DELETE FROM skill_usage WHERE task_id=$1 OR exploration_id=$2`, task.ID, task.ExplorationID)
 		_, _ = d.Exec(`DELETE FROM tool_usage WHERE task_id=$1 OR exploration_id=$2`, task.ID, task.ExplorationID)
+		// purgeTaskNow leaves llm_records alone because a fresh test database may
+		// not have the table at all — it is created lazily. This test created it.
+		_, _ = d.Exec(`DELETE FROM llm_records WHERE COALESCE(task_id,'')=$1`, fmt.Sprint(task.ID))
 		_, _ = d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID)
-		_ = d.DeleteTask(task.ID)
+		purgeTaskNow(t, d, task.ID)
 		_, _ = d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, llmProfileID)
 		_, _ = d.Exec(`DELETE FROM companies WHERE id=$1`, companyID)
 	}()
@@ -352,7 +355,7 @@ func TestTaskArchiveBlockersIgnoreQueuedDependents(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	source, err := d.CreateTaskWithOptions("archive blocker source", "source", TaskCreateOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -361,13 +364,13 @@ func TestTaskArchiveBlockersIgnoreQueuedDependents(t *testing.T) {
 		SourceTaskIDs: []int64{source.ID},
 	})
 	if err != nil {
-		_ = d.DeleteTask(source.ID)
+		purgeTaskNow(t, d, source.ID)
 		t.Fatal(err)
 	}
 	defer func() {
 		_, _ = d.Exec(`DELETE FROM task_archives WHERE task_id IN ($1,$2)`, source.ID, dependent.ID)
-		_ = d.DeleteTask(dependent.ID)
-		_ = d.DeleteTask(source.ID)
+		purgeTaskNow(t, d, dependent.ID)
+		purgeTaskNow(t, d, source.ID)
 	}()
 
 	blockers, err := d.TaskArchiveBlockers()
@@ -397,14 +400,14 @@ func TestRecoverInterruptedArchiveRequiresManualRetry(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { _ = d.Close() })
 	task, err := d.CreateTaskWithOptions("interrupted archive", "must not restart automatically", TaskCreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
 		_, _ = d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID)
-		_ = d.DeleteTask(task.ID)
+		purgeTaskNow(t, d, task.ID)
 	}()
 	if err := d.SetPaused(task.ID, true); err != nil {
 		t.Fatal(err)

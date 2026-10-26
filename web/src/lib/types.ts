@@ -505,6 +505,9 @@ export interface Finding {
   summary: string;
   evidence: string;
   report?: string; // 详细报告(Markdown);仅详情接口返回,列表为空
+  // 原始 HTTP 报文(PoC 原文);非 HTTP 漏洞或未采集时为空。
+  http_request?: string;
+  http_response?: string;
   intent_id?: string;
   param_id?: string;
   task_id?: string;
@@ -528,6 +531,9 @@ export interface FindingGroup {
   task_name?: string; // 可选任务名称;空/缺省=未命名
   task_description: string;
   task_status: string;
+  // 无 LLM 漏扫任务分组:task_id 为空时由 scan_task_id 归属。
+  scan_task_id?: number | null;
+  scan_task_name?: string;
   count: number;
   critical: number;
   high: number;
@@ -538,6 +544,29 @@ export interface FindingGroup {
 
 export interface FindingGroupsPage {
   items: FindingGroup[];
+  total: number;
+  finding_total: number;
+  page: number;
+  page_size: number;
+}
+
+// FindingSystemGroup 是「按任务 → 系统」视图里的一个系统桶(host:port 或裸主机)。
+export interface FindingSystemGroup {
+  system: string;
+  label: string;
+  host?: string;
+  port?: number;
+  service?: string;
+  count: number;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  last_found_at: string;
+}
+
+export interface FindingSystemsPage {
+  items: FindingSystemGroup[];
   total: number;
   finding_total: number;
   page: number;
@@ -581,10 +610,13 @@ export interface FindingQuery {
   status?: "all" | FindingStatus;
   vulnclass?: string;
   task?: string; // 任务 id;"all"/空 = 不按任务筛选
+  scanTaskId?: string; // 漏扫任务 id;空 = 不按漏扫任务筛选
   query?: string;
   sort?: "severity" | "time";
   // 资产树节点 key;选中一个节点 = 选中它的整棵子树。空 = 不按资产筛选。
   assetScope?: string;
+  // 系统 key(svc:<host>:<port> / host:<host> / __none__);空 = 不按系统筛选。
+  system?: string;
 }
 
 // ---- Findings by asset (资产视图) ----
@@ -831,6 +863,27 @@ export interface BatchControlItem {
   error?: string;
 }
 
+// 批量删除任务的逐任务结果。deleted / *_deleted 计数与单任务删除接口一致，
+// ok=false 时 error/status 说明这条为什么没删掉（例如仍有 Agent 在跑）。
+export interface DeleteTaskBatchItem extends DeleteTaskResult {
+  ok: boolean;
+  error?: string;
+  status?: number;
+}
+
+export interface DeleteTasksBatchResult {
+  items: DeleteTaskBatchItem[];
+  deleted: number;
+  failed: number;
+  assets_deleted: number;
+  assets_detached: number;
+  traffic_deleted: number;
+  files_deleted: boolean;
+  findings_deleted: number;
+  llm_records_deleted: number;
+  cleanup_warnings?: string[];
+}
+
 // 批量改分类的逐任务结果。失败只可能是任务已被删除，分类本身的写入是原子的。
 export interface BatchCategoryItem {
   id: string;
@@ -983,6 +1036,9 @@ export interface Settings {
   // worker/主 agent/对话)由 noa 接管上下文压缩,取代内置 compaction;每 run 读一次,对
   // 之后启动的 run 生效。
   noa_compaction?: boolean;
+  // 确定性目标防护(工具调用范围/资产拦截)的运行时模式:strict|warn|off。
+  // 敏感信息外防不受此开关影响,始终强制拦截。
+  guard_enforcement?: "off" | "warn" | "strict";
   // ---- 漏洞 IM 推送（渠道本身是独立资源，见 /api/notify/*，这里只有三项全局配置）----
   notify_enabled?: boolean; // 推送总开关，默认开；用于维护期一键止血
   notify_public_base_url?: string; // 漏洞详情回链的外部访问地址；空=消息不带回链
@@ -1488,6 +1544,365 @@ export interface POCRunResponse {
   timed_out: boolean;
   template_count: number;
   target_count: number;
+}
+
+// ---- LLM-free automated scanning ----
+export type ScanMode = "auto" | "selected" | "full";
+export type ScanStatus = "queued" | "running" | "done" | "failed" | "canceled";
+export type ScanStage =
+  | "queued"
+  | "discover"
+  | "fingerprint"
+  | "match"
+  | "scan"
+  | "finalize"
+  | "done"
+  | "failed"
+  | "canceled";
+
+export interface ScanTask {
+  id: number;
+  name: string;
+  targets: string[];
+  mode: ScanMode;
+  poc_ids: number[];
+  ports: string;
+  min_severity: string;
+  fingerprint: boolean;
+  create_findings: boolean;
+  webshell_inject: boolean;
+  webshell_params: Record<string, unknown>;
+  rate_limit: number;
+  concurrency: number;
+  timeout_seconds: number;
+  status: ScanStatus;
+  stage: ScanStage;
+  progress: Record<string, number>;
+  summary: Record<string, unknown>;
+  log?: string;
+  error?: string;
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+}
+
+export interface ScanTaskInput {
+  name?: string;
+  targets: string[];
+  mode: ScanMode;
+  poc_ids?: number[];
+  ports: string;
+  min_severity?: string;
+  fingerprint: boolean;
+  create_findings: boolean;
+  webshell_inject?: boolean;
+  webshell_params?: Record<string, unknown>;
+  rate_limit?: number;
+  concurrency?: number;
+  timeout_seconds?: number;
+}
+
+export interface ScanAsset {
+  asset_id: number;
+  asset_type: string;
+  host: string;
+  url: string;
+  note: string;
+  status_code?: number;
+  page_title: string;
+  technologies: string[];
+  created_at: string;
+}
+
+export interface ScanResult {
+  id: number;
+  finding_id?: number;
+  template_id: string;
+  name: string;
+  severity: string;
+  host: string;
+  matched_at: string;
+  type: string;
+  curl_command?: string;
+  extracted: string[];
+  raw?: Record<string, unknown>;
+  finding_status?: string;
+  created_at: string;
+}
+
+// ---- Deep exploitation (verification / exploitation / WAF bypass / webshell) ----
+export type DeepTaskKind = "verify" | "exploit" | "waf_bypass" | "webshell_inject";
+export type DeepTaskStatus = "queued" | "running" | "done" | "failed" | "canceled";
+
+export interface DeepTask {
+  id: number;
+  name: string;
+  kind: DeepTaskKind;
+  target: string;
+  params: Record<string, unknown>;
+  status: DeepTaskStatus;
+  stage: string;
+  progress: Record<string, number>;
+  summary: Record<string, unknown>;
+  scan_task_id?: number;
+  auto_run: boolean;
+  log?: string;
+  error?: string;
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+}
+
+export interface DeepTaskInput {
+  name?: string;
+  kind: DeepTaskKind;
+  target: string;
+  params?: Record<string, unknown>;
+}
+
+export interface ExploitRecord {
+  id: number;
+  task_id: number;
+  mode: string;
+  template_id: string;
+  name: string;
+  severity: string;
+  target: string;
+  verdict: string;
+  status_code?: number;
+  request: string;
+  response: string;
+  extracted: string[];
+  curl_command?: string;
+  evidence: string;
+  elapsed_ms: number;
+  created_at: string;
+}
+
+export interface WAFBypassResult {
+  id: number;
+  task_id: number;
+  target: string;
+  waf_detected: boolean;
+  waf_vendor: string;
+  variant: string;
+  variant_desc: string;
+  method: string;
+  path: string;
+  status_code?: number;
+  resp_length: number;
+  verdict: string;
+  note: string;
+  created_at: string;
+}
+
+export interface ScanAutoResult {
+  tasks: DeepTask[];
+  records: ExploitRecord[];
+  waf_results: WAFBypassResult[];
+}
+
+export interface Webshell {
+  id: number;
+  name: string;
+  url: string;
+  shell_type: string;
+  password: string;
+  target: string;
+  source: string;
+  task_id?: number;
+  status: string;
+  note: string;
+  last_checked?: string;
+  last_output: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WebshellInput {
+  name?: string;
+  url: string;
+  shell_type?: string;
+  password?: string;
+  target?: string;
+  source?: string;
+  note?: string;
+}
+
+export interface JavaChainsStatus {
+  configured: boolean;
+  online: boolean;
+  url: string;
+  callback_host: string;
+  bind_host: string;
+  error?: string;
+}
+
+// ---- Intranet two-phase MVP: sessions / tunnels / scope approvals ----
+export interface IntranetSession {
+  id: number;
+  name: string;
+  webshell_id?: number;
+  task_id?: number;
+  host: string;
+  cwd: string;
+  status: "active" | "closed" | string;
+  last_seen?: string;
+  metadata: Record<string, unknown>;
+  note: string;
+  created_at: string;
+  updated_at: string;
+  webshell_name?: string;
+  webshell_url?: string;
+  shell_type?: string;
+}
+
+export interface IntranetSessionInput {
+  name?: string;
+  webshell_id: number;
+  task_id?: number;
+  host?: string;
+  cwd?: string;
+  note?: string;
+}
+
+export interface IntranetSessionEvent {
+  id: number;
+  session_id: number;
+  kind: string;
+  command: string;
+  output: string;
+  is_error: boolean;
+  created_at: string;
+}
+
+export interface IntranetExecResult {
+  output: string;
+  cwd?: string;
+  exit_code: number;
+  is_error: boolean;
+  note?: string;
+}
+
+export interface IntranetProbeInfo {
+  host?: string;
+  kernel?: string;
+  user?: string;
+  bins?: string[];
+  raw?: string;
+}
+
+export interface IntranetBatchItem {
+  session_id: number;
+  name: string;
+  result: IntranetExecResult;
+  error?: string;
+}
+
+export interface IntranetTunnel {
+  id: number;
+  name: string;
+  session_id?: number;
+  task_id?: number;
+  kind: "socks5" | "port_forward" | "reverse_forward" | string;
+  listen_host: string;
+  listen_port: number;
+  remote_host: string;
+  remote_port: number;
+  status: "planned" | "deployed" | "verified" | "failed" | "stopped" | string;
+  deploy_command: string;
+  verify_command: string;
+  teardown_command: string;
+  pid?: number;
+  evidence: string;
+  note: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface IntranetTunnelInput {
+  name?: string;
+  session_id: number;
+  task_id?: number;
+  kind?: string;
+  listen_host?: string;
+  listen_port: number;
+  remote_host?: string;
+  remote_port?: number;
+  deploy_command?: string;
+  verify_command?: string;
+  teardown_command?: string;
+  note?: string;
+}
+
+export interface IntranetScopeRequest {
+  id: number;
+  task_id: number;
+  host: string;
+  port: number;
+  reason: string;
+  session_id?: number;
+  status: "pending" | "approved" | "rejected" | string;
+  decided_note: string;
+  decided_at?: string;
+  created_at: string;
+}
+
+export interface IntranetScopeRequestInput {
+  task_id: number;
+  host: string;
+  port?: number;
+  reason?: string;
+  session_id?: number;
+}
+
+export interface IntranetHandoffInput {
+  from_task_id: number;
+  name?: string;
+  description?: string;
+  goal?: string;
+  session_ids?: number[];
+  tunnel_ids?: number[];
+}
+
+// ---- Managed resource ledger & port audit ----
+export type ManagedResourceKind = "callback" | "webshell" | "tunnel" | "listener";
+
+export interface ManagedResource {
+  id: number;
+  kind: ManagedResourceKind | string;
+  name: string;
+  endpoint: string;
+  target: string;
+  owner: string;
+  task_id?: number;
+  status: "active" | "released" | "expired" | string;
+  expires_at?: string;
+  released_at?: string;
+  metadata: Record<string, unknown>;
+  note: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PortListener {
+  proto: string;
+  address: string;
+  port: number;
+  pid?: number;
+  process?: string;
+  scope: "loopback" | "wildcard" | "interface" | string;
+  managed: boolean;
+  managed_id?: number;
+  managed_kind?: string;
+  platform: boolean;
+}
+
+export interface PortAuditResult {
+  checked_at: string;
+  listeners: PortListener[];
+  unmanaged: PortListener[];
+  allow_ports: number[];
 }
 
 // ---- Command recording (Bash execution history) ----
