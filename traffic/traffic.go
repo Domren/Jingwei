@@ -2049,7 +2049,7 @@ func (t *Traffic) Tools() []actool.CoreTool {
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"host":          map[string]any{"type": "string", "description": "按主机过滤（必填；如 '107.172.96.177'、'107.172.96.177:8082' 或 'http://107.172.96.177:8082/path'）"},
+				"host":          map[string]any{"type": "string", "description": "按主机过滤（必填；如 '203.0.113.10'、'203.0.113.10:8082' 或 'http://203.0.113.10:8082/path'）"},
 				"contains":      map[string]any{"type": "string", "description": "URL 子串过滤（可选，如 'api' / 'login'）"},
 				"body_contains": map[string]any{"type": "string", "description": "正文全文搜索（可选，至少 3 个字符），匹配请求/响应的头与正文，如 'password' / 'root:x:0' / '内网测试'"},
 				"limit":         map[string]any{"type": "integer", "description": "每页条数，默认 3，最大 10"},
