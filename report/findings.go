@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/db"
 )
 
 // 发现页「导出」用的渲染:把一批 findings 表行渲染成汇总 Markdown、单条 Markdown、
@@ -207,4 +207,21 @@ func findingTrafficMarkdown(f *db.DBFinding, attachments bool) string {
 	}
 	out.WriteString("\n")
 	return out.String()
+}
+
+// screenshotBase64 strips a leading data: URL prefix (if any) so callers get
+// raw base64-encoded PNG bytes.
+func screenshotBase64(data string) string {
+	if i := strings.Index(data, ","); i >= 0 && strings.HasPrefix(data, "data:") {
+		return data[i+1:]
+	}
+	return data
+}
+
+// screenshotDataURL normalizes a stored base64 PNG into a usable data: URL.
+func screenshotDataURL(data string) string {
+	if strings.HasPrefix(data, "data:") {
+		return data
+	}
+	return "data:image/png;base64," + data
 }

@@ -40,6 +40,7 @@ func (s *Server) webuiHandler() http.Handler {
 				return
 			}
 		}
+		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeFileFS(w, r, root, "index.html")
 	})
 }
@@ -55,6 +56,19 @@ func serveFileIfExists(w http.ResponseWriter, r *http.Request, fsys fs.FS, name 
 	if statErr != nil || st.IsDir() {
 		return false
 	}
+	setWebuiCache(w, name)
 	http.ServeFileFS(w, r, fsys, name)
 	return true
+}
+
+// setWebuiCache 设置前端资源缓存策略：HTML 不缓存（保证改版后浏览器拿到最新
+// chunk 引用，不再因启发式缓存停留在旧页面）；_next 静态资源按内容哈希命名，
+// 可长缓存。其余（favicon 等）保持默认。
+func setWebuiCache(w http.ResponseWriter, name string) {
+	switch {
+	case strings.HasSuffix(name, ".html"):
+		w.Header().Set("Cache-Control", "no-cache")
+	case strings.HasPrefix(name, "_next/static/"):
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
 }

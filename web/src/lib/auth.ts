@@ -1,4 +1,4 @@
-const TOKEN_KEY = "artex_token";
+const TOKEN_KEY = "jingwei_token";
 const COOKIE_MAX_AGE = 7 * 24 * 60 * 60; // 7 天（秒）
 
 export interface CurrentUser {

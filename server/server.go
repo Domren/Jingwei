@@ -20,24 +20,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/artex/llmpool"
-	"github.com/Autumn-27/artex/llmrec"
-	"github.com/Autumn-27/artex/report"
-	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/jingwei/agent"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/intercept"
+	"github.com/Autumn-27/jingwei/llmpool"
+	"github.com/Autumn-27/jingwei/llmrec"
+	"github.com/Autumn-27/jingwei/report"
+	"github.com/Autumn-27/jingwei/traffic"
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
 )
 
-// BuildVersion is the backend application version, injected from cmd/artex at
+// BuildVersion is the backend application version, injected from cmd/jingwei at
 // startup (which in turn gets it from -ldflags "-X main.version=<tag>").
 // Defaults to "dev" for local builds. Exposed to the frontend via GET /api/health.
 var BuildVersion = "dev"
 
-// Server exposes the ARTEX backend over a JSON HTTP API for the shadcn/ui
+// Server exposes the Jingwei backend over a JSON HTTP API for the shadcn/ui
 // frontend.
 type Server struct {
 	scheduleMu  sync.Mutex
@@ -843,9 +843,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/asset-tree", s.findingAssetTree)
 	mux.HandleFunc("GET /api/exploration/findings/stats", s.findingStats)
 	mux.HandleFunc("GET /api/exploration/findings/export", s.findingsExport)
+	mux.HandleFunc("GET /api/exploration/findings/ids", s.findingIDs)
 	s.registerFindingTraffic(mux)
 	mux.HandleFunc("GET /api/exploration/findings/{id}", s.getFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
+	mux.HandleFunc("GET /api/exploration/findings/{id}/events", s.listFindingReviewEvents)
+	mux.HandleFunc("GET /api/exploration/findings/{id}/screenshots", s.listFindingScreenshots)
+	mux.HandleFunc("POST /api/exploration/findings/{id}/screenshots", s.addFindingScreenshot)
+	mux.HandleFunc("POST /api/exploration/findings/{id}/screenshot/auto", s.autoFindingScreenshot)
+	mux.HandleFunc("POST /api/exploration/findings/{id}/screenshot/page", s.pageFindingScreenshot)
+	mux.HandleFunc("POST /api/exploration/findings/screenshots/auto", s.autoFindingScreenshots)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/retests", s.listFindingRetests)
 	mux.HandleFunc("GET /api/exploration/findings/retests/active", s.listActiveFindingRetests)
@@ -871,6 +878,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/gc", s.gc)
 	mux.HandleFunc("GET /api/traffic", s.getTraffic)
 	mux.HandleFunc("GET /api/traffic/hosts", s.getTrafficHosts)
+	// 请求重发：把改过的原始报文按字节发出去，响应回给前端（不落库，落库走抓包代理）。
+	s.registerRepeater(mux)
 	mux.HandleFunc("DELETE /api/traffic", s.deleteTraffic)
 	mux.HandleFunc("DELETE /api/traffic/hosts", s.deleteTrafficHosts)
 	mux.HandleFunc("DELETE /api/traffic/all", s.deleteAllTraffic)
@@ -910,6 +919,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/deep/webshells/{id}", s.updateWebshell)
 	mux.HandleFunc("DELETE /api/deep/webshells/{id}", s.deleteWebshell)
 	mux.HandleFunc("POST /api/deep/webshells/{id}/check", s.checkWebshell)
+	// 凭据库：全局凭据视图（跨任务）
+	mux.HandleFunc("GET /api/deep/credentials", s.listGlobalCredentials)
 	mux.HandleFunc("POST /api/deep/webshells/{id}/exec", s.execWebshellCommand)
 	mux.HandleFunc("GET /api/deep/java-chains/status", s.javaChainsStatus)
 	// 内网两阶段 MVP：会话 / 隧道 / 范围审批 / 任务交接（与 agent 工具共用数据）
@@ -1010,12 +1021,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/mcp/{id}", s.pgDeleteMCP)
 	mux.HandleFunc("GET /api/mcp/{id}/tools", s.pgMCPTools)
 	mux.HandleFunc("POST /api/mcp/{id}/refresh", s.pgRefreshMCP)
-	// 资产同步 — ScopeSentry 数据源
-	mux.HandleFunc("GET /api/sync/scopesentry/status", s.syncSSStatus)
-	mux.HandleFunc("POST /api/sync/scopesentry/datasource", s.syncSSDatasource)
-	mux.HandleFunc("GET /api/sync/scopesentry/projects", s.syncSSProjects)
-	mux.HandleFunc("GET /api/sync/scopesentry/tasks", s.syncSSTasks)
-	mux.HandleFunc("POST /api/sync/scopesentry/sync", s.syncSSRun)
 	// Skill CRUD (文件系统)
 	mux.HandleFunc("GET /api/skills", s.fsListSkills)
 	mux.HandleFunc("POST /api/skills", s.fsCreateSkill)
@@ -2355,7 +2360,7 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	stage, err := os.MkdirTemp("", "artex-finding-export-")
+	stage, err := os.MkdirTemp("", "jingwei-finding-export-")
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -2380,6 +2385,12 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 	// 空报告用确定性模板兜底；已有报告中缺失原始 HTTP 报文时补到 POC。
 	for _, f := range fs {
 		f.Report = report.CompleteFindingReport(f)
+	}
+	// HTML/DOCX 报告内嵌取证截图（base64 PNG）；加载失败不阻断导出，仅告警。
+	if format == "html" || format == "docx" {
+		if err := s.attachFindingScreenshots(fs); err != nil {
+			log.Printf("[export] 加载取证截图失败: %v", err)
+		}
 	}
 	now := time.Now()
 	// 毫秒后缀避免同一秒内多次导出(例如两个漏扫任务接连导出)互相覆盖。
@@ -2559,18 +2570,30 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Status    *string `json:"status"`
-		Severity  *string `json:"severity"`
-		Name      *string `json:"name"`
-		VulnClass *string `json:"vulnclass"`
+		Status    *string  `json:"status"`
+		Severity  *string  `json:"severity"`
+		Name      *string  `json:"name"`
+		VulnClass *string  `json:"vulnclass"`
+		CVSS      *float64 `json:"cvss"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
-	if body.Status == nil && body.Severity == nil && body.Name == nil && body.VulnClass == nil {
-		writeErr(w, 400, "nothing to update: provide status/severity/name/vulnclass")
+	if body.Status == nil && body.Severity == nil && body.Name == nil && body.VulnClass == nil && body.CVSS == nil {
+		writeErr(w, 400, "nothing to update: provide status/severity/name/vulnclass/cvss")
 		return
+	}
+	if body.CVSS != nil {
+		if *body.CVSS < 0 || *body.CVSS > 10 {
+			writeErr(w, 400, "bad cvss: must be 0.0-10.0")
+			return
+		}
+		if _, err := s.m.pg.SetFindingCVSS(id, *body.CVSS); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		_ = s.m.pg.RecordFindingReviewEvent(id, "cvss", "operator", "", "", fmt.Sprintf("%.1f", *body.CVSS))
 	}
 	if body.Status != nil {
 		if !db.ValidFindingStatus(*body.Status) {
@@ -2592,6 +2615,7 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		if !notified && from != *body.Status {
 			log.Printf("[notify] 状态变更事件未登记 finding=%d %s→%s（状态已更新）", id, from, *body.Status)
 		}
+		_ = s.m.pg.RecordFindingReviewEvent(id, "status", "operator", "", from, *body.Status)
 	}
 	if body.Severity != nil {
 		if !db.ValidSeverity(*body.Severity) {
@@ -2607,6 +2631,7 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 404, "finding not found")
 			return
 		}
+		_ = s.m.pg.RecordFindingReviewEvent(id, "severity", "operator", "", "", *body.Severity)
 	}
 	if body.Name != nil {
 		n, err := s.m.pg.SetFindingName(id, strings.TrimSpace(*body.Name))
@@ -2618,6 +2643,7 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 404, "finding not found")
 			return
 		}
+		_ = s.m.pg.RecordFindingReviewEvent(id, "name", "operator", "", "", strings.TrimSpace(*body.Name))
 	}
 	if body.VulnClass != nil {
 		n, err := s.m.pg.SetFindingVulnClass(id, strings.TrimSpace(*body.VulnClass))
@@ -2629,6 +2655,7 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 404, "finding not found")
 			return
 		}
+		_ = s.m.pg.RecordFindingReviewEvent(id, "vulnclass", "operator", "", "", strings.TrimSpace(*body.VulnClass))
 	}
 	f, err := s.m.pg.GetFinding(id)
 	if err != nil {
@@ -2640,6 +2667,122 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, findingFromDB(f, s.resolveAssetIDs(f.AssetIDs)))
+}
+
+// listFindingReviewEvents returns a finding's operator review timeline.
+func (s *Server) listFindingReviewEvents(w http.ResponseWriter, r *http.Request) {
+	id := int64(atoiDefault(r.PathValue("id"), 0))
+	if id <= 0 {
+		writeErr(w, 400, "bad finding id")
+		return
+	}
+	events, err := s.m.pg.ListFindingReviewEvents(id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"events": events})
+}
+
+// listFindingScreenshots returns a finding's evidence screenshots (data omitted).
+func (s *Server) listFindingScreenshots(w http.ResponseWriter, r *http.Request) {
+	id := int64(atoiDefault(r.PathValue("id"), 0))
+	if id <= 0 {
+		writeErr(w, 400, "bad finding id")
+		return
+	}
+	withData := r.URL.Query().Get("with_data") == "1"
+	shots, err := s.m.pg.ListFindingScreenshots(id, withData)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"screenshots": shots})
+}
+
+// addFindingScreenshot attaches a base64 PNG evidence screenshot to a finding.
+func (s *Server) addFindingScreenshot(w http.ResponseWriter, r *http.Request) {
+	id := int64(atoiDefault(r.PathValue("id"), 0))
+	if id <= 0 {
+		writeErr(w, 400, "bad finding id")
+		return
+	}
+	var body struct {
+		Caption string `json:"caption"`
+		Data    string `json:"data"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, 400, "bad json: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(body.Data) == "" {
+		writeErr(w, 400, "data 不能为空（base64 PNG）")
+		return
+	}
+	if len(body.Data) > 8<<20 {
+		writeErr(w, 400, "截图过大（上限 8MB base64）")
+		return
+	}
+	sid, err := s.m.pg.AddFindingScreenshot(id, body.Caption, body.Data)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 201, map[string]any{"id": sid})
+}
+
+// attachFindingScreenshots bulk-loads evidence screenshots (base64 PNG) for a
+// batch of findings and fills DBFinding.Screenshots, so the HTML/DOCX report
+// can inline them. A missing screenshot for any single finding is a no-op;
+// a load failure is logged by the caller rather than aborting the export.
+func (s *Server) attachFindingScreenshots(fs []*db.DBFinding) error {
+	if len(fs) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(fs))
+	for _, f := range fs {
+		ids = append(ids, f.ID)
+	}
+	byID, err := s.m.pg.ListFindingScreenshotsForFindings(ids)
+	if err != nil {
+		return err
+	}
+	for _, f := range fs {
+		if shots, ok := byID[f.ID]; ok {
+			f.Screenshots = orderFindingScreenshots(shots)
+		}
+	}
+	return nil
+}
+
+// orderFindingScreenshots puts evidence in reading order and drops exact
+// duplicates: 报文取证（面板）→ 页面取证 → 人工上传。同一张图（字节相同）只留
+// 一次——重复补拍不该让报告里出现两张一模一样的图。
+func orderFindingScreenshots(shots []db.FindingScreenshot) []db.FindingScreenshot {
+	rank := func(caption string) int {
+		c := strings.TrimSpace(caption)
+		switch {
+		case strings.HasPrefix(c, "自动取证"), strings.Contains(c, "报文取证"):
+			return 0
+		case strings.HasPrefix(c, "页面取证"):
+			return 1
+		default:
+			return 2
+		}
+	}
+	sort.SliceStable(shots, func(i, j int) bool { return rank(shots[i].Caption) < rank(shots[j].Caption) })
+	seen := make(map[string]struct{}, len(shots))
+	out := make([]db.FindingScreenshot, 0, len(shots))
+	for _, s := range shots {
+		if s.Data != "" {
+			if _, dup := seen[s.Data]; dup {
+				continue
+			}
+			seen[s.Data] = struct{}{}
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // deleteFinding removes a finding (findings row + originating exploration node).
@@ -2665,6 +2808,21 @@ func (s *Server) deleteFinding(w http.ResponseWriter, r *http.Request) {
 // maxFindingDeleteBatch caps one batch request so a mistaken "select everything"
 // cannot lock a huge slice of the findings table in a single transaction.
 const maxFindingDeleteBatch = 500
+
+// findingIDs 返回当前筛选条件下所有匹配的 finding id（上限 maxFindingDeleteBatch），
+// 供前端「全选所有」后批量删除使用。
+func (s *Server) findingIDs(w http.ResponseWriter, r *http.Request) {
+	store := s.pg(w)
+	if store == nil {
+		return
+	}
+	ids, err := store.ListFindingIDs(findingFilterFromQuery(r.URL.Query()), maxFindingDeleteBatch)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ids": ids, "count": len(ids)})
+}
 
 // deleteFindingsBatch removes the listed findings in one transaction. ids are the
 // standalone findings-table ids (DTO finding_id), the same handles the single
@@ -3647,16 +3805,19 @@ func (s *Server) settingsPayload() map[string]any {
 		db.SettingCredentialAgent:   s.m.pg.GetBool(db.SettingCredentialAgent, false),
 		db.SettingCredentialTraffic: s.m.pg.GetBool(db.SettingCredentialAgent, false) && s.m.pg.GetBool(db.SettingCredentialTraffic, false),
 		"llm_record":                s.m.LLMRecordEnabled(),
-		"web_search_enabled":        on,
-		"web_search_backend":        backend,
-		"brave_key_set":             strings.TrimSpace(braveKey) != "",
-		"tavily_key_set":            strings.TrimSpace(tavilyKey) != "",
-		"web_search_proxy":          proxy,                       // 独立出口代理(http/https/socks5)，空=直连
-		"global_proxy":              s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
-		"python_interpreter":        strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
-		"workers":                   s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
-		"task_concurrency_enabled":  concOn,                      // 任务并发上限开关(默认关)
-		"task_concurrency_limit":    concLimit,                   // 同时运行任务上限(开启后默认5)
+		// 自动标题（默认关）：会话/任务建好后用一次 LLM 调用起个可读名字。
+		db.SettingTaskAutoTitle:    s.m.pg.GetBool(db.SettingTaskAutoTitle, false),
+		db.SettingChatAutoTitle:    s.m.pg.GetBool(db.SettingChatAutoTitle, false),
+		"web_search_enabled":       on,
+		"web_search_backend":       backend,
+		"brave_key_set":            strings.TrimSpace(braveKey) != "",
+		"tavily_key_set":           strings.TrimSpace(tavilyKey) != "",
+		"web_search_proxy":         proxy,                       // 独立出口代理(http/https/socks5)，空=直连
+		"global_proxy":             s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
+		"python_interpreter":       strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
+		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
+		"task_concurrency_enabled": concOn,                      // 任务并发上限开关(默认关)
+		"task_concurrency_limit":   concLimit,                   // 同时运行任务上限(开启后默认5)
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
 		// 自动切到下一个配置。bind_fallback 仅在轮询开启时有意义(默认关)。
 		"llm_pool_enabled":       s.m.LLMPoolEnabled(),
@@ -3730,6 +3891,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		CredentialAgent     *bool `json:"credential_agent_enabled"`
 		CredentialTraffic   *bool `json:"credential_traffic_binding"`
 		LLMRecord           *bool `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
+		// 自动标题开关（默认关）：会话标题、任务名称各一个，保存即生效。
+		TaskAutoTitle *bool `json:"task_auto_title_enabled"`
+		ChatAutoTitle *bool `json:"chat_auto_title_enabled"`
 		// Web search. WebSearchEnabled/Backend toggle the tool + backend; BraveKey/TavilyKey
 		// are optional — omit (null) to leave a stored key untouched, send "" to clear.
 		WebSearchEnabled *bool   `json:"web_search_enabled"`
@@ -3860,6 +4024,19 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	if req.LLMRecord != nil {
 		// 录制器每次调用读取该标志，切换即时生效，无需 applyLLM 重建。
 		if err := s.m.SetLLMRecordEnabled(*req.LLMRecord); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	// 自动标题：两个开关都即时生效（各自的写入点每次都读库）。
+	if req.TaskAutoTitle != nil {
+		if err := s.m.pg.SetBool(db.SettingTaskAutoTitle, *req.TaskAutoTitle); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.ChatAutoTitle != nil {
+		if err := s.m.pg.SetBool(db.SettingChatAutoTitle, *req.ChatAutoTitle); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -4309,4 +4486,9 @@ func atoiDefault(s string, d int) int {
 		return n
 	}
 	return d
+}
+
+// queryInt reads an integer query parameter with a fallback.
+func queryInt(r *http.Request, name string, def int) int {
+	return atoiDefault(r.URL.Query().Get(name), def)
 }

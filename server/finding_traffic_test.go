@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/jingwei/agent"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/traffic"
 )
 
 func trafficEvidenceServer(t *testing.T) (*Server, *db.RecordedFinding, func(string, string, string) *httptest.ResponseRecorder) {
@@ -621,10 +621,15 @@ func purgeTaskNow(t *testing.T, pg *db.DB, taskID int64, findingIDs ...int64) {
 		args  []any
 	}
 	var snapshotIDs []string
-	if err := pg.QueryRow(`SELECT COALESCE(array_agg(DISTINCT b.snapshot_id), '{}'::text[])::text[]
+	// pgx's database/sql layer hands text[] back as a string, so aggregate to
+	// JSON and decode it here instead of scanning the array directly.
+	var snapshotJSON string
+	if err := pg.QueryRow(`SELECT COALESCE(json_agg(DISTINCT b.snapshot_id), '[]'::json)::text
 FROM finding_traffic_bindings b JOIN findings f ON f.id=b.finding_id WHERE `+ownedFindings,
-		taskID, findingIDs).Scan(&snapshotIDs); err != nil {
+		taskID, findingIDs).Scan(&snapshotJSON); err != nil {
 		t.Logf("读取夹具快照失败(task=%d): %v", taskID, err)
+	} else if err := json.Unmarshal([]byte(snapshotJSON), &snapshotIDs); err != nil {
+		t.Logf("解析夹具快照失败(task=%d): %v", taskID, err)
 	}
 	for _, step := range []sweepStep{
 		// The payload carries the task even after the finding row is gone, so

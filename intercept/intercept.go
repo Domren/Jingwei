@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/db"
 )
 
 // ctxKey is the unexported context key type to avoid collisions.
@@ -139,7 +139,8 @@ type Interceptor struct {
 	cached       []compiledRule  // sorted by priority DESC; nil means not loaded yet
 	enabledTools map[string]bool // nil means not loaded yet
 	pending      *pendingManager
-	reviewer     Reviewer // nil = LLM fallback judge not wired
+	reviewer     Reviewer        // nil = LLM fallback judge not wired
+	exemptions   *ExemptionStore // time-limited auto-approve (一键放行)
 }
 
 // SetReviewer installs the LLM fallback judge callback. Passing nil disables it.
@@ -160,7 +161,7 @@ var defaultEnabledTools = []string{
 // New creates an Interceptor backed by d. The rule cache is lazy-loaded on
 // first use.
 func New(d *db.DB) *Interceptor {
-	return &Interceptor{db: d, pending: newPendingManager()}
+	return &Interceptor{db: d, pending: newPendingManager(), exemptions: NewExemptionStore()}
 }
 
 // Invalidate clears the in-memory rule cache and the enabled-tools cache.
@@ -734,4 +735,23 @@ func (i *Interceptor) Decide(pendingID int64, allowed bool) error {
 	}
 	i.pending.resolve(pendingID, allowed)
 	return nil
+}
+
+// ApproveWithExemption approves a pending request AND creates a time-limited
+// exemption so similar future calls are auto-approved. 一键放行：审批一次，
+// 2/4/8 小时内同类调用不再弹窗。deny 不支持豁免。
+func (i *Interceptor) ApproveWithExemption(pendingID int64, tool, input string, duration time.Duration) error {
+	if duration <= 0 {
+		duration = 2 * time.Hour
+	}
+	if err := i.Decide(pendingID, true); err != nil {
+		return err
+	}
+	i.exemptions.Add(tool, input, duration, "一键放行")
+	return nil
+}
+
+// CheckExemption returns true if a non-expired exemption covers this tool+input.
+func (i *Interceptor) CheckExemption(tool, input string) (Exemption, bool) {
+	return i.exemptions.Check(tool, input)
 }

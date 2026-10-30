@@ -50,6 +50,8 @@ import type {
   FindingGroupsPage,
   FindingQuery,
   FindingRetest,
+  FindingReviewEvent,
+  FindingScreenshot,
   FindingStats,
   FindingSystemsPage,
   FindingStatus,
@@ -109,8 +111,6 @@ import type {
   Severity,
   SkillCall,
   SkillItem,
-  SSProject,
-  SSTask,
   Stats,
   Task,
   TaskArchive,
@@ -147,7 +147,7 @@ import type {
 
 function getToken(): string | null {
   if (typeof window === "undefined") return null;
-  return localStorage.getItem("artex_token");
+  return localStorage.getItem("jingwei_token");
 }
 
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
@@ -163,8 +163,8 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (r.status === 401) {
     if (typeof window !== "undefined") {
-      localStorage.removeItem("artex_token");
-      document.cookie = "artex_token=; path=/; max-age=0";
+      localStorage.removeItem("jingwei_token");
+      document.cookie = "jingwei_token=; path=/; max-age=0";
       window.location.href = "/login";
     }
     throw new Error("未授权");
@@ -648,6 +648,10 @@ export const api = {
     p.set("limit", String(q.pageSize));
     return get<FindingsPage>(`/exploration/findings?${p.toString()}`);
   },
+  findingIDs: (q: Omit<FindingQuery, "page" | "pageSize">) => {
+    const p = findingFilterParams(q);
+    return get<{ ids: number[]; count: number }>(`/exploration/findings/ids?${p.toString()}`);
+  },
   findingGroups: (q: FindingQuery) => {
     const p = findingFilterParams(q);
     p.set("page", String(q.page));
@@ -678,9 +682,9 @@ export const api = {
     get<FindingCaseDetail>(
       `/exploration/finding-cases/${id}${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,
     ),
-  findingCaseMembers: (id: string, page = 1, contextTask?: string) =>
+  findingCaseMembers: (id: string, page = 1, pageSize = 20, contextTask?: string) =>
     get<FindingsPage>(
-      `/exploration/finding-cases/${id}/members?page=${page}&limit=20${contextTask ? `&context_task=${encodeURIComponent(contextTask)}` : ""}`,
+      `/exploration/finding-cases/${id}/members?page=${page}&limit=${pageSize}${contextTask ? `&context_task=${encodeURIComponent(contextTask)}` : ""}`,
     ),
   removeFindingCaseMember: (id: string, fid: string, reason: string) =>
     http<{ ok: boolean }>(`/exploration/finding-cases/${id}/members/${fid}`, {
@@ -821,8 +825,29 @@ export const api = {
   // 一次保存漏洞的名称/类别/严重等级(发现列表行内编辑用),只传出现的字段。
   updateFinding: (
     id: string,
-    fields: { name?: string; vulnclass?: string; severity?: Severity; status?: FindingStatus },
+    fields: { name?: string; vulnclass?: string; severity?: Severity; status?: FindingStatus; cvss?: number },
   ) => patch<Finding>(`/exploration/findings/${id}`, fields),
+  // 设置 CVSS 基础分(0.0-10.0),后端会留一条复核时间线事件。
+  setFindingCvss: (id: string, cvss: number) => patch<Finding>(`/exploration/findings/${id}`, { cvss }),
+  // 复核时间线:该漏洞的处置留痕(状态/等级/CVSS 变更)。
+  findingEvents: (id: string) =>
+    get<{ events: FindingReviewEvent[] }>(`/exploration/findings/${encodeURIComponent(id)}/events`).then((r) =>
+      arr(r.events),
+    ),
+  // 取证截图列表;withData=true 时返回 base64 数据用于展示。
+  findingScreenshots: (id: string, withData = false) =>
+    get<{ screenshots: FindingScreenshot[] }>(
+      `/exploration/findings/${encodeURIComponent(id)}/screenshots${withData ? "?with_data=1" : ""}`,
+    ).then((r) => arr(r.screenshots)),
+  // 上传一张取证截图(base64 PNG)。
+  addFindingScreenshot: (id: string, caption: string, data: string) =>
+    post<{ id: number }>(`/exploration/findings/${encodeURIComponent(id)}/screenshots`, { caption, data }),
+  // 自动取证:用该漏洞已绑定的真实报文渲染一张取证面板(带北京时间时钟 + 命中高亮)。
+  autoFindingScreenshot: (id: string) =>
+    post<{ id: number }>(`/exploration/findings/${encodeURIComponent(id)}/screenshot/auto`),
+  // 页面取证:用无头浏览器打开目标地址,把渲染后的页面截成图(用户看到的页面)。
+  pageFindingScreenshot: (id: string) =>
+    post<{ id: number }>(`/exploration/findings/${encodeURIComponent(id)}/screenshot/page`),
   // 删除漏洞:移除 findings 记录 + 来源探索节点(从发现列表/任务发现 Tab/探索图一并消失)。
   deleteFinding: (id: string) => del<{ deleted: boolean; id: number }>(`/exploration/findings/${id}`),
   // 批量删除:一次事务删掉勾选的全部漏洞，deleted 为实际删除条数（已消失的会被跳过）。
@@ -962,6 +987,28 @@ export const api = {
         (opts.order ? `&order=${encodeURIComponent(opts.order)}` : ""),
     ),
   trafficExchange: (id: string) => get<TrafficDetail>(`/traffic/exchange?id=${encodeURIComponent(id)}`),
+  // 请求重发：把改过的报文按字节发给目标，返回原始响应（不落库，落库走抓包代理）。
+  repeaterSend: (payload: {
+    method?: string;
+    url: string;
+    headers?: Record<string, string>;
+    body?: string;
+    timeout_ms?: number;
+    insecure_skip_verify?: boolean;
+    use_recording_proxy?: boolean;
+  }) =>
+    post<{
+      status: number;
+      status_text: string;
+      proto: string;
+      headers: Record<string, string[]>;
+      body: string;
+      body_truncated: boolean;
+      body_bytes: number;
+      elapsed_ms: number;
+      url: string;
+      error?: string;
+    }>("/repeater/send", payload),
   trafficHosts: () => get<{ hosts: TrafficHost[] }>(`/traffic/hosts`),
   trafficDeleteHost: (host: string) => del<{ deleted: number }>(`/traffic?host=${encodeURIComponent(host)}`),
   trafficDeleteHosts: (hosts: string[]) => del<{ deleted: number }>(`/traffic/hosts`, { hosts }),
@@ -1281,35 +1328,6 @@ export const api = {
   mcpTools: (id: number) => get<{ tools: MCPTool[] }>(`/mcp/${id}/tools`).then((r) => arr(r.tools)),
   refreshMcpServer: (id: number) => post<{ tools: MCPTool[] }>(`/mcp/${id}/refresh`, {}).then((r) => arr(r.tools)),
 
-  // ---- 资产同步 (ScopeSentry 数据源) ----
-  ssStatus: () =>
-    get<{ exists: boolean; configured: boolean; enabled: boolean; reachable: boolean; url?: string; tools: string[] }>(
-      "/sync/scopesentry/status",
-    ),
-  ssDatasource: (body: { url?: string; api_key?: string }) =>
-    post<{ id: number; enabled: boolean }>("/sync/scopesentry/datasource", body),
-  ssProjects: (page = 1, size = 50, search = "") =>
-    get<{ projects: SSProject[]; tag: Record<string, number> }>(
-      `/sync/scopesentry/projects?page=${page}&size=${size}${search ? `&search=${encodeURIComponent(search)}` : ""}`,
-    ).then((r) => ({ projects: arr(r.projects), tag: r.tag ?? {} })),
-  ssTasks: (page = 1, size = 50, search = "") =>
-    get<{ tasks: SSTask[] }>(
-      `/sync/scopesentry/tasks?page=${page}&size=${size}${search ? `&search=${encodeURIComponent(search)}` : ""}`,
-    ).then((r) => arr(r.tasks)),
-  ssSync: (body: {
-    dimension: "project" | "task";
-    targets: string[];
-    asset_types: string[];
-    create_company?: boolean;
-    page_size?: number;
-  }) =>
-    post<{
-      synced: Record<string, number>;
-      companies: string[] | null;
-      warnings: string[] | null;
-      errors: string[] | null;
-    }>("/sync/scopesentry/sync", body),
-
   // ---- skills (文件系统) ----
   skills: () => get<{ skills: SkillItem[] }>("/skills").then((r) => arr(r.skills)),
   createSkill: (s: {
@@ -1531,6 +1549,8 @@ export const api = {
   checkWebshell: (id: number) =>
     post<{ alive: boolean; status: string; note: string }>(`/deep/webshells/${id}/check`, {}),
   execWebshell: (id: number, command: string) => post<{ output: string }>(`/deep/webshells/${id}/exec`, { command }),
+  // 凭据库：全局凭据视图（跨任务）
+  globalCredentials: () => get<IntelligencePage>("/deep/credentials"),
 
   // ---- 内网两阶段：会话 / 隧道 / 范围审批 / 交接 ----
   intranetSessions: (params?: { status?: string; task_id?: number; limit?: number; offset?: number }) => {

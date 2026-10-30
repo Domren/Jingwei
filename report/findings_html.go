@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/db"
 )
 
 // FindingsHTMLOptions controls the print-ready HTML report.
@@ -121,6 +121,11 @@ padding:10mm 6mm;border-top:8px solid var(--brand)}
 .finding h4{font-size:11.5pt;margin:16px 0 6px;color:var(--brand)}
 .steps{margin:6px 0 0;padding-left:20px}
 .steps li{margin:4px 0}
+.repro{margin:6px 0 0}
+.repro-step{border:1px solid var(--line);border-left:3px solid var(--brand);border-radius:6px;padding:10px 12px;margin:10px 0;break-inside:avoid}
+.repro-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:2px}
+.repro-no{background:var(--brand);color:#fff;border-radius:4px;padding:1px 8px;font-size:8.5pt;font-weight:700}
+.repro-tag{color:var(--muted);font-size:9pt}
 details{margin:6px 0 10px}
 summary{cursor:pointer;color:var(--brand);font-weight:600;font-size:9.5pt}
 .tag{display:inline-block;background:var(--brand-soft);color:var(--brand);border-radius:4px;padding:0 6px;font-size:8.5pt;margin-right:4px}
@@ -269,11 +274,17 @@ func writeFindingHTML(b *strings.Builder, f *db.DBFinding, number string) {
 	b.WriteString(`<h4>漏洞概述</h4>`)
 	fmt.Fprintf(b, `<p>%s</p>`, h(nz(strings.TrimSpace(f.Summary), "（未填写概述，详见下方证据与验证数据）")))
 
-	b.WriteString(`<h4>验证步骤</h4><ol class="steps">`)
-	for _, step := range steps {
-		fmt.Fprintf(b, `<li>%s</li>`, h(step))
+	// 有结构化复现就按它渲染（步骤各自带报文），否则回退到从证据重构的验证步骤。
+	repro := buildReproView(f)
+	if repro != nil {
+		writeReproductionHTML(b, repro)
+	} else {
+		b.WriteString(`<h4>验证步骤</h4><ol class="steps">`)
+		for _, step := range steps {
+			fmt.Fprintf(b, `<li>%s</li>`, h(step))
+		}
+		b.WriteString(`</ol>`)
 	}
-	b.WriteString(`</ol>`)
 
 	if len(data) > 0 {
 		b.WriteString(`<h4>验证数据</h4><table><thead><tr><th style="width:24%">项目</th><th>值</th></tr></thead><tbody>`)
@@ -283,38 +294,22 @@ func writeFindingHTML(b *strings.Builder, f *db.DBFinding, number string) {
 		b.WriteString(`</tbody></table>`)
 	}
 
-	hasPackets := strings.TrimSpace(f.HTTPRequest) != "" || strings.TrimSpace(f.HTTPResponse) != ""
-	packetHeading, reqTitle, respTitle, missingNote := packetLabels(in, hasPackets)
-	b.WriteString(`<h4>` + packetHeading + `</h4>`)
-	if !hasPackets {
-		b.WriteString(`<p class="muted">` + h(missingNote) + `</p>`)
-	} else {
-		req, reqTrunc := truncateHTMLPacket(f.HTTPRequest)
-		resp, respTrunc := truncateHTMLPacket(f.HTTPResponse)
-		fmt.Fprintf(b, `<details open><summary>%s</summary>`, reqTitle)
-		if req == "" {
-			b.WriteString(`<p class="muted">未采集到请求报文。</p>`)
-		} else {
-			fmt.Fprintf(b, `<pre class="http">%s</pre>`, h(req))
-			if reqTrunc {
-				b.WriteString(`<p class="muted small">请求报文过长，页面仅展示前 192 KiB；完整字节见证据包。</p>`)
-			}
-		}
-		fmt.Fprintf(b, `</details><details open><summary>%s</summary>`, respTitle)
-		if resp == "" {
-			b.WriteString(`<p class="muted">未采集到响应报文。</p>`)
-		} else {
-			fmt.Fprintf(b, `<pre class="http">%s</pre>`, h(resp))
-			if respTrunc {
-				b.WriteString(`<p class="muted small">响应报文过长，页面仅展示前 192 KiB；完整字节见证据包。</p>`)
-			}
-		}
-		b.WriteString(`</details>`)
+	// 结构化复现的每一步已经带了自己的真实报文；只有它没覆盖到抓包字节时才额外
+	// 输出主报文，避免同一份报文在报告里出现两遍。
+	if repro == nil || !repro.anyFromPacket() {
+		writeFindingPacketsHTML(b, f, in)
 	}
 
 	if e := strings.TrimSpace(sanitizeEvidence(f.Evidence)); e != "" {
 		b.WriteString(`<h4>证据</h4>`)
 		fmt.Fprintf(b, `<pre class="evidence">%s</pre>`, h(truncateText(e, 20000)))
+	}
+	if len(f.Screenshots) > 0 {
+		b.WriteString(`<h4>取证截图</h4>`)
+		for i, shot := range f.Screenshots {
+			cap := h(nz(shot.Caption, "取证截图"))
+			fmt.Fprintf(b, `<figure style="margin:8px 0 16px;break-inside:avoid"><img src="%s" alt="%s" style="max-width:100%%;border:1px solid var(--line);border-radius:6px"/><figcaption class="muted small">图 %d · %s</figcaption></figure>`, screenshotDataURL(shot.Data), cap, i+1, cap)
+		}
 	}
 	if len(f.TrafficBindings) > 0 {
 		b.WriteString(`<h4>关联流量证据</h4><ul class="small">`)
@@ -514,4 +509,44 @@ func truncateHTMLPacket(s string) (string, bool) {
 		return s, false
 	}
 	return s[:limit], true
+}
+
+// writeFindingPacketsHTML renders the finding's primary captured exchange. It is
+// the fallback path: once a structured reproduction covers the packets per step,
+// printing the same bytes again here would only pad the report.
+func writeFindingPacketsHTML(b *strings.Builder, f *db.DBFinding, in FindingReportInput) {
+	hasPackets := strings.TrimSpace(f.HTTPRequest) != "" || strings.TrimSpace(f.HTTPResponse) != ""
+	packetHeading, reqTitle, respTitle, missingNote := packetLabels(in, hasPackets)
+	b.WriteString(`<h4>` + packetHeading + `</h4>`)
+	if !hasPackets {
+		b.WriteString(`<p class="muted">` + h(missingNote) + `</p>`)
+		return
+	}
+	req, reqTrunc := truncateHTMLPacket(f.HTTPRequest)
+	// 响应包只保留「响应头 + 命中漏洞片段」，避免整页 HTML/JSON 噪音进入报告。
+	reqStart, _, reqBody, _ := parseMessageHead(f.HTTPRequest)
+	reqTarget := ""
+	if fields := strings.Fields(reqStart); len(fields) > 1 {
+		reqTarget = fields[1]
+	}
+	resp, respTrunc := clipHTTPResponseForReport(f.VulnClass, f.Name, reqTarget, reqBody, f.HTTPResponse)
+	fmt.Fprintf(b, `<details open><summary>%s</summary>`, reqTitle)
+	if req == "" {
+		b.WriteString(`<p class="muted">未采集到请求报文。</p>`)
+	} else {
+		fmt.Fprintf(b, `<pre class="http">%s</pre>`, h(req))
+		if reqTrunc {
+			b.WriteString(`<p class="muted small">请求报文过长，页面仅展示前 192 KiB；完整字节见证据包。</p>`)
+		}
+	}
+	fmt.Fprintf(b, `</details><details open><summary>%s</summary>`, respTitle)
+	if resp == "" {
+		b.WriteString(`<p class="muted">未采集到响应报文。</p>`)
+	} else {
+		fmt.Fprintf(b, `<pre class="http">%s</pre>`, h(resp))
+		if respTrunc {
+			b.WriteString(`<p class="muted small">响应报文过长，页面仅展示前 192 KiB；完整字节见证据包。</p>`)
+		}
+	}
+	b.WriteString(`</details>`)
 }

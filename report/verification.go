@@ -212,10 +212,14 @@ var (
 	xssEvidenceRE      = regexp.MustCompile(`(?is)<script[^>]{0,200}>[^<]{0,300}(?:alert|prompt|confirm|document\.cookie)[^<]{0,300}</script>|<svg[^>]{0,200}onload[^>]{0,200}>|<img[^>]{0,200}onerror[^>]{0,200}>`)
 	cmdEvidenceRE      = regexp.MustCompile(`(?i)uid=\d+\([^)]*\)\s*gid=\d+\([^)]*\)[^\r\n<]{0,80}|nt authority\\system`)
 	fileEvidenceRE     = regexp.MustCompile(`(?is)root:x:0:0:[^\r\n<]{0,120}|\[boot loader\][^\r\n<]{0,80}|\[extensions\][^\r\n<]{0,80}`)
-	uploadEvidenceRE   = regexp.MustCompile(`(?i)[^<>]{0,60}(?:succesfully|successfully) uploaded[^<]{0,60}`)
+	uploadEvidenceRE   = regexp.MustCompile(`(?i)[^<>]{0,60}(?:succes+fully\s+uploaded|uploaded\s+succes+fully|upload(?:ed)?\s+success\w*)[^<]{0,60}`)
 	authEvidenceRE     = regexp.MustCompile(`(?i)(?:you have logged in as|welcome to the password protected area|logged in)[^<]{0,80}`)
 	csrfEvidenceRE     = regexp.MustCompile(`(?i)Password Changed\.?|Passwords do not match\.?`)
 	genericTagRE       = regexp.MustCompile(`(?s)<[^>]*>`)
+	// genericEvidenceRE is the last resort when the finding's class matches none
+	// of the type-specific markers: it catches the shapes that prove a finding
+	// on their own (a uid, a credential, a key, a flag).
+	genericEvidenceRE = regexp.MustCompile(`(?i)uid=\d+\([^)]*\)|root:x:0:0:|flag\{[^}]{1,80}\}|jdbc:[^"'\s]{4,120}|AKID[0-9A-Za-z]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|password\s*[:=]\s*\S{3,}|token\s*[:=]\s*\S{6,}`)
 )
 
 // isSessionFinding reports whether the response cookie itself is the proof.
@@ -228,10 +232,12 @@ func isSessionFinding(vulnClass, name string) bool {
 // vulnerability instead of quoting the document preamble. Scan findings carry an
 // extractor value; agent findings do not, so the excerpt is located from the
 // recorded response using class-appropriate markers and reflected input.
-func evidenceExcerpt(vulnClass, name, reqTarget, reqBody, respBody string) string {
+// evidenceRange 返回命中证据在响应体中的字节区间 [start,end)；未命中返回 (-1,-1)。
+// 抽出来供「报告裁剪响应报文」复用，避免整页 HTML/JSON 噪音进入报告。
+func evidenceRange(vulnClass, name, reqTarget, reqBody, respBody string) (int, int) {
 	body := toValidText(respBody)
 	if strings.TrimSpace(body) == "" {
-		return ""
+		return -1, -1
 	}
 	class := strings.ToLower(vulnClass + " " + name)
 	var markers []*regexp.Regexp
@@ -259,29 +265,118 @@ func evidenceExcerpt(vulnClass, name, reqTarget, reqBody, respBody string) strin
 	}
 	var fallback []*regexp.Regexp
 	if len(markers) == 0 {
-		fallback = []*regexp.Regexp{blindSQLEvidenceRE, sqlHashEvidenceRE, sqlEvidenceRE, xssEvidenceRE, cmdEvidenceRE, fileEvidenceRE, uploadEvidenceRE, authEvidenceRE, csrfEvidenceRE}
+		// 类别没匹配上任何专属标记时才用通用特征兜底：类别明确（例如 SQL）却
+		// 没命中专属标记时，硬套通用规则容易在一整页 HTML 里随便圈一段，那比
+		// 不标更糟——报告里的高亮必须是"证据"，不能是噪音。
+		fallback = []*regexp.Regexp{blindSQLEvidenceRE, sqlHashEvidenceRE, sqlEvidenceRE, xssEvidenceRE, cmdEvidenceRE, fileEvidenceRE, uploadEvidenceRE, authEvidenceRE, csrfEvidenceRE, genericEvidenceRE}
 	}
 	if reflectFirst {
 		if idx, payload := reflectedInput(reqTarget, reqBody, body); idx >= 0 {
-			return snippetAt(body, idx, idx+len(payload), 160)
+			return idx, idx + len(payload)
 		}
 	}
 	for _, re := range markers {
 		if loc := re.FindStringIndex(body); loc != nil {
-			return snippetAt(body, loc[0], loc[1], 160)
+			return loc[0], loc[1]
 		}
 	}
 	if !reflectFirst {
 		if idx, payload := reflectedInput(reqTarget, reqBody, body); idx >= 0 {
-			return snippetAt(body, idx, idx+len(payload), 160)
+			return idx, idx + len(payload)
 		}
 	}
 	for _, re := range fallback {
 		if loc := re.FindStringIndex(body); loc != nil {
-			return snippetAt(body, loc[0], loc[1], 160)
+			return loc[0], loc[1]
 		}
 	}
+	return -1, -1
+}
+
+// NormalizeEvidenceText makes a captured packet safe to render: NUL bytes are
+// dropped and invalid UTF-8 is replaced. Renderers must use the same text they
+// match against, otherwise a highlight lands on the wrong byte.
+func NormalizeEvidenceText(s string) string { return toValidText(s) }
+
+// EvidenceMatchRange reports where in the response body the vulnerability
+// evidence shows up, so the forensic screenshot can highlight exactly the part
+// that proves the finding instead of dumping a whole page of HTML.
+func EvidenceMatchRange(vulnClass, name, reqTarget, reqBody, respBody string) (int, int, bool) {
+	start, end := evidenceRange(vulnClass, name, reqTarget, reqBody, respBody)
+	if start < 0 || end <= start {
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
+// evidenceExcerpt 是 evidenceRange 的可读形态：命中位置附近的短片段。
+func evidenceExcerpt(vulnClass, name, reqTarget, reqBody, respBody string) string {
+	body := toValidText(respBody)
+	if strings.TrimSpace(body) == "" {
+		return ""
+	}
+	if start, end := evidenceRange(vulnClass, name, reqTarget, reqBody, body); start >= 0 {
+		return snippetAt(body, start, end, 160)
+	}
 	return visibleExcerpt(body, 160)
+}
+
+// clipHTTPResponseForReport 把 HTTP 响应裁剪为「响应头 + 命中片段」，避免报告里
+// 出现整页 HTML/JSON 噪音（用户只看命中漏洞的那一块）。命中片段由 evidenceRange
+// 定位，保留前后各 ctx 字节；定位不到时保留响应体首尾摘要。返回裁剪文本与是否裁剪。
+func clipHTTPResponseForReport(vulnClass, name, reqTarget, reqBody, rawResponse string) (string, bool) {
+	raw := strings.TrimSpace(toValidText(rawResponse))
+	if raw == "" {
+		return "", false
+	}
+	sep := "\r\n\r\n"
+	idx := strings.Index(raw, sep)
+	if idx < 0 {
+		sep = "\n\n"
+		idx = strings.Index(raw, sep)
+	}
+	if idx < 0 {
+		if len(raw) <= 4096 {
+			return raw, false
+		}
+		return truncateText(raw, 4096), true
+	}
+	head := raw[:idx+len(sep)]
+	body := raw[idx+len(sep):]
+	const bodyKeep = 8000
+	if len(body) <= bodyKeep {
+		return raw, false
+	}
+	var b strings.Builder
+	b.WriteString(head)
+	if start, end := evidenceRange(vulnClass, name, reqTarget, reqBody, body); start >= 0 {
+		const ctx = 800
+		from := start - ctx
+		if from < 0 {
+			from = 0
+		}
+		to := end + ctx
+		if to > len(body) {
+			to = len(body)
+		}
+		if from > 0 {
+			fmt.Fprintf(&b, "…（前略 %d 字节）…\n", from)
+		}
+		b.WriteString(body[from:to])
+		if to < len(body) {
+			fmt.Fprintf(&b, "\n…（后略 %d 字节，完整报文见证据包 ZIP）", len(body)-to)
+		}
+		return b.String(), true
+	}
+	const headKeep, tailKeep = 2000, 500
+	if len(body) > headKeep+tailKeep {
+		b.WriteString(body[:headKeep])
+		fmt.Fprintf(&b, "\n…（中间省略 %d 字节，完整报文见证据包 ZIP）…\n", len(body)-headKeep-tailKeep)
+		b.WriteString(body[len(body)-tailKeep:])
+	} else {
+		b.WriteString(body)
+	}
+	return b.String(), true
 }
 
 // reflectedInput finds the longest request parameter value echoed verbatim in

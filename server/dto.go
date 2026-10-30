@@ -6,12 +6,12 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/traffic"
 )
 
 // DTO/serialization layer: each handler emits EXACTLY the frontend's spec shapes
-// (artex/web/src/lib/types.ts). These reshape db package structs so the
+// (jingwei/web/src/lib/types.ts). These reshape db package structs so the
 // internal DB model never leaks over the API. The db structs and the frontend are
 // the canonical contracts; this file maps one onto the other.
 
@@ -316,18 +316,21 @@ type FindingDTO struct {
 	ReportStale           bool                       `json:"report_stale"`
 	TrafficBindings       []db.FindingTrafficBinding `json:"traffic_bindings,omitempty"`
 
-	ID        string `json:"id"`
-	FindingID string `json:"finding_id,omitempty"` // standalone findings-table id — the handle for status updates
-	VulnClass string `json:"vulnclass"`
-	Name      string `json:"name,omitempty"` // 漏洞名称;为空时前端回退展示 vulnclass
-	Severity  string `json:"severity"`       // critical | high | medium | low
-	Status    string `json:"status"`         // pending | in_progress | confirmed | resolved | fixed | false_positive | ignored | duplicate | risk_accepted
-	Summary   string `json:"summary"`
-	Evidence  string `json:"evidence"`
-	Report    string `json:"report,omitempty"` // 详细报告(Markdown);仅详情接口返回,列表为空
+	ID        string   `json:"id"`
+	FindingID string   `json:"finding_id,omitempty"` // standalone findings-table id — the handle for status updates
+	VulnClass string   `json:"vulnclass"`
+	Name      string   `json:"name,omitempty"` // 漏洞名称;为空时前端回退展示 vulnclass
+	Severity  string   `json:"severity"`       // critical | high | medium | low
+	CVSS      *float64 `json:"cvss,omitempty"` // CVSS v3.1 基础分
+	Status    string   `json:"status"`         // pending | in_progress | confirmed | resolved | fixed | false_positive | ignored | duplicate | risk_accepted
+	Summary   string   `json:"summary"`
+	Evidence  string   `json:"evidence"`
+	Report    string   `json:"report,omitempty"` // 详细报告(Markdown);仅详情接口返回,列表为空
 	// 原始 HTTP 报文(PoC 原文);非 HTTP 漏洞或未采集时为空。
 	HTTPRequest  string `json:"http_request,omitempty"`
 	HTTPResponse string `json:"http_response,omitempty"`
+	// 结构化复现过程(agent 落库时就地记录);为空时前端/报告回退到重构的验证步骤。
+	Reproduction *db.Reproduction `json:"reproduction,omitempty"`
 
 	IntentID        string            `json:"intent_id,omitempty"`
 	ParamID         string            `json:"param_id,omitempty"`
@@ -461,12 +464,14 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 		VulnClass:   f.VulnClass,
 		Name:        f.Name,
 		Severity:    f.Severity,
+		CVSS:        f.CVSS,
 		Status:      status,
 		Summary:     f.Summary,
 		Evidence:    f.Evidence,
 		Report:      f.Report,
 		HTTPRequest: f.HTTPRequest, HTTPResponse: f.HTTPResponse,
-		TS: rfc3339(f.CreatedAt),
+		Reproduction: f.Reproduction,
+		TS:           rfc3339(f.CreatedAt),
 	}
 	if f.ExportCaseID > 0 {
 		d.ID = "case:" + i64s(f.ExportCaseID)

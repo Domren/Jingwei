@@ -2411,13 +2411,6 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (seg[0] === "mcp" && seg[2] === "refresh") return { tools: D.mcpToolsById[Number(seg[1])] ?? [] };
   if (seg[0] === "mcp" && seg.length === 2 && m === "DELETE") return { deleted: Number(seg[1]) };
 
-  // ── scopesentry（demo：未配置）──
-  if (path === "/sync/scopesentry/status")
-    return { exists: false, configured: false, enabled: false, reachable: false, tools: [] };
-  if (path === "/sync/scopesentry/projects") return { projects: [], tag: {} };
-  if (path === "/sync/scopesentry/tasks") return { tasks: [] };
-  if (path === "/sync/scopesentry/sync") return { synced: {}, companies: null, warnings: null, errors: null };
-
   // ── skills ──
   if (path === "/skills" && m === "GET") return { skills: D.skills };
   if (path === "/skills/missing") return { missing: D.missingSkills };

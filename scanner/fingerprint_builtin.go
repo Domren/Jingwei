@@ -70,10 +70,19 @@ var fpRules = []fpRule{
 	{name: "ActiveMQ", tags: []string{"activemq"}, body: []string{"activemq"}},
 	{name: "Solr", tags: []string{"solr"}, body: []string{"solr"}},
 	{name: "Hadoop", tags: []string{"hadoop"}, body: []string{"hadoop"}},
-	{name: "Flask", tags: []string{"flask", "python"}, headers: map[string][]string{"server": {"werkzeug"}}},
-	{name: "Django", tags: []string{"django", "python"}, cookies: []string{"csrftoken", "django_language"}},
+	{name: "Flask", tags: []string{"flask", "python"}, headers: map[string][]string{"server": {"werkzeug", "gunicorn"}}},
+	{name: "Django", tags: []string{"django", "python"}, cookies: []string{"csrftoken", "django_language"}, headers: map[string][]string{"server": {"gunicorn", "wsgiserver"}}},
 	{name: "FastAPI", tags: []string{"fastapi", "python"}, headers: map[string][]string{"server": {"uvicorn"}}},
+	{name: "Gunicorn", tags: []string{"gunicorn", "python", "wsgi", "flask"}, headers: map[string][]string{"server": {"gunicorn"}}},
+	{name: "uWSGI", tags: []string{"uwsgi", "python", "wsgi"}, headers: map[string][]string{"server": {"uwsgi"}}},
+	{name: "Jinja2", tags: []string{"jinja2", "ssti", "python", "flask"}, headers: map[string][]string{"server": {"gunicorn", "werkzeug"}}, body: []string{"jinja2", "template not found", "jinja"}},
+	{name: "Twisted", tags: []string{"twisted", "python"}, headers: map[string][]string{"server": {"twistedweb"}}},
+	{name: "Tornado", tags: []string{"tornado", "python"}, headers: map[string][]string{"server": {"tornadoserver"}}},
 	{name: "Ruby on Rails", tags: []string{"rails", "ruby"}, headers: map[string][]string{"x-powered-by": {"phusion passenger"}, "server": {"puma"}}},
+	{name: "Express", tags: []string{"express", "node", "nodejs"}, headers: map[string][]string{"x-powered-by": {"express"}}},
+	{name: "Node.js", tags: []string{"node", "nodejs"}, headers: map[string][]string{"x-powered-by": {"node", "express"}, "server": {"node"}}},
+	{name: "CherryPy", tags: []string{"cherrypy", "python"}, headers: map[string][]string{"server": {"cherrypy"}}},
+	{name: "Go net/http", tags: []string{"go", "golang"}, headers: map[string][]string{"server": {"go", "golang"}}},
 }
 
 // DetectTechnologies matches response headers/cookies/body against the curated
@@ -296,24 +305,33 @@ func MatchTemplates(techs []string, metas []TemplateMeta) []int64 {
 			}
 		}
 	}
-	if len(aliases) == 0 {
-		return nil
-	}
+	// 无指纹时回退到通用 dast 模板（动态应用安全测试类，如反射型 SSTI/XSS 等
+	// 无需特定产品指纹、对任意 Web 目标都该跑的一类），避免"指纹识别失败=全量跳过"。
+	fallbackDAST := len(aliases) == 0
 	ids := []int64{}
 	for _, m := range metas {
 		matched := false
-		for _, tag := range m.Tags {
-			if aliases[normToken(tag)] {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			tokens := tokenize(m.TemplateID + " " + m.Name)
-			for t := range tokens {
-				if aliases[t] {
+		if fallbackDAST {
+			for _, tag := range m.Tags {
+				if normToken(tag) == "dast" {
 					matched = true
 					break
+				}
+			}
+		} else {
+			for _, tag := range m.Tags {
+				if aliases[normToken(tag)] {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				tokens := tokenize(m.TemplateID + " " + m.Name)
+				for t := range tokens {
+					if aliases[t] {
+						matched = true
+						break
+					}
 				}
 			}
 		}

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/agent"
+	"github.com/Autumn-27/jingwei/db"
 )
 
 type goalSpec struct {
@@ -47,6 +47,9 @@ func (s *Server) startTaskEngine(t *Task) {
 	}
 	s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
 		Summary: "第 0 轮目标拆解"})
+	// #96 LLM 前置：规划前先跑一次资产发现 + POC 初筛，结果落资产库和事实节点，
+	// 让 planner 从结构化侦察结果出发，而不是仅凭目标文本猜测（先探测后渗透）。
+	s.prescanTask(ctx, t)
 	goals := s.createGoals(ctx, t, func(r db.Activity) {
 		s.engine.emitActivity(t, r)
 	})

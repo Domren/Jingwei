@@ -2,7 +2,15 @@
 
 import * as React from "react";
 
-import { CpuIcon, FlaskConicalIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon } from "lucide-react";
+import {
+  CpuIcon,
+  FlaskConicalIcon,
+  KeyboardIcon,
+  RadioTowerIcon,
+  SearchIcon,
+  ShieldAlertIcon,
+  SparklesIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -48,6 +56,10 @@ export default function SystemSettingsPage() {
   // 操作约束注入范围(默认都开)。
   const [injectPlanner, setInjectPlanner] = React.useState(true);
   const [injectWorker, setInjectWorker] = React.useState(true);
+  // 自动标题（默认关）：会话标题 / 任务名称。
+  const [chatAutoTitle, setChatAutoTitle] = React.useState(false);
+  const [taskAutoTitle, setTaskAutoTitle] = React.useState(false);
+  const [savingAutoTitle, setSavingAutoTitle] = React.useState(false);
   // 实验功能:noa 上下文压缩(默认关)。
   const [noaCompaction, setNoaCompaction] = React.useState(false);
   // 纯前端偏好：不走 /api/settings，直接读写 localStorage。
@@ -57,6 +69,8 @@ export default function SystemSettingsPage() {
     setCredentialAgent(!!s.credential_agent_enabled);
     setCredentialBinding(!!s.credential_traffic_binding);
     setIntelligenceEnabled(!!s.task_intelligence_enabled);
+    setChatAutoTitle(!!s.chat_auto_title_enabled);
+    setTaskAutoTitle(!!s.task_auto_title_enabled);
     setTrafficCapture(!!s.traffic_capture);
     setAgentTrafficBinding(!!s.agent_traffic_binding);
     setWebSearch(!!s.web_search_enabled);
@@ -526,6 +540,72 @@ export default function SystemSettingsPage() {
                 />
               </Field>
             ) : null}
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <SparklesIcon className="size-4" />
+              自动标题
+            </CardTitle>
+            <CardDescription>
+              默认关闭。开启后，会话与任务在建好后各调用一次模型，用第一段输入生成
+              10–30 字的标题，替代「新对话」「未命名任务」。生成失败或超时不影响会话与任务本身，
+              异步补写；这期间你手动改过的名字不会被覆盖。每次约多花一次短调用。
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Field orientation="horizontal">
+              <FieldContent>
+                <FieldLabel htmlFor="chat-auto-title">会话标题</FieldLabel>
+                <FieldDescription>
+                  对话第一句发出后，用模型生成会话标题；先用首行占位，生成成功再替换。
+                </FieldDescription>
+              </FieldContent>
+              <Switch
+                id="chat-auto-title"
+                checked={chatAutoTitle}
+                disabled={!loaded || savingAutoTitle}
+                onCheckedChange={async (value) => {
+                  setSavingAutoTitle(true);
+                  try {
+                    const settings = await api.setSettings({ chat_auto_title_enabled: value });
+                    setChatAutoTitle(!!settings.chat_auto_title_enabled);
+                    toast.success(value ? "会话自动标题已开启" : "会话自动标题已关闭");
+                  } catch (error) {
+                    toast.error("保存失败：" + (error as Error).message);
+                  } finally {
+                    setSavingAutoTitle(false);
+                  }
+                }}
+              />
+            </Field>
+            <Field orientation="horizontal" className="mt-5">
+              <FieldContent>
+                <FieldLabel htmlFor="task-auto-title">任务名称</FieldLabel>
+                <FieldDescription>
+                  编排 Agent 新建任务时，用任务描述与目标生成名称；同样异步、失败不影响建任务。
+                </FieldDescription>
+              </FieldContent>
+              <Switch
+                id="task-auto-title"
+                checked={taskAutoTitle}
+                disabled={!loaded || savingAutoTitle}
+                onCheckedChange={async (value) => {
+                  setSavingAutoTitle(true);
+                  try {
+                    const settings = await api.setSettings({ task_auto_title_enabled: value });
+                    setTaskAutoTitle(!!settings.task_auto_title_enabled);
+                    toast.success(value ? "任务自动命名已开启" : "任务自动命名已关闭");
+                  } catch (error) {
+                    toast.error("保存失败：" + (error as Error).message);
+                  } finally {
+                    setSavingAutoTitle(false);
+                  }
+                }}
+              />
+            </Field>
           </CardContent>
         </Card>
 

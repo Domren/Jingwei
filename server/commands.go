@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/db"
 )
 
 // pgListCommands returns tool executions (any tool) from the activity table.

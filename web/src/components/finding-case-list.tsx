@@ -122,6 +122,7 @@ export function FindingCaseMembers({
   renderRecords?: (items: Finding[]) => React.ReactNode;
 }) {
   const [page, setPage] = React.useState(1);
+  const [pageSize, setPageSize] = React.useState(20);
   const [data, setData] = React.useState<{ items: Finding[]; total: number } | null>(null);
   const [error, setError] = React.useState("");
   const [retry, setRetry] = React.useState(0);
@@ -130,7 +131,7 @@ export function FindingCaseMembers({
     let active = true;
     setError("");
     api
-      .findingCaseMembers(caseId, page, contextTask)
+      .findingCaseMembers(caseId, page, pageSize, contextTask)
       .then((v) => {
         if (active) setData(v);
       })
@@ -140,7 +141,7 @@ export function FindingCaseMembers({
     return () => {
       active = false;
     };
-  }, [caseId, page, version, contextTask, retry]);
+  }, [caseId, page, pageSize, version, contextTask, retry]);
   if (error)
     return (
       <Alert>
@@ -173,14 +174,17 @@ export function FindingCaseMembers({
               matched={!matchedIds || matchedIds.includes(Number(f.finding_id))}
             />
           ))}
-      {data.total > 20 ? (
+      {data.total > pageSize ? (
         <TablePagination
           page={page}
-          pageSize={20}
+          pageSize={pageSize}
           total={data.total}
           onPageChange={setPage}
-          onPageSizeChange={() => setPage(1)}
-          pageSizeOptions={[20]}
+          onPageSizeChange={(s) => {
+            setPageSize(s);
+            setPage(1);
+          }}
+          pageSizeOptions={[20, 50, 100, 200]}
         />
       ) : null}
     </div>
@@ -350,6 +354,7 @@ export function FindingCaseList({
   onTotal?: (total: number) => void;
 }) {
   const [page, setPage] = React.useState(1);
+  const [pageSize, setPageSize] = React.useState(20);
   const [data, setData] = React.useState<FindingCasePage | null>(null);
   const [error, setError] = React.useState("");
   const [refresh, setRefresh] = React.useState(0);
@@ -364,7 +369,7 @@ export function FindingCaseList({
     let timer: ReturnType<typeof setTimeout>;
     async function load() {
       try {
-        const v = await api.findingCases({ ...JSON.parse(key), page, pageSize: 20 });
+        const v = await api.findingCases({ ...JSON.parse(key), page, pageSize });
         if (active) {
           setData(v);
           setError("");
@@ -380,10 +385,19 @@ export function FindingCaseList({
       active = false;
       clearTimeout(timer);
     };
-  }, [key, page, refresh]);
+  }, [key, page, pageSize, refresh]);
   React.useEffect(() => {
     if (data) onTotal?.(data.total);
   }, [data, onTotal]);
+  // 当前页可勾选的 finding id（case 文件夹内部成员异步加载，不在此列）。
+  const pageIds = React.useMemo(
+    () => (data?.items ?? []).flatMap((row) => (row.finding ? [String(row.finding.finding_id ?? row.finding.id)] : [])),
+    [data],
+  );
+  const pageSelectedCount = pageIds.filter((id) => selectedIds?.has(id)).length;
+  let headerChecked: boolean | "indeterminate" = false;
+  if (pageIds.length > 0 && pageSelectedCount === pageIds.length) headerChecked = true;
+  else if (pageSelectedCount > 0) headerChecked = "indeterminate";
   return (
     <div className="flex min-w-0 flex-col gap-3">
       {!readOnly ? (
@@ -411,6 +425,18 @@ export function FindingCaseList({
         <p className="text-muted-foreground text-xs">
           {data.stats.total} 个独立漏洞 · {data.stats.reports} 条上报
         </p>
+      ) : null}
+      {data && !readOnly && pageIds.length > 0 ? (
+        <div className="flex items-center gap-2 border-b px-1 pb-2">
+          <Checkbox
+            checked={headerChecked}
+            onCheckedChange={(checked) => {
+              for (const id of pageIds) onSelect?.(id, checked === true);
+            }}
+            aria-label="选择当前页全部"
+          />
+          <span className="text-muted-foreground text-xs">全选当前页（{pageIds.length} 条）</span>
+        </div>
       ) : null}
       {data?.items.map((row) => {
         if (row.case) {
@@ -444,11 +470,14 @@ export function FindingCaseList({
       {data ? (
         <TablePagination
           page={page}
-          pageSize={20}
+          pageSize={pageSize}
           total={data.total}
           onPageChange={setPage}
-          onPageSizeChange={() => setPage(1)}
-          pageSizeOptions={[20]}
+          onPageSizeChange={(s) => {
+            setPageSize(s);
+            setPage(1);
+          }}
+          pageSizeOptions={[20, 50, 100, 200]}
         />
       ) : null}
     </div>

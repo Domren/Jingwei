@@ -636,7 +636,7 @@ const malformedIPAssetsSampled = 5
 
 // logAttributionWarning records a recompute warning in the server log. Every
 // recompute path calls it, so the warning is reported even for triggers with no
-// per-request response (company deletion, scopesentry sync, agent asset writes).
+// per-request response (company deletion, agent asset writes).
 func logAttributionWarning(warning string) {
 	if warning != "" {
 		log.Printf("[assets] %s", warning)

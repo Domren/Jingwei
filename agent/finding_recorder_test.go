@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/evidence"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/evidence"
 )
 
 type failingFindingRecorder struct{}
@@ -17,6 +17,10 @@ type failingFindingRecorder struct{}
 func (failingFindingRecorder) Record(context.Context, db.RecordFindingInput, []db.TrafficRef) (*db.RecordedFinding, error) {
 	return nil, errors.New("fixture persistence failed")
 }
+
+// report_finding rejects calls without a structured reproduction, so every
+// fixture body carries this minimal one.
+const reproFixture = `"reproduction":{"entry_point":"GET /fixture","steps":[{"request":"GET /fixture HTTP/1.1\r\nHost: 192.0.2.10\r\n\r\n","response":"HTTP/1.1 200 OK\r\n\r\nfixture","expected":"fixture endpoint answers","proves":"the fixture reproduces the finding"}]}`
 
 func TestReportFindingOptionalTrafficWithoutCapture(t *testing.T) {
 	d := testDB(t)
@@ -32,7 +36,7 @@ func TestReportFindingOptionalTrafficWithoutCapture(t *testing.T) {
 	notices := 0
 	ts.notifyFinding = func(int64, string) { notices++ }
 	for _, refs := range []string{"", `,"traffic_refs":[]`, `,"traffic_refs":null`} {
-		res, err := ts.addFinding().Call(t.Context(), json.RawMessage(`{"vulnclass":"TCP","severity":"low","summary":"verified TCP fixture","evidence":"command output proves the finding"`+refs+`}`), nil)
+		res, err := ts.addFinding().Call(t.Context(), json.RawMessage(`{"vulnclass":"TCP","severity":"low","summary":"verified TCP fixture","evidence":"command output proves the finding",`+reproFixture+refs+`}`), nil)
 		if err != nil || !strings.HasPrefix(res.Flatten(), "finding recorded: ") {
 			t.Fatalf("optional traffic rejected: %v %s", err, res.Flatten())
 		}
@@ -76,7 +80,7 @@ func TestReportFindingAtomicContract(t *testing.T) {
 		return res.Flatten()
 	}
 	ts.SetFindingRecorder(failingFindingRecorder{})
-	if got := call(`{"vulnclass":"TEST","summary":"fail","severity":"low","traffic_refs":[{"traffic_id":"x"}]}`); !strings.Contains(got, "persistence failed") {
+	if got := call(`{"vulnclass":"TEST","summary":"fail","severity":"low","evidence":"fixture request answered 200 and returned the marker","traffic_refs":[{"traffic_id":"x"}],` + reproFixture + `}`); !strings.Contains(got, "persistence failed") {
 		t.Fatal(got)
 	}
 	if notices != 0 || ts.writes.Findings != 0 {
@@ -85,13 +89,13 @@ func TestReportFindingAtomicContract(t *testing.T) {
 	ts.SetFindingRecorder(nil)
 	// An HTTP finding with no captured request cannot be replayed, so it is refused
 	// while the reporter is still untouched; no_raw_capture is the honest way out.
-	if got := call(`{"vulnclass":"TEST","summary":"no packets","severity":"low"}`); !strings.Contains(got, "逐字节重放") {
+	if got := call(`{"vulnclass":"TEST","summary":"no packets","severity":"low","evidence":"fixture request answered 200 and returned the marker",` + reproFixture + `}`); !strings.Contains(got, "逐字节重放") {
 		t.Fatal(got)
 	}
 	if notices != 0 || ts.writes.Findings != 0 {
 		t.Fatal("refused finding without packets was still recorded/notified")
 	}
-	got := call(`{"vulnclass":"TEST","summary":"legacy report","severity":"low","no_raw_capture":true}`)
+	got := call(`{"vulnclass":"TEST","summary":"legacy report","severity":"low","evidence":"fixture conclusion from command output","no_raw_capture":true,` + reproFixture + `}`)
 	lines := strings.SplitN(got, "\n", 2)
 	if len(lines) != 2 {
 		t.Fatal(got)
@@ -112,7 +116,7 @@ func TestReportFindingAtomicContract(t *testing.T) {
 	if f.Name != "TEST" {
 		t.Fatalf("name fallback = %q, want the vulnclass", f.Name)
 	}
-	if got = call(`{"vulnclass":"TEST","summary":"no storage","severity":"low","traffic_refs":[{"traffic_id":"x"}]}`); !strings.Contains(got, "未登记") {
+	if got = call(`{"vulnclass":"TEST","summary":"no storage","severity":"low","evidence":"fixture request answered 200 and returned the marker","traffic_refs":[{"traffic_id":"x"}],` + reproFixture + `}`); !strings.Contains(got, "未登记") {
 		t.Fatal(got)
 	}
 	if notices != 1 {

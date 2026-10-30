@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/notify"
+	"github.com/Autumn-27/jingwei/notify"
 )
 
 var (
@@ -330,6 +330,7 @@ func (d *DB) EditFindingTraffic(ctx context.Context, findingID, bindingID, versi
 type RecordFindingInput struct {
 	TaskID, ExplorationID, IntentID                      int64
 	VulnClass, Name, Severity, Summary, Evidence, Worker string
+	CVSS                                                 *float64 // 提交时强制填写的 CVSS 基础分
 	AssetIDs                                             []int64
 	// RawRequest/RawResponse carry byte-exact non-HTTP protocol data (RESP,
 	// MySQL, SSH banners…) that the proxy cannot capture; Protocol names it so
@@ -337,6 +338,11 @@ type RecordFindingInput struct {
 	Protocol    string
 	RawRequest  string
 	RawResponse string
+	// Reproduction is the structured recipe the agent records at confirm time
+	// (entry point / prerequisites / ordered verbatim steps / provenance). Its
+	// steps are resolved onto the bound snapshots inside the recording
+	// transaction, so the report can print each step next to its own packet.
+	Reproduction *Reproduction
 }
 
 // storeRawPacketsTx writes agent-supplied raw protocol bytes onto a finding.
@@ -440,8 +446,8 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 		assets = []int64{}
 	}
 	raw, _ := json.Marshal(assets)
-	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,dedupe_key)
-VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,'')) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw), identity).Scan(&out.FindingID); err != nil {
+	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,dedupe_key,cvss)
+VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),$11) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw), identity, in.CVSS).Scan(&out.FindingID); err != nil {
 		return nil, err
 	}
 	if _, err := storeRawPacketsTx(tx, out.FindingID, in); err != nil {
@@ -465,7 +471,15 @@ VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,'')) RETURNING id`, in.Ta
 	}
 	var err error
 	out.Traffic, err = FindingTrafficTx(tx, out.FindingID)
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	// 复现过程与流量绑定在同一事务里完成：步骤要落到刚绑定好的快照上，
+	// 拆开就会有一段时间报告里「步骤有、报文没有」。
+	if _, err := storeReproductionTx(tx, out.FindingID, in.Reproduction, out.Traffic.Bindings); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // findingClassKey folds the free-form vulnclass/name an LLM writes into a
@@ -631,6 +645,11 @@ func mergeAgentFindingTx(ctx context.Context, tx *sql.Tx, findingID, nodeID int6
 		evidence = in.Evidence
 		changed = true
 	}
+	if in.CVSS != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE findings SET cvss=$2 WHERE id=$1 AND cvss IS NULL`, findingID, *in.CVSS); err != nil {
+			return nil, err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE findings SET name=$2, severity=$3, summary=$4, evidence=$5 WHERE id=$1`,
 		findingID, name, severity, summary, evidence); err != nil {
 		return nil, err
@@ -650,6 +669,18 @@ func mergeAgentFindingTx(ctx context.Context, tx *sql.Tx, findingID, nodeID int6
 	traffic, err := FindingTrafficTx(tx, findingID)
 	if err != nil {
 		return nil, err
+	}
+	// 合并时用最新一次记录覆盖复现过程——重复上报的通常是对同一漏洞更完整的
+	// 复现链条；空值不覆盖已有内容（见 storeReproductionTx）。
+	reproStored, err := storeReproductionTx(tx, findingID, in.Reproduction, traffic.Bindings)
+	if err != nil {
+		return nil, err
+	}
+	if reproStored && !changed && !stored {
+		// 复现过程变了同样意味着报告要重出，否则详情页/报告会停在旧版本。
+		if err := bumpEvidenceVersionTx(tx, findingID); err != nil {
+			return nil, err
+		}
 	}
 	return &RecordedFinding{FindingID: findingID, NodeID: nodeID, Traffic: traffic}, nil
 }

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/artex/scanner"
+	"github.com/Autumn-27/jingwei/scanner"
 )
 
 func TestIntranetScriptQuotesCwd(t *testing.T) {

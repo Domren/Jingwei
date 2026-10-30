@@ -113,7 +113,33 @@ func (a systemAsset) systemInfo() (key, label, host string, port int, service st
 	} else {
 		key = "host:" + host
 	}
+	// 应用层系统（同 host:port 下挂在子路径上的独立系统）：URL 带非根路径的
+	// service 资产自成一组，组键带上路径前缀，避免和根站点混在一个系统里。
+	if a.kind == "service" && a.url != "" {
+		if p := urlPathPrefix(a.url); p != "" && p != "/" {
+			key += p
+			label += " " + strings.TrimSuffix(p, "/")
+		}
+	}
 	return key, label, host, port, service
+}
+
+// urlPathPrefix extracts the path portion of an asset URL, lowercased and
+// without query/anchor. "" when the URL has no path at all.
+func urlPathPrefix(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	p := strings.ToLower(u.EscapedPath())
+	if i := strings.IndexAny(p, "?#"); i >= 0 {
+		p = p[:i]
+	}
+	return p
 }
 
 // splitURLHost parses the host and effective port from a URL. Scheme-less values

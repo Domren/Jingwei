@@ -3,11 +3,13 @@ package report
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/db"
 )
 
 // FindingsDOCXOptions controls the Word report.
@@ -143,7 +145,7 @@ func FindingsDOCX(fs []*db.DBFinding, opts FindingsDOCXOptions) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	return packDOCX(doc, title, at)
+	return packDOCX(doc, title, at, b.images)
 }
 
 func trafficRoleLabel(role string) string {
@@ -177,9 +179,15 @@ func (b *docxBuilder) finding(f *db.DBFinding, number string) {
 	b.heading("漏洞概述", 3, false)
 	b.para(nz(strings.TrimSpace(f.Summary), "（未填写概述，详见下方证据与验证数据）"), "")
 
-	b.heading("验证步骤", 3, false)
-	for i, step := range steps {
-		b.numbered(i+1, step)
+	// 有结构化复现就按它渲染（每步自带真实报文），否则回退到重构的验证步骤。
+	repro := buildReproView(f)
+	if repro != nil {
+		writeReproductionDOCX(b, repro)
+	} else {
+		b.heading("验证步骤", 3, false)
+		for i, step := range steps {
+			b.numbered(i+1, step)
+		}
 	}
 
 	if len(data) > 0 {
@@ -191,36 +199,20 @@ func (b *docxBuilder) finding(f *db.DBFinding, number string) {
 		b.table([]string{"项目", "值"}, rows, []int{2200, 7160}, false)
 	}
 
-	hasPackets := strings.TrimSpace(f.HTTPRequest) != "" || strings.TrimSpace(f.HTTPResponse) != ""
-	packetHeading, reqTitle, respTitle, missingNote := packetLabels(in, hasPackets)
-	b.heading(packetHeading, 3, false)
-	if !hasPackets {
-		b.para(missingNote, "Small")
-	} else {
-		b.heading(reqTitle, 3, false)
-		if strings.TrimSpace(f.HTTPRequest) == "" {
-			b.para("未采集到请求报文。", "Small")
-		} else {
-			b.code(f.HTTPRequest, docxPacketLimit)
-			if len(f.HTTPRequest) > docxPacketLimit {
-				b.para("请求报文过长，仅展示前 192 KiB；完整字节见证据包。", "Small")
-			}
-		}
-		b.heading(respTitle, 3, false)
-		if strings.TrimSpace(f.HTTPResponse) == "" {
-			b.para("未采集到响应报文。", "Small")
-		} else {
-			b.code(f.HTTPResponse, docxPacketLimit)
-			if len(f.HTTPResponse) > docxPacketLimit {
-				b.para("响应报文过长，仅展示前 192 KiB；完整字节见证据包。", "Small")
-			}
-		}
+	// 结构化复现已经逐步展示过真实报文时，这里不再重复主报文。
+	covered := repro != nil && repro.anyFromPacket()
+	if !covered {
+		b.writeFindingPacketsDOCX(f, in)
 	}
 
 	extras := 0
 	for _, packet := range f.EvidencePackets {
 		if packet.Primary {
 			continue
+		}
+		if covered {
+			// 这些报文已按步骤逐条展示在「复现过程」里，不再重复一遍。
+			break
 		}
 		if extras == 0 {
 			b.heading("全部验证报文（按复现顺序）", 3, false)
@@ -245,7 +237,13 @@ func (b *docxBuilder) finding(f *db.DBFinding, number string) {
 		if strings.TrimSpace(packet.HTTPResponse) == "" {
 			b.para("未采集到响应报文。", "Small")
 		} else {
-			b.code(packet.HTTPResponse, docxPacketLimit)
+			reqStart, _, reqBody, _ := parseMessageHead(packet.HTTPRequest)
+			reqTarget := ""
+			if fields := strings.Fields(reqStart); len(fields) > 1 {
+				reqTarget = fields[1]
+			}
+			clipped, _ := clipHTTPResponseForReport(f.VulnClass, f.Name, reqTarget, reqBody, packet.HTTPResponse)
+			b.code(clipped, docxPacketLimit)
 		}
 	}
 	if f.EvidencePacketOmitted > 0 {
@@ -255,6 +253,13 @@ func (b *docxBuilder) finding(f *db.DBFinding, number string) {
 	if e := strings.TrimSpace(sanitizeEvidence(f.Evidence)); e != "" {
 		b.heading("证据", 3, false)
 		b.code(truncateText(e, 20000), 0)
+	}
+	if len(f.Screenshots) > 0 {
+		b.heading("取证截图", 3, false)
+		for i, shot := range f.Screenshots {
+			b.para(fmt.Sprintf("图 %d · %s", i+1, nz(shot.Caption, "取证截图")), "Small")
+			b.image(shot.Data)
+		}
 	}
 	if len(f.TrafficBindings) > 0 {
 		b.heading("关联流量证据", 3, false)
@@ -287,8 +292,53 @@ func (b *docxBuilder) finding(f *db.DBFinding, number string) {
 
 // ---- OOXML builders ----
 
+type docxImage struct {
+	rid      string
+	filename string
+	data     []byte
+}
+
 type docxBuilder struct {
-	body strings.Builder
+	body   strings.Builder
+	images []docxImage
+}
+
+// writeFindingPacketsDOCX prints the finding's primary captured exchange. It is
+// the fallback path; when a structured reproduction already carries the real
+// packet per step, repeating it here would only pad the document.
+func (b *docxBuilder) writeFindingPacketsDOCX(f *db.DBFinding, in FindingReportInput) {
+	hasPackets := strings.TrimSpace(f.HTTPRequest) != "" || strings.TrimSpace(f.HTTPResponse) != ""
+	packetHeading, reqTitle, respTitle, missingNote := packetLabels(in, hasPackets)
+	b.heading(packetHeading, 3, false)
+	if !hasPackets {
+		b.para(missingNote, "Small")
+		return
+	}
+	b.heading(reqTitle, 3, false)
+	if strings.TrimSpace(f.HTTPRequest) == "" {
+		b.para("未采集到请求报文。", "Small")
+	} else {
+		b.code(f.HTTPRequest, docxPacketLimit)
+		if len(f.HTTPRequest) > docxPacketLimit {
+			b.para("请求报文过长，仅展示前 192 KiB；完整字节见证据包。", "Small")
+		}
+	}
+	b.heading(respTitle, 3, false)
+	if strings.TrimSpace(f.HTTPResponse) == "" {
+		b.para("未采集到响应报文。", "Small")
+		return
+	}
+	// 响应包只保留「响应头 + 命中漏洞片段」，避免整页 HTML/JSON 噪音。
+	reqStart, _, reqBody, _ := parseMessageHead(f.HTTPRequest)
+	reqTarget := ""
+	if fields := strings.Fields(reqStart); len(fields) > 1 {
+		reqTarget = fields[1]
+	}
+	clipped, truncated := clipHTTPResponseForReport(f.VulnClass, f.Name, reqTarget, reqBody, f.HTTPResponse)
+	b.code(clipped, docxPacketLimit)
+	if truncated {
+		b.para("响应报文已裁剪为「响应头 + 命中漏洞片段」；完整字节见证据包 ZIP。", "Small")
+	}
 }
 
 func (b *docxBuilder) spacer(twips int) {
@@ -372,6 +422,48 @@ func (b *docxBuilder) run(text string, bold, mono, small bool) {
 
 func (b *docxBuilder) pageBreak() {
 	b.body.WriteString(`<w:p><w:r><w:br w:type="page"/></w:r></w:p>`)
+}
+
+// image embeds a base64 PNG screenshot inline and registers its relationship
+// + media part so packDOCX can attach the bytes.
+func (b *docxBuilder) image(dataB64 string) {
+	data, err := base64.StdEncoding.DecodeString(screenshotBase64(dataB64))
+	if err != nil {
+		return
+	}
+	idx := len(b.images) + 1
+	rid := fmt.Sprintf("rId%d", 3+idx) // rId1..3 reserved for styles/settings/footer
+	filename := fmt.Sprintf("image%d.png", idx)
+	b.images = append(b.images, docxImage{rid: rid, filename: filename, data: data})
+	cx, cy := emuFromPNG(data)
+	docPrID := 1000 + idx
+	fmt.Fprintf(&b.body, `<w:p><w:pPr><w:spacing w:after="60"/><w:jc w:val="center"/></w:pPr><w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="%d" cy="%d"/><wp:docPr id="%d" name="Picture %d"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="%s"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="%s"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="%d" cy="%d"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>`, cx, cy, docPrID, idx, filename, rid, cx, cy)
+}
+
+// pngSize reads a PNG's pixel dimensions from the IHDR chunk.
+func pngSize(data []byte) (int, int) {
+	if len(data) < 24 || data[0] != 0x89 || data[1] != 'P' || data[2] != 'N' || data[3] != 'G' {
+		return 0, 0
+	}
+	return int(binary.BigEndian.Uint32(data[16:20])), int(binary.BigEndian.Uint32(data[20:24]))
+}
+
+const maxImgWidthEMU = 5715000 // ~6.3 inch, fits within page margins
+
+// emuFromPNG converts PNG pixels to EMU, capped at the page width so oversized
+// screenshots scale down proportionally.
+func emuFromPNG(data []byte) (int64, int64) {
+	w, h := pngSize(data)
+	if w <= 0 || h <= 0 {
+		return 5943600, 3343050 // 6.3in x 3.53in default
+	}
+	cx := int64(w) * 9525
+	cy := int64(h) * 9525
+	if cx > maxImgWidthEMU {
+		cy = cy * maxImgWidthEMU / cx
+		cx = maxImgWidthEMU
+	}
+	return cx, cy
 }
 
 func (b *docxBuilder) tocField() {
@@ -486,7 +578,7 @@ func (b *docxBuilder) table(headers []string, rows [][]string, widths []int, bol
 func (b *docxBuilder) documentXML() ([]byte, error) {
 	var out strings.Builder
 	out.WriteString(xmlDecl)
-	out.WriteString(`<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>`)
+	out.WriteString(`<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><w:body>`)
 	out.WriteString(b.body.String())
 	out.WriteString(`<w:sectPr><w:footerReference w:type="default" r:id="rId3"/>`)
 	out.WriteString(`<w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1247" w:right="1247" w:bottom="1440" w:left="1247" w:header="720" w:footer="720" w:gutter="0"/>`)
@@ -496,7 +588,7 @@ func (b *docxBuilder) documentXML() ([]byte, error) {
 
 const xmlDecl = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` + "\n"
 
-func packDOCX(document []byte, title string, at time.Time) ([]byte, error) {
+func packDOCX(document []byte, title string, at time.Time, images []docxImage) ([]byte, error) {
 	parts := []struct {
 		name string
 		data []byte
@@ -509,7 +601,7 @@ func packDOCX(document []byte, title string, at time.Time) ([]byte, error) {
 		{"word/styles.xml", []byte(stylesXML)},
 		{"word/settings.xml", []byte(settingsXML)},
 		{"word/footer1.xml", []byte(footerXML)},
-		{"word/_rels/document.xml.rels", []byte(documentRelsXML)},
+		{"word/_rels/document.xml.rels", []byte(buildDocumentRels(images))},
 	}
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
@@ -519,6 +611,15 @@ func packDOCX(document []byte, title string, at time.Time) ([]byte, error) {
 			return nil, err
 		}
 		if _, err := w.Write(part.data); err != nil {
+			return nil, err
+		}
+	}
+	for _, img := range images {
+		w, err := zw.Create("word/media/" + img.filename)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := w.Write(img.data); err != nil {
 			return nil, err
 		}
 	}
@@ -547,6 +648,7 @@ func docxEscape(s string) string { return docxEscaper.Replace(docxSafe(s)) }
 const contentTypesXML = xmlDecl + `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
 	`<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
 	`<Default Extension="xml" ContentType="application/xml"/>` +
+	`<Default Extension="png" ContentType="image/png"/>` +
 	`<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>` +
 	`<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>` +
 	`<Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>` +
@@ -561,11 +663,21 @@ const packageRelsXML = xmlDecl + `<Relationships xmlns="http://schemas.openxmlfo
 	`<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>` +
 	`</Relationships>`
 
-const documentRelsXML = xmlDecl + `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
-	`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>` +
-	`<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>` +
-	`<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>` +
-	`</Relationships>`
+// buildDocumentRels emits the document relationships, appending one image
+// relationship per embedded screenshot.
+func buildDocumentRels(images []docxImage) string {
+	var b strings.Builder
+	b.WriteString(xmlDecl)
+	b.WriteString(`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">`)
+	b.WriteString(`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>`)
+	b.WriteString(`<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>`)
+	b.WriteString(`<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>`)
+	for _, img := range images {
+		fmt.Fprintf(&b, `<Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/%s"/>`, img.rid, img.filename)
+	}
+	b.WriteString(`</Relationships>`)
+	return b.String()
+}
 
 const corePropsXML = xmlDecl + `<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">` +
 	`<dc:title>%s</dc:title><dc:creator>精卫 Jingwei</dc:creator><cp:lastModifiedBy>精卫 Jingwei</cp:lastModifiedBy>` +

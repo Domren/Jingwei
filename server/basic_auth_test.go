@@ -371,7 +371,7 @@ func TestBasicAuthExpiredCookieAndSecureFlag(t *testing.T) {
 	cfg := s.basicAuth.snapshot()
 	for _, expires := range []*jwt.NumericDate{nil, jwt.NewNumericDate(time.Now().Add(-time.Minute))} {
 		token, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-			Subject: cfg.Revision, Audience: jwt.ClaimStrings{"artex-basic-auth"}, ExpiresAt: expires,
+			Subject: cfg.Revision, Audience: jwt.ClaimStrings{"jingwei-basic-auth"}, ExpiresAt: expires,
 		}).SignedString(s.basicAuthSigningKey())
 		r := httptest.NewRequest("GET", "/", nil)
 		r.AddCookie(&http.Cookie{Name: basicAuthCookie, Value: token})
@@ -471,7 +471,7 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 	if err := restarted.basicAuth.load(m.pg); err != nil {
 		t.Fatal(err)
 	}
-	loginBody := `{"username":"ARTEX","password":"admin-password"}`
+	loginBody := `{"username":"Jingwei","password":"admin-password"}`
 	r = httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(loginBody))
 	w = httptest.NewRecorder()
 	restarted.Handler().ServeHTTP(w, r)

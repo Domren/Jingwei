@@ -17,7 +17,7 @@ func TestStageDownloadAndVerify(t *testing.T) {
 	requireUnix(t)
 	var archive bytes.Buffer
 	zw := zip.NewWriter(&archive)
-	f, err := zw.Create("artex")
+	f, err := zw.Create("jingwei")
 	if err != nil {
 		t.Fatal(err)
 	}

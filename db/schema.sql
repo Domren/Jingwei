@@ -855,13 +855,6 @@ DROP TRIGGER IF EXISTS trg_mcp_upd ON mcp_servers;
 CREATE TRIGGER trg_mcp_upd BEFORE UPDATE ON mcp_servers
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
--- 默认数据源占位：ScopeSentry 资产同步 MCP（地址与认证均留空、未启用）。
--- 供「资产同步」页检测数据源是否已配置；用户在页面填入 url 与 X-API-Key 后再启用。
--- 仅在缺失时插入，绝不覆盖用户已配置/已启用的服务器（schema.sql 每次启动都会 Exec）。
-INSERT INTO mcp_servers (name, transport, url, env, enabled)
-VALUES ('ScopeSentry', 'http', NULL, '{"X-API-Key":""}', false)
-ON CONFLICT (name) DO NOTHING;
-
 CREATE TABLE IF NOT EXISTS mcp_tools_cache (
     id            BIGSERIAL PRIMARY KEY,
     server_id     BIGINT NOT NULL REFERENCES mcp_servers(id) ON DELETE CASCADE,
@@ -1155,6 +1148,33 @@ CREATE TABLE IF NOT EXISTS findings (
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS cvss NUMERIC(3,1);
+-- 结构化复现过程：agent 在 report_finding 落库时就地记录，而不是事后从证据文本重构。
+-- 形状 {entry_point, prerequisites[], steps[{request,response,expected,proves,snapshot_id}], provenance}；
+-- steps[].request/response 是当时真实收发的原文，steps[].snapshot_id 指向本漏洞已绑定的流量快照，
+-- 报告据此把「第 N 步」和它自己的那条报文放在一起。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS reproduction JSONB;
+
+CREATE TABLE IF NOT EXISTS finding_review_events (
+    id BIGSERIAL PRIMARY KEY,
+    finding_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    action TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    from_val TEXT,
+    to_val TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_finding_review_events_finding ON finding_review_events(finding_id);
+
+CREATE TABLE IF NOT EXISTS finding_screenshots (
+    id BIGSERIAL PRIMARY KEY,
+    finding_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    caption TEXT NOT NULL DEFAULT '',
+    data TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_finding_screenshots_finding ON finding_screenshots(finding_id);
 -- 原始 HTTP 请求/响应报文(PoC 原文)；由 nuclei -irr 或深度利用记录写入。
 -- 非 HTTP 漏洞或未采集时为空字符串，与「空报告」区分开。
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS http_request  TEXT NOT NULL DEFAULT '';

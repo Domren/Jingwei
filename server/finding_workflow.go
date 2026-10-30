@@ -8,9 +8,9 @@ import (
 	"log"
 	"strconv"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/jingwei/agent"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/traffic"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -27,6 +27,15 @@ func (s *Server) seedFindingWorkflowTools() {
 			log.Printf("[evidence] upgrade traffic_search description: %v", err)
 		} else {
 			_ = s.m.pg.SetSetting(hostSearchDescriptionFlag, "true")
+		}
+	}
+	const reportFindingDefaultsFlag = "finding_workflow_tools_v4_report_finding_defaults"
+	if value, _, _ := s.m.pg.GetSetting(reportFindingDefaultsFlag); value != "true" {
+		if err := s.upgradeReportFindingDefaults(); err != nil {
+			// Leave the flag unset so the next startup retries.
+			log.Printf("[evidence] upgrade report_finding defaults: %v", err)
+		} else {
+			_ = s.m.pg.SetSetting(reportFindingDefaultsFlag, "true")
 		}
 	}
 	const flag = "finding_workflow_tools_v2_reporter"
@@ -104,6 +113,102 @@ func (s *Server) seedFindingWorkflowTools() {
 		return
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
+}
+
+// legacyReportFindingDescription is the seeded text from before the structured
+// reproduction process became mandatory. Only this exact text is upgraded, so a
+// user-authored description always survives the migration.
+const legacyReportFindingDescription = "记录确认的漏洞。HTTP 漏洞的 evidence 用原始 HTTP 请求/响应报文（请求行、Host、关键请求头、响应状态行与关键响应片段）说明复现与验证结论，并配合 traffic_refs 绑定已采集的真实流量；非 HTTP 协议（Redis/MySQL/SSH 等）用 protocol 写明协议名，并把实际收发字节放进 raw_request/raw_response，evidence 写协议层结论。任何情况都不要用 curl 命令或口头描述代替报文。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。"
+
+// upgradeReportFindingDefaults backfills parameters added to report_finding after
+// an install was seeded. The stored system-tool schema is what the model sees,
+// and SeedTool only inserts once, so an upgraded install otherwise keeps a
+// schema without reproduction/cvss while the executor requires reproduction —
+// every report_finding call then fails validation.
+func (s *Server) upgradeReportFindingDefaults() error {
+	row, err := s.m.pg.GetTool("report_finding")
+	if err != nil {
+		return err
+	}
+	if row == nil || !row.System {
+		return nil
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(row.Schema, &schema); err != nil {
+		return fmt.Errorf("invalid report_finding schema: %w", err)
+	}
+	if schema == nil {
+		return errors.New("missing report_finding object schema")
+	}
+	desc, defaults := agent.ReportFindingDefaults()
+	if mergeMissingToolProps(schema, defaults) {
+		raw, err := json.Marshal(schema)
+		if err != nil {
+			return err
+		}
+		// Optimistic concurrency: if the row changed since we read it, leave the
+		// flag unset and retry next start instead of overwriting a user edit.
+		result, err := s.m.pg.Exec(`UPDATE tools SET schema=$1::jsonb,updated_at=now() WHERE key='report_finding' AND system AND schema=$2::jsonb`, string(raw), string(row.Schema))
+		if err != nil {
+			return err
+		}
+		if n, _ := result.RowsAffected(); n != 1 {
+			return errors.New("report_finding schema changed concurrently; will retry")
+		}
+	}
+	if row.Description == legacyReportFindingDescription {
+		if _, err := s.m.pg.Exec(`UPDATE tools SET description=$1,updated_at=now() WHERE key='report_finding' AND system AND description=$2`, desc, legacyReportFindingDescription); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mergeMissingToolProps adds top-level properties and required entries that the
+// code default declares but the stored schema lacks. Existing properties keep
+// their user-edited descriptions; reports whether the schema changed.
+func mergeMissingToolProps(schema, defaults map[string]any) bool {
+	changed := false
+	wantProps, _ := defaults["properties"].(map[string]any)
+	props := objectProperty(schema, "properties")
+	for name, spec := range wantProps {
+		if _, exists := props[name]; !exists {
+			props[name] = spec
+			changed = true
+		}
+	}
+	required := stringList(schema["required"])
+	present := make(map[string]bool, len(required))
+	for _, name := range required {
+		present[name] = true
+	}
+	for _, name := range stringList(defaults["required"]) {
+		if !present[name] {
+			required = append(required, name)
+			present[name] = true
+			changed = true
+		}
+	}
+	if len(required) > 0 {
+		schema["required"] = required
+	}
+	return changed
+}
+
+func stringList(value any) []string {
+	switch list := value.(type) {
+	case []string:
+		return list
+	case []any:
+		out := make([]string, 0, len(list))
+		for _, item := range list {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 func objectProperty(parent map[string]any, key string) map[string]any {

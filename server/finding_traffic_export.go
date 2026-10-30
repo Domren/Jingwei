@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/evidence"
-	"github.com/Autumn-27/artex/report"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/evidence"
+	"github.com/Autumn-27/jingwei/report"
 )
 
 const maxHydratedPacketBytes = 512 << 10

@@ -17,10 +17,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/evidence"
-	"github.com/Autumn-27/artex/report"
-	"github.com/Autumn-27/artex/scanner"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/evidence"
+	"github.com/Autumn-27/jingwei/report"
+	"github.com/Autumn-27/jingwei/scanner"
 )
 
 const (
@@ -30,11 +30,28 @@ const (
 	maxFullTemplates     = 10000
 	maxScanNucleiTargets = 3000
 	maxScanPortChecks    = 200000
+	maxAppServices       = 50
+	maxAppNucleiTargets  = 15
 
 	// 原始报文可能非常大；保留足够复现的头部与正文，避免单条命中撑爆 findings。
 	maxStoredHTTPRequest  = 64 << 10
 	maxStoredHTTPResponse = 128 << 10
 )
+
+// appSourceRank orders app-layer discovery sources by signal strength: admin
+// dictionaries first, then target-declared entries, then JS route extraction.
+func appSourceRank(source string) int {
+	switch source {
+	case "dictionary":
+		return 0
+	case "robots", "sitemap":
+		return 1
+	case "js":
+		return 2
+	default:
+		return 3
+	}
+}
 
 // scanManager serializes LLM-free scan tasks inside the server process. Tasks
 // are persisted in PostgreSQL, so queued work survives a restart and a single
@@ -215,8 +232,26 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 	summary["assets"] = assetCount
 	summary["exposure_findings"] = exposureFindings
 
+	appSystems, appLinked := r.runAppDiscovery(res, assets)
+	summary["app_systems"] = len(appSystems)
+	if len(appSystems) > 0 {
+		summary["app_systems_linked"] = appLinked
+	}
+
+	// 固定基线：Web 登录弱口令。放在 POC 匹配之前，模板命中与否都要跑。
+	weakFound := r.runWeakPassBaseline(res.Services, appSystems, assets, summary)
+	exposureFindings += weakFound
+
 	r.logf("match", "结合 %d 个 Web 服务的指纹匹配 POC", len(res.Services))
-	templates, err := r.selectTemplates(res.Services)
+	services := res.Services
+	for _, app := range appSystems {
+		services = append(services, scanner.WebService{
+			URL: app.URL, Host: app.Host, IP: app.IP, Port: app.Port, Scheme: app.Scheme,
+			StatusCode: app.StatusCode, Title: app.Title, Server: app.Server,
+			Technologies: app.Technologies, ContentLength: app.ContentLength,
+		})
+	}
+	templates, err := r.selectTemplates(services)
 	if err != nil {
 		return "failed", "failed", err.Error(), summary
 	}
@@ -226,17 +261,19 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 			r.logf("match", "未匹配到可用的 POC 模板，扫描结束")
 			summary["targets"] = 0
 			summary["results"] = 0
+			r.runInjectionBaseline(res.Services, appSystems, summary, nil)
 			summary["findings"] = exposureFindings
 			return "done", "done", "", summary
 		}
 		return "failed", "failed", "没有可执行的 POC 模板", summary
 	}
 
-	scanTargets := r.nucleiTargets(res, targets)
+	scanTargets := r.nucleiTargets(res, targets, appSystems)
 	summary["targets"] = len(scanTargets)
 	if len(scanTargets) == 0 {
 		r.logf("scan", "未发现可扫描的 Web 服务或端口，扫描结束")
 		summary["results"] = 0
+		r.runInjectionBaseline(res.Services, appSystems, summary, nil)
 		summary["findings"] = exposureFindings
 		return "done", "done", "", summary
 	}
@@ -276,11 +313,14 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 		if stored == 0 {
 			return "failed", "failed", msg, summary
 		}
-		r.autoExploit(nrun.Results, findingIDs, summary)
+		covered := r.autoExploit(nrun.Results, findingIDs, summary)
+		r.runInjectionBaseline(res.Services, appSystems, summary, covered)
 		return "done", "done", msg, summary
 	}
 	r.logf("scan", "扫描完成：%d 条结果，%d 条写入发现", stored, findings)
-	r.autoExploit(nrun.Results, findingIDs, summary)
+	covered := r.autoExploit(nrun.Results, findingIDs, summary)
+	// 固定基线：SQL/XSS 参数位置由页面枚举得出，nuclei 有没有命中都要交给工具判定。
+	r.runInjectionBaseline(res.Services, appSystems, summary, covered)
 	return "done", "done", "", summary
 }
 
@@ -412,6 +452,42 @@ func (idx *scanAssetIndex) addOtherService(host string, port int, id int64) {
 	}
 }
 
+// longestPathPrefix finds the most specific indexed URL whose path is a prefix
+// of the given URL (same origin), so findings deep under an app-layer system
+// ("/admin/users.php") link to that system ("/admin") before any host-level
+// fallback. Only URLs that actually carry a path participate.
+func (idx *scanAssetIndex) longestPathPrefix(normalized string) int64 {
+	if normalized == "" {
+		return 0
+	}
+	best := 0
+	var bestID int64
+	for key, id := range idx.byURL {
+		if id <= 0 {
+			continue
+		}
+		schemeEnd := strings.Index(key, "://")
+		if schemeEnd < 0 {
+			continue
+		}
+		if strings.Index(key[schemeEnd+3:], "/") < 0 {
+			continue // origin-only URL: no path prefix to offer
+		}
+		if !strings.HasPrefix(normalized, key) {
+			continue
+		}
+		rest := normalized[len(key):]
+		if rest != "" && !strings.HasPrefix(rest, "/") && !strings.HasPrefix(rest, "?") {
+			continue // "/admi" must not match "/admin"
+		}
+		if len(key) > best {
+			best = len(key)
+			bestID = id
+		}
+	}
+	return bestID
+}
+
 func (idx *scanAssetIndex) idsFor(matchedAt, host string) []int64 {
 	seen := map[int64]bool{}
 	out := []int64{}
@@ -422,6 +498,11 @@ func (idx *scanAssetIndex) idsFor(matchedAt, host string) []int64 {
 		}
 	}
 	if id := idx.byURL[normalizeScanURL(matchedAt)]; id > 0 {
+		add(id)
+	}
+	// 应用层系统按路径前缀归属：/admin 下任何深度的命中都应挂到 /admin 这个
+	// 系统资产上，而不是整台主机。取最长匹配前缀。
+	if id := idx.longestPathPrefix(normalizeScanURL(matchedAt)); id > 0 {
 		add(id)
 	}
 	candidates := []string{strings.ToLower(host)}
@@ -612,6 +693,86 @@ func (r *scanRun) persistDiscovery(res *scanner.DiscoverResult) (*scanAssetIndex
 	return idx, linked, exposureFindings
 }
 
+// runAppDiscovery runs the app-layer phase (path-level systems under each web
+// service) and registers every discovered system as its own asset so the same
+// domain:port can hold multiple systems in the ledger.
+func (r *scanRun) runAppDiscovery(res *scanner.DiscoverResult, assets *scanAssetIndex) ([]scanner.AppSystem, int) {
+	services := res.Services
+	if len(services) > maxAppServices {
+		services = services[:maxAppServices]
+		r.logf("app", "Web 服务 %d 个，仅对前 %d 个做应用层发现", len(res.Services), maxAppServices)
+	}
+	if len(services) == 0 {
+		return nil, 0
+	}
+	r.setProgress("app", map[string]any{"services": len(services)})
+	r.logf("app", "应用层发现：%d 个 Web 服务，探测同端口子路径系统", len(services))
+	systems, err := scanner.AppDiscover(r.ctx, services, scanner.AppDiscoverOptions{
+		MaxCandidates: 240,
+		MaxJSFiles:    20,
+		Concurrency:   8,
+		Timeout:       8 * time.Second,
+		Logf:          func(format string, args ...any) { r.logf("app", format, args...) },
+	})
+	if err != nil {
+		r.logf("app", "应用层发现失败：%v", err)
+		return nil, 0
+	}
+	if r.ctx.Err() != nil {
+		return nil, 0
+	}
+	r.setProgress("app", map[string]any{"systems": len(systems)})
+	linked := 0
+	for _, app := range systems {
+		status := app.StatusCode
+		length := app.ContentLength
+		id, err := r.pg.Assets().UpsertHTTPService(db.UpsertHTTPServiceReq{
+			URL:           app.URL,
+			Technologies:  app.Technologies,
+			StatusCode:    &status,
+			ContentLength: &length,
+			PageTitle:     app.Title,
+			IP:            app.IP,
+		})
+		if err != nil {
+			r.logf("app", "写入应用层系统资产失败 %s: %v", app.URL, err)
+			continue
+		}
+		assets.addService(app.URL, id)
+		note := "应用层系统 · 来源 " + appSourceLabel(app.Source)
+		if app.Server != "" {
+			note += " · " + app.Server
+		}
+		if err := r.pg.AddScanTaskAsset(r.task.ID, db.ScanTaskAsset{
+			AssetID: id, AssetType: "app", Host: app.Host, URL: app.URL, Note: note,
+			StatusCode: &status, PageTitle: app.Title, Technologies: app.Technologies,
+		}); err != nil {
+			r.logf("app", "关联应用层系统资产失败 %s: %v", app.URL, err)
+			continue
+		}
+		linked++
+	}
+	if len(systems) > 0 {
+		r.logf("app", "应用层发现完成：子路径系统 %d 个（入库 %d 个）", len(systems), linked)
+	}
+	return systems, linked
+}
+
+func appSourceLabel(source string) string {
+	switch source {
+	case "dictionary":
+		return "路径字典"
+	case "robots":
+		return "robots.txt"
+	case "sitemap":
+		return "sitemap"
+	case "js":
+		return "前端路由"
+	default:
+		return source
+	}
+}
+
 // exposedServiceProfiles maps non-HTTP service labels to deterministic findings
 // so a scan reports reachable high-risk services even when no POC template
 // applies. Keyed by scanner service labels from target.go.
@@ -751,9 +912,8 @@ func (r *scanRun) selectTemplates(services []scanner.WebService) ([]scanner.Nucl
 		}
 		sort.Strings(techs)
 		r.logf("match", "识别技术指纹 %d 个：%s", len(techs), strings.Join(techs, ", "))
-		if len(techs) == 0 {
-			return nil, nil
-		}
+		// 无指纹不直接放弃：MatchTemplates 会回退到通用 dast 模板（反射型 SSTI/XSS 等），
+		// 让这类无需特定指纹的探测仍能对目标执行。
 		metas, err := r.pg.ListEnabledPOCMetadata()
 		if err != nil {
 			return nil, fmt.Errorf("加载 POC 元数据失败: %w", err)
@@ -868,7 +1028,7 @@ func severityLabel(sev string) string {
 	return sev
 }
 
-func (r *scanRun) nucleiTargets(res *scanner.DiscoverResult, raw []scanner.Target) []string {
+func (r *scanRun) nucleiTargets(res *scanner.DiscoverResult, raw []scanner.Target, apps []scanner.AppSystem) []string {
 	seen := map[string]bool{}
 	out := []string{}
 	add := func(v string) {
@@ -911,6 +1071,24 @@ func (r *scanRun) nucleiTargets(res *scanner.DiscoverResult, raw []scanner.Targe
 				add(net.JoinHostPort(domain, strconv.Itoa(pf.Port)))
 			}
 		}
+	}
+	// 应用层系统作为额外 nuclei 目标：每条模板会对每个目标执行，全量模式
+	// 下路径目标过多会把模板×目标乘积拉爆，故只带最有信号的一小部分
+	// （后台类来源优先、带指纹的优先）。
+	if len(apps) > maxAppNucleiTargets {
+		sort.SliceStable(apps, func(i, j int) bool {
+			si, sj := appSourceRank(apps[i].Source), appSourceRank(apps[j].Source)
+			if si != sj {
+				return si < sj
+			}
+			return len(apps[i].Technologies) > len(apps[j].Technologies)
+		})
+		dropped := len(apps) - maxAppNucleiTargets
+		apps = apps[:maxAppNucleiTargets]
+		r.logf("scan", "应用层系统 %d 个，仅前 %d 个进入 POC 执行（后台类/带指纹优先），其余仅登记资产", dropped+maxAppNucleiTargets, maxAppNucleiTargets)
+	}
+	for _, app := range apps {
+		add(app.URL)
 	}
 	if len(out) > maxScanNucleiTargets {
 		r.logf("scan", "扫描目标 %d 个，超过上限 %d，已截断", len(out), maxScanNucleiTargets)
@@ -1253,7 +1431,7 @@ func (s *Server) createScanTask(w http.ResponseWriter, r *http.Request) {
 		req.Concurrency = 100
 	}
 	if req.TimeoutSeconds <= 0 {
-		req.TimeoutSeconds = 600
+		req.TimeoutSeconds = 1200
 	}
 	if req.TimeoutSeconds < 30 {
 		req.TimeoutSeconds = 30

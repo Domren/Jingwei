@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Autumn-27/artex/selfupdate"
+	"github.com/Autumn-27/jingwei/selfupdate"
 )
 
 const updateSettingsKey = "update.network"

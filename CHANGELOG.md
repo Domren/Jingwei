@@ -2,6 +2,95 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.2.0] - 2026-10-30
+
+本版把「扫到什么报什么」推进到「固定流程必跑基础漏洞」：新增应用层发现、弱口令与
+SQL/XSS 注入基线；LLM 任务在规划前先做资产探测与 POC 初筛；同时补齐证据截图、结构化
+复现、请求重发、凭据库与内网拓扑，并把工程标识从 ARTEX 全面切换为 Jingwei。
+相对 v1.1.0 共变更 334 个文件（266 个已跟踪文件，其中 4 个删除；68 个新增），
+新增约 14.5k 行、删除 2.2k 行。
+
+### 应用层发现与固定渗透基线
+
+- 新增应用层发现（`scanner/appdiscover.go`）：同一服务下按内置路径字典、robots.txt/sitemap、
+  页面链接与脚本、SPA 路由串识别子路径系统；随机路径 soft-404 基线过滤「全路径同响应」；
+  识别结果作为系统级资产入库并关联（`db/finding_systems.go`）。
+- 新增登录页发现（`scanner/loginform.go`）：相对链接解析、两级爬取、静态资源跳过，以
+  `<input type="password">` 判定表单，供弱口令基线选点。
+- 固定基线 · 弱口令（`server/scan_baseline.go` + `scanner/webcrack.go`）：镜像内置 vendored
+  WebCrack 引擎（`tools/webcrack/`），按评分取前 8 个登录页跑 admin 字典，命中直接落
+  finding 并带原始请求/响应。默认只装核心依赖；带验证码的页面需
+  `--build-arg WEBCRACK_OCR=true` 构建，缺 OCR 时跳过该页并记录原因，不再整页放弃。
+- 固定基线 · 注入点（`scanner/injection_harvest.go`）：只读枚举页面链接查询串与表单字段
+  （跳过 password/token/csrf 等字段、不提交表单、跨主机丢弃，24 页 / 80 点 / 8 秒上限），
+  参数位置排队给 sqlmap / dalfox 专项任务判定；同一 `METHOD|host+path|参数集` 只付一次
+  工具成本，已被 POC 阶段覆盖的位置不再重复排队。
+- 基线在扫描的四个出口都会执行（含「无模板命中」「无 nuclei 目标」两条早退路径），
+  nuclei 全灰也照样枚举参数并交给专项验证器。
+- 扫描详情前端新增「应用层发现 / 弱口令检测 / 注入基线」阶段与对应徽标。
+
+### LLM 任务：先探测后渗透
+
+- 规划前置（`server/task_prescan.go`）：planner 首轮前完成端口/指纹/应用层发现与 POC 初筛，
+  结果落资产与发现并写入摘要事实节点；预扫描失败不影响任务继续。
+- 新增 `chains` 包：L2 反问纪律常驻 planner/worker system prompt，L3 场景链按意图与
+  vulnclass 由代码路由注入，不靠模型自觉。
+- 新增 `honeydetect`：按服务 banner、HTTP 头、响应体与协议怪癖给输出打蜜罐评分，接入
+  Guard 的不可信内容标记。
+- 每任务固定 UA（`guard/ua_pool.go`，由 task id 派生），避免跨任务被 UA 关联。
+- 审批「一键放行」：放行 2/4/8 小时，同类调用自动通过；指纹对数字/UUID 归一，deny 永不豁免。
+- 会话/任务自动标题：首段用户输入压成一行标题，模型输出经清洗，输入按不可信数据处理。
+
+### 证据、复现与报告
+
+- 证据质量校验（`agent/evidence_quality.go`）：拦截「见截图」「详见报告」式占位文案，
+  要求证据本身包含结论与具体片段。
+- 结构化复现（`db/finding_reproduction.go` + `report/reproduction.go`）：上报瞬间记录真实
+  步骤与报文，报告按步绑定流量快照；每步紧跟自己的报文与「对应流量证据 #N」，响应按
+  命中片段裁剪，避免整页噪音。
+- 取证截图（`evidence/shot.go`）：用镜像内 Chromium headless 把真实收发报文渲染成 PNG
+  取证面板（高亮命中片段 + 采集时间），发现详情可自动/手动生成、查看与删除。
+- 发现复核时间线（`db/finding_review.go`）：记录每次人工改状态的时间与前后值，便于审计。
+
+### 深度利用扩展
+
+- 新增「请求重发」：原始报文直接重发，可走录制代理、跳过 TLS 校验、自定义超时；回显完整
+  响应与耗时；本机/链路本地地址默认拒绝（`JINGWEI_REPEATER_ALLOW_LOCAL=1` 放行）。
+- 新增「凭据库」：跨任务汇总已获取凭据与来源，便于一个口令打多个服务。
+- 新增「内网拓扑」页；侧栏移除「资产同步」页。
+- 加密 WebShell 会话（`scanner/shell_crypto.go`）：AES-256-CBC，密钥由口令派生，
+  流量中不出现明文命令。
+
+### 漏扫引擎改进
+
+- 指纹无命中时回退到 `dast` 标签模板，避免「指纹识别失败 = 全量跳过」。
+- 补强 Python/Node 指纹（gunicorn、uWSGI、Jinja2、Tornado、Twisted、Express 等）。
+- nuclei 输出上限 8 MiB → 64 MiB，避免大量 info 命中截断尾部高危结果。
+- 修复 curl 命令解析：`-x`/`--proxy` 以前被当成方法（`-x http://…` 解析出 method
+  `HTTP://…`，真实 POST 丢失）；现支持 `-XPOST`、`-xhttp://…`、`--proxy=` 等写法，
+  `-h` 不再吞掉 URL，代理单独保存为 `Proxy` 字段。
+
+### 工程与构建
+
+- 模块与产物更名：`github.com/Autumn-27/artex` → `github.com/Autumn-27/jingwei`；
+  二进制 `artex` → `jingwei`（`cmd/jingwei`），镜像入口 `/app/jingwei`。
+- 环境变量统一为 `JINGWEI_*`（`JINGWEI_PG_DSN` / `JINGWEI_CONFIG` / `JINGWEI_SKILL_DIR` /
+  `JINGWEI_LLM_*` / `JINGWEI_NOTIFY_ALLOW_LOCAL` / `JINGWEI_REPEATER_ALLOW_LOCAL`）；
+  旧 `ARTEX_*` 不再读取，升级时必须同步修改 `.env` 与 compose。
+- Dockerfile：Node 改从 npmmirror 下载、nuclei 增加 gh-proxy 回退、pip 使用 cache mount、
+  WebCrack 依赖分核心/OCR 两档。
+- 新增单元测试：重定向策略（同主机放行、≤3 跳、跨主机拦截）、nuclei/sqlmap/dalfox
+  执行层（假二进制记录 argv 与产出、超时强杀）；删除 chains 包文档中指向未移植
+  `skills/chains/` 的 L4 悬空引用。
+
+### 修复
+
+- 预扫端口范围收敛（`server/task_prescan.go`）：显式指定非标准端口（如 `:10800`）时只探测
+  该端口，不再扩成 80/443/8000/8080 等整套 Web 端口；只给主机名或 80/443 时仍按 Web 端口集探测。
+- 存量安装的 `report_finding` 工具 Schema 自动升级（`finding_workflow_tools_v4_report_finding_defaults`）：
+  补齐 `reproduction` / `cvss` / `traffic_refs` / `evidence_hint_id` 并把 `cvss` 设为必填，
+  修复旧库升级后上报因旧 Schema 被拒绝的问题。
+
 ## [1.1.0] - 2026-10-26
 
 ### 自动化漏扫引擎（不依赖 LLM）

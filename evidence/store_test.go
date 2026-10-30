@@ -14,15 +14,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/traffic"
 )
 
 func evidenceFixture(t *testing.T) (*Store, db.RecordFindingInput, string) {
 	t.Helper()
-	dsn := os.Getenv("ARTEX_PG_DSN")
+	dsn := os.Getenv("JINGWEI_PG_DSN")
 	if dsn == "" {
-		t.Skip("ARTEX_PG_DSN is required for evidence integration tests")
+		t.Skip("JINGWEI_PG_DSN is required for evidence integration tests")
 	}
 	pg, err := db.Open(dsn)
 	if err != nil {

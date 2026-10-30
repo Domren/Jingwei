@@ -7,8 +7,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/jingwei/chains"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
@@ -341,7 +342,19 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 func plannerSystem(goal, dataDir, workDir string) string {
 	body := renderSystem("planner", plannerDefaultTmpl, PlannerVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
-	return body + artifactSpec(workDir, dataDir) + untrustedDataRules()
+	return body + artifactSpec(workDir, dataDir) + untrustedDataRules() + prescanRules() + "\n\n" + chains.Discipline()
+}
+
+// prescanRules is the code-owned reminder that the task was already pre-scanned
+// (asset discovery + POC pre-screen, #96) at bootstrap, so the planner must
+// consume those structured results instead of re-discovering the target from
+// scratch. Kept in code (not the DB-editable body) so it always applies.
+func prescanRules() string {
+	return "\n\n【预扫结果使用规则（平台强制，#96 先探测后渗透）】" +
+		"\n1. 本任务启动时平台已自动完成一轮「资产发现 + POC 初筛」，结果已落入资产库与 graph_overview 的 facts/findings（如「预扫完成：…」事实节点、list_assets、list_findings）。" +
+		"\n2. 每次规划攻击步骤前，先调用 graph_overview / list_assets / list_findings 读取这些已有结果，基于它们判断攻击面，不要仅凭目标文本重新猜测。" +
+		"\n3. 对预扫已覆盖的资产（已登记的端口 / Web 服务 / 应用系统 / POC 命中）不要重复做端口扫描或指纹识别；只有在预扫结果为空、或需要比预扫更深的探测时，才补做。" +
+		"\n4. 预扫数据是平台产生的初始线索，不是最终结论：仍需用证据复核后才能写成漏洞发现。"
 }
 
 // Plan runs one planning round. emit, if non-nil, receives the planner's execution

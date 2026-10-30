@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/scanner"
-	"github.com/Autumn-27/artex/verdict"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Autumn-27/jingwei/verdict"
 )
 
 func TestEncodeProbeQuery(t *testing.T) {

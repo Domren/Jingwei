@@ -18,9 +18,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/report"
-	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/report"
+	"github.com/Autumn-27/jingwei/traffic"
 )
 
 type Store struct {
@@ -339,6 +339,13 @@ func (s *Store) Bind(ctx context.Context, findingID int64, refs []db.TrafficRef)
 		out, err = db.FindingTrafficTx(tx, findingID)
 		return err
 	})
+	if err == nil {
+		// 后补流量：把已记录的复现步骤重新对到刚绑定的报文上。失败只影响报告里
+		// 「步骤↔报文」的跳转，不影响绑定本身，所以不向上报错。
+		if relinkErr := s.DB.ReResolveFindingReproduction(ctx, findingID); relinkErr != nil {
+			log.Printf("[evidence] 复现步骤重新关联流量失败 finding=%d: %v", findingID, relinkErr)
+		}
+	}
 	return
 }
 

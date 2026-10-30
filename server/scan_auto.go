@@ -6,8 +6,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/scanner"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/scanner"
 )
 
 const (
@@ -64,13 +64,18 @@ type autoHostGroup struct {
 // proves a response looked interesting, while those tools prove the parameter is
 // an injection point. Finding IDs are carried into the deep task so a confirmed
 // result marks the scan finding instead of creating a duplicate.
-func (r *scanRun) autoExploit(results []scanner.NucleiResult, findingIDs map[string]int64, summary map[string]any) {
+//
+// It returns the parameter locations the tools were given, so the fixed
+// injection baseline can skip a point the POC stage already covers instead of
+// paying for the same sqlmap run twice.
+func (r *scanRun) autoExploit(results []scanner.NucleiResult, findingIDs map[string]int64, summary map[string]any) map[string]bool {
+	covered := map[string]bool{}
 	if len(results) == 0 || r.ctx.Err() != nil || r.s.deepMgr == nil {
-		return
+		return covered
 	}
 	groups, skipped := groupAutoResults(results, findingIDs)
 	if len(groups) == 0 {
-		return
+		return covered
 	}
 	r.logf("auto", "开始自动验证/利用：%d 个主机分组（命中低于 medium 的 %d 条结果仅保留发现）", len(groups), skipped)
 	if len(groups) > maxAutoDeepHosts {
@@ -90,7 +95,12 @@ func (r *scanRun) autoExploit(results []scanner.NucleiResult, findingIDs map[str
 		}
 		hosts++
 		scanID := r.task.ID
-		handled, probeIDs, points := r.queueAutoInjections(g, scanID)
+		for _, pts := range g.injections {
+			for _, p := range pts {
+				recordProbeLocation(covered, p)
+			}
+		}
+		handled, probeIDs, points := r.queueAutoInjections(g, scanID, "scan")
 		probes += len(probeIDs)
 		probePoints += points
 		taskIDs = append(taskIDs, probeIDs...)
@@ -163,7 +173,7 @@ func (r *scanRun) autoExploit(results []scanner.NucleiResult, findingIDs map[str
 
 	if len(taskIDs) == 0 {
 		r.logf("auto", "没有可排队的自动利用任务")
-		return
+		return covered
 	}
 	r.setProgress("auto", map[string]any{"auto_tasks": len(taskIDs), "auto_hosts": hosts})
 	summary["auto_tasks"] = taskIDs
@@ -173,18 +183,67 @@ func (r *scanRun) autoExploit(results []scanner.NucleiResult, findingIDs map[str
 	summary["auto_probe_points"] = probePoints
 	summary["auto_webshell"] = shells
 	summary["auto_skipped"] = skipped
+	summary["auto_probe_covered"] = len(covered)
 	r.logf("auto", "已排队 %d 个自动任务（%d 个主机，%d 个模板，%d 个专项注入任务/%d 个注入点，%d 个 Webshell 尝试）",
 		len(taskIDs), hosts, queuedTemplates, probes, probePoints, shells)
 	r.s.deepMgr.wakeup()
+	return covered
+}
+
+// probeLocationKey identifies one parameter location ignoring its values: a POC
+// hit and the link the page itself exposes are the same spot when the method,
+// the endpoint and the parameter names match.
+func probeLocationKey(method, rawURL, body string) string {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	names := []string{}
+	seen := map[string]bool{}
+	collect := func(query string) {
+		for _, part := range strings.Split(query, "&") {
+			key, _, ok := strings.Cut(part, "=")
+			if !ok {
+				continue
+			}
+			key = strings.ToLower(strings.TrimSpace(key))
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			names = append(names, key)
+		}
+	}
+	collect(u.RawQuery)
+	collect(body)
+	sort.Strings(names)
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if method == "" {
+		method = "GET"
+	}
+	return method + "|" + strings.ToLower(u.Host+u.Path) + "|" + strings.Join(names, ",")
+}
+
+func recordProbeLocation(into map[string]bool, p probePoint) {
+	if key := probeLocationKey(p.Method, p.URL, p.Body); key != "" {
+		into[key] = true
+	}
 }
 
 // queueAutoInjections creates one sqlmap / dalfox task per proven injection
 // class for the host. The returned map holds the template ids the specialized
 // tools now own, so autoExploit can drop them from the generic POC replay.
-func (r *scanRun) queueAutoInjections(g autoHostGroup, scanID int64) (map[string]bool, []int64, int) {
+// source lands in the deep task params ("scan" for POC hits, "baseline" for the
+// fixed step) and decides the task name plus whether a tool confirmation may
+// open its own finding: baseline points arrive with no finding to upgrade.
+func (r *scanRun) queueAutoInjections(g autoHostGroup, scanID int64, source string) (map[string]bool, []int64, int) {
 	handled := map[string]bool{}
 	ids := []int64{}
 	points := 0
+	prefix := "自动"
+	if source == "baseline" {
+		prefix = "基线"
+	}
 	for _, class := range []string{scanner.InjectionSQLi, scanner.InjectionXSS} {
 		pts := g.injections[class]
 		if len(pts) == 0 {
@@ -202,7 +261,7 @@ func (r *scanRun) queueAutoInjections(g autoHostGroup, scanID int64) (map[string
 		}
 		for i, batch := range batches {
 			wall := autoProbeWall(budget, len(batch))
-			name := "自动" + label + "专项验证 · " + g.target
+			name := prefix + label + "专项验证 · " + g.target
 			if len(batches) > 1 {
 				name = fmt.Sprintf("%s（第 %d/%d 批）", name, i+1, len(batches))
 			}
@@ -211,7 +270,10 @@ func (r *scanRun) queueAutoInjections(g autoHostGroup, scanID int64) (map[string
 				"finding_ids_by_template": g.findings,
 				"max_points":              len(batch),
 				"wall_seconds":            wall,
-				"source":                  "scan",
+				"source":                  source,
+			}
+			if source == "baseline" {
+				params["write_finding"] = r.task.CreateFindings
 			}
 			task, err := r.pg.CreateDeepTask(db.DeepTaskInput{
 				Name:       name,
@@ -222,8 +284,8 @@ func (r *scanRun) queueAutoInjections(g autoHostGroup, scanID int64) (map[string
 				AutoRun:    true,
 			})
 			if err != nil {
-				r.logf("auto", "创建自动%s专项验证任务失败 %s: %v（%d 个注入点未经专项工具验证，发现保持待复核）",
-					label, g.target, err, len(batch))
+				r.logf("auto", "创建%s%s专项验证任务失败 %s: %v（%d 个注入点未经专项工具验证，发现保持待复核）",
+					prefix, label, g.target, err, len(batch))
 				continue
 			}
 			ids = append(ids, task.ID)

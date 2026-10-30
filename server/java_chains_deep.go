@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/scanner"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/scanner"
 )
 
 // javaChainAttempt tracks one automatically published chain and its delivery.

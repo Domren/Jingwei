@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/db"
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -1312,11 +1314,38 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 
 // --- worker write tools ---
 
-func (t *ToolSet) addFinding() actool.CoreTool {
-	return writeTool("report_finding", "记录确认的漏洞。HTTP 漏洞的 evidence 用原始 HTTP 请求/响应报文（请求行、Host、关键请求头、响应状态行与关键响应片段）说明复现与验证结论，并配合 traffic_refs 绑定已采集的真实流量；非 HTTP 协议（Redis/MySQL/SSH 等）用 protocol 写明协议名，并把实际收发字节放进 raw_request/raw_response，evidence 写协议层结论。任何情况都不要用 curl 命令或口头描述代替报文。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
+// severityDefaultCVSS 在 report_finding 未显式给 cvss 时，按 severity 推导一个合理的
+// 默认基础分，避免模型漏传 cvss 导致漏洞丢单。映射取常见 CVSS v3.1 基线值。
+func severityDefaultCVSS(severity string) float64 {
+	switch strings.ToLower(severity) {
+	case "critical":
+		return 9.8
+	case "high":
+		return 7.5
+	case "medium":
+		return 5.3
+	case "low":
+		return 3.1
+	default:
+		return 5.0
+	}
+}
+
+const reportFindingDescription = "记录确认的漏洞。HTTP 漏洞的 evidence 用原始 HTTP 请求/响应报文（请求行、Host、关键请求头、响应状态行与关键响应片段）说明复现与验证结论，并配合 traffic_refs 绑定已采集的真实流量；非 HTTP 协议（Redis/MySQL/SSH 等）用 protocol 写明协议名，并把实际收发字节放进 raw_request/raw_response，evidence 写协议层结论。任何情况都不要用 curl 命令或口头描述代替报文。任务上下文传当前 intent_id。**必须同时填 reproduction 结构化复现过程**（入口点 / 前置条件 / 有序真实步骤 / 攻击链来源）：它在落库那一刻就固定下来并直接渲染进报告，事后没有任何人能替你准确还原，request/response 一律逐字取自真实执行。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。"
+
+// ReportFindingDefaults exposes the code-defined description and schema so
+// one-time DB migrations can backfill parameters added after an install was
+// seeded (SeedTool only inserts once).
+func ReportFindingDefaults() (string, map[string]any) {
+	return reportFindingDescription, reportFindingSchema()
+}
+
+func reportFindingSchema() map[string]any {
+	return obj(map[string]any{
 		"vulnclass": str("漏洞类别"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
+		"cvss":      map[string]any{"type": "number", "description": "CVSS v3.1 基础分，必填：按 AV/AC/PR/UI/S/C/I/A 向量逐项打分后取总分（0.0-10.0，保留一位小数）。"},
 		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
-		"evidence":         str("证据文本：判定依据与结论。HTTP(S) 漏洞写关键请求行/头与响应状态行、响应片段（真实报文由 traffic_refs 绑定）；非 HTTP 协议写命令与协议层结论。真实收发的完整字节放 raw_request/raw_response，不要贴在这里；任何情况都不要写 curl 命令"),
+		"evidence":         str("证据文本：判定依据与结论。必须写「发了什么、回来什么、因此说明什么」——关键请求行/头、响应状态行与命中片段，再写结论。真实收发的完整字节放 raw_request/raw_response 或 traffic_refs，但**不能只写「见截图/见报告/同上/略」这类指向**：截图是事后产物，evidence 本身才是判定依据，任何情况都不要用 curl 命令或口头描述代替报文"),
 		"protocol":         str("非 HTTP 协议漏洞必填：协议名（如 redis、mysql、ssh、memcached、tcp）。HTTP(S) 漏洞省略；填写后报告按该协议展示「原始协议报文」，同时必须提供 raw_request/raw_response"),
 		"raw_request":      map[string]any{"type": "string", "description": "protocol 非空时必填：本次实际发送给目标的完整原始字节（真实 CRLF，JSON 里写成单反斜杠转义 \"\\r\\n\"，不要写双反斜杠 \\\\r\\\\n 字面量），例如 \"PING\\r\\n\"；报告把它作为可重放的请求数据；HTTP 漏洞用 traffic_refs 绑定真实流量，不要手写请求行"},
 		"raw_response":     map[string]any{"type": "string", "description": "protocol 非空时必填：与 raw_request 同一次交互中目标真实返回的原始字节（含协议前缀/状态行与换行，原样保留）；不得虚构，只写实际收到的内容"},
@@ -1324,9 +1353,26 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		"no_raw_capture":   map[string]any{"type": "boolean", "description": "仅在确实无法取得可重放报文/字节时传 true（例如结论只来自源码阅读、配置或命令输出，本次没有实际向目标发送过可复现的请求），并在 evidence 说明原因；默认省略。未传时 HTTP 漏洞缺 traffic_refs、非 HTTP 漏洞缺 raw_request/raw_response 会被退回要求补齐"},
 		"traffic_refs": map[string]any{"type": "array", "description": "HTTP/HTTPS 漏洞必填：先 traffic_search 检索、traffic_get 逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID（提交链路要带上展示/触发危害的那一次 GET）。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测；确实无法取得报文时改传 no_raw_capture=true。TCP 等非 HTTP 漏洞用 raw_request/raw_response，此处省略或传 []。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
 			"items": obj(map[string]any{"traffic_id": str("traffic_search 返回的真实流量 ID"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("该流量如何支持漏洞结论")}, "traffic_id")},
-	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+		"reproduction": obj(map[string]any{
+			"entry_point":   str("入口点：触发漏洞的关键接口/位置，写成「METHOD /path（表单 / JSON / 哪个参数）」。非 HTTP 协议写成「协议 命令」，例如 redis CONFIG SET"),
+			"prerequisites": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "复现前置条件：需要的账号/角色/前置状态。若需要测试账号，写清【怎么注册】（哪个接口 + 关键字段），让人从零也能复现"},
+			"steps": map[string]any{"type": "array", "description": "有序复现步骤，严格按你本次实际执行的先后顺序。每一步的 request 必须是真实发过的请求原文——逐字取自执行记录，不要改写、不要美化、不要编造",
+				"items": obj(map[string]any{
+					"request":  str("该步真实发出的请求原文：完整 HTTP 报文（请求行 / Host / 关键请求头 / 请求体）或你实际执行的 curl 命令。逐字取自真实执行，不要改写"),
+					"response": str("该步真实收到的响应原文：状态行 + 关键响应头 + 能证明问题的响应体片段。内容太长就只留关键片段（命中位置附近），不要整页 HTML"),
+					"expected": str("该步的预期/观察结果，一句话"),
+					"proves":   str("这一步证明了什么，一句话"),
+				}, "request")},
+			"provenance": str("该漏洞的攻击链来源/依赖：从哪个入口、依赖哪些前置步骤或凭据得来"),
+		}, "steps"),
+	}, "vulnclass", "severity", "summary", "cvss")
+}
+
+func (t *ToolSet) addFinding() actool.CoreTool {
+	return writeTool("report_finding", reportFindingDescription, reportFindingSchema(), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
+			CVSS                                         *float64          `json:"cvss"`
 			Protocol                                     string            `json:"protocol"`
 			RawRequest                                   string            `json:"raw_request"`
 			RawResponse                                  string            `json:"raw_response"`
@@ -1335,8 +1381,26 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			AssetIDs                                     []json.RawMessage `json:"asset_ids"`
 			TrafficRefs                                  []db.TrafficRef   `json:"traffic_refs"`
 			EvidenceHintID                               json.RawMessage   `json:"evidence_hint_id"`
+			Reproduction                                 *db.Reproduction  `json:"reproduction"`
 		}
 		if err := json.Unmarshal(in, &a); err != nil {
+			return actool.Errorf(err.Error()), nil
+		}
+		// cvss 未提供时按 severity 自动推导默认分（弱模型/旧 schema 常漏传，不硬卡、不让漏洞因此丢单）。
+		// 只有越界(0-10 之外)才拒绝，避免模型瞎填。
+		if a.CVSS == nil {
+			def := severityDefaultCVSS(a.Severity)
+			a.CVSS = &def
+		}
+		if *a.CVSS < 0 || *a.CVSS > 10 {
+			return actool.Errorf("report_finding 的 CVSS 基础分越界（须 0.0-10.0）。请保持 vulnclass/name/severity/summary/evidence 不变，重新调用并补上合法的 cvss。本次调用未登记漏洞，不会产生重复记录。"), nil
+		}
+		a.Reproduction.Normalize()
+		if a.Reproduction.Empty() {
+			return actool.Errorf("report_finding 必须提供结构化复现过程（reproduction 字段）：entry_point（入口接口）、prerequisites（前置条件，需要账号就写清怎么注册）、steps（至少 1 步，每步 request=你真实发过的请求原文、response=真实响应片段、expected/proves 各一句话）、provenance（攻击链来源）。这份过程会直接进报告，决定别人能否照着复现；你刚执行完，只有你能准确还原。请保持 vulnclass/name/severity/summary/evidence/traffic_refs 不变，重新调用并补上 reproduction。本次调用未登记漏洞，不会产生重复记录。"), nil
+		}
+		// 证据必须是实质内容：截图是事后可补的产物，evidence 本身才是判定依据。
+		if err := validateFindingEvidence(a.Evidence); err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
 		if t.ts == nil {
@@ -1381,7 +1445,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if proto != "" && !strings.Contains(evidence, "类型:") {
 			evidence = "类型: " + proto + "\n" + evidence
 		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: name, Severity: a.Severity, Summary: a.Summary, Evidence: evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), Protocol: proto, RawRequest: rawReq, RawResponse: rawResp}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: name, Severity: a.Severity, Summary: a.Summary, Evidence: evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), Protocol: proto, RawRequest: rawReq, RawResponse: rawResp, CVSS: a.CVSS, Reproduction: a.Reproduction}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1392,6 +1456,18 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		}
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
+		}
+		// 漏洞一旦确认，就顺手把取证面板渲染成图存进证据表——报告要的是
+		// "有图可证"，而不是等操作员事后手工截图。渲染是异步的：它不该拖慢
+		// 上报，失败也只记日志，绝不因为截图问题丢掉一条已确认的漏洞。
+		if shotter, ok := t.findingRecorder.(FindingShotter); ok {
+			go func(fid int64) {
+				sctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+				defer cancel()
+				if _, err := shotter.CaptureShot(sctx, fid); err != nil {
+					log.Printf("[evidence] 自动取证截图失败 finding=%d: %v", fid, err)
+				}
+			}(recorded.FindingID)
 		}
 		if t.notifyFinding != nil {
 			iid := input.IntentID

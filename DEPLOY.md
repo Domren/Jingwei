@@ -1,6 +1,6 @@
 # Jingwei（精卫）Docker 部署指南
 
-适用版本：**v1.1.0**。Jingwei 自 1.0.0 起只通过容器镜像分发，
+适用版本：**v1.2.0**。Jingwei 自 1.0.0 起只通过容器镜像分发，
 部署、升级和回滚都使用 Docker Compose。
 
 - 镜像：`ghcr.io/domren/jingwei`
@@ -26,7 +26,7 @@ LLM 不是启动必需项，但对话、任务执行和 Agent 自动规划需要
 ### 2.1 使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.1.0 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.2.0 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 ```
@@ -35,8 +35,8 @@ cp .env.example .env
 
 ```bash
 mkdir -p jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.1.0/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.1.0/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.2.0/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.2.0/deploy/.env.example
 ```
 
 两种方式得到的目录结构相同：
@@ -52,7 +52,7 @@ curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.1.0/deploy/
 镜像默认发布到 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.1.0
+docker pull ghcr.io/domren/jingwei:1.2.0
 ```
 
 维护者把 Package 可见性设为 **Public** 后，以上命令无需登录。
@@ -70,9 +70,9 @@ unset GHCR_TOKEN
 
 | 标签 | 说明 |
 | --- | --- |
-| `1.1.0` / `v1.1.0` | 固定版本，生产环境推荐 |
+| `1.2.0` / `v1.2.0` | 固定版本，生产环境推荐 |
 | `latest` | 最新正式版 |
-| `v1.1.0-amd64` / `v1.1.0-arm64` | 单架构中间镜像，一般不用 |
+| `v1.2.0-amd64` / `v1.2.0-arm64` | 单架构中间镜像，一般不用 |
 
 ## 4. 配置 `.env`
 
@@ -82,7 +82,7 @@ unset GHCR_TOKEN
 POSTGRES_USER=jingwei
 POSTGRES_PASSWORD=请替换为强随机密码
 POSTGRES_DB=jingwei
-JINGWEI_IMAGE=ghcr.io/domren/jingwei:1.1.0
+JINGWEI_IMAGE=ghcr.io/domren/jingwei:1.2.0
 JINGWEI_WEB_PORT=9790
 JINGWEI_PROXY_PORT=9791
 ```
@@ -91,15 +91,15 @@ JINGWEI_PROXY_PORT=9791
 
 - `POSTGRES_PASSWORD` 会被拼进数据库连接串，建议只使用字母和数字。
   若必须包含 `@`、`:`、`/` 等字符，请对整段 DSN 做 URL 编码并通过
-  `ARTEX_PG_DSN` 覆盖，例如：
+  `JINGWEI_PG_DSN` 覆盖，例如：
   ```dotenv
-  ARTEX_PG_DSN=postgres://jingwei:URL_ENCODED_PASSWORD@postgres:5432/jingwei?sslmode=disable
+  JINGWEI_PG_DSN=postgres://jingwei:URL_ENCODED_PASSWORD@postgres:5432/jingwei?sslmode=disable
   ```
 - `.env` 含密码与密钥，建议 `chmod 600 .env`，且不要提交到 Git。
 - LLM 可先在 `.env` 填写，也可启动后进入「系统 → LLM」配置。
-  使用 OpenAI 兼容服务时，通常填写 `OPENAI_API_KEY`、`ARTEX_LLM_BASE_URL` 和
-  `ARTEX_LLM_MODEL`。
-- `ARTEX_LLM_CALL_TIMEOUT` 限制单次模型调用的总墙钟（含 SDK 重试与流式读取），默认 `15m`。
+  使用 OpenAI 兼容服务时，通常填写 `OPENAI_API_KEY`、`JINGWEI_LLM_BASE_URL` 和
+  `JINGWEI_LLM_MODEL`。
+- `JINGWEI_LLM_CALL_TIMEOUT` 限制单次模型调用的总墙钟（含 SDK 重试与流式读取），默认 `15m`。
   网关变慢时会出现「任务在跑、日志里持续出现 `单次调用超过硬性墙钟`、漏洞数为 0」，
   此时调小为 `300s` 可让 worker 尽快放弃卡住的那一次并继续推进。
 - 如果需要限制访问来源，建议保持 `JINGWEI_PROXY_PORT` 只绑定 `127.0.0.1`，
@@ -117,8 +117,13 @@ curl -fsS http://127.0.0.1:9790/api/health
 期望健康检查返回：
 
 ```json
-{"ok":true,"service":"jingwei","version":"1.1.0"}
+{"ok":true,"service":"jingwei","version":"1.2.0"}
 ```
+
+从 v1.1.0 升级时注意：环境变量前缀已由 `ARTEX_` 改为 `JINGWEI_`，旧变量不再读取。
+需要把 `.env` / compose 中的 `ARTEX_PG_DSN`、`ARTEX_LLM_*`、`ARTEX_CONFIG`、
+`ARTEX_SKILL_DIR` 换成对应的 `JINGWEI_*`，镜像入口二进制也由 `/app/artex` 改为
+`/app/jingwei`（官方 compose 已同步，无需手动改入口）。
 
 浏览器访问 `http://<服务器IP>:9790`：
 
@@ -269,7 +274,7 @@ cd web && npm ci && cd ..
 也可以分别启动：
 
 ```bash
-go run ./cmd/artex
+go run ./cmd/jingwei
 cd web && npm run dev
 ```
 
@@ -289,9 +294,9 @@ rm -rf server/webui/dist
 cp -r web/out server/webui/dist
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.1.0" -o dist/amd64/artex ./cmd/artex
+  -ldflags "-s -w -X main.version=1.2.0" -o dist/amd64/jingwei ./cmd/jingwei
 
-docker build --network=host --build-arg TARGETARCH=amd64 -t jingwei:1.1.0 .
+docker build --network=host --build-arg TARGETARCH=amd64 -t jingwei:1.2.0 .
 ```
 
 ARM64 构建时把 `GOARCH` 与 `TARGETARCH` 改为 `arm64`，并在对应架构的机器上
@@ -324,7 +329,7 @@ docker compose logs --tail=100 postgres
 
 ### 10.2 无法拉取 GHCR 镜像
 
-- 确认镜像版本存在：`docker manifest inspect ghcr.io/domren/jingwei:1.1.0`
+- 确认镜像版本存在：`docker manifest inspect ghcr.io/domren/jingwei:1.2.0`
 - 若 Package 是私有的，先按第 3 节登录；Token 需要 `read:packages`。
 - 确认 Docker 所在网络可以访问 `ghcr.io`。
 
@@ -342,8 +347,8 @@ JINGWEI_PROXY_PORT=19791
 ### 10.4 配置了模型仍无法执行任务
 
 检查「系统 → LLM」中的 Provider、Base URL、模型名与密钥；保存后可点击测试。
-OpenAI 兼容服务通常需要同时设置 `ARTEX_LLM_PROVIDER=openai`（或 UI 中对应选项）、
-`ARTEX_LLM_BASE_URL` 和 `ARTEX_LLM_MODEL`。如果服务端需要代理访问外网，
+OpenAI 兼容服务通常需要同时设置 `JINGWEI_LLM_PROVIDER=openai`（或 UI 中对应选项）、
+`JINGWEI_LLM_BASE_URL` 和 `JINGWEI_LLM_MODEL`。如果服务端需要代理访问外网，
 在「系统配置」中填写服务端可达的代理地址，注意容器内的 `127.0.0.1` 指容器自身。
 
 ### 10.5 忘记管理员密码

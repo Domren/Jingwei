@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ARTEX 安装脚本：① 全部 Docker  ② 本地编译运行
+# Jingwei 安装脚本：① 全部 Docker  ② 本地编译运行
 set -euo pipefail
 cd "$(cd "$(dirname "$0")" && pwd)"
 
@@ -50,7 +50,7 @@ install_docker(){
   docker compose pull
   docker compose up -d
   ok "启动完成 → http://localhost:8787"
-  info "查看日志：docker compose logs -f artex"
+  info "查看日志：docker compose logs -f jingwei"
 }
 
 # ── ② 本地编译运行 ──────────────────────────────
@@ -62,16 +62,16 @@ install_local(){
     2)
       ensure_docker
       local pw; pw="$(ask 'Postgres 密码（回车随机）' "$(rand)")"
-      docker run -d --name artex-pg -p 5432:5432 \
-        -e POSTGRES_USER=artex -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=artex \
-        -v artex-pg:/var/lib/postgresql/data postgres:16-alpine
-      DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=artex DB_PASS="$pw" DB_NAME=artex DB_SSL=disable ;;
+      docker run -d --name jingwei-pg -p 5432:5432 \
+        -e POSTGRES_USER=jingwei -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=jingwei \
+        -v jingwei-pg:/var/lib/postgresql/data postgres:16-alpine
+      DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=jingwei DB_PASS="$pw" DB_NAME=jingwei DB_SSL=disable ;;
     *)
       DB_HOST="$(ask '数据库地址' 127.0.0.1)"
       DB_PORT="$(ask '端口' 5432)"
-      DB_USER="$(ask '账号' artex)"
+      DB_USER="$(ask '账号' jingwei)"
       DB_PASS="$(ask '密码' '')"
-      DB_NAME="$(ask '数据库名' artex)"
+      DB_NAME="$(ask '数据库名' jingwei)"
       DB_SSL="$(ask 'sslmode (disable/require)' disable)" ;;
   esac
 
@@ -100,19 +100,19 @@ JSON
     ( cd web && npm ci && npm run build:static )
     rm -rf server/webui/dist && cp -r web/out server/webui/dist
     info "编译内嵌单二进制…"
-    CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+    CGO_ENABLED=0 go build -tags embedui -trimpath -o jingwei ./cmd/jingwei
   else
     warn "未检测到 npm：将编译**不内嵌前端**的后端（前端需另跑 npm run dev）"
-    CGO_ENABLED=0 go build -o artex ./cmd/artex
+    CGO_ENABLED=0 go build -o jingwei ./cmd/jingwei
   fi
-  ok "编译完成 → ./artex"
+  ok "编译完成 → ./jingwei"
 
   info "启动…（Ctrl-C 退出）"
-  ./artex
+  ./jingwei
 }
 
 echo "=============================="
-echo "  ARTEX 安装"
+echo "  Jingwei 安装"
 echo "  1) 全部 Docker 安装"
 echo "  2) 本地运行（go 编译）"
 echo "=============================="

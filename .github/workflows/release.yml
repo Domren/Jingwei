@@ -95,12 +95,12 @@ jobs:
           mkdir -p "dist/$GOARCH"
           CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -tags embedui -trimpath \
             -ldflags "-s -w -X main.version=$VERSION" \
-            -o "dist/$GOARCH/artex" ./cmd/artex
-          file "dist/$GOARCH/artex"
+            -o "dist/$GOARCH/jingwei" ./cmd/jingwei
+          file "dist/$GOARCH/jingwei"
       - uses: actions/upload-artifact@v4
         with:
           name: bin-linux-${{ matrix.arch }}
-          path: dist/${{ matrix.arch }}/artex
+          path: dist/${{ matrix.arch }}/jingwei
           retention-days: 3
 
   docker:
@@ -155,9 +155,9 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           ARCH: ${{ matrix.arch }}
         run: |
-          docker run --rm --entrypoint /app/artex "jingwei:smoke-$ARCH" -h
+          docker run --rm --entrypoint /app/jingwei "jingwei:smoke-$ARCH" -h
           docker run -d --name jingwei-smoke --network host \
-            -e ARTEX_PG_DSN='postgres://jingwei:jingwei-ci-test@127.0.0.1:5432/jingwei?sslmode=disable' \
+            -e JINGWEI_PG_DSN='postgres://jingwei:jingwei-ci-test@127.0.0.1:5432/jingwei?sslmode=disable' \
             "jingwei:smoke-$ARCH"
           trap 'docker logs jingwei-smoke; docker rm -f jingwei-smoke' EXIT
           curl --fail --retry 30 --retry-connrefused --retry-delay 2 --max-time 3 \

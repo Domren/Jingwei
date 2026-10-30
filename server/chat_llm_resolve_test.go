@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/db"
 )
 
 // TestChatUnavailableReasonDistinguishesStates pins the operator-facing message
@@ -28,8 +28,8 @@ func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
 	// dev database that table holds the operator's live credentials — wiping it to
 	// satisfy one assertion destroys their configuration, so require an opt-in.
 	existing, _ := m.pg.ListProfiles()
-	if len(existing) > 0 && os.Getenv("ARTEX_TEST_ALLOW_DB_WIPE") != "1" {
-		t.Skipf("llm_profiles 已有 %d 条配置（可能是使用者真实凭据），拒绝清空；在专用库上跑本测试请设 ARTEX_TEST_ALLOW_DB_WIPE=1", len(existing))
+	if len(existing) > 0 && os.Getenv("JINGWEI_TEST_ALLOW_DB_WIPE") != "1" {
+		t.Skipf("llm_profiles 已有 %d 条配置（可能是使用者真实凭据），拒绝清空；在专用库上跑本测试请设 JINGWEI_TEST_ALLOW_DB_WIPE=1", len(existing))
 	}
 	for _, p := range existing {
 		if p.IsDefault {

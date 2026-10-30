@@ -89,3 +89,49 @@ func TestFindingSystemGroups(t *testing.T) {
 		t.Fatalf("unassigned filter: count=%d page=%+v err=%v", count, page, err)
 	}
 }
+
+// TestSystemInfoPathPrefix verifies the app-layer grouping rule: a service
+// asset whose URL carries a non-root path forms its own system bucket
+// ("svc:host:port/path") while origin-only services keep the plain
+// host(:port) key.
+func TestSystemInfoPathPrefix(t *testing.T) {
+	cases := []struct {
+		name      string
+		asset     systemAsset
+		wantKey   string
+		wantLabel string
+	}{
+		{
+			name:    "origin only",
+			asset:   systemAsset{kind: "service", domain: "a.test", port: 8080, url: "http://a.test:8080/"},
+			wantKey: "svc:a.test:8080", wantLabel: "a.test:8080",
+		},
+		{
+			name:    "path system",
+			asset:   systemAsset{kind: "service", domain: "a.test", port: 8080, url: "http://a.test:8080/admin"},
+			wantKey: "svc:a.test:8080/admin", wantLabel: "a.test:8080 /admin",
+		},
+		{
+			name:    "path with query stripped",
+			asset:   systemAsset{kind: "service", domain: "a.test", port: 443, url: "https://a.test/api?x=1"},
+			wantKey: "svc:a.test:443/api", wantLabel: "a.test:443 /api",
+		},
+		{
+			name:    "endpoint kind unaffected",
+			asset:   systemAsset{kind: "endpoint", domain: "a.test", port: 443, url: "https://a.test/admin"},
+			wantKey: "svc:a.test:443", wantLabel: "a.test:443",
+		},
+	}
+	for _, c := range cases {
+		key, label, _, _, _ := c.asset.systemInfo()
+		if key != c.wantKey || label != c.wantLabel {
+			t.Errorf("%s: key=%q label=%q want key=%q label=%q", c.name, key, label, c.wantKey, c.wantLabel)
+		}
+	}
+	if p := urlPathPrefix("http://h/p/Q#f"); p != "/p/q" {
+		t.Errorf("urlPathPrefix lowercases path: %q", p)
+	}
+	if p := urlPathPrefix("not a url"); p != "" {
+		t.Errorf("urlPathPrefix garbage: %q", p)
+	}
+}

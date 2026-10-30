@@ -3234,14 +3234,6 @@ export const skills: SkillItem[] = [
     usage_agents: ["worker"],
     last_used: "2026-08-19T21:40:00Z",
   },
-  {
-    name: "scopesentry",
-    description: "从 ScopeSentry 拉取资产并归并到公司范围；批量导入资产时使用。",
-    files: ["SKILL.md", "assets/mapping.md"],
-    calls: 0,
-    tasks: 0,
-    usage_agents: [],
-  },
 ];
 
 export const skillCalls: SkillCall[] = [
@@ -3325,6 +3317,8 @@ export const tools: Tool[] = [
 // ── Settings ─────────────────────────────────────────────────────────────────
 export const settings: Settings = {
   task_intelligence_enabled: false,
+  task_auto_title_enabled: false,
+  chat_auto_title_enabled: false,
   credential_agent_enabled: false,
   credential_traffic_binding: false,
   traffic_capture: true,

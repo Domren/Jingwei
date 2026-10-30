@@ -23,11 +23,11 @@ import (
 // minutes on one reply. It exists to kill hangs, not to cap normal latency.
 const defaultLLMCallTimeout = 15 * time.Minute
 
-// llmCallTimeout resolves ARTEX_LLM_CALL_TIMEOUT. Accepts a Go duration
+// llmCallTimeout resolves JINGWEI_LLM_CALL_TIMEOUT. Accepts a Go duration
 // ("10m", "900s") or plain seconds; invalid values fall back to the default.
 // <= 0 disables the hard cap.
 func llmCallTimeout() time.Duration {
-	raw := strings.TrimSpace(os.Getenv("ARTEX_LLM_CALL_TIMEOUT"))
+	raw := strings.TrimSpace(os.Getenv("JINGWEI_LLM_CALL_TIMEOUT"))
 	if raw == "" {
 		return defaultLLMCallTimeout
 	}
@@ -37,7 +37,7 @@ func llmCallTimeout() time.Duration {
 	if secs, err := strconv.Atoi(raw); err == nil {
 		return time.Duration(secs) * time.Second
 	}
-	log.Printf("[llm] ARTEX_LLM_CALL_TIMEOUT=%q 无效，使用默认 %s", raw, defaultLLMCallTimeout)
+	log.Printf("[llm] JINGWEI_LLM_CALL_TIMEOUT=%q 无效，使用默认 %s", raw, defaultLLMCallTimeout)
 	return defaultLLMCallTimeout
 }
 

@@ -16,8 +16,19 @@ LLM 驱动的全链自动化红队渗透平台 · Docker 分发版
 
 ---
 
-## Jingwei 1.1.0
+## Jingwei 1.2.0
 
+- **应用层发现**：同一服务下按路径字典、robots/sitemap、页面链接与 SPA 路由识别子路径系统，
+  随机路径 soft-404 过滤后作为系统级资产入库并关联。
+- **固定渗透基线**：弱口令（内置 WebCrack 引擎跑登录页 admin 字典）与 SQL/XSS 参数位置枚举
+  作为扫描必跑步骤，不依赖 nuclei 是否命中；参数位置交给镜像内 sqlmap / dalfox 专项判定，
+  同一位置只付一次工具成本。
+- **先探测后渗透**：LLM 任务在 planner 首轮前完成端口/指纹/应用层发现与 POC 初筛，结果落
+  资产与发现；`chains` 的反问纪律与场景链由代码按意图注入，不靠提示词自觉。
+- **可复现证据**：上报即固化结构化复现过程（入口/前置/真实步骤/来源），报告逐步绑定流量
+  快照；证据质量校验拦截「见截图」式占位；发现可用 Chromium 头less 渲染取证截图。
+- **深度利用扩展**：请求重发（原始报文重放）、跨任务凭据库、内网拓扑页、AES-256-CBC 加密
+  WebShell 会话；「资产同步」页退役。
 - **品牌化**：控制台、登录/初始化页、侧栏、报告、通知、页脚与后端服务名统一为「精卫 Jingwei」。
 - **POC 模板库**：nuclei 模板的搜索、筛选、统计、详情、上传、启停与批量执行；镜像内置 nuclei 3.11.1。
 - **自动化漏扫**：不配置 LLM 也能跑——端口探测 + 25,136 条 FLUX 指纹 + nuclei 命中直接生成漏洞发现，
@@ -28,7 +39,7 @@ LLM 驱动的全链自动化红队渗透平台 · Docker 分发版
   Java 反序列化走可选 java-chains sidecar + MCP。
 - **安全边界**：工具调用统一经 Guard 做目标范围与出站限制、密钥脱敏与痕迹清理，判定结果带反证去重。
 - **全链自动化**：planner / worker / main-agent 协作，探索图 + 资产图双图驱动任务推进。
-- **完整工作台**：任务与计划任务、发现与报告（DOCX/HTML 导出）、资产与 ScopeSentry 同步、流量录制、工具执行、LLM 记录。
+- **完整工作台**：任务与计划任务、发现与报告（DOCX/HTML 导出）、资产与内网拓扑、流量录制、工具执行、LLM 记录。
 - **人在环路**：拦截规则、审批记录、旁路问答与通知推送。
 - **Docker 分发**：`linux/amd64` / `linux/arm64` 多架构镜像，Compose 一键部署，升级只换镜像。
 
@@ -70,7 +81,7 @@ LLM 驱动的全链自动化红队渗透平台 · Docker 分发版
 ### 方式一：使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.1.0 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.2.0 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 # 编辑 .env：至少修改 POSTGRES_PASSWORD
@@ -82,8 +93,8 @@ docker compose up -d
 
 ```bash
 mkdir jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.1.0/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.1.0/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.2.0/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.2.0/deploy/.env.example
 # 编辑 .env 后启动
 docker compose pull
 docker compose up -d
@@ -97,7 +108,7 @@ docker compose up -d
 镜像发布在 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.1.0
+docker pull ghcr.io/domren/jingwei:1.2.0
 ```
 
 仓库维护者将 Package 设为公开后可直接拉取。若镜像仍为私有，请使用具备
@@ -115,14 +126,14 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u Domren --password-stdin
 | --- | :---: | --- |
 | `POSTGRES_PASSWORD` | 是 | 数据库密码，建议使用字母数字强随机值 |
 | `POSTGRES_USER` / `POSTGRES_DB` | 否 | 默认均为 `jingwei` |
-| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.1.0` |
+| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.2.0` |
 | `JINGWEI_WEB_PORT` | 否 | Web/API 宿主端口，默认 `9790` |
 | `JINGWEI_PROXY_PORT` | 否 | 流量代理宿主端口，默认 `9791`，仅绑定 `127.0.0.1` |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | 否 | 也可启动后在 UI 配置 |
-| `ARTEX_LLM_PROVIDER` / `ARTEX_LLM_MODEL` / `ARTEX_LLM_BASE_URL` / `ARTEX_LLM_PROXY` | 否 | 自定义 OpenAI 兼容端点或代理 |
+| `JINGWEI_LLM_PROVIDER` / `JINGWEI_LLM_MODEL` / `JINGWEI_LLM_BASE_URL` / `JINGWEI_LLM_PROXY` | 否 | 自定义 OpenAI 兼容端点或代理 |
 
 密码含 `@`、`:`、`/` 等特殊字符时会被直接拼入 DSN，请改用 URL 编码后的
-`ARTEX_PG_DSN` 覆盖完整连接串，或使用字母数字密码。
+`JINGWEI_PG_DSN` 覆盖完整连接串，或使用字母数字密码。
 
 ### 升级
 
@@ -190,11 +201,11 @@ cd web && npm ci && npm run build:static && cd ..
 # 2. 嵌入前端并编译 Linux 二进制
 rm -rf server/webui/dist && cp -r web/out server/webui/dist
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.1.0" -o dist/amd64/artex ./cmd/artex
+  -ldflags "-s -w -X main.version=1.2.0" -o dist/amd64/jingwei ./cmd/jingwei
 
 # 3. 构建运行镜像
 docker build --network=host --build-arg TARGETARCH=amd64 \
-  -t jingwei:1.1.0 .
+  -t jingwei:1.2.0 .
 ```
 
 本地开发运行后端与前端的方法见 [DEPLOY.md](DEPLOY.md#从源码开发)。

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/db"
 )
 
 func TestFindingsDOCXPaginatesAndEmbedsRealPackets(t *testing.T) {
@@ -273,4 +273,61 @@ func TestFindingsDOCXDisclosesMergedAndCappedPackets(t *testing.T) {
 	if strings.Contains(doc, "证据 #51 ·") {
 		t.Fatal("the primary packet is rendered once, above the sequence")
 	}
+}
+
+func TestFindingsDOCXEmbedsScreenshots(t *testing.T) {
+	at := time.Date(2026, 10, 27, 10, 0, 0, 0, time.Local)
+	// 1x1 红色 PNG
+	pngB64 := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	fs := []*db.DBFinding{
+		{
+			ID: 1, Name: "反射型 XSS", VulnClass: "xss", Severity: db.SeverityMedium,
+			Status: db.FindingConfirmed, Summary: "存在反射型 XSS",
+			Screenshots: []db.FindingScreenshot{{ID: 9, FindingID: 1, Caption: "重放截图", Data: pngB64}},
+			CreatedAt:   at,
+		},
+	}
+	data, err := FindingsDOCX(fs, FindingsDOCXOptions{GeneratedAt: at, ScopeLabel: "筛选"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := readDOCXParts(t, data)
+
+	// 1) media 文件存在且内容正确
+	media, ok := files["word/media/image1.png"]
+	if !ok {
+		t.Fatalf("expected word/media/image1.png, got parts: %v", keysOf(files))
+	}
+	if len(media) == 0 {
+		t.Fatal("media file empty")
+	}
+	if media[0] != 0x89 || media[1] != 'P' || media[2] != 'N' || media[3] != 'G' {
+		t.Fatalf("media file is not a PNG, first bytes: % x", media[:8])
+	}
+
+	// 2) document.xml 引用了图片关系 rId4
+	doc := string(files["word/document.xml"])
+	if !strings.Contains(doc, `r:embed="rId4"`) {
+		t.Fatalf("document.xml missing r:embed=rId4:\n%s", doc[strings.Index(doc, "<w:drawing>"):][:300])
+	}
+
+	// 3) 关系文件含 image 关系
+	rels := string(files["word/_rels/document.xml.rels"])
+	if !strings.Contains(rels, `Target="media/image1.png"`) {
+		t.Fatalf("rels missing media/image1.png:\n%s", rels)
+	}
+
+	// 4) content types 声明了 png
+	ct := string(files["[Content_Types].xml"])
+	if !strings.Contains(ct, `Extension="png"`) {
+		t.Fatalf("content types missing png default:\n%s", ct)
+	}
+}
+
+func keysOf(m map[string][]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

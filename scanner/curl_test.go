@@ -15,6 +15,7 @@ func TestParseCurlRequest(t *testing.T) {
 		wantURL    string
 		wantBody   string
 		wantCookie string
+		wantProxy  string
 		ok         bool
 	}{
 		{
@@ -46,6 +47,41 @@ func TestParseCurlRequest(t *testing.T) {
 			curl: `curl -X 'POST' -d 'a=1'`,
 			ok:   false,
 		},
+		{
+			// curl's -x is the proxy. The old parser lowercased flags, so this
+			// became method "HTTP://127.0.0.1:8080" and the real POST was lost.
+			name:       "short proxy flag keeps method",
+			curl:       `curl -x http://127.0.0.1:8080 -X POST -d 'a=1' 'http://192.0.2.4/api'`,
+			wantMethod: "POST",
+			wantURL:    "http://192.0.2.4/api",
+			wantBody:   "a=1",
+			wantProxy:  "http://127.0.0.1:8080",
+			ok:         true,
+		},
+		{
+			name:       "long proxy flag attached value",
+			curl:       `curl --proxy=socks5://127.0.0.1:1080 'http://192.0.2.4/api'`,
+			wantMethod: "GET",
+			wantURL:    "http://192.0.2.4/api",
+			wantProxy:  "socks5://127.0.0.1:1080",
+			ok:         true,
+		},
+		{
+			name:       "attached method value",
+			curl:       `curl -XPOST -xhttp://127.0.0.1:8080 -H 'X-Test: 1' 'http://192.0.2.4/api'`,
+			wantMethod: "POST",
+			wantURL:    "http://192.0.2.4/api",
+			wantProxy:  "http://127.0.0.1:8080",
+			ok:         true,
+		},
+		{
+			// -h is curl's help flag, not a header; it must not swallow the URL.
+			name:       "lowercase h is not a header",
+			curl:       `curl -h 'http://192.0.2.4/api'`,
+			wantMethod: "GET",
+			wantURL:    "http://192.0.2.4/api",
+			ok:         true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -61,6 +97,9 @@ func TestParseCurlRequest(t *testing.T) {
 			}
 			if got.Cookie != tc.wantCookie {
 				t.Errorf("cookie = %q, want %q", got.Cookie, tc.wantCookie)
+			}
+			if got.Proxy != tc.wantProxy {
+				t.Errorf("proxy = %q, want %q", got.Proxy, tc.wantProxy)
 			}
 			for _, h := range got.Headers {
 				if strings.HasPrefix(strings.ToLower(strings.TrimSpace(h)), "cookie") ||

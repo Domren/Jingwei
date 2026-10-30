@@ -81,7 +81,7 @@ import {
   UNASSIGNED_TASK,
 } from "./_components/findings-table";
 
-const FINDING_LIST_PREFERENCE_KEY = "artex_finding_list_preferences";
+const FINDING_LIST_PREFERENCE_KEY = "jingwei_finding_list_preferences";
 
 // 列表视图:grouped = 按任务 → 系统两级折叠(默认);cases = 按漏洞案例;
 // flat = 跨任务平铺大表;asset = 左侧资产树 + 右侧该子树下的发现。
@@ -1036,7 +1036,7 @@ export default function FindingsPage() {
                 setFlatPageSize(nextSize);
                 setFlatPage(1);
               }}
-              pageSizeOptions={[10, 20, 50, 100]}
+              pageSizeOptions={[10, 20, 50, 100, 200]}
             />
           </>
         )}
@@ -1182,7 +1182,12 @@ export default function FindingsPage() {
 
           <div className="ml-auto flex items-center gap-3">
             {selectedIds.size > 0 && (
-              <span className="text-xs text-muted-foreground tabular-nums">已选 {selectedIds.size} 条</span>
+              <>
+                <span className="text-xs text-muted-foreground tabular-nums">已选 {selectedIds.size} 条</span>
+                <Button size="sm" variant="ghost" onClick={() => setSelectedIds(new Set())}>
+                  取消选择
+                </Button>
+              </>
             )}
             <Button
               size="sm"
@@ -1472,6 +1477,7 @@ export default function FindingsPage() {
                                           onPageSizeChange={(nextSize) =>
                                             void loadGroup(key, system.system, 1, nextSize)
                                           }
+                                          pageSizeOptions={[10, 20, 50, 100, 200]}
                                         />
                                       </>
                                     )}
@@ -1506,7 +1512,7 @@ export default function FindingsPage() {
                 setPageSize(nextPageSize);
                 setPage(1);
               }}
-              pageSizeOptions={[5, 10, 20]}
+              pageSizeOptions={[5, 10, 20, 50, 100, 200]}
             />
           </div>
         )}

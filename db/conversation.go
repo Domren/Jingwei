@@ -197,6 +197,15 @@ func (d *DB) RenameConversation(id int64, title string) error {
 	return err
 }
 
+// RenameConversationIfTitle updates a thread only while its title is still an
+// initial placeholder or preview. 自动标题是异步补全的，用这条条件更新才不会
+// 覆盖用户在这期间手动改的名字。
+func (d *DB) RenameConversationIfTitle(id int64, title, initial string) error {
+	_, err := d.Exec(`UPDATE conversations SET title=$2
+WHERE id=$1 AND title IN ('', '新对话', $3)`, id, title, initial)
+	return err
+}
+
 // TouchConversation bumps updated_at so the thread floats to the top of the list.
 func (d *DB) TouchConversation(id int64) error {
 	_, err := d.Exec(`UPDATE conversations SET updated_at=now() WHERE id=$1`, id)

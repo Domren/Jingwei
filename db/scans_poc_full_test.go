@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/Autumn-27/artex/pocparse"
+	"github.com/Autumn-27/jingwei/pocparse"
 )
 
 // TestListEnabledPOCContentsSeverityFirst pins the full-scan template pick: the
@@ -25,7 +25,7 @@ func TestListEnabledPOCContentsSeverityFirst(t *testing.T) {
 			p, err := d.CreatePOCTemplate(&pocparse.Template{
 				TemplateID: fmt.Sprintf("t-fullcap-%s-%d", severity, i),
 				Name:       "fullcap " + severity, Severity: severity, Protocol: "http",
-				Content:    "id: " + severity,
+				Content: "id: " + severity,
 			}, "test", "")
 			if err != nil {
 				t.Fatal(err)

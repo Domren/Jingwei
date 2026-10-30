@@ -15,7 +15,7 @@ ARTEX 借鉴独立输出预算、近期内容与滚动摘要、有限恢复的�
 ## 请求预算与执行
 
 - 消息沿用 norma 的按内容块 UTF-8 字节估算及 4/3 余量；额外计入系统提示、工具 schema 和消息封装开销。估算不是模型精确 token 计数。
-- 旁路输出默认最多 8192 tokens，也不超过主配置已设的输出上限。可用服务环境变量 `ARTEX_BTW_MAX_OUTPUT_TOKENS` 设置 256–32768 的上限；不会修改产品默认模型或主任务参数。
+- 旁路输出默认最多 8192 tokens，也不超过主配置已设的输出上限。可用服务环境变量 `JINGWEI_BTW_MAX_OUTPUT_TOKENS` 设置 256–32768 的上限；不会修改产品默认模型或主任务参数。
 - 输入预算为上下文窗口减去输出上限和安全余量；未知窗口使用平台默认 200K。安全余量为窗口的 5%，最小 128、最大 8192 tokens。
 - 成功问答按递增序号每批最多加载 20 组。最多保留 20 组原文，其 token 预算最多为输入预算的 1/4，且不超过 16K。
 - 超额问答更新到滚动摘要。摘要带历史来源与上下文时间；历史助手回答不等同于新的工具证据，冲突时优先依据最新主快照。
@@ -48,7 +48,7 @@ POST 先接纳并返回请求，准备与压缩在后台执行，不持有准入
 
 ```sh
 go test -race ./sidequestion ./db ./server -run 'TestSide|TestCheckpoint|TestSnapshot|TestBuildRequest|TestService|TestMainSide|TestTaskArchive' -count=1
-go build ./cmd/artex
+go build ./cmd/jingwei
 npx tsc --noEmit
 npm run build -- --webpack
 ```

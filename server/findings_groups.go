@@ -9,7 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/db"
 )
 
 const maxFindingFollowUpRunes = 4000
@@ -61,7 +61,7 @@ func (s *Server) findingAssetTree(w http.ResponseWriter, r *http.Request) {
 func (s *Server) findingGroups(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	page := findingPaginationParam(q.Get("page"), 1, 0)
-	limit := findingPaginationParam(q.Get("limit"), 10, 100)
+	limit := findingPaginationParam(q.Get("limit"), 10, 200)
 	groups, total, findingTotal, err := s.m.pg.ListFindingGroups(findingFilterFromQuery(q), page, limit)
 	if err != nil {
 		writeErr(w, 500, err.Error())

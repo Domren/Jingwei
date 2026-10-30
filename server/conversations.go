@@ -13,10 +13,11 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/artex/sidequestion"
+	"github.com/Autumn-27/jingwei/agent"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/intercept"
+	"github.com/Autumn-27/jingwei/sidequestion"
+	"github.com/Autumn-27/norma/llm"
 )
 
 const (
@@ -446,6 +447,62 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 			title = "附件消息"
 		}
 		_ = pg.RenameConversation(c.ID, title)
+		// 先用首行当占位标题（列表里立刻可读），再异步让模型起一个真正的名字。
+		// 条件更新保证不覆盖这期间用户的手动改名。
+		if s.m.pg.GetBool(db.SettingChatAutoTitle, false) {
+			conversationID := c.ID
+			agentKey := c.AgentKey
+			pinnedProfile := c.LLMProfileID
+			promptContent := msg
+			if len(req.Attachments) > 0 {
+				var names []string
+				for _, attachment := range req.Attachments {
+					if name := strings.TrimSpace(attachment.Name); name != "" {
+						names = append(names, name)
+					}
+				}
+				if len(names) > 0 {
+					if promptContent != "" {
+						promptContent += "\n"
+					}
+					promptContent += "附件：" + strings.Join(names, "、")
+				}
+			}
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				profileID := s.effectiveProfileForAgent(agentKey, pinnedProfile)
+				var prov llm.Provider
+				providerOK := false
+				if profileID != nil {
+					prov, _, providerOK = s.providerForProfile(*profileID)
+				}
+				if !providerOK {
+					if active, activeErr := s.m.pg.ActiveProfile(); activeErr == nil && active != nil {
+						profileID = &active.ID
+						prov, _, providerOK = s.providerForProfile(active.ID)
+					} else if activeErr != nil {
+						log.Printf("[auto-title] conversation %d active profile lookup failed: %v", conversationID, activeErr)
+					}
+				}
+				if profileID == nil || !providerOK || prov == nil {
+					log.Printf("[auto-title] conversation %d: no effective profile", conversationID)
+					return
+				}
+				generated, err := agent.GenerateAutoTitle(ctx, prov, promptContent)
+				if err != nil {
+					log.Printf("[auto-title] conversation %d: %v", conversationID, err)
+					return
+				}
+				if !autoTitleIsUsable(generated) {
+					log.Printf("[auto-title] conversation %d: generated title is empty or placeholder", conversationID)
+					return
+				}
+				if err := s.m.pg.RenameConversationIfTitle(conversationID, generated, title); err != nil {
+					log.Printf("[auto-title] conversation %d rename failed: %v", conversationID, err)
+				}
+			}()
+		}
 	}
 	_ = pg.TouchConversation(c.ID)
 
@@ -863,6 +920,12 @@ func (s *Server) runTriggeredRun(item triggeredRun) {
 	s.chatBusy[busyKey] = true
 	s.chatMu.Unlock()
 	s.runConversationSync(c, msg, busyKey)
+}
+
+// autoTitleIsUsable rejects an empty or placeholder title so a failed completion
+// cannot leave the thread named "新对话".
+func autoTitleIsUsable(generated string) bool {
+	return generated != "" && generated != "新对话"
 }
 
 // firstLine returns a single-line, length-capped preview (shared with summaries).

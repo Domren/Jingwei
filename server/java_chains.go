@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/scanner"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/scanner"
 )
 
 // seedJavaChainsMCP registers the optional java-chains gateway as a Streamable

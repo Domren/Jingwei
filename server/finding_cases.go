@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/intercept"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -56,7 +56,7 @@ func (s *Server) caseFindingDTO(f *db.DBFinding) FindingDTO {
 func (s *Server) listFindingCases(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	page := findingPaginationParam(q.Get("page"), 1, 0)
-	size := findingPaginationParam(q.Get("limit"), 20, 100)
+	size := findingPaginationParam(q.Get("limit"), 20, 200)
 	rows, total, err := s.m.pg.ListFindingCases(findingFilterFromQuery(q), page, size)
 	if err != nil {
 		caseHTTPError(w, err)
@@ -155,7 +155,7 @@ func (s *Server) getFindingCaseMembers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	page := findingPaginationParam(r.URL.Query().Get("page"), 1, 0)
-	size := findingPaginationParam(r.URL.Query().Get("limit"), 20, 100)
+	size := findingPaginationParam(r.URL.Query().Get("limit"), 20, 200)
 	fs, total, err := s.m.pg.FindingCaseMembers(c.ID, page, size)
 	if err != nil {
 		caseHTTPError(w, err)

@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/pocparse"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/pocparse"
 )
 
 const (

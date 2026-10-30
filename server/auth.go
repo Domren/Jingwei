@@ -104,12 +104,12 @@ func verifyJWT(tokenStr string, key []byte) bool {
 }
 
 // extractToken reads the JWT from Authorization: Bearer header,
-// artex_token cookie, or ?token= query param (for SSE connections).
+// jingwei_token cookie, or ?token= query param (for SSE connections).
 func extractToken(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return strings.TrimPrefix(h, "Bearer ")
 	}
-	if c, err := r.Cookie("artex_token"); err == nil && c.Value != "" {
+	if c, err := r.Cookie("jingwei_token"); err == nil && c.Value != "" {
 		return c.Value
 	}
 	return r.URL.Query().Get("token")
@@ -272,8 +272,8 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "请求格式错误")
 		return
 	}
-	// 产品已更名为 Jingwei（精卫）；仍接受 ARTEX 以兼容旧部署的登录脚本。
-	if req.Username != "Jingwei" && req.Username != "ARTEX" {
+	// 产品已更名为 Jingwei（精卫）；仍接受 Jingwei 以兼容旧部署的登录脚本。
+	if req.Username != "Jingwei" {
 		writeErr(w, 401, "用户名或密码错误")
 		return
 	}

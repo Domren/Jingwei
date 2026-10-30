@@ -490,9 +490,27 @@ export interface FindingAsset {
   label: string;
 }
 
+// FindingReproStep 是一条复现步骤：request/response 是 agent 当时真实收发的原文，
+// snapshot_id 指向该步骤对应的已绑定流量报文（可能为空=未关联到抓包）。
+export interface FindingReproStep {
+  request: string;
+  response?: string;
+  expected?: string;
+  proves?: string;
+  snapshot_id?: string;
+  match?: string; // request=按请求匹配  position=按顺序匹配
+}
+
+// FindingReproduction 是 agent 在记录漏洞时就地写下的结构化复现过程。
+export interface FindingReproduction {
+  entry_point?: string;
+  prerequisites?: string[];
+  provenance?: string;
+  steps?: FindingReproStep[];
+}
+
 export interface Finding {
-  case_id?: string;
-  traffic_count?: number;
+  case_id?: string;  traffic_count?: number;
   evidence_version?: number;
   report_evidence_version?: number;
   report_stale?: boolean;
@@ -501,6 +519,7 @@ export interface Finding {
   vulnclass: string;
   name?: string; // 漏洞名称;为空时展示回退到 vulnclass
   severity: Severity;
+  cvss?: number | null; // CVSS v3.1 基础分(0.0-10.0)
   status: FindingStatus;
   summary: string;
   evidence: string;
@@ -508,6 +527,8 @@ export interface Finding {
   // 原始 HTTP 报文(PoC 原文);非 HTTP 漏洞或未采集时为空。
   http_request?: string;
   http_response?: string;
+  // 结构化复现过程(agent 落库时就地记录);为空时页面回退到文字证据。
+  reproduction?: FindingReproduction;
   intent_id?: string;
   param_id?: string;
   task_id?: string;
@@ -516,6 +537,28 @@ export interface Finding {
   inherited?: boolean;
   assets?: FindingAsset[];
   ts: string;
+}
+
+// FindingReviewEvent 是操作员对漏洞的处置留痕(状态/等级/名称/类型/CVSS 变更),
+// 构成详情页的「复核时间线」。
+export interface FindingReviewEvent {
+  id: number;
+  finding_id: number;
+  action: string; // status | severity | name | vulnclass | cvss
+  actor: string;
+  note?: string;
+  from_val?: string;
+  to_val?: string;
+  created_at: string;
+}
+
+// FindingScreenshot 是绑到漏洞的取证截图(base64 PNG);列表接口默认省略 data。
+export interface FindingScreenshot {
+  id: number;
+  finding_id: number;
+  caption: string;
+  data?: string; // base64 PNG,with_data=1 时返回
+  created_at: string;
 }
 
 // FindingsPage 是发现列表的服务端分页响应。
@@ -1003,6 +1046,9 @@ export interface Settings {
   credential_agent_enabled: boolean;
   credential_traffic_binding: boolean;
   task_intelligence_enabled: boolean; // 默认关闭；关闭不注入情报工具或提示
+  // 自动标题（默认关）：会话标题 / 任务名称各一个开关，保存即生效。
+  task_auto_title_enabled: boolean;
+  chat_auto_title_enabled: boolean;
   agent_traffic_binding: boolean; // Agent 自动绑定流量证据，默认关闭；不影响人工绑定
   llm_record: boolean; // LLM 录制开关（默认关）；关闭时不记录任何 LLM 调用
   // Web search. brave_key_set / tavily_key_set reflect whether a key is stored
@@ -1460,24 +1506,6 @@ export interface InterceptApprovalRow extends InterceptPending {
   conv_title: string; // "" if no linked conversation
   conv_agent_key: string; // "" if no linked conversation
   rule_name: string; // "" if rule was deleted
-}
-
-// ── 资产同步 (ScopeSentry 数据源) ──────────────────────────────────────────────
-export interface SSProject {
-  id: string; // MongoDB ObjectID — used as filter.project
-  name: string;
-  logo?: string;
-  AssetCount?: number;
-  tag?: string;
-}
-
-export interface SSTask {
-  id: string;
-  name: string; // used as filter.task
-  status?: number;
-  progress?: number;
-  creatTime?: string;
-  endTime?: string;
 }
 
 // ConvTokenSummary — one conversation's token total (+ profile/date) for merging
@@ -2101,7 +2129,7 @@ export interface UpdateCheck {
   os: string;
   arch: string;
   repo: string;
-  /** 是否存在可回滚的上一版本（artex.old）。 */
+  /** 是否存在可回滚的上一版本（jingwei.old）。 */
   has_backup: boolean;
   /** 本次启动时自更新自举的结论（换装失败 / 已回滚等），无事发生时为空。 */
   boot_notice?: string;

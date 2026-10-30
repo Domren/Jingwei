@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/scanner"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/scanner"
 )
 
 func TestScanTargetBlockReason(t *testing.T) {
@@ -146,5 +146,25 @@ func TestCleanPacketTextKeepsRawProtocolTerminators(t *testing.T) {
 	}
 	if got := cleanPacketText("  GET / HTTP/1.1\r\n\r\n  ", 0, false); got != "GET / HTTP/1.1" {
 		t.Fatalf("HTTP text is still trimmed, got %q", got)
+	}
+}
+
+func TestScanAssetIndexLongestPathPrefix(t *testing.T) {
+	idx := newScanAssetIndex()
+	idx.addService("http://10.0.0.5:8080", 1)       // root service, origin-only
+	idx.addService("http://10.0.0.5:8080/admin", 2) // app-layer system
+	idx.addService("http://10.0.0.5:8080/api", 3)   // app-layer system
+
+	cases := map[string]int64{
+		"http://10.0.0.5:8080/admin":           2, // exact
+		"http://10.0.0.5:8080/admin/users.php": 2, // deep under the system
+		"http://10.0.0.5:8080/api/v2/orders":   3,
+		"http://10.0.0.5:8080/index.php":       0, // falls back to host, no prefix
+		"http://10.0.0.5:8080/adminx":          0, // boundary: /admi must not match /admin
+	}
+	for matched, want := range cases {
+		if got := idx.longestPathPrefix(normalizeScanURL(matched)); got != want {
+			t.Errorf("longestPathPrefix(%q)=%d want %d", matched, got, want)
+		}
 	}
 }

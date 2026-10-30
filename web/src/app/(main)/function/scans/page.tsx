@@ -88,9 +88,13 @@ function statusMeta(task: ScanTask): { label: string; className: string } {
   if (task.status === "running") {
     const stages: Record<string, string> = {
       discover: "资产发现",
+      app: "应用层发现",
+      weakpass: "弱口令检测",
       fingerprint: "指纹识别",
       match: "匹配 POC",
       scan: "漏洞扫描",
+      baseline: "注入基线",
+      auto: "自动利用",
       finalize: "结果入库",
     };
     return { label: stages[task.stage] ?? "执行中", className: "border-sky-500/30 bg-sky-500/10 text-sky-600" };
@@ -103,6 +107,19 @@ function statusMeta(task: ScanTask): { label: string; className: string } {
 
 function modeLabel(mode: string) {
   return MODES.find((m) => m.value === mode)?.label ?? mode;
+}
+
+function assetTypeLabel(type: string) {
+  switch (type) {
+    case "app":
+      return "应用系统";
+    case "service":
+      return "服务";
+    case "ip":
+      return "IP";
+    default:
+      return type;
+  }
 }
 
 function portsLabel(ports: string) {
@@ -971,6 +988,12 @@ export default function ScansPage() {
                 <Badge variant="secondary">资产 {num(detailTask.summary.assets)}</Badge>
                 <Badge variant="secondary">端口 {num(detailTask.summary.open_ports)}</Badge>
                 <Badge variant="secondary">Web {num(detailTask.summary.services)}</Badge>
+                {num(detailTask.summary.app_systems) > 0 && (
+                  <Badge variant="secondary">应用层系统 {num(detailTask.summary.app_systems)}</Badge>
+                )}
+                {num(detailTask.summary.weak_pass_targets) > 0 && (
+                  <Badge variant="secondary">弱口令页面 {num(detailTask.summary.weak_pass_targets)}</Badge>
+                )}
                 <Badge variant="secondary">POC {num(detailTask.summary.templates)}</Badge>
                 <Badge variant="secondary">结果 {num(detailTask.summary.results)}</Badge>
                 <Badge variant="outline" className={num(detailTask.summary.findings) > 0 ? severityClass("high") : ""}>
@@ -1034,7 +1057,9 @@ export default function ScansPage() {
                       ) : (
                         detailAssets.map((a) => (
                           <TableRow key={`${a.asset_type}-${a.asset_id}`}>
-                            <TableCell className="text-xs uppercase text-muted-foreground">{a.asset_type}</TableCell>
+                            <TableCell className="text-xs uppercase text-muted-foreground">
+                              {assetTypeLabel(a.asset_type)}
+                            </TableCell>
                             <TableCell className="max-w-80 truncate font-mono text-xs">{a.url || a.host}</TableCell>
                             <TableCell className="text-xs">{a.status_code ?? "—"}</TableCell>
                             <TableCell className="max-w-56 truncate text-xs">{a.page_title || "—"}</TableCell>
@@ -1128,6 +1153,14 @@ export default function ScansPage() {
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge variant="secondary">自动主机 {num(detailTask.summary.auto_hosts)}</Badge>
                       <Badge variant="secondary">模板 {num(detailTask.summary.auto_templates)}</Badge>
+                      <Badge variant="secondary">基线注入点 {num(detailTask.summary.baseline_points)}</Badge>
+                      <Badge variant="secondary">基线任务 {num(detailTask.summary.baseline_tasks)}</Badge>
+                      <Badge
+                        variant="outline"
+                        className={num(detailTask.summary.weak_pass_found) > 0 ? severityClass("high") : undefined}
+                      >
+                        弱口令命中 {num(detailTask.summary.weak_pass_found)}
+                      </Badge>
                       <Badge
                         variant="outline"
                         className={num(detailTask.summary.auto_webshell) > 0 ? severityClass("high") : undefined}
@@ -1144,7 +1177,7 @@ export default function ScansPage() {
                       <div className="rounded-md border border-dashed py-8 text-center text-xs text-muted-foreground">
                         {detailRunning
                           ? "扫描完成后将自动验证 / 利用命中结果"
-                          : "没有自动任务：可能没有 medium 及以上命中，或任务未正常完成"}
+                          : "没有自动任务：可能没有 medium 及以上命中、页面未枚举出参数位置，或任务未正常完成"}
                       </div>
                     ) : (
                       <div className="flex flex-col gap-2">

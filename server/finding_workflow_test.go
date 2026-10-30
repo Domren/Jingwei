@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/agent"
+	"github.com/Autumn-27/jingwei/db"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -101,7 +101,11 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 		t.Fatal("Planner missed runtime guidance")
 	}
 	report := workflowTool(t, tools, "report_finding")
-	result := workflowCall(t, ctx, report, map[string]any{"vulnclass": "TEST", "severity": "low", "summary": "Planner handoff fixture", "evidence_hint_id": hints.IDs[0]}, false)
+	result := workflowCall(t, ctx, report, map[string]any{"vulnclass": "TEST", "severity": "low", "summary": "Planner handoff fixture", "evidence_hint_id": hints.IDs[0],
+		"evidence": "GET /handoff answered 200 with the handoff marker, confirming the hinted traffic supports the finding",
+		"reproduction": map[string]any{"entry_point": "GET /handoff", "steps": []any{map[string]any{
+			"request": "GET /handoff HTTP/1.1\r\nHost: lab.example\r\n\r\n", "response": "HTTP/1.1 200 OK\r\n\r\nhandoff",
+			"expected": "the handoff endpoint answers", "proves": "the fixture reproduces the finding"}}}}, false)
 	var recorded db.RecordedFinding
 	if err := json.Unmarshal([]byte(strings.SplitN(result, "\n", 2)[1]), &recorded); err != nil {
 		t.Fatal(err)
@@ -149,7 +153,11 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 	badHint := workflowCall(t, ctx, s.toolAddHint(), map[string]any{"task_id": task.ID, "text": "missing packet", "traffic_refs": []db.TrafficRef{{TrafficID: "missing"}}}, false)
 	var badID int64
 	fmt.Sscanf(badHint, "hint added: %d", &badID)
-	workflowCall(t, ctx, report, map[string]any{"vulnclass": "TEST", "severity": "low", "summary": "must fail", "evidence_hint_id": badID}, true)
+	workflowCall(t, ctx, report, map[string]any{"vulnclass": "TEST", "severity": "low", "summary": "must fail", "evidence_hint_id": badID,
+		"evidence": "GET /handoff answered 200 with the handoff marker, confirming the hinted traffic supports the finding",
+		"reproduction": map[string]any{"entry_point": "GET /handoff", "steps": []any{map[string]any{
+			"request": "GET /handoff HTTP/1.1\r\nHost: lab.example\r\n\r\n", "response": "HTTP/1.1 200 OK\r\n\r\nhandoff",
+			"expected": "the handoff endpoint answers", "proves": "the fixture reproduces the finding"}}}}, true)
 	if notices != 1 {
 		t.Fatal("failed handoff notified before commit")
 	}
@@ -170,7 +178,11 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 	workflowCall(t, ctx, bind, input, true)
 	// Turning binding off must still save a confirmed finding from an already
 	// assembled tool, even if the model sends the old optional evidence fields.
-	offResult := workflowCall(t, ctx, report, map[string]any{"vulnclass": "TEST", "severity": "low", "summary": "off", "evidence_hint_id": hints.IDs[0]}, false)
+	offResult := workflowCall(t, ctx, report, map[string]any{"vulnclass": "TEST", "severity": "low", "summary": "off", "evidence_hint_id": hints.IDs[0],
+		"evidence": "GET /handoff answered 200 with the handoff marker, confirming the hinted traffic supports the finding",
+		"reproduction": map[string]any{"entry_point": "GET /handoff", "steps": []any{map[string]any{
+			"request": "GET /handoff HTTP/1.1\r\nHost: lab.example\r\n\r\n", "response": "HTTP/1.1 200 OK\r\n\r\nhandoff",
+			"expected": "the handoff endpoint answers", "proves": "the fixture reproduces the finding"}}}}, false)
 	var offRecord struct {
 		db.RecordedFinding
 		EvidenceStatus string `json:"evidence_status"`
@@ -182,7 +194,11 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 	if offRecord.FindingID <= 0 || len(offRecord.Traffic.Bindings) != 0 || offRecord.EvidenceStatus != "not_bound" || !strings.Contains(offRecord.EvidenceNote, "已关闭") {
 		t.Fatal("disabled binding discarded finding or bound evidence", offResult)
 	}
-	workflowCall(t, ctx, report, map[string]any{"vulnclass": "TCP", "severity": "low", "summary": "no packet needed"}, false)
+	workflowCall(t, ctx, report, map[string]any{"vulnclass": "TCP", "severity": "low", "summary": "no packet needed",
+		"evidence": "command output proves the fixture conclusion",
+		"reproduction": map[string]any{"entry_point": "fixture command", "steps": []any{map[string]any{
+			"request": "fixture command output", "response": "expected fixture output",
+			"expected": "the command prints the marker", "proves": "the fixture reproduces the finding"}}}}, false)
 	if notices != 3 {
 		t.Fatal("optional no-packet report failed")
 	}
@@ -264,6 +280,86 @@ func TestFindingWorkflowMigrationPreservesUserConfiguration(t *testing.T) {
 	search, _ = pg.GetTool("traffic_search")
 	if contains(search.Agents, "reporter") {
 		t.Fatal("one-time migration undid later unbinding")
+	}
+}
+
+func TestMergeMissingToolPropsBackfillsReportFindingDefaults(t *testing.T) {
+	_, defaults := agent.ReportFindingDefaults()
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"vulnclass": map[string]any{"type": "string", "description": "USER EDIT"},
+			"summary":   map[string]any{"type": "string"},
+		},
+		"required": []any{"vulnclass", "summary"},
+	}
+	if !mergeMissingToolProps(schema, defaults) {
+		t.Fatal("expected schema backfill")
+	}
+	props := schema["properties"].(map[string]any)
+	for _, name := range []string{"reproduction", "cvss", "traffic_refs", "evidence_hint_id"} {
+		if _, ok := props[name]; !ok {
+			t.Fatalf("missing backfilled property %q", name)
+		}
+	}
+	if got := props["vulnclass"].(map[string]any)["description"]; got != "USER EDIT" {
+		t.Fatalf("user property overwritten: %v", got)
+	}
+	required := stringList(schema["required"])
+	for _, name := range []string{"vulnclass", "severity", "summary", "cvss"} {
+		if !contains(required, name) {
+			t.Fatalf("missing required %q: %v", name, required)
+		}
+	}
+	if mergeMissingToolProps(schema, defaults) {
+		t.Fatal("second merge must be a no-op")
+	}
+}
+
+func TestFindingWorkflowMigrationUpgradesLegacyReportFindingRow(t *testing.T) {
+	s, _, _ := trafficEvidenceServer(t)
+	pg := s.m.pg
+	old, err := pg.GetTool("report_finding")
+	if err != nil || old == nil {
+		t.Fatal("missing report_finding", err)
+	}
+	t.Cleanup(func() {
+		bindings, _ := json.Marshal(old.Agents)
+		_ = pg.UpdateTool("report_finding", old.Description, old.Schema, bindings, old.Enabled)
+	})
+	const flag = "finding_workflow_tools_v4_report_finding_defaults"
+	preserveSetting(t, pg, flag)
+	if _, err := pg.Exec(`DELETE FROM settings WHERE key=$1`, flag); err != nil {
+		t.Fatal(err)
+	}
+	legacy := json.RawMessage(`{"type":"object","properties":{"vulnclass":{"type":"string"},"severity":{"type":"string"},"summary":{"type":"string"}},"required":["vulnclass","severity","summary"]}`)
+	if err := pg.UpdateTool("report_finding", legacyReportFindingDescription, legacy, json.RawMessage(`["worker"]`), true); err != nil {
+		t.Fatal(err)
+	}
+	s.seedFindingWorkflowTools()
+	row, err := pg.GetTool("report_finding")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(row.Schema, &schema); err != nil {
+		t.Fatal(err)
+	}
+	props, _ := schema["properties"].(map[string]any)
+	for _, name := range []string{"reproduction", "cvss"} {
+		if _, ok := props[name]; !ok {
+			t.Fatalf("%s was not backfilled: %s", name, row.Schema)
+		}
+	}
+	if !contains(stringList(schema["required"]), "cvss") {
+		t.Fatal("cvss not required after migration")
+	}
+	desc, _ := agent.ReportFindingDefaults()
+	if row.Description != desc {
+		t.Fatal("legacy description was not upgraded")
+	}
+	if value, _, _ := pg.GetSetting(flag); value != "true" {
+		t.Fatal("migration flag not set")
 	}
 }
 

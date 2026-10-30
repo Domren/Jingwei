@@ -30,7 +30,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/db"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	mproxy "github.com/lqqyt2423/go-mitmproxy/proxy"
@@ -389,9 +389,16 @@ type sink struct {
 	t *Traffic
 }
 
+// debugRecord turns on per-flow recording diagnostics (JINGWEI_TRAFFIC_DEBUG=1).
+// "代理能转发但抓不到包"这类问题，光看结果分不清是没拦截、没回调还是没写库。
+var debugRecord = os.Getenv("JINGWEI_TRAFFIC_DEBUG") != ""
+
 func (s *sink) Response(f *mproxy.Flow) {
 	if f.Request == nil || f.Response == nil {
 		return
+	}
+	if debugRecord {
+		log.Printf("[traffic] 收到完整流量 %s %s", f.Request.Method, f.Request.URL)
 	}
 	s.t.record(f)
 }
@@ -438,6 +445,12 @@ func (t *Traffic) record(f *mproxy.Flow) {
 	// can run under the same lock without racing a concurrent record.
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
+	if t.stopping() {
+		if debugRecord {
+			log.Printf("[traffic] 跳过记录（进程正在退出）")
+		}
+		return
+	}
 	host := f.Request.URL.Hostname()
 	method := f.Request.Method
 	tmpl := db.TemplatePath(f.Request.URL.EscapedPath())
@@ -506,6 +519,10 @@ VALUES(?,?,?,?,?,?,?)`,
 
 	if err := tx.Commit(); err != nil {
 		log.Printf("[traffic] 记录 %s 失败（提交）：%v", url, err)
+		return
+	}
+	if debugRecord {
+		log.Printf("[traffic] 已记录 %s（%d 字节响应）", url, len(f.Response.Body))
 	}
 }
 

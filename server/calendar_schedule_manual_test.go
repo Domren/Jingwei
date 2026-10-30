@@ -10,13 +10,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/db"
 )
 
 func manualScheduleTestServer(t *testing.T) (*Server, *Scheduler) {
 	t.Helper()
-	if os.Getenv("ARTEX_PG_DSN") == "" {
-		t.Skip("requires isolated ARTEX_PG_DSN")
+	if os.Getenv("JINGWEI_PG_DSN") == "" {
+		t.Skip("requires isolated JINGWEI_PG_DSN")
 	}
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {

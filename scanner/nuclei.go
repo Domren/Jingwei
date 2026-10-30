@@ -81,7 +81,13 @@ type NucleiRun struct {
 	RawTemplates int
 }
 
-const maxNucleiOutput = 8 << 20
+// maxNucleiOutput caps the raw JSONL stdout retained per scan. 8 MiB was enough
+// for small template sets but truncates when dozens of templates each attach a
+// full request/response, silently dropping hits at the tail (e.g. a high-severity
+// SSTI hit lost behind many info-level banner hits). Raised to 64 MiB so a full
+// 334-environment vulhub scan keeps every result; the buffer is in-memory and
+// bounded, so the larger cap only costs memory, not disk.
+const maxNucleiOutput = 64 << 20
 
 // minNetworkReadSize is the read-size floor applied to network requests before
 // a template runs. Upstream network templates often cap at 2048 bytes, which

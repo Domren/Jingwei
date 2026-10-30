@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/scanner"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/scanner"
 )
 
 // resourceManager owns the lifecycle of resources the platform creates on its
@@ -317,7 +317,7 @@ func (s *Server) auditLocalPorts(ctx context.Context) PortAuditResult {
 // listeners. JINGWEI_PORT_AUDIT_ALLOW augments the built-in defaults.
 func portAuditAllowList() []int {
 	out := []int{8787, 8788, 9790}
-	for _, key := range []string{"JINGWEI_PORT_AUDIT_ALLOW", "ARTEX_PORT_AUDIT_ALLOW"} {
+	for _, key := range []string{"JINGWEI_PORT_AUDIT_ALLOW"} {
 		for _, part := range strings.Split(os.Getenv(key), ",") {
 			if n, err := strconv.Atoi(strings.TrimSpace(part)); err == nil && n > 0 && !sliceContainsInt(out, n) {
 				out = append(out, n)

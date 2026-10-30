@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/agent"
+	"github.com/Autumn-27/jingwei/db"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -306,7 +306,30 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			if pin != nil {
 				llmIDs = []int64{*pin}
 			}
+			// 自动给任务起名（设置里默认关）。起名失败不影响建任务——名字只是
+			// 列表里的可读性，绝不能因为它让一次编排失败。
+			name := ""
+			if s.m.pg.GetBool(db.SettingTaskAutoTitle, false) {
+				titleCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				active, activeErr := s.m.pg.ActiveProfile()
+				if activeErr != nil {
+					log.Printf("[auto-title] active profile lookup failed: %v", activeErr)
+				} else if active == nil {
+					log.Printf("[auto-title] no active profile")
+				} else if prov, _, providerOK := s.providerForProfile(active.ID); providerOK {
+					generated, titleErr := agent.GenerateAutoTitle(titleCtx, prov, a.Description+"\n"+a.Goal)
+					if titleErr == nil {
+						name = generated
+					} else {
+						log.Printf("[auto-title] task title generation failed: %v", titleErr)
+					}
+				} else {
+					log.Printf("[auto-title] task provider unavailable for active profile %d", active.ID)
+				}
+			}
 			t, err := s.m.CreateTaskWithOptions(a.Description, a.Goal, db.TaskCreateOptions{
+				Name:                 name,
 				SourceTaskIDs:        sourceIDs,
 				LLMProfileIDs:        llmIDs,
 				TimeoutSeconds:       a.TimeoutSeconds,

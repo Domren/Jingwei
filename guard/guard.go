@@ -10,13 +10,15 @@ package guard
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/jingwei/honeydetect"
+	"github.com/Autumn-27/jingwei/intercept"
 	"github.com/Autumn-27/norma/hook"
 )
 
@@ -38,6 +40,7 @@ type Guard struct {
 	interceptor *intercept.Interceptor // optional; nil disables user-configured rules
 	egress      *EgressGuard           // optional; process-wide secret fingerprints
 	policy      TargetPolicy           // optional; task scope + asset block rules
+	uaPool      *uaPool                // stable User-Agent per task
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
@@ -48,11 +51,16 @@ func New() *Guard { return newGuard(nil) }
 func NewWithInterceptor(ic *intercept.Interceptor) *Guard { return newGuard(ic) }
 
 func newGuard(ic *intercept.Interceptor) *Guard {
-	g := &Guard{attrib: map[string]int{}, interceptor: ic}
+	g := &Guard{attrib: map[string]int{}, interceptor: ic, uaPool: NewUAPool(nil)}
 	g.reg = hook.NewRegistry().
 		On(hook.PreToolUse, g.preToolUse).
 		On(hook.PostToolUse, g.postToolUse)
 	return g
+}
+
+// UAForTask returns a stable User-Agent for the given task.
+func (g *Guard) UAForTask(taskID int64) string {
+	return g.uaPool.ForTask(taskID)
 }
 
 // Hooks returns the hook registry to attach to an agent session.
@@ -176,7 +184,7 @@ func (g *Guard) checkEgress(ev hook.Event, cmd string) (hook.Result, bool) {
 	return hook.Result{}, false
 }
 
-var rePlatformSecretRef = regexp.MustCompile(`(?i)(jwt\.key|/proc/(?:self|[0-9]+)/environ|\b(?:ANTHROPIC_API_KEY|OPENAI_API_KEY|ARTEX_PG_DSN|JAVA_CHAINS_MCP_TOKEN|JAVA_CHAINS_PASS)\b)`)
+var rePlatformSecretRef = regexp.MustCompile(`(?i)(jwt\.key|/proc/(?:self|[0-9]+)/environ|\b(?:ANTHROPIC_API_KEY|OPENAI_API_KEY|JINGWEI_PG_DSN|JAVA_CHAINS_MCP_TOKEN|JAVA_CHAINS_PASS)\b)`)
 
 // checkTargets enforces the deterministic scope/asset policy. The third return
 // value reports that an audit entry was already written (warn mode), so the
@@ -246,6 +254,13 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 		g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), dec, ev.ToolName, ev.Input, "allowed")
 		return hook.Result{}
 	case "ask":
+		// 一键放行：如果存在未过期的豁免（操作员之前审批过同类调用并选择了
+		// 时限放行），直接通过，不再弹窗。
+		if ex, ok := g.interceptor.CheckExemption(ev.ToolName, string(ev.Input)); ok {
+			g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), dec, ev.ToolName, ev.Input, "allowed")
+			_ = ex // exemption reason could be logged if needed
+			return hook.Result{}
+		}
 		// If the worker context is already cancelled (task stopped / killed), block
 		// immediately without creating a pending record — avoids orphaned DB entries
 		// and makes execOne complete fast, reducing the race against drainSynthetic.
@@ -261,7 +276,7 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 	return hook.Result{}
 }
 
-// systemBlockMessage frames an intercept block as an ARTEX platform-governance
+// systemBlockMessage frames an intercept block as an Jingwei platform-governance
 // decision so the agent does not mistake it for a target-side defense.
 //
 // The bare reasons ("禁止执行此工具" / "用户拒绝") read exactly like a WAF/403 on
@@ -297,6 +312,14 @@ func (g *Guard) postToolUse(_ context.Context, ev hook.Event) hook.Result {
 	g.mu.Lock()
 	g.attrib[class]++
 	g.mu.Unlock()
+
+	// 蜜罐检测：工具输出里出现蜜罐特征时提醒 agent。不阻断（先让 agent 自己
+	// 判断），但把检测结果注入返回，让它在写 fact/finding 时把「疑似蜜罐」考虑进去。
+	if len(ev.Result) > 0 && len(ev.Result) < 65536 {
+		if score := honeypotDetect(string(ev.Result)); score != "" {
+			return hook.Result{Message: score}
+		}
+	}
 	return hook.Result{}
 }
 
@@ -309,6 +332,17 @@ func (g *Guard) Attributions() map[string]int {
 		out[k] = v
 	}
 	return out
+}
+
+// honeypotDetect scans tool output for honeypot indicators and returns a
+// warning message if any are found. Returns empty string when clean.
+func honeypotDetect(output string) string {
+	score := honeydetect.Detect(honeydetect.Input{Body: output})
+	if score.Verdict == "clean" {
+		return ""
+	}
+	return fmt.Sprintf("[蜜罐检测] %s (置信度 %.0f%%)：%s。若确认是蜜罐，请用 record_fact 记录「疑似蜜罐」并停止深挖。",
+		score.Verdict, score.Value*100, honeydetect.Summary(score))
 }
 
 func (g *Guard) block(tool, reason, cmd string) hook.Result {

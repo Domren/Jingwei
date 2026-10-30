@@ -119,7 +119,7 @@ export function UpdateCard() {
   // 轮询 /api/health 直到版本号变化。
   //
   // 判据必须是"版本变了"而不是"能连上了"：换装过程中旧版本会短暂地重新起来一次
-  // （那一次只负责把 artex.new 换上去然后立刻退出），只看连通性会误判成功。
+  // （那一次只负责把 jingwei.new 换上去然后立刻退出），只看连通性会误判成功。
   const waitForNewVersion = React.useCallback(async (fromVersion: string) => {
     setRestarting(true);
     const deadline = Date.now() + RESTART_TIMEOUT_MS;
@@ -420,7 +420,7 @@ export function UpdateCard() {
 
         <p className="text-xs text-muted-foreground">
           一键更新依赖守护脚本重启程序。请通过 <span className="font-mono">start.sh</span>（Windows 为
-          <span className="font-mono"> start.bat</span>）启动 Jingwei；直接运行 artex 本体时，程序退出后不会被自动拉起。
+          <span className="font-mono"> start.bat</span>）启动 Jingwei；直接运行 Jingwei 本体时，程序退出后不会被自动拉起。
         </p>
       </CardContent>
     </Card>

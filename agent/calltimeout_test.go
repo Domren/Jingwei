@@ -53,19 +53,19 @@ func TestCallTimeoutProviderComplete(t *testing.T) {
 }
 
 func TestLLMCallTimeoutResolution(t *testing.T) {
-	t.Setenv("ARTEX_LLM_CALL_TIMEOUT", "90s")
+	t.Setenv("JINGWEI_LLM_CALL_TIMEOUT", "90s")
 	if got := llmCallTimeout(); got != 90*time.Second {
 		t.Fatalf("duration form: got %s", got)
 	}
-	t.Setenv("ARTEX_LLM_CALL_TIMEOUT", "120")
+	t.Setenv("JINGWEI_LLM_CALL_TIMEOUT", "120")
 	if got := llmCallTimeout(); got != 2*time.Minute {
 		t.Fatalf("seconds form: got %s", got)
 	}
-	t.Setenv("ARTEX_LLM_CALL_TIMEOUT", "bogus")
+	t.Setenv("JINGWEI_LLM_CALL_TIMEOUT", "bogus")
 	if got := llmCallTimeout(); got != defaultLLMCallTimeout {
 		t.Fatalf("invalid value must fall back: got %s", got)
 	}
-	t.Setenv("ARTEX_LLM_CALL_TIMEOUT", "0")
+	t.Setenv("JINGWEI_LLM_CALL_TIMEOUT", "0")
 	if got := llmCallTimeout(); got != 0 {
 		t.Fatalf("zero must disable the cap: got %s", got)
 	}

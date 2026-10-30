@@ -23,8 +23,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/jingwei/agent"
+	"github.com/Autumn-27/jingwei/db"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/skill"
 )
@@ -1675,7 +1675,7 @@ func skillRelPath(file string) (string, string) {
 		return "", "invalid path: must be relative with no empty segments"
 	}
 	// 4. Normalize as a URL/API path, not as a host filesystem path. API paths
-	//    always use '/', including when ARTEX runs on Windows. Filesystem calls
+	//    always use '/', including when Jingwei runs on Windows. Filesystem calls
 	//    below accept this canonical form through filepath.Join.
 	clean := path.Clean(file)
 	if clean == "." || path.IsAbs(clean) || strings.HasPrefix(clean, "..") {

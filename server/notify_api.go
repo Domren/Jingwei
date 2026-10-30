@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/notify"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/notify"
 )
 
 // 本文件是推送功能的 HTTP 接口。全部路由挂在 requireAuth 之后（见 Handler()），
@@ -449,7 +449,7 @@ func notifyTestMessage(baseURL string) notify.Message {
 			VulnClass: "连通性测试",
 			Severity:  "low",
 			Summary:   "这是 Jingwei（精卫）推送渠道的测试消息，收到即表示该渠道配置可用。",
-			Assets:    []string{"artex.example.com"},
+			Assets:    []string{"jingwei.example.com"},
 			DetailURL: baseURL,
 		}},
 		HomeURL: baseURL,

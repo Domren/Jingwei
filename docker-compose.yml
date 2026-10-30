@@ -22,23 +22,25 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ${ARTEX_IMAGE:-jingwei:local}
+    image: ${JINGWEI_IMAGE:-jingwei:local}
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      ARTEX_PG_DSN: postgres://${POSTGRES_USER:-jingwei}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-jingwei}?sslmode=disable
+      JINGWEI_PG_DSN: postgres://${POSTGRES_USER:-jingwei}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-jingwei}?sslmode=disable
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      ARTEX_LLM_PROVIDER: ${ARTEX_LLM_PROVIDER:-}
-      ARTEX_LLM_MODEL: ${ARTEX_LLM_MODEL:-}
-      ARTEX_LLM_BASE_URL: ${ARTEX_LLM_BASE_URL:-}
-      ARTEX_LLM_PROXY: ${ARTEX_LLM_PROXY:-}
+      JINGWEI_LLM_PROVIDER: ${JINGWEI_LLM_PROVIDER:-}
+      JINGWEI_LLM_MODEL: ${JINGWEI_LLM_MODEL:-}
+      JINGWEI_LLM_BASE_URL: ${JINGWEI_LLM_BASE_URL:-}
+      JINGWEI_LLM_PROXY: ${JINGWEI_LLM_PROXY:-}
       JAVA_CHAINS_URL: ${JAVA_CHAINS_URL:-http://java-chains:8011}
       JAVA_CHAINS_PASS: ${JAVA_CHAINS_PASS:-}
       JAVA_CHAINS_MCP_TOKEN: ${JAVA_CHAINS_MCP_TOKEN:-}
       JAVA_CHAINS_CALLBACK_BIND: ${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}
       JAVA_CHAINS_CALLBACK_HOST: ${JAVA_CHAINS_CALLBACK_HOST:-127.0.0.1}
+      # 抓包记录诊断：置 1 后每条完成流量都会打一行日志（定位"代理能转发但抓不到包"）
+      JINGWEI_TRAFFIC_DEBUG: ${JINGWEI_TRAFFIC_DEBUG:-}
     ports:
       - "9790:8787"
       - "127.0.0.1:9791:8788"

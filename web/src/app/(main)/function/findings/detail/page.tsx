@@ -5,7 +5,7 @@ import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
-import { ArrowLeftIcon, ArrowUpRightIcon, ShieldAlertIcon } from "lucide-react";
+import { ArrowLeftIcon, ArrowUpRightIcon, CameraIcon, GlobeIcon, Loader2Icon, ShieldAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { CopyButton } from "@/components/copy-button";
@@ -17,13 +17,15 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
+import { FindingAgentChatDrawer } from "@/components/finding-agent-chat-drawer";
 import { statusMeta } from "@/lib/status";
-import type { Finding, FindingStatus, Severity } from "@/lib/types";
+import type { Finding, FindingReviewEvent, FindingScreenshot, FindingStatus, Severity } from "@/lib/types";
 
 import { FindingLineageView } from "./lineage";
 
@@ -42,6 +44,25 @@ const FINDING_STATUSES: FindingStatus[] = [
 
 function fmtTime(ts: string) {
   return new Date(ts).toLocaleString("zh-CN");
+}
+
+// REVIEW_ACTION_LABELS 把复核事件动作映射成中文标签。
+const REVIEW_ACTION_LABELS: Record<string, string> = {
+  status: "处理状态",
+  severity: "严重等级",
+  cvss: "CVSS 评分",
+  name: "漏洞名称",
+  vulnclass: "漏洞类型",
+};
+
+// fileToBase64 读取文件为纯 base64(去掉 data: 前缀)。
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(",")[1] ?? "");
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(file);
+  });
 }
 
 // FieldRow is one label/value line in the right-hand status panel.
@@ -89,6 +110,12 @@ function FindingDetailInner() {
   const [finding, setFinding] = React.useState<Finding | null>(null);
   const [loaded, setLoaded] = React.useState(false);
   const [tab, setTab] = React.useState("overview");
+  const [events, setEvents] = React.useState<FindingReviewEvent[]>([]);
+  const [screenshots, setScreenshots] = React.useState<FindingScreenshot[]>([]);
+  const [shotCaption, setShotCaption] = React.useState("");
+  const [autoShotting, setAutoShotting] = React.useState(false);
+  const [pageShotting, setPageShotting] = React.useState(false);
+  const [cvssDraft, setCvssDraft] = React.useState("");
 
   const load = React.useCallback(() => {
     if (!id) {
@@ -100,6 +127,8 @@ function FindingDetailInner() {
       .then((f) => setFinding(f))
       .catch(() => setFinding(null))
       .finally(() => setLoaded(true));
+    api.findingEvents(id).then(setEvents).catch(() => setEvents([]));
+    api.findingScreenshots(id, true).then(setScreenshots).catch(() => setScreenshots([]));
   }, [contextTaskId, id]);
   React.useEffect(() => {
     load();
@@ -138,6 +167,77 @@ function FindingDetailInner() {
     },
     [finding, id],
   );
+
+  // CVSS 草稿随 finding 同步；失焦/回车时提交。
+  React.useEffect(() => {
+    setCvssDraft(finding?.cvss != null ? String(finding.cvss) : "");
+  }, [finding?.cvss]);
+
+  const commitCVSS = React.useCallback(async () => {
+    if (!finding || finding.inherited) return;
+    const num = parseFloat(cvssDraft);
+    if (Number.isNaN(num) || num < 0 || num > 10) {
+      setCvssDraft(finding.cvss != null ? String(finding.cvss) : "");
+      if (cvssDraft !== "") toast.error("CVSS 需在 0.0-10.0 之间");
+      return;
+    }
+    if (num === finding.cvss) return;
+    try {
+      const updated = await api.setFindingCvss(id, num);
+      setFinding(updated);
+      setEvents(await api.findingEvents(id));
+      toast.success(`CVSS 已设为 ${num.toFixed(1)}`);
+    } catch (e) {
+      setCvssDraft(finding.cvss != null ? String(finding.cvss) : "");
+      toast.error("更新失败：" + (e as Error).message);
+    }
+  }, [finding, cvssDraft, id]);
+
+  const onPickShot = React.useCallback(
+    async (file: File) => {
+      if (!id || finding?.inherited) return;
+      try {
+        const b64 = await fileToBase64(file);
+        await api.addFindingScreenshot(id, shotCaption.trim() || file.name, b64);
+        setShotCaption("");
+        setScreenshots(await api.findingScreenshots(id, true));
+        toast.success("取证截图已上传");
+      } catch (e) {
+        toast.error("上传失败：" + (e as Error).message);
+      }
+    },
+    [id, shotCaption, finding?.inherited],
+  );
+
+  // 自动取证:用已绑定的真实报文渲染取证面板(时钟 + 命中高亮),不用手工截屏。
+  const onAutoShot = React.useCallback(async () => {
+    if (!id || finding?.inherited) return;
+    setAutoShotting(true);
+    try {
+      await api.autoFindingScreenshot(id);
+      setScreenshots(await api.findingScreenshots(id, true));
+      toast.success("已生成自动取证截图");
+    } catch (e) {
+      toast.error("自动取证失败：" + (e as Error).message);
+    } finally {
+      setAutoShotting(false);
+    }
+  }, [id, finding?.inherited]);
+
+  // 页面取证:无头浏览器打开目标页面截真图,补"用户看到什么"这一半证据。
+  const onPageShot = React.useCallback(async () => {
+    if (!id || finding?.inherited) return;
+    setPageShotting(true);
+    try {
+      await api.pageFindingScreenshot(id);
+      setScreenshots(await api.findingScreenshots(id, true));
+      toast.success("已生成页面取证截图");
+    } catch (e) {
+      toast.error("页面取证失败：" + (e as Error).message);
+    } finally {
+      setPageShotting(false);
+    }
+  }, [id, finding?.inherited]);
 
   if (!finding) {
     return (
@@ -187,9 +287,12 @@ function FindingDetailInner() {
           {finding.inherited && finding.source_task_id && (
             <Badge variant="outline">来源任务 #{finding.source_task_id} · 只读</Badge>
           )}
+          <FindingAgentChatDrawer finding={finding} />
         </div>
         <TabsList>
           <TabsTrigger value="overview">概览</TabsTrigger>
+          <TabsTrigger value="screenshots">取证截图</TabsTrigger>
+          <TabsTrigger value="review">复核时间线</TabsTrigger>
           <TabsTrigger value="lineage">链路图</TabsTrigger>
         </TabsList>
       </header>
@@ -209,6 +312,61 @@ function FindingDetailInner() {
                   <p className="text-sm leading-relaxed whitespace-pre-wrap">{finding.summary || "（无摘要）"}</p>
                 </CardContent>
               </Card>
+              {/* 结构化复现过程：agent 记录漏洞时就地写下的真实步骤，每步带自己的报文 */}
+              {finding.reproduction?.steps?.length ? (
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">复现过程</CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <div className="space-y-2 text-sm">
+                      {finding.reproduction.entry_point ? (
+                        <p>
+                          <span className="text-xs font-medium text-muted-foreground">入口点：</span>
+                          {finding.reproduction.entry_point}
+                        </p>
+                      ) : null}
+                      {finding.reproduction.prerequisites?.length ? (
+                        <div>
+                          <span className="text-xs font-medium text-muted-foreground">前置条件：</span>
+                          <ul className="mt-1 list-disc pl-5">
+                            {finding.reproduction.prerequisites.map((p) => (
+                              <li key={p}>{p}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                      {finding.reproduction.provenance ? (
+                        <p>
+                          <span className="text-xs font-medium text-muted-foreground">攻击链来源：</span>
+                          {finding.reproduction.provenance}
+                        </p>
+                      ) : null}
+                    </div>
+                    {finding.reproduction.steps.map((step, i) => (
+                      <div
+                        // biome-ignore lint/suspicious/noArrayIndexKey: 步骤按位置展示，无稳定 id
+                        key={`${i}:${step.request.slice(0, 24)}`}
+                        className="space-y-2 rounded-md border border-l-2 border-l-primary px-3 py-2"
+                      >
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="rounded bg-primary px-2 py-0.5 text-xs font-medium text-primary-foreground">
+                            步骤 {i + 1}
+                          </span>
+                          {step.expected ? (
+                            <span className="text-xs text-muted-foreground">预期：{step.expected}</span>
+                          ) : null}
+                          {step.proves ? (
+                            <span className="text-xs text-muted-foreground">证明：{step.proves}</span>
+                          ) : null}
+                        </div>
+                        <HTTPMessageBlock title="请求" text={step.request} />
+                        <HTTPMessageBlock title="响应" text={step.response} />
+                      </div>
+                    ))}
+                  </CardContent>
+                </Card>
+              ) : null}
               <FindingRetestPanel key={`retest:${id}`} findingId={id} readOnly={finding.inherited} onCompleted={load} />
               <Card>
                 <CardHeader className="flex-row items-center justify-between gap-2">
@@ -310,6 +468,28 @@ function FindingDetailInner() {
                   )}
                 </FieldRow>
 
+                {/* CVSS 评分 */}
+                <FieldRow label="CVSS 评分">
+                  {finding.inherited ? (
+                    <span className="tabular-nums">{finding.cvss != null ? finding.cvss.toFixed(1) : "—"}</span>
+                  ) : (
+                    <Input
+                      type="number"
+                      min={0}
+                      max={10}
+                      step={0.1}
+                      value={cvssDraft}
+                      onChange={(e) => setCvssDraft(e.target.value)}
+                      onBlur={commitCVSS}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                      }}
+                      placeholder="0.0-10.0"
+                      className="h-7 w-24 text-right text-sm"
+                    />
+                  )}
+                </FieldRow>
+
                 {/* 处理状态 */}
                 <FieldRow label="处理状态">
                   {finding.inherited ? (
@@ -383,6 +563,102 @@ function FindingDetailInner() {
               </CardContent>
             </Card>
           </div>
+        </TabsContent>
+
+        {/* 取证截图：重放/现场截图证据 + 上传 */}
+        <TabsContent value="screenshots" className="mt-0">
+          <Card>
+            <CardHeader className="flex-row items-center justify-between gap-2">
+              <CardTitle className="text-sm">取证截图</CardTitle>
+              {!finding.inherited ? (
+                <div className="flex items-center gap-2">
+                  <Button size="sm" variant="outline" disabled={autoShotting} onClick={() => void onAutoShot()}>
+                    {autoShotting ? <Loader2Icon className="size-3.5 animate-spin" /> : <CameraIcon className="size-3.5" />}
+                    报文取证
+                  </Button>
+                  <Button size="sm" variant="outline" disabled={pageShotting} onClick={() => void onPageShot()}>
+                    {pageShotting ? <Loader2Icon className="size-3.5 animate-spin" /> : <GlobeIcon className="size-3.5" />}
+                    页面取证
+                  </Button>
+                  <label className="flex cursor-pointer items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs hover:bg-muted">
+                    <CameraIcon className="size-3.5" /> 上传截图
+                    <input
+                      type="file"
+                      accept="image/png,image/jpeg"
+                      className="hidden"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (f) onPickShot(f);
+                        e.target.value = "";
+                      }}
+                    />
+                  </label>
+                </div>
+              ) : null}
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {!finding.inherited ? (
+                <Input
+                  value={shotCaption}
+                  onChange={(e) => setShotCaption(e.target.value)}
+                  placeholder="截图说明（可选，如：重放请求后响应含特征串）"
+                  className="max-w-md"
+                />
+              ) : null}
+              {screenshots.length === 0 ? (
+                <p className="text-sm text-muted-foreground">暂无取证截图。</p>
+              ) : (
+                <div className="grid gap-4 md:grid-cols-2">
+                  {screenshots.map((s) => (
+                    <figure key={s.id} className="space-y-1">
+                      <img
+                        src={s.data?.startsWith("data:") ? s.data : `data:image/png;base64,${s.data ?? ""}`}
+                        alt={s.caption}
+                        className="w-full rounded-md border"
+                      />
+                      <figcaption className="text-xs text-muted-foreground">
+                        {s.caption || "未命名截图"} · {fmtTime(s.created_at)}
+                      </figcaption>
+                    </figure>
+                  ))}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        {/* 复核时间线：操作员处置留痕 */}
+        <TabsContent value="review" className="mt-0">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm">复核时间线</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {events.length === 0 ? (
+                <p className="text-sm text-muted-foreground">暂无复核记录。</p>
+              ) : (
+                <ol className="space-y-0 border-l pl-4">
+                  {events.map((ev) => (
+                    <li key={ev.id} className="relative pb-4 pl-4">
+                      <span className="absolute -left-[7px] top-1.5 size-2.5 rounded-full bg-primary" />
+                      <div className="flex flex-wrap items-center gap-2 text-sm">
+                        <span className="font-medium">{REVIEW_ACTION_LABELS[ev.action] ?? ev.action}</span>
+                        {ev.from_val || ev.to_val ? (
+                          <span className="text-muted-foreground">
+                            {ev.from_val || "—"} → {ev.to_val || "—"}
+                          </span>
+                        ) : null}
+                      </div>
+                      <div className="mt-0.5 text-xs text-muted-foreground">
+                        {ev.actor || "操作员"} · {fmtTime(ev.created_at)}
+                        {ev.note ? ` · ${ev.note}` : ""}
+                      </div>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </CardContent>
+          </Card>
         </TabsContent>
 
         {/* 链路图：从任务初始节点回溯到本漏洞节点的攻击链路 */}

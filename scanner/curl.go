@@ -9,16 +9,22 @@ type CurlRequest struct {
 	Body    string
 	Headers []string
 	Cookie  string
+	Proxy   string
 }
 
 // curlValueFlags are the curl options that consume the token after them.
+// Short options are case-sensitive in curl: -X is the HTTP method while -x is
+// the proxy, and -H is a header while -h is help. Lowercasing the token (as
+// this parser used to) turned a proxied replay into a request with method
+// "HTTP://..." and dropped the real method.
 var curlValueFlags = map[string]bool{
-	"-x": true, "--request": true,
+	"-X": true, "--request": true,
+	"-x": true, "--proxy": true,
 	"-d": true, "--data": true, "--data-raw": true, "--data-binary": true,
 	"--data-urlencode": true,
-	"-h":               true, "--header": true,
+	"-H":               true, "--header": true,
 	"-b": true, "--cookie": true,
-	"-a": true, "--user-agent": true,
+	"-A": true, "--user-agent": true,
 	"-e": true, "--referer": true,
 	"-o": true, "--output": true,
 	"--url": true,
@@ -39,26 +45,23 @@ func ParseCurlRequest(curl string) (CurlRequest, bool) {
 	for i := 0; i < len(tokens); i++ {
 		tok := tokens[i]
 		if strings.HasPrefix(tok, "-") && len(tok) > 1 {
-			flag := strings.ToLower(tok)
-			var value string
-			if eq := strings.Index(flag, "="); eq > 0 && flag != "--data-urlencode" {
-				flag, value = flag[:eq], tok[eq+1:]
-			} else if curlValueFlags[flag] && i+1 < len(tokens) {
+			flag, value, attached := normalizeCurlFlag(tok)
+			if !attached && curlValueFlags[flag] && i+1 < len(tokens) {
 				i++
 				value = tokens[i]
-			} else {
+			} else if !attached && !curlValueFlags[flag] {
 				continue
 			}
 			switch flag {
-			case "-x", "--request", "--url":
-				if flag == "--url" {
-					req.URL = value
-				} else {
-					req.Method = strings.ToUpper(value)
-				}
+			case "-X", "--request":
+				req.Method = strings.ToUpper(value)
+			case "--url":
+				req.URL = value
+			case "-x", "--proxy":
+				req.Proxy = value
 			case "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode":
 				req.Body = value
-			case "-h", "--header":
+			case "-H", "--header":
 				name, _, ok := strings.Cut(value, ":")
 				name = strings.TrimSpace(name)
 				switch {
@@ -72,7 +75,7 @@ func ParseCurlRequest(curl string) (CurlRequest, bool) {
 				}
 			case "-b", "--cookie":
 				req.Cookie = value
-			case "-a", "--user-agent":
+			case "-A", "--user-agent":
 				req.Headers = append(req.Headers, "User-Agent: "+value)
 			case "-e", "--referer":
 				req.Headers = append(req.Headers, "Referer: "+value)
@@ -87,6 +90,31 @@ func ParseCurlRequest(curl string) (CurlRequest, bool) {
 		return CurlRequest{}, false
 	}
 	return req, true
+}
+
+// normalizeCurlFlag splits one option token into the flag curl interprets and
+// its value. Short options keep their case and may carry an attached value
+// (-XPOST, -xhttp://proxy:8080); long options accept --flag=value. The
+// --data-urlencode exception exists because its value legitimately contains '='.
+func normalizeCurlFlag(tok string) (flag, value string, attached bool) {
+	if strings.HasPrefix(tok, "--") {
+		if eq := strings.Index(tok, "="); eq > 0 && !strings.EqualFold(tok[:eq], "--data-urlencode") {
+			return strings.ToLower(tok[:eq]), tok[eq+1:], true
+		}
+		return strings.ToLower(tok), "", false
+	}
+	shape := tok
+	if len(shape) > 2 {
+		shape = shape[:2]
+	}
+	if len(shape) < 2 || !curlValueFlags[shape] {
+		// Boolean short flag (-k, -s, -L): nothing to consume.
+		return strings.ToLower(tok), "", false
+	}
+	if len(tok) > 2 {
+		return shape, tok[2:], true
+	}
+	return shape, "", false
 }
 
 // curlTokens splits a command line into arguments, honouring single and double

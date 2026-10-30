@@ -13,10 +13,10 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/guard"
-	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/artex/llmrec"
+	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/guard"
+	"github.com/Autumn-27/jingwei/intercept"
+	"github.com/Autumn-27/jingwei/llmrec"
 	"github.com/Autumn-27/norma/llm"
 )
 

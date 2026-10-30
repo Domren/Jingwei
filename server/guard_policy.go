@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	pgdb "github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/guard"
+	pgdb "github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/guard"
 )
 
 // settingGuardEnforcement is the runtime override for the deterministic agent

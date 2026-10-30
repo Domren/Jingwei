@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/pocparse"
+	"github.com/Autumn-27/jingwei/pocparse"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
