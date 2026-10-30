@@ -235,6 +235,16 @@ docker build --network=host --build-arg TARGETARCH=amd64 \
 
 发布只使用仓库内置 `GITHUB_TOKEN`，无需配置 Docker Hub 凭据。
 
+## 交流
+
+扫码关注微信公众号 **网安智界**，在公众号后台私信即可入群交流。
+
+<div align="center">
+
+<img src="screenshots/wechat-qr.jpg" alt="微信公众号 网安智界" width="240" />
+
+</div>
+
 ## 许可与免责声明
 
 ### 开源协议
