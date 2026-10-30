@@ -17,7 +17,7 @@ services:
     restart: unless-stopped
 
   jingwei:
-    image: ${JINGWEI_IMAGE:-ghcr.io/domren/jingwei:1.2.1}
+    image: ${JINGWEI_IMAGE:-ghcr.io/domren/jingwei:1.2.2}
     depends_on:
       postgres:
         condition: service_healthy
