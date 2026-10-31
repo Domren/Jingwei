@@ -63,6 +63,50 @@ type SQLMapRun struct {
 // Found reports whether sqlmap proved at least one injection point.
 func (r SQLMapRun) Found() bool { return len(r.Injections) > 0 }
 
+// SQLMapEscalation is the outcome of the post-verification metadata query. It
+// only carries what the injected DB account revealed about itself; no table
+// data is ever read.
+type SQLMapEscalation struct {
+	Banner      string
+	CurrentUser string
+	CurrentDB   string
+	Hostname    string
+	DBAText     string
+	IsDBA       bool
+	Version     string
+	Log         string
+	Elapsed     time.Duration
+	TimedOut    bool
+	Missing     bool
+	Err         error
+}
+
+// HasFindings reports whether the escalation returned anything worth showing.
+func (e SQLMapEscalation) HasFindings() bool {
+	return e.Banner != "" || e.CurrentUser != "" || e.CurrentDB != "" || e.Hostname != "" || e.IsDBA
+}
+
+// Summary renders the one-line impact statement used in evidence and records.
+func (e SQLMapEscalation) Summary() string {
+	parts := []string{}
+	if e.CurrentUser != "" {
+		parts = append(parts, "DB 用户 "+e.CurrentUser)
+	}
+	if e.CurrentDB != "" {
+		parts = append(parts, "当前库 "+e.CurrentDB)
+	}
+	if e.Hostname != "" {
+		parts = append(parts, "主机 "+e.Hostname)
+	}
+	if e.Banner != "" {
+		parts = append(parts, "版本 "+e.Banner)
+	}
+	if e.DBAText != "" {
+		parts = append(parts, "DBA="+e.DBAText)
+	}
+	return strings.Join(parts, " · ")
+}
+
 const (
 	maxSQLMapOutput = 4 << 20
 	sqlmapBanner    = "sqlmap identified the following injection point"
@@ -157,11 +201,44 @@ func RunSQLMap(ctx context.Context, target string, opts SQLMapOptions) SQLMapRun
 		"--time-sec", clampRangeStr(opts.TimeSeconds, 1, 10, 3),
 		"--output-dir", filepath.Join(tmp, "out"),
 	}
+	targetArgs, err := sqlmapTargetArgs(target, opts, tmp)
+	if err != nil {
+		run.Err = err
+		return run
+	}
+	args = append(args, targetArgs...)
+
+	runCtx := ctx
+	var cancel context.CancelFunc
+	if opts.WallSeconds > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, time.Duration(opts.WallSeconds)*time.Second)
+		defer cancel()
+	}
+	var out limitedBuffer
+	out.limit = maxSQLMapOutput
+	started := time.Now()
+	cmd := exec.CommandContext(runCtx, bin, args...)
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err = cmd.Run()
+	run.Elapsed = time.Since(started)
+	run.TimedOut = errors.Is(runCtx.Err(), context.DeadlineExceeded)
+	run.Log = tailText(out.String(), 24_000)
+	run.Injections, run.DBMS, run.Tech, run.OS = ParseSQLMapOutput(out.String())
+	if err != nil && !run.Found() && !reSQLMapNotInj.MatchString(out.String()) && run.Version == "" {
+		run.Err = fmt.Errorf("sqlmap 执行失败: %v", err)
+	}
+	return run
+}
+
+// sqlmapTargetArgs builds the flags that locate the request to test and carry
+// its session. Both the detection and the escalation run need exactly the same
+// view of the point, so the two command lines cannot drift apart.
+func sqlmapTargetArgs(target string, opts SQLMapOptions, tmp string) ([]string, error) {
+	args := []string{}
 	if opts.RawRequest != "" {
 		reqFile := filepath.Join(tmp, "request.txt")
 		if err := os.WriteFile(reqFile, []byte(normalizeRawRequestForTool(opts.RawRequest)), 0o600); err != nil {
-			run.Err = fmt.Errorf("写入请求文件失败: %w", err)
-			return run
+			return nil, fmt.Errorf("写入请求文件失败: %w", err)
 		}
 		args = append(args, "-r", reqFile)
 	} else {
@@ -190,6 +267,48 @@ func RunSQLMap(ctx context.Context, target string, opts SQLMapOptions) SQLMapRun
 	if p := strings.TrimSpace(opts.Proxy); p != "" {
 		args = append(args, "--proxy", p)
 	}
+	return args, nil
+}
+
+// RunSQLMapEscalation queries what the injected DB account can see once a point
+// has been proven injectable. It asks for metadata only (banner, current user,
+// current database, DBA flag, hostname): no table is read, no file is written
+// and no OS shell is opened. target and opts must describe the same point the
+// detection run proved, with opts.Params pinned to the proven parameter.
+func RunSQLMapEscalation(ctx context.Context, target string, opts SQLMapOptions) SQLMapEscalation {
+	esc := SQLMapEscalation{Version: SQLMapVersion()}
+	bin, err := sqlmapBinary()
+	if err != nil {
+		esc.Missing = true
+		esc.Err = errors.New("sqlmap 未安装")
+		return esc
+	}
+	tmp, err := os.MkdirTemp("", "jingwei-sqlmap-escalate-*")
+	if err != nil {
+		esc.Err = err
+		return esc
+	}
+	defer os.RemoveAll(tmp)
+
+	args := []string{
+		"--batch", "--flush-session",
+		"--level", clampRangeStr(opts.Level, 1, 5, 3),
+		"--risk", clampRangeStr(opts.Risk, 1, 3, 2),
+		// One worker: the point is already known, and a metadata query should not
+		// multiply load on a database that just showed a time-based behaviour.
+		"--threads", "1",
+		"--timeout", clampRangeStr(opts.TimeoutSeconds, 1, 120, 15),
+		"--retries", clampOptionalStr(opts.Retries, 0, 3),
+		"--time-sec", clampRangeStr(opts.TimeSeconds, 1, 10, 3),
+		"--output-dir", filepath.Join(tmp, "out"),
+		"--banner", "--current-user", "--current-db", "--is-dba", "--hostname",
+	}
+	targetArgs, err := sqlmapTargetArgs(target, opts, tmp)
+	if err != nil {
+		esc.Err = err
+		return esc
+	}
+	args = append(args, targetArgs...)
 
 	runCtx := ctx
 	var cancel context.CancelFunc
@@ -203,14 +322,44 @@ func RunSQLMap(ctx context.Context, target string, opts SQLMapOptions) SQLMapRun
 	cmd := exec.CommandContext(runCtx, bin, args...)
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err = cmd.Run()
-	run.Elapsed = time.Since(started)
-	run.TimedOut = errors.Is(runCtx.Err(), context.DeadlineExceeded)
-	run.Log = tailText(out.String(), 24_000)
-	run.Injections, run.DBMS, run.Tech, run.OS = ParseSQLMapOutput(out.String())
-	if err != nil && !run.Found() && !reSQLMapNotInj.MatchString(out.String()) && run.Version == "" {
-		run.Err = fmt.Errorf("sqlmap 执行失败: %v", err)
+	esc.Elapsed = time.Since(started)
+	esc.TimedOut = errors.Is(runCtx.Err(), context.DeadlineExceeded)
+	esc.Log = tailText(out.String(), 12_000)
+	esc.Banner, esc.CurrentUser, esc.CurrentDB, esc.Hostname, esc.DBAText, esc.IsDBA = ParseSQLMapEscalation(out.String())
+	if err != nil && !esc.TimedOut && !esc.HasFindings() {
+		esc.Err = fmt.Errorf("sqlmap 影响评估执行失败: %v", err)
 	}
-	return run
+	return esc
+}
+
+var (
+	reSQLMapEscBanner = regexp.MustCompile(`(?m)^banner:\s*'?([^'\r\n]*)'?\s*$`)
+	reSQLMapEscUser   = regexp.MustCompile(`(?m)^current user:\s*'?([^'\r\n]*)'?\s*$`)
+	reSQLMapEscDB     = regexp.MustCompile(`(?m)^current database:\s*'?([^'\r\n]*)'?\s*$`)
+	reSQLMapEscHost   = regexp.MustCompile(`(?m)^hostname:\s*'?([^'\r\n]*)'?\s*$`)
+	reSQLMapEscDBA    = regexp.MustCompile(`(?m)^current user is DBA:\s*(True|False)\s*$`)
+)
+
+// ParseSQLMapEscalation reads the metadata lines sqlmap prints for the
+// --banner/--current-user/--current-db/--is-dba/--hostname run.
+func ParseSQLMapEscalation(text string) (banner, currentUser, currentDB, hostname, dbaText string, isDBA bool) {
+	banner = sqlmapMetaValue(reSQLMapEscBanner, text)
+	currentUser = sqlmapMetaValue(reSQLMapEscUser, text)
+	currentDB = sqlmapMetaValue(reSQLMapEscDB, text)
+	hostname = sqlmapMetaValue(reSQLMapEscHost, text)
+	if m := reSQLMapEscDBA.FindStringSubmatch(text); m != nil {
+		dbaText = strings.TrimSpace(m[1])
+		isDBA = strings.EqualFold(dbaText, "True")
+	}
+	return banner, currentUser, currentDB, hostname, dbaText, isDBA
+}
+
+func sqlmapMetaValue(re *regexp.Regexp, text string) string {
+	m := re.FindStringSubmatch(text)
+	if m == nil {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
 }
 
 // ParseSQLMapOutput reads the injection-point block sqlmap prints when it proves

@@ -7,6 +7,44 @@ import (
 
 // 内置「删除类接口路径」规则匹配的是整个 tool_input JSON 串，因此用例直接以
 // JSON 形态给出，与 Interceptor 实际拿到的 subject 一致。
+// 内置「删除系统关键目录」（v4）规则直接匹配 agent 的 tool_input。
+func TestRMCriticalPathPattern(t *testing.T) {
+	re := regexp.MustCompile(rmCriticalPathPattern)
+
+	hit := []string{
+		`{"command":"rm -f /etc/passwd"}`,
+		`{"command":"rm -f /etc"}`,
+		`{"command":"rm -f /bin/sh"}`,
+		`{"command":"rm -f /usr/bin/x"}`,
+		`{"command":"rm -f /var/lib/mysql/ibdata1"}`,
+		`{"command":"rm -f /var/run/x.pid"}`,
+		`{"command":"rm -f /var"}`,
+		`{"command":"rm -f /root/.bash_history"}`,
+		`{"command":"rm -f /"}`,
+		`{"command":"cd / && rm -f /lib/libc.so.6"}`,
+	}
+	for _, s := range hit {
+		if !re.MatchString(s) {
+			t.Errorf("应命中却放行: %s", s)
+		}
+	}
+
+	// 应用数据（web 根目录等）必须允许清理，否则 P4 撤离删不掉落地 webshell。
+	miss := []string{
+		`{"command":"rm -f /var/www/html/upload/shell.php"}`,
+		`{"command":"cd /var/www/html/upload && rm -f shell.php token123.php"}`,
+		`{"command":"rm -f /etcetera"}`,
+		`{"command":"rm -f /varnish/cache"}`,
+		`{"command":"rm -f /home/user/notes.txt"}`,
+		`{"command":"nmap -p80 10.0.0.1"}`,
+	}
+	for _, s := range miss {
+		if re.MatchString(s) {
+			t.Errorf("误拦: %s", s)
+		}
+	}
+}
+
 func TestDeleteEndpointPathPattern(t *testing.T) {
 	re := regexp.MustCompile(deleteEndpointPathPattern)
 

@@ -126,6 +126,38 @@ func (d *DB) ListDeepTasksByScan(scanTaskID int64) ([]*DeepTask, error) {
 	return out, rows.Err()
 }
 
+// ScanAutoStats aggregates the deep tasks one scan spawned in its current run.
+// A rerun resets started_at, so tasks from an earlier run are excluded exactly
+// like ListDeepTasksByScan.
+type ScanAutoStats struct {
+	Tasks     int `json:"tasks"`
+	Done      int `json:"done"`
+	Running   int `json:"running"`
+	Failed    int `json:"failed"` // failed + canceled
+	Records   int `json:"records"`
+	Confirmed int `json:"confirmed"`
+}
+
+func (d *DB) ScanAutoStats(scanTaskID int64) (ScanAutoStats, error) {
+	var st ScanAutoStats
+	err := d.QueryRow(`
+WITH dt AS (
+    SELECT id, status FROM deep_tasks
+    WHERE scan_task_id=$1
+      AND created_at >= COALESCE((SELECT started_at FROM scan_tasks WHERE id=$1), now())
+), rec AS (
+    SELECT r.verdict FROM exploit_records r JOIN dt ON dt.id=r.task_id
+)
+SELECT (SELECT count(*) FROM dt),
+       (SELECT count(*) FROM dt WHERE status='done'),
+       (SELECT count(*) FROM dt WHERE status='running'),
+       (SELECT count(*) FROM dt WHERE status IN ('failed','canceled')),
+       (SELECT count(*) FROM rec),
+       (SELECT count(*) FROM rec WHERE verdict='confirmed')`, scanTaskID).
+		Scan(&st.Tasks, &st.Done, &st.Running, &st.Failed, &st.Records, &st.Confirmed)
+	return st, err
+}
+
 // ListDeepTasks returns newest-first deep tasks, optionally filtered by kind.
 func (d *DB) ListDeepTasks(kind string, limit, offset int) ([]*DeepTask, int, error) {
 	if limit <= 0 {

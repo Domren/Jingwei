@@ -65,9 +65,14 @@ import type {
   InterceptDetail,
   InterceptPending,
   InterceptRule,
+  IntranetArtifact,
+  IntranetArtifactInput,
   IntranetBatchItem,
+  IntranetEvacuationInput,
+  IntranetEvacuationReport,
   IntranetExecResult,
   IntranetHandoffInput,
+  IntranetPersistInput,
   IntranetProbeInfo,
   IntranetScopeRequest,
   IntranetScopeRequestInput,
@@ -1643,6 +1648,37 @@ export const api = {
     post<{ request: IntranetScopeRequest }>(`/intranet/scope-requests/${id}/reject`, { note }),
   intranetHandoff: (input: IntranetHandoffInput) =>
     post<{ task: Task; warnings?: string[] }>("/intranet/handoff", input),
+
+  // ---- 落地物台账与撤离清理 ----
+  intranetArtifacts: (params?: {
+    task_id?: number;
+    session_id?: number;
+    host?: string;
+    kind?: string;
+    status?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const sp = new URLSearchParams();
+    if (params?.task_id) sp.set("task_id", String(params.task_id));
+    if (params?.session_id) sp.set("session_id", String(params.session_id));
+    if (params?.host) sp.set("host", params.host);
+    if (params?.kind) sp.set("kind", params.kind);
+    if (params?.status) sp.set("status", params.status);
+    sp.set("limit", String(params?.limit ?? 200));
+    sp.set("offset", String(params?.offset ?? 0));
+    return get<{ artifacts: IntranetArtifact[]; total: number }>(`/intranet/artifacts?${sp}`);
+  },
+  registerIntranetArtifact: (input: IntranetArtifactInput) =>
+    post<{ artifact: IntranetArtifact }>("/intranet/artifacts", input),
+  revokeIntranetArtifact: (id: number, sessionId?: number) =>
+    post<{ artifact: IntranetArtifact; revoked: boolean; error?: string }>(`/intranet/artifacts/${id}/revoke`, {
+      session_id: sessionId,
+    }),
+  persistIntranetSession: (id: number, input: IntranetPersistInput) =>
+    post<{ artifact: IntranetArtifact; deployed: boolean; error?: string }>(`/intranet/sessions/${id}/persist`, input),
+  evacuateIntranetTask: (input: IntranetEvacuationInput) =>
+    post<{ report: IntranetEvacuationReport }>("/intranet/evacuate", input),
 
   // ---- Managed resources & port audit ----
   managedResources: (params?: { kind?: string; status?: string; limit?: number; offset?: number }) => {

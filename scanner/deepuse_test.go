@@ -85,6 +85,21 @@ func TestUploadWebshellMultipart(t *testing.T) {
 	}
 }
 
+func TestNormalizeUploadURL(t *testing.T) {
+	cases := map[string]string{
+		"http://host:10800":           "http://host:10800/",
+		"http://host:10800/":          "http://host:10800/",
+		"http://host:10800/upload/":   "http://host:10800/upload/",
+		"https://host/upload.php?d=1": "https://host/upload.php?d=1",
+		"  http://host  ":             "http://host/",
+	}
+	for in, want := range cases {
+		if got := normalizeUploadURL(in); got != want {
+			t.Errorf("normalizeUploadURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestWebshellCommandRoundTrip(t *testing.T) {
 	payload := BuildShellPayload("php", "pw")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

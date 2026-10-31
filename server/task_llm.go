@@ -8,6 +8,7 @@ import (
 	"iter"
 	"log"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -85,6 +86,70 @@ func isQuotaExhaustedError(err error) bool {
 	return err != nil && agent.IsQuotaExhaustedMessage(err.Error())
 }
 
+var taskProfileHTTPStatusRe = regexp.MustCompile(`(?i)\bstatus(?:\s+code)?\s*[=:]?\s*(\d{3})\b`)
+
+// taskProfileErrorStatus extracts the HTTP status an SDK error carries in its
+// text ("<prefix>: status <code>: <body>"). 0 means the error has no status.
+func taskProfileErrorStatus(err error) int {
+	if err == nil {
+		return 0
+	}
+	m := taskProfileHTTPStatusRe.FindStringSubmatch(err.Error())
+	if m == nil {
+		return 0
+	}
+	code, _ := strconv.Atoi(m[1])
+	return code
+}
+
+// isTaskProfileFailoverError reports whether the task-level explicit chain should
+// retire the current profile and advance. Besides quota exhaustion, 401/403/404/402
+// are configuration-class failures (invalid key, missing subscription, wrong
+// endpoint or model, payment required): replaying the same request on that profile
+// keeps failing until a human fixes it, so keeping the intent pinned there only
+// burns turns. Transient failures (429/408/5xx/network) are handled by the
+// same-provider retry layer and must not rotate profiles.
+func isTaskProfileFailoverError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isQuotaExhaustedError(err) {
+		return true
+	}
+	switch taskProfileErrorStatus(err) {
+	case 401, 402, 403, 404:
+		return true
+	}
+	return false
+}
+
+// taskProfileFailoverStatus maps the failure to the persisted chain-entry status.
+func taskProfileFailoverStatus(err error) string {
+	if isQuotaExhaustedError(err) {
+		return db.TaskLLMProfileQuotaExhausted
+	}
+	return db.TaskLLMProfileUnavailable
+}
+
+// taskProfileFailoverReason is the short human label used in the transition
+// activity summary.
+func taskProfileFailoverReason(err error) string {
+	if isQuotaExhaustedError(err) {
+		return "额度不足"
+	}
+	switch taskProfileErrorStatus(err) {
+	case 401:
+		return "鉴权失败（HTTP 401）"
+	case 402:
+		return "要求付费（HTTP 402）"
+	case 403:
+		return "配置不可用（HTTP 403）"
+	case 404:
+		return "配置不可用（HTTP 404）"
+	}
+	return "配置不可用"
+}
+
 type taskLLMSelection struct {
 	task      *Task
 	profileID int64
@@ -105,7 +170,7 @@ type taskLLMStreamHooks struct {
 // Agent 绑定 → 任务 LLM 配置链 → 全局/环境配置。
 // 绑定优先于任务链：某个角色被显式指定了模型，就一直跑在那个模型上；绑定不存在或
 // 构建失败时才降级到任务链，任务链为空时再降级到全局配置。
-// 返回的 profile id 只有走任务链时才非零 —— streamTaskLLM 以此判断额度错误是否
+// 返回的 profile id 只有走任务链时才非零 —— streamTaskLLM 以此判断故障转移类错误是否
 // 应该推进任务的故障转移状态（绑定/全局路径不改任务链状态，沿用既有语义）。
 func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 	taskNum, err := parseTaskID(r.taskID)
@@ -128,7 +193,7 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 	}
 	if len(pt.LLMProfileIDs) > 0 {
 		if pt.ActiveLLMProfileID == nil {
-			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, cause: errors.New("all selected profiles are quota exhausted")}
+			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, cause: errors.New("all selected profiles are unavailable")}
 		}
 		sel.profileID = *pt.ActiveLLMProfileID
 		prov, cfg, ok := r.s.providerForProfile(sel.profileID)
@@ -197,14 +262,15 @@ func parseTaskID(id string) (int64, error) {
 }
 
 // streamHooks builds the failover/exhaustion callbacks shared by Stream and
-// Complete: how to read the current profile selection, how to mark it quota
-// exhausted, and how to emit a failover transition.
+// Complete: how to read the current profile selection, how to retire a profile
+// that can no longer serve this task, and how to emit a failover transition.
 func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
 	return taskLLMStreamHooks{
 		current: r.current,
 		exhaust: func(selection taskLLMSelection, cause error) (db.TaskLLMTransition, error) {
 			taskNum, _ := parseTaskID(r.taskID)
-			transition, err := r.s.m.pg.MarkTaskLLMProfileQuotaExhaustedAtRevision(taskNum, selection.profileID, selection.revision, cause.Error())
+			transition, err := r.s.m.pg.MarkTaskLLMProfileFailedAtRevision(
+				taskNum, selection.profileID, selection.revision, taskProfileFailoverStatus(cause), cause.Error())
 			if err != nil {
 				return transition, err
 			}
@@ -266,13 +332,13 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 		if callErr == nil {
 			return msg, sr, usage, nil
 		}
-		// profileID=0: 显式链已被清空;非额度错误:透传。二者都不改任务 failover 状态。
-		if selection.profileID == 0 || !isQuotaExhaustedError(callErr) {
+		// profileID=0: 显式链已被清空;非故障转移类错误:透传。二者都不改任务 failover 状态。
+		if selection.profileID == 0 || !isTaskProfileFailoverError(callErr) {
 			return llm.Message{}, "", llm.Usage{}, callErr
 		}
 		transition, markErr := hooks.exhaust(selection, callErr)
 		if markErr != nil {
-			return llm.Message{}, "", llm.Usage{}, fmt.Errorf("mark profile quota exhausted after %v: %w", callErr, markErr)
+			return llm.Message{}, "", llm.Usage{}, fmt.Errorf("mark profile unavailable after %v: %w", callErr, markErr)
 		}
 		if transition.Advanced && !transition.Stale && hooks.transition != nil {
 			hooks.transition(selection, transition, callErr)
@@ -348,7 +414,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 			// profileID=0 means the explicit chain was cleared while this stable task
 			// bundle was still in use. Agent/global fallback errors follow the legacy
 			// behavior and never mutate task failover state.
-			if selection.profileID == 0 || !isQuotaExhaustedError(streamErr) {
+			if selection.profileID == 0 || !isTaskProfileFailoverError(streamErr) {
 				for _, buffered := range pending {
 					if !yield(buffered, nil) {
 						return
@@ -359,7 +425,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 			}
 			transition, markErr := hooks.exhaust(selection, streamErr)
 			if markErr != nil {
-				cause := fmt.Errorf("mark profile quota exhausted after %v: %w", streamErr, markErr)
+				cause := fmt.Errorf("mark profile unavailable after %v: %w", streamErr, markErr)
 				if committed {
 					// Output may already have driven tool execution. Report the persistence
 					// failure, but classify it as router-handled so the worker does not
@@ -425,9 +491,9 @@ func sameProviderRetryPolicy(r agent.RetryConfig) (retries int, backoff func(int
 
 // isRetryableStreamError 判断「提交前的流失败」是否值得在同一 provider 上重放。
 // 瞬时的传输中断 / 供应商过载 / 限流会自行恢复,可安全重试;而以下三类不重试:
-//   - 额度耗尽:交给 profile 故障转移处理,别在这里白烧重试
+//   - 额度耗尽 / 配置类拒绝(401/403/404):交给 profile 故障转移处理,别在这里白烧重试
 //   - 上下文过长:相同请求重放也没用,交给 harness 的 reactive 压缩兜底
-//   - 4xx 确定性拒绝(400/401/403/404/422):到哪个 provider 都一样会失败
+//   - 其他 4xx 确定性拒绝(400/422):到哪个 provider 都一样会失败
 func isRetryableStreamError(err error) bool {
 	if err == nil {
 		return false
@@ -626,7 +692,7 @@ func (s *Server) emitTaskLLMTransition(t *Task, transition db.TaskLLMTransition,
 	}
 	mode := "automatic"
 	kind := "llm_switch"
-	summary := fmt.Sprintf("%s 额度不足", llmAuditProfileLabel(previous))
+	summary := fmt.Sprintf("%s %s", llmAuditProfileLabel(previous), taskProfileFailoverReason(cause))
 	if transition.NextProfileID != nil {
 		summary += fmt.Sprintf("，后续调用切换到 %s", llmAuditProfileLabel(next))
 	} else {

@@ -81,7 +81,7 @@ export const RETRY_LAYERS = {
     trigger:
       "流已经建立（拿到 200）之后才出问题：连接中途断开、供应商 overloaded、流内的 429 / 5xx 错误事件——且一个 token 都还没交给调用方。",
     skips:
-      "额度耗尽（402 / insufficient_quota，交给轮询换配置）、上下文过长（413 / context length，交给压缩）、400 / 401 / 403 / 404 / 422 确定性拒绝，都不重试。",
+      "额度耗尽（402 / insufficient_quota，交给轮询换配置）、上下文过长（413 / context length，交给压缩）、400 / 422 确定性拒绝，都不重试；401 / 403 / 404 也不在这里重试，直接交给任务配置链切换。",
     desc: "在同一个配置上重放同一个请求。因为还没交付任何输出，重放不会重复模型输出或工具执行。",
     attemptsLabel: "重试次数",
     defAttempts: 2,

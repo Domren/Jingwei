@@ -172,9 +172,9 @@ function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: L
         {exhausted && (
           <Alert variant="destructive">
             <CircleAlertIcon />
-            <AlertTitle>配置链额度已耗尽</AlertTitle>
+            <AlertTitle>配置链已不可用</AlertTitle>
             <AlertDescription>
-              {task.llm_failover_reason ?? "所有已选配置均被判定为额度不足。保存配置链可重置故障状态。"}
+              {task.llm_failover_reason ?? "所有已选配置均已不可用（额度耗尽或鉴权/配置失效）。保存配置链可重置故障状态。"}
             </AlertDescription>
           </Alert>
         )}

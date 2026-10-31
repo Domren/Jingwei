@@ -578,10 +578,25 @@ func isThinkingOnlyTurn(messages []llm.Message) bool {
 	return false
 }
 
+// steerExemptTools are persistence tools: they are the worker's only way to write
+// what it already found back into the ledger. A queued steer used to block the
+// next tool unconditionally, so a correction arriving right before report_finding
+// silently discarded the finding. These tools always run; the steer stays queued
+// and applies to the next non-write tool.
+var steerExemptTools = map[string]bool{
+	"report_finding":       true,
+	"record_fact":          true,
+	"record_intelligence":  true,
+	"insert_assets":        true,
+	"bind_finding_traffic": true,
+}
+
 func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
-	if msg, ok := h.drain(); ok {
-		return true, "【规划者实时纠偏】" + msg +
-			"\n（这是规划者对本意图的即时指令；本次工具调用未执行，请据此调整下一步。若与你当前打算冲突，以此为准。）", nil
+	if !steerExemptTools[name] {
+		if msg, ok := h.drain(); ok {
+			return true, "【规划者实时纠偏】" + msg +
+				"\n（这是规划者对本意图的即时指令；本次工具调用未执行，请据此调整下一步。若与你当前打算冲突，以此为准。）", nil
+		}
 	}
 	var updated []byte
 	if h.inner != nil {

@@ -180,6 +180,11 @@ http:
 			t.Errorf("argv缺少 %s: %v", flag, call)
 		}
 	}
+	// -dast switches nuclei's loader to fuzzing-only mode, which skips legacy
+	// payload templates; it must never be added to their invocation.
+	if argsHave(call, "-dast") {
+		t.Errorf("legacy template must not run in dast mode: %v", call)
+	}
 	for _, pair := range [][2]string{{"-rate-limit", "50"}, {"-concurrency", "25"}, {"-timeout", "10"}, {"-retries", "1"}} {
 		if !argsHave(call, pair[0], pair[1]) {
 			t.Errorf("argv缺少 %s %s: %v", pair[0], pair[1], call)
@@ -201,6 +206,113 @@ http:
 	}
 	if !strings.Contains(string(written), "read-size: 16384") {
 		t.Errorf("read-size 未提升到下限:\n%s", written)
+	}
+}
+
+// nuclei's dast loader and its legacy loader keep mutually exclusive template
+// sets: -dast drops legacy payload templates, and omitting it disables fuzzing
+// templates as default. A scan mixing both must therefore produce two calls,
+// each with the flag its templates need, or one half of every such scan
+// silently disappears (a dast-only scan even dies with "no templates provided").
+func TestRunNucleiSplitsDASTCalls(t *testing.T) {
+	logPath, _ := installFakeTools(t)
+	legacy := `id: legacy-ssti
+info:
+  name: legacy
+  severity: high
+http:
+  - raw:
+      - |
+        GET /?name={{ssti}} HTTP/1.1
+    payloads:
+      ssti:
+        - "1"
+`
+	fuzzing := `id: fuzz-sqli
+info:
+  name: fuzz
+  severity: high
+http:
+  - payloads:
+      injection:
+        - "'"
+    fuzzing:
+      - part: query
+        type: replace
+        mode: single
+        fuzz:
+          - "{{injection}}"
+`
+	run := RunNuclei(context.Background(),
+		[]NucleiTemplate{{ID: "legacy-ssti", Content: legacy}, {ID: "fuzz-sqli", Content: fuzzing}},
+		[]string{"http://192.0.2.4/"}, NucleiOptions{})
+	if run.Err != nil {
+		t.Fatalf("run error: %v", run.Err)
+	}
+	calls := readFakeCalls(t, logPath)
+	if len(calls) != 2 {
+		t.Fatalf("calls = %d, want 2 (legacy + dast)", len(calls))
+	}
+	withDast, without := 0, 0
+	for _, call := range calls {
+		if argsHave(call, "-dast") {
+			withDast++
+		} else {
+			without++
+		}
+	}
+	if withDast != 1 || without != 1 {
+		t.Errorf("calls with -dast = %d, without = %d; want 1/1", withDast, without)
+	}
+	if run.Chains+run.Singles != 2 {
+		t.Errorf("counted templates = %d+%d, want 2", run.Chains, run.Singles)
+	}
+}
+
+// Headless templates load only under -headless, which downloads Chromium at
+// scan time when the image lacks a browser. A mixed run must drop them and
+// keep going; an all-headless run must fail with a clear message instead of
+// handing nuclei an empty template set ("no templates provided for scan").
+func TestRunNucleiSkipsHeadlessTemplates(t *testing.T) {
+	logPath, _ := installFakeTools(t)
+	headless := `id: dom-xss
+info:
+  name: dom xss
+  severity: medium
+headless:
+  - steps:
+      - action: navigate
+`
+	http := `id: plain
+info:
+  name: plain
+  severity: high
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/"
+`
+	run := RunNuclei(context.Background(),
+		[]NucleiTemplate{{ID: "dom-xss", Content: headless}, {ID: "plain", Content: http}},
+		[]string{"http://192.0.2.4/"}, NucleiOptions{})
+	if run.Err != nil {
+		t.Fatalf("run error: %v", run.Err)
+	}
+	if run.HeadlessSkipped != 1 || run.TemplateCount != 1 {
+		t.Errorf("headless skipped = %d, template count = %d; want 1/1", run.HeadlessSkipped, run.TemplateCount)
+	}
+	if calls := readFakeCalls(t, logPath); len(calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(calls))
+	}
+
+	run = RunNuclei(context.Background(),
+		[]NucleiTemplate{{ID: "dom-xss", Content: headless}},
+		[]string{"http://192.0.2.4/"}, NucleiOptions{})
+	if run.Err == nil || !strings.Contains(run.Err.Error(), "headless") {
+		t.Fatalf("all-headless run error = %v, want a headless message", run.Err)
+	}
+	if calls := readFakeCalls(t, logPath); len(calls) != 1 {
+		t.Errorf("all-headless run still invoked nuclei: %d calls", len(calls))
 	}
 }
 

@@ -2,8 +2,10 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Autumn-27/jingwei/db"
 )
@@ -149,5 +151,70 @@ func TestQueuedProbeNoteTracksFindingLinks(t *testing.T) {
 	}
 	if note := queuedProbeNote(db.DeepTaskExploit, 193, deepToolInput{}); strings.Contains(note, "finding_ids") {
 		t.Fatalf("non-probe kind got probe advice: %q", note)
+	}
+}
+
+// A scan whose POC pass found nothing can still get its first finding from an
+// automatic SQLi/XSS deep task. The scan summary must then stop saying 0/0,
+// otherwise the UI hides the finding and disables the report export.
+func TestSyncScanAutoSummaryIncludesDeepFinding(t *testing.T) {
+	dsn, _, err := db.DSN()
+	if err != nil {
+		t.Skip("no test database configured")
+	}
+	d, err := db.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	scan, err := d.CreateScanTask(db.ScanTaskInput{
+		Name: "deep sync", Targets: []string{"http://127.0.0.1:9/"}, Mode: "auto",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM scan_tasks WHERE id=$1`, scan.ID) })
+	if ok, err := d.ClaimScanTask(scan.ID); err != nil || !ok {
+		t.Fatalf("claim scan: ok=%v err=%v", ok, err)
+	}
+	deep, err := d.CreateDeepTask(db.DeepTaskInput{
+		Kind: db.DeepTaskSQLiProbe, Target: "http://127.0.0.1:9/", ScanTaskID: &scan.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`UPDATE deep_tasks SET status='running' WHERE id=$1`, deep.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.FinishDeepTask(deep.ID, "done", "done", "", map[string]any{"confirmed": 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	id, _, err := d.UpsertFinding(0, 0, "sqli-probe", "SQL 注入", "high",
+		"扫描未命中，深挖确认", "证据", "deep:test", nil,
+		fmt.Sprintf("%s-%d", t.Name(), time.Now().UnixNano()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM findings WHERE id=$1`, id) })
+	if err := d.LinkScanTaskResult(scan.ID, id, db.ScanTaskResult{
+		TemplateID: "sqli-probe", Name: "SQL 注入", Severity: "high",
+		Host: "http://127.0.0.1:9/", MatchedAt: "http://127.0.0.1:9/item?id=1", Type: "sqli_probe",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	syncScanAutoSummary(d, scan.ID)
+	got, err := d.GetScanTask(scan.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Summary["results"] != float64(1) || got.Summary["findings"] != float64(1) {
+		t.Fatalf("summary results/findings = %v/%v, want 1/1: %v",
+			got.Summary["results"], got.Summary["findings"], got.Summary)
+	}
+	if got.Summary["auto_tasks"] != float64(1) {
+		t.Fatalf("auto_tasks = %v, want 1: %v", got.Summary["auto_tasks"], got.Summary)
 	}
 }

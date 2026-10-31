@@ -1,7 +1,9 @@
 package db
 
 import (
+	"fmt"
 	"testing"
+	"time"
 )
 
 func deepTestSetup(t *testing.T) *DB {
@@ -211,6 +213,153 @@ func TestExploitRecordAndWAFResultStorage(t *testing.T) {
 	}
 	if !results[0].WAFDetected || results[0].WAFVendor != "Cloudflare" {
 		t.Errorf("waf fields not persisted: %+v", results[0])
+	}
+}
+
+func TestScanAutoStatsAndSummaryMerge(t *testing.T) {
+	d := deepTestSetup(t)
+	t.Cleanup(func() { _ = d.Close() })
+
+	scan, err := d.CreateScanTask(ScanTaskInput{
+		Name: "auto stats", Targets: []string{"http://127.0.0.1:9/"}, Mode: "auto",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM scan_tasks WHERE id = $1`, scan.ID)
+	if ok, err := d.ClaimScanTask(scan.ID); err != nil || !ok {
+		t.Fatalf("claim scan: ok=%v err=%v", ok, err)
+	}
+
+	// A deep task left over from an earlier run must not be counted.
+	stale, err := d.CreateDeepTask(DeepTaskInput{
+		Kind: DeepTaskExploit, Target: "http://127.0.0.1:9/", ScanTaskID: &scan.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`UPDATE deep_tasks SET status='done', created_at=now()-interval '1 hour' WHERE id=$1`, stale.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	task, err := d.CreateDeepTask(DeepTaskInput{
+		Kind: DeepTaskExploit, Target: "http://127.0.0.1:9/", ScanTaskID: &scan.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"confirmed", "not_reproduced"} {
+		if _, err := d.AddExploitRecord(ExploitRecord{
+			TaskID: task.ID, Mode: "verify", TemplateID: "t-" + v, Target: task.Target, Verdict: v,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := d.Exec(`UPDATE deep_tasks SET status='running' WHERE id=$1`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.FinishDeepTask(task.ID, "done", "done", "", map[string]any{"confirmed": 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := d.ScanAutoStats(scan.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ScanAutoStats{Tasks: 1, Done: 1, Records: 2, Confirmed: 1}
+	if st != want {
+		t.Errorf("stats = %+v, want %+v", st, want)
+	}
+
+	if err := d.MergeScanTaskSummary(scan.ID, map[string]any{
+		"auto_tasks": st.Tasks, "auto_done": st.Done, "auto_confirmed": st.Confirmed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.GetScanTask(scan.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Summary["auto_tasks"] != float64(1) || got.Summary["auto_confirmed"] != float64(1) {
+		t.Errorf("summary not merged: %v", got.Summary)
+	}
+}
+
+func TestLinkScanTaskResultBindsDeepFinding(t *testing.T) {
+	d := deepTestSetup(t)
+	t.Cleanup(func() { _ = d.Close() })
+
+	scan, err := d.CreateScanTask(ScanTaskInput{
+		Name: "deep link", Targets: []string{"http://127.0.0.1:9/"}, Mode: "auto",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM scan_tasks WHERE id = $1`, scan.ID)
+
+	dedupe := fmt.Sprintf("test-scan-link-%d", time.Now().UnixNano())
+	link, err := func() (int64, error) {
+		id, _, err := d.UpsertFinding(0, 0, "sqli-probe", "SQL 注入", "high",
+			"深挖确认", "证据", "deep:test", nil, dedupe)
+		return id, err
+	}()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM findings WHERE id = $1`, link)
+
+	// The scan never recorded this match; the deep task's row is inserted.
+	deepResult := ScanTaskResult{
+		TemplateID: "sqli-probe", Name: "SQL 注入", Severity: "high",
+		Host: "http://127.0.0.1:9/", MatchedAt: "http://127.0.0.1:9/item?id=1",
+		Type: "verify", Extracted: []string{"id 参数"},
+		Raw: map[string]any{"source": "deep", "deep_task_id": 1},
+	}
+	if err := d.LinkScanTaskResult(scan.ID, link, deepResult); err != nil {
+		t.Fatal(err)
+	}
+	results, findings, err := d.ScanTaskResultCounts(scan.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results != 1 || findings != 1 {
+		t.Fatalf("counts after link = %d/%d, want 1/1", results, findings)
+	}
+
+	// Re-linking the same match must not duplicate the row.
+	if err := d.LinkScanTaskResult(scan.ID, link, deepResult); err != nil {
+		t.Fatal(err)
+	}
+	list, err := d.ListScanTaskResults(scan.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].FindingID == nil || *list[0].FindingID != link {
+		t.Fatalf("linked results = %+v", list)
+	}
+
+	// A result the scan stored without a finding gets the finding attached
+	// instead of a second row.
+	empty := ScanTaskResult{TemplateID: "xss-probe", Severity: "medium",
+		MatchedAt: "http://127.0.0.1:9/search?q=1"}
+	if _, err := d.AddScanTaskResult(scan.ID, 0, empty); err != nil {
+		t.Fatal(err)
+	}
+	link2, _, err := d.UpsertFinding(0, 0, "xss-probe", "XSS", "medium",
+		"深挖确认", "证据", "deep:test", nil, dedupe+"-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM findings WHERE id = $1`, link2)
+	if err := d.LinkScanTaskResult(scan.ID, link2, empty); err != nil {
+		t.Fatal(err)
+	}
+	results, findings, err = d.ScanTaskResultCounts(scan.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results != 2 || findings != 2 {
+		t.Fatalf("counts after attach = %d/%d, want 2/2", results, findings)
 	}
 }
 

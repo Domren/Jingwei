@@ -279,6 +279,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.seedDefaultInterceptRulesV3(); err != nil {
 		return fmt.Errorf("seed intercept rules v3: %w", err)
 	}
+	if err := d.seedDefaultInterceptRulesV4(); err != nil {
+		return fmt.Errorf("seed intercept rules v4: %w", err)
+	}
 	if err := d.seedDefaultAssetInterceptRules(); err != nil {
 		return fmt.Errorf("seed asset intercept rules: %w", err)
 	}
@@ -613,4 +616,28 @@ WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
 		return fmt.Errorf("rule %q: %w", name, err)
 	}
 	return d.SetSetting("intercept_default_rules_v3", "done")
+}
+
+// The v1 "删除系统关键目录" rule rejected any path under /var, so cleaning a
+// webshell at /var/www/html/upload/shell.php was blocked as a system path. The
+// v4 pattern matches the exact system directories (and only /var/lib, /var/run
+// below /var), so web roots and other application data stay deletable for
+// cleanup while /, /etc, /var, /var/lib, … remain protected.
+//
+// Exported as package consts only so the seeded regex is unit-testable without a DB.
+const rmCriticalPathPattern = `\brm\b[^"'\n]{0,60}["'\s](?:/(?:[\s"']|$)|/(?:etc|bin|sbin|usr|boot|lib|lib64|sys|proc|dev|root)(?:/|[\s"']|$)|/var(?:/(?:lib|run)(?:/|[\s"']|$)|[\s"']|$))`
+
+const oldRMCriticalPathPattern = `\brm\b[^"'\n]{0,60}["'\s](/|/etc|/bin|/usr|/boot|/var|/lib|/sys|/proc|/dev|/sbin|/root)`
+
+func (d *DB) seedDefaultInterceptRulesV4() error {
+	if v, _, _ := d.GetSetting("intercept_default_rules_v4"); v == "done" {
+		return nil
+	}
+	// Replace only the untouched built-in rule: a user edit changes the pattern
+	// and must survive this migration.
+	if _, err := d.Exec(`UPDATE intercept_rules SET pattern=$2 WHERE name=$1 AND pattern=$3`,
+		"[内置] 删除系统关键目录", rmCriticalPathPattern, oldRMCriticalPathPattern); err != nil {
+		return fmt.Errorf("rule 删除系统关键目录: %w", err)
+	}
+	return d.SetSetting("intercept_default_rules_v4", "done")
 }

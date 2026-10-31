@@ -10,11 +10,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/report"
 	"github.com/Autumn-27/jingwei/traffic"
 )
 
@@ -256,6 +258,62 @@ func TestEvidenceAtomicFailuresAndLegacy(t *testing.T) {
 	}
 	if _, err = s.Record(ctx, in, nil); err != nil {
 		t.Fatal("legacy no-traffic report failed:", err)
+	}
+}
+
+// A finding recorded with bound traffic must carry the proof exchange's wire
+// bytes both in findings.http_request/http_response and in its auto report;
+// before this, the report said "未采集到原始 HTTP 请求/响应报文" while three
+// bindings existed.
+func TestEvidenceRecordFillsRawPackets(t *testing.T) {
+	s, in, _ := evidenceFixture(t)
+	ctx := context.Background()
+	seedExchange(t, s, "proofpkt", []byte("proof-body"), false)
+	r, err := s.Record(ctx, in, []db.TrafficRef{{TrafficID: "proofpkt", Role: "proof"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req, resp string
+	if err = s.DB.QueryRow(`SELECT http_request, http_response FROM findings WHERE id=$1`, r.FindingID).Scan(&req, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(req, "POST /test HTTP/1.1") || !strings.Contains(req, "\r\n\r\n{}") {
+		t.Fatalf("request packet: %q", req)
+	}
+	if !strings.Contains(resp, "HTTP/1.1 200") || !strings.Contains(resp, "\r\n\r\nproof-body") {
+		t.Fatalf("response packet: %q", resp)
+	}
+	f, err := s.DB.GetFinding(r.FindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.Report, "proof-body") {
+		t.Fatalf("auto report lacks captured packet: %q", f.Report)
+	}
+	if !strings.Contains(report.CompleteFindingReport(f), "proof-body") {
+		t.Fatal("completed report dropped the captured packet")
+	}
+}
+
+// A finding recorded without traffic is backfilled by a later bind, so the
+// detail page and report show the replayable packet without a re-record.
+func TestEvidenceBindBackfillsRawPackets(t *testing.T) {
+	s, in, _ := evidenceFixture(t)
+	ctx := context.Background()
+	seedExchange(t, s, "latepkt", []byte("late-body"), false)
+	r, err := s.Record(ctx, in, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Bind(ctx, r.FindingID, []db.TrafficRef{{TrafficID: "latepkt", Role: "proof"}}); err != nil {
+		t.Fatal(err)
+	}
+	var resp string
+	if err = s.DB.QueryRow(`SELECT http_response FROM findings WHERE id=$1`, r.FindingID).Scan(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp, "late-body") {
+		t.Fatalf("bind did not backfill the packet: %q", resp)
 	}
 }
 

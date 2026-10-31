@@ -268,6 +268,30 @@ func TestBodyProductWordInProseDoesNotMatch(t *testing.T) {
 	}
 }
 
+// Plain-text error pages used to be labeled Docker_Daemon because two library
+// rules matched only on "text/plain" and "Content-Length:19".
+func TestDockerDaemonGenericHeaderFalsePositive(t *testing.T) {
+	h := http.Header{}
+	h.Set("Content-Type", "text/plain; charset=utf-8")
+	h.Set("Content-Length", "19")
+	techs := DetectTechnologies(h, "404 page not found\n")
+	if containsFold(techs, "Docker_Daemon") {
+		t.Fatalf("generic text/plain response matched Docker_Daemon: %v", techs)
+	}
+	if !headerKeywordTooGeneric("text/plain") || !headerKeywordTooGeneric("Content-Length:19") {
+		t.Fatal("generic MIME/Length header keyword must be filtered")
+	}
+	if headerKeywordTooGeneric("docker-distribution-api") {
+		t.Fatal("specific Docker API header wrongly filtered")
+	}
+
+	reg := http.Header{}
+	reg.Set("Docker-Distribution-Api-Version", "registry/2.0")
+	if got := DetectTechnologies(reg, ""); !containsFold(got, "Docker-Distribution-Api") {
+		t.Fatalf("real Docker registry header lost: %v", got)
+	}
+}
+
 func TestGenericHeaderKeywordFalsePositive(t *testing.T) {
 	h := http.Header{}
 	h.Set("Server", "Apache/2.4.52 (Ubuntu)")

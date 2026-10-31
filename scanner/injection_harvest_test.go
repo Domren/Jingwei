@@ -28,6 +28,10 @@ const harvestSample = `<html><head><link rel="stylesheet" href="/static/app.css?
 <form method="post" action="login.php">
   <input name="username" type="text"><input name="password" type="password">
 </form>
+<form method="post" action="/admin/login.php">
+  <input name="username" type="text"><input name="password" type="password">
+  <input name="captcha" type="text"><img src="/captcha.png" alt="验证码">
+</form>
 <script>fetch("/api/user/list?uid=" + id)</script>
 </body></html>`
 
@@ -76,6 +80,9 @@ func TestExtractParamPoints(t *testing.T) {
 		}
 		if strings.HasSuffix(p.URL, ".js") || strings.HasSuffix(p.URL, ".css") {
 			t.Fatalf("static asset became a point: %s", p.URL)
+		}
+		if strings.Contains(p.URL, "/admin/login.php") {
+			t.Fatalf("captcha-gated form must not become an injection point: %s", p.URL)
 		}
 	}
 	if _, ok := byKey["GET|http://127.0.0.1:8080/api/user/list?uid="]; !ok {

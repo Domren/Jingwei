@@ -11,30 +11,36 @@ func TestAnalyzeTemplate(t *testing.T) {
 		content  string
 		stateful bool
 		rawOK    bool
+		dast     bool
+		headless bool
 	}{
-		{"single request", "http:\n  - raw:\n      - |\n        GET /a HTTP/1.1\n        Host: {{Hostname}}\n", false, false},
-		{"two raw requests", "http:\n  - raw:\n      - |\n        GET /a HTTP/1.1\n      - |\n        GET /b HTTP/1.1\n", true, false},
-		{"cookie reuse", "http:\n  - raw:\n      - |\n        GET /a HTTP/1.1\n    cookie-reuse: true\n", true, false},
-		{"req condition", "http:\n  - raw:\n      - |\n        GET /a HTTP/1.1\n    req-condition: true\n", true, false},
-		{"redirect follow", "http:\n  - method: GET\n    path:\n      - \"{{BaseURL}}/a\"\n    redirects: true\n", true, false},
-		{"two paths", "http:\n  - method: GET\n    path:\n      - \"{{BaseURL}}/a\"\n      - \"{{BaseURL}}/b\"\n", true, false},
-		{"one path", "http:\n  - method: GET\n    path:\n      - \"{{BaseURL}}/a\"\n", false, false},
-		{"network chain", "network:\n  - host:\n      - \"{{Host}}:6379\"\n    inputs:\n      - data:\n          - \"PING\\r\\n\"\n      - data:\n          - \"INFO\\r\\n\"\n", true, true},
-		{"network single", "network:\n  - host:\n      - \"{{Host}}:6379\"\n    inputs:\n      - data:\n          - \"PING\\r\\n\"\n", false, true},
-		{"tcp single (exposed-redis shape)", "tcp:\n  - inputs:\n      - data: \"info\\r\\nquit\\r\\n\"\n    host:\n      - \"{{Hostname}}\"\n    port: 6379,6380\n", false, true},
-		{"tcp chain", "tcp:\n  - inputs:\n      - data: \"AUTH x\\r\\n\"\n      - data: \"INFO\\r\\n\"\n", true, true},
-		{"javascript single", "javascript:\n  - code: |\n      const net = require('nuclei/net');\n", false, true},
-		{"ssl single", "ssl:\n  - address: \"{{Hostname}}:443\"\n", false, true},
-		{"code template", "code:\n  - engine: python\n    code: print(1)\n", false, false},
-		{"headless template", "headless:\n  - steps:\n      - action: navigate\n", false, false},
-		{"malformed raw tcp", "id: x\ntcp:\n  - inputs:\n       - data: \"PING\\r\\n\"\n   bad indent here\n", false, true},
-		{"malformed raw http", "id: x\nhttp:\n  - raw:\n       - |\n         GET / HTTP/1.1\n   bad indent here\n", false, false},
+		{"single request", "http:\n  - raw:\n      - |\n        GET /a HTTP/1.1\n        Host: {{Hostname}}\n", false, false, false, false},
+		{"two raw requests", "http:\n  - raw:\n      - |\n        GET /a HTTP/1.1\n      - |\n        GET /b HTTP/1.1\n", true, false, false, false},
+		{"cookie reuse", "http:\n  - raw:\n      - |\n        GET /a HTTP/1.1\n    cookie-reuse: true\n", true, false, false, false},
+		{"req condition", "http:\n  - raw:\n      - |\n        GET /a HTTP/1.1\n    req-condition: true\n", true, false, false, false},
+		{"redirect follow", "http:\n  - method: GET\n    path:\n      - \"{{BaseURL}}/a\"\n    redirects: true\n", true, false, false, false},
+		{"two paths", "http:\n  - method: GET\n    path:\n      - \"{{BaseURL}}/a\"\n      - \"{{BaseURL}}/b\"\n", true, false, false, false},
+		{"one path", "http:\n  - method: GET\n    path:\n      - \"{{BaseURL}}/a\"\n", false, false, false, false},
+		{"fuzzing dast", "http:\n  - payloads:\n      injection:\n        - \"'\"\n    fuzzing:\n      - part: query\n        type: replace\n        mode: single\n        fuzz:\n          - \"{{injection}}\"\n", false, false, true, false},
+		{"legacy payload template", "http:\n  - raw:\n      - |\n        GET /?name={{ssti}} HTTP/1.1\n    payloads:\n      ssti:\n        - \"1\"\n", false, false, false, false},
+		{"malformed fuzzing dast", "id: x\nhttp:\n  - fuzzing:\n      - part: query\n   bad indent here\n", false, false, true, false},
+		{"network chain", "network:\n  - host:\n      - \"{{Host}}:6379\"\n    inputs:\n      - data:\n          - \"PING\\r\\n\"\n      - data:\n          - \"INFO\\r\\n\"\n", true, true, false, false},
+		{"network single", "network:\n  - host:\n      - \"{{Host}}:6379\"\n    inputs:\n      - data:\n          - \"PING\\r\\n\"\n", false, true, false, false},
+		{"tcp single (exposed-redis shape)", "tcp:\n  - inputs:\n      - data: \"info\\r\\nquit\\r\\n\"\n    host:\n      - \"{{Hostname}}\"\n    port: 6379,6380\n", false, true, false, false},
+		{"tcp chain", "tcp:\n  - inputs:\n      - data: \"AUTH x\\r\\n\"\n      - data: \"INFO\\r\\n\"\n", true, true, false, false},
+		{"javascript single", "javascript:\n  - code: |\n      const net = require('nuclei/net');\n", false, true, false, false},
+		{"ssl single", "ssl:\n  - address: \"{{Hostname}}:443\"\n", false, true, false, false},
+		{"code template", "code:\n  - engine: python\n    code: print(1)\n", false, false, false, false},
+		{"headless template", "headless:\n  - steps:\n      - action: navigate\n", false, false, false, true},
+		{"malformed headless", "id: x\nheadless:\n  - steps:\n   bad indent here\n", false, false, false, true},
+		{"malformed raw tcp", "id: x\ntcp:\n  - inputs:\n       - data: \"PING\\r\\n\"\n   bad indent here\n", false, true, false, false},
+		{"malformed raw http", "id: x\nhttp:\n  - raw:\n       - |\n         GET / HTTP/1.1\n   bad indent here\n", false, false, false, false},
 	}
 	for _, c := range cases {
 		got := analyzeTemplate(c.content)
-		if got.stateful != c.stateful || got.rawOK != c.rawOK {
-			t.Errorf("%s: got (stateful=%v rawOK=%v) want (%v, %v)",
-				c.name, got.stateful, got.rawOK, c.stateful, c.rawOK)
+		if got.stateful != c.stateful || got.rawOK != c.rawOK || got.dast != c.dast || got.headless != c.headless {
+			t.Errorf("%s: got (stateful=%v rawOK=%v dast=%v headless=%v) want (%v, %v, %v, %v)",
+				c.name, got.stateful, got.rawOK, got.dast, got.headless, c.stateful, c.rawOK, c.dast, c.headless)
 		}
 	}
 }
@@ -129,6 +135,40 @@ func TestBuildNucleiGroups(t *testing.T) {
 		[]string{"1.2.3.4:6379"}, 25, 50)
 	if len(groups) != 0 {
 		t.Errorf("groups = %v, want none (HTTP POC must not wrap a raw port)", dirs(groups))
+	}
+}
+
+func TestBuildNucleiGroupsSplitsDAST(t *testing.T) {
+	const legacySingle = "http:\n  - raw:\n      - |\n        GET /?a=1 HTTP/1.1\n"
+	const legacyChain = "http:\n  - raw:\n      - |\n        GET /a HTTP/1.1\n      - |\n        GET /b HTTP/1.1\n"
+	const fuzzingSingle = "http:\n  - payloads:\n      injection:\n        - \"'\"\n    fuzzing:\n      - part: query\n        type: replace\n        mode: single\n        fuzz:\n          - \"{{injection}}\"\n"
+	templates := []NucleiTemplate{
+		{ID: "legacy-single", Content: legacySingle},
+		{ID: "legacy-chain", Content: legacyChain},
+		{ID: "fuzz-single", Content: fuzzingSingle},
+	}
+	groups := buildNucleiGroups(templates, []string{"http://1.2.3.4/"}, 25, 50)
+	if got, want := dirs(groups), []string{"chains", "single", "dast-single"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("dirs = %v, want %v", got, want)
+	}
+	byDir := map[string]nucleiGroup{}
+	for _, g := range groups {
+		byDir[g.dir] = g
+	}
+	if !byDir["dast-single"].dast {
+		t.Error("dast-single must carry the -dast flag")
+	}
+	for _, d := range []string{"chains", "single"} {
+		if byDir[d].dast {
+			t.Errorf("%s must not run in dast mode", d)
+		}
+	}
+	if got := byDir["dast-single"].templates; len(got) != 1 || got[0].ID != "fuzz-single" {
+		t.Errorf("dast-single = %v", ids(got))
+	}
+	legacy, dast := SplitDASTTemplates(templates)
+	if len(legacy) != 2 || len(dast) != 1 || dast[0].ID != "fuzz-single" {
+		t.Errorf("split = %v / %v", ids(legacy), ids(dast))
 	}
 }
 

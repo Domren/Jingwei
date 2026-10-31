@@ -22,21 +22,36 @@ type WebCrackOptions struct {
 	PerURLSeconds int      // wall budget per URL inside the tool
 	DelayMS       int      // pause between attempts
 	TimeoutSecond int      // total wall budget for the whole run
+	// Pairs switches the bridge from dictionary mode to exact-pair mode: each
+	// "user:password" is tried on every URL. Used to reuse credentials that were
+	// already proven elsewhere, without paying for a full dictionary run.
+	Pairs []string
+	// Proxy routes login requests through a proxy (intranet tunnel).
+	Proxy string
 }
 
 // WebCrackResult is the outcome of one login URL.
 type WebCrackResult struct {
-	URL       string   `json:"url"`
-	Found     bool     `json:"found"`
-	Username  string   `json:"username"`
-	Password  string   `json:"password"`
-	Kind      string   `json:"kind"` // weak | universal
+	URL      string `json:"url"`
+	Found    bool   `json:"found"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Kind     string `json:"kind"` // weak | universal
+	// Cookie is the session the successful login established (the tool's cookie
+	// jar). A follow-up exploit needs it when the login itself was a redirect and
+	// the Set-Cookie header never reached the final response.
+	Cookie    string   `json:"cookie"`
 	Attempts  int      `json:"attempts"`
 	ElapsedMS int64    `json:"elapsed_ms"`
 	Request   string   `json:"request"`
 	Response  string   `json:"response"`
 	Error     string   `json:"error"`
 	Log       []string `json:"log"`
+	// Captcha reports that the login page carried an image captcha and the
+	// bridge solved it with OCR on every attempt (fresh image per try).
+	Captcha         bool `json:"captcha"`
+	CaptchaRetries  int  `json:"captcha_retries"`
+	CaptchaOCRFails int  `json:"captcha_ocr_failures"`
 }
 
 // WebCrackRun is the outcome of one bridge invocation.
@@ -172,6 +187,32 @@ func RunWebCrack(ctx context.Context, opts WebCrackOptions) WebCrackRun {
 		delay = 50
 	}
 	args = append(args, "--delay", fmt.Sprintf("%.3f", float64(delay)/1000))
+	proxy, err := NormalizeProxyURL(opts.Proxy)
+	if err != nil {
+		run.Err = err
+		return run
+	}
+	if proxy != "" {
+		args = append(args, "--proxy", proxy)
+	}
+	pairsJSON := ""
+	if len(opts.Pairs) > 0 {
+		pairs := make([]map[string]string, 0, len(opts.Pairs))
+		for _, raw := range opts.Pairs {
+			user, pass, ok := strings.Cut(raw, ":")
+			if !ok || strings.TrimSpace(user) == "" {
+				continue
+			}
+			pairs = append(pairs, map[string]string{"user": user, "password": pass})
+		}
+		if len(pairs) == 0 {
+			run.Err = errors.New("webcrack：复用凭据格式应为 user:password")
+			return run
+		}
+		blob, _ := json.Marshal(pairs)
+		pairsJSON = string(blob)
+		args = append(args, "--pairs-stdin", "-")
+	}
 
 	runCtx := ctx
 	var cancel context.CancelFunc
@@ -183,6 +224,11 @@ func RunWebCrack(ctx context.Context, opts WebCrackOptions) WebCrackRun {
 	out.limit = 8 << 20
 	cmd := exec.CommandContext(runCtx, parts[0], args...)
 	cmd.Stdout, cmd.Stderr = &out, &out
+	if pairsJSON != "" {
+		// Credentials are handed over on stdin so they never appear in the
+		// process title, which any local user can read.
+		cmd.Stdin = strings.NewReader(pairsJSON)
+	}
 	cmdErr := cmd.Run()
 	run.Elapsed = time.Since(start)
 

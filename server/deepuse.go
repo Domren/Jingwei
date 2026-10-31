@@ -105,7 +105,41 @@ func (m *deepManager) run(parent context.Context, task *db.DeepTask) {
 	if err := m.s.m.pg.FinishDeepTask(task.ID, status, stage, errMsg, summary); err != nil {
 		log.Printf("[deep %d] finish: %v", task.ID, err)
 	}
+	if task.ScanTaskID != nil {
+		syncScanAutoSummary(m.s.m.pg, *task.ScanTaskID)
+	}
 	log.Printf("[deep %d] %s (%s)", task.ID, status, stage)
+}
+
+// syncScanAutoSummary folds deep-dive progress back into the parent scan's
+// summary. Automatic verification/exploitation finishes after the scan itself,
+// so without this the scan list would keep the completion-time snapshot.
+func syncScanAutoSummary(pg *db.DB, scanTaskID int64) {
+	st, err := pg.ScanAutoStats(scanTaskID)
+	if err != nil {
+		log.Printf("[deep] scan %d auto stats: %v", scanTaskID, err)
+		return
+	}
+	fields := map[string]any{
+		"auto_tasks":     st.Tasks,
+		"auto_done":      st.Done,
+		"auto_running":   st.Running,
+		"auto_failed":    st.Failed,
+		"auto_records":   st.Records,
+		"auto_confirmed": st.Confirmed,
+	}
+	// A deep task can write the first finding of a scan that found nothing by
+	// POC alone. Recount from the result table so the scan page no longer says
+	// 0 results / 0 findings and unlocks the report export.
+	if results, findings, err := pg.ScanTaskResultCounts(scanTaskID); err != nil {
+		log.Printf("[deep] scan %d result counts: %v", scanTaskID, err)
+	} else {
+		fields["results"] = results
+		fields["findings"] = findings
+	}
+	if err := pg.MergeScanTaskSummary(scanTaskID, fields); err != nil {
+		log.Printf("[deep] scan %d merge summary: %v", scanTaskID, err)
+	}
 }
 
 func (m *deepManager) cancelTask(id int64) {
@@ -129,6 +163,10 @@ type deepRun struct {
 	// confirmedFindings guards against appending the same verification note on
 	// every repeat; access is confined to the single task goroutine.
 	confirmedFindings map[int64]bool
+
+	// sqliEscalations bounds how many confirmed SQLi points pay for the metadata
+	// query; access is confined to the single task goroutine.
+	sqliEscalations int
 }
 
 func (r *deepRun) logf(stage, format string, args ...any) {
@@ -152,6 +190,17 @@ func (r *deepRun) setProgress(stage string, values map[string]any) {
 	}
 }
 
+// taskProxy returns the outbound proxy configured for this deep task. Tasks
+// spawned by a scan inherit its proxy so intranet targets keep using the same
+// tunnel; empty means direct.
+func (r *deepRun) taskProxy() string {
+	return strings.TrimSpace(stringParam(r.task.Params, "proxy"))
+}
+
+func (r *deepRun) newDeepClient(timeout time.Duration) *scanner.DeepClient {
+	return scanner.NewDeepClientWithProxy(timeout, r.taskProxy())
+}
+
 func (r *deepRun) execute() (status, stage, errMsg string, summary map[string]any) {
 	summary = map[string]any{"kind": r.task.Kind, "target": r.task.Target}
 	defer func() {
@@ -164,6 +213,14 @@ func (r *deepRun) execute() (status, stage, errMsg string, summary map[string]an
 
 	if err := r.checkTargetAllowed(); err != nil {
 		return "failed", "failed", err.Error(), summary
+	}
+	if proxy := r.taskProxy(); proxy != "" {
+		normalized, err := scanner.NormalizeProxyURL(proxy)
+		if err != nil {
+			return "failed", "failed", "代理地址无效: " + err.Error(), summary
+		}
+		r.task.Params["proxy"] = normalized
+		r.logf("run", "出站代理：%s", redactProxyURL(normalized))
 	}
 
 	switch r.task.Kind {
@@ -281,6 +338,26 @@ func boolParam(params map[string]any, key string) bool {
 		return strings.EqualFold(strings.TrimSpace(t), "true")
 	}
 	return false
+}
+
+// paramDefaultTrue reads a boolean parameter whose absence means "on". The
+// other boolean helper turns a missing key into false, which would silently
+// disable a feature that is supposed to run by default.
+func paramDefaultTrue(params map[string]any, key string) bool {
+	if params == nil {
+		return true
+	}
+	v, ok := params[key]
+	if !ok {
+		return true
+	}
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		return !strings.EqualFold(strings.TrimSpace(t), "false")
+	}
+	return true
 }
 
 func intSliceParam(params map[string]any, key string) []int64 {
@@ -569,7 +646,7 @@ func (r *deepRun) replayTemplates(templates []db.POCTemplate, target string, rep
 			break
 		}
 		run := scanner.RunNuclei(r.ctx, runnable, []string{target},
-			scanner.NucleiOptions{RateLimit: 25, Concurrency: 5, TimeoutSeconds: 180})
+			scanner.NucleiOptions{RateLimit: 25, Concurrency: 5, TimeoutSeconds: 180, Proxy: r.taskProxy()})
 		if run.Err != nil && len(run.Results) == 0 {
 			r.logf(mode, "nuclei 执行失败: %v", run.Err)
 			ranOut = true
@@ -690,7 +767,7 @@ func (r *deepRun) runCustomExploit(target, raw string, summary map[string]any) (
 	if err != nil {
 		return "failed", "failed", err.Error(), summary
 	}
-	client := scanner.NewDeepClient(20 * time.Second)
+	client := r.newDeepClient(20 * time.Second)
 	r.logf("exploit", "发送自定义请求 %s %s", req.Method, req.URL)
 	resp := client.Do(r.ctx, req)
 	if resp.Error != "" {
@@ -843,6 +920,28 @@ func (r *deepRun) writeFinding(rec db.ExploitRecord) int64 {
 	}
 	if !created {
 		r.logf("exploit", "命中已合并到既有发现 #%d（%s）", id, rec.TemplateID)
+	}
+	// Auto tasks belong to a scan: bind the proven finding to the scan's result
+	// list and counts, otherwise the scan tab keeps reporting zero even though
+	// the deep-dive tab shows a confirmed issue.
+	if r.task.ScanTaskID != nil {
+		if err := r.pg.LinkScanTaskResult(*r.task.ScanTaskID, id, db.ScanTaskResult{
+			TemplateID: rec.TemplateID,
+			Name:       rec.Name,
+			Severity:   strings.ToLower(rec.Severity),
+			Host:       r.task.Target,
+			MatchedAt:  displayOr(rec.Target, r.task.Target),
+			Type:       displayOr(rec.Mode, r.task.Kind),
+			Curl:       rec.Curl,
+			Extracted:  rec.Extracted,
+			Raw: map[string]any{
+				"source":       "deep",
+				"deep_task_id": r.task.ID,
+				"verdict":      rec.Verdict,
+			},
+		}); err != nil {
+			r.logf("exploit", "关联扫描结果失败 %s: %v", rec.TemplateID, err)
+		}
 	}
 	autoReport := report.BuildFindingReport(report.FindingReportInput{
 		FindingID:       id,
@@ -999,7 +1098,7 @@ func (r *deepRun) runWAFBypass(summary map[string]any) (string, string, string, 
 	}
 	keywords := stringSliceParam(r.task.Params, "keywords")
 
-	client := scanner.NewDeepClient(15 * time.Second)
+	client := r.newDeepClient(15 * time.Second)
 	r.logf("waf", "探测 WAF: %s", base)
 	det := scanner.DetectWAF(r.ctx, client, base)
 	summary["waf_detected"] = det.Detected
@@ -1080,8 +1179,12 @@ func (r *deepRun) runWebshellInject(summary map[string]any) (string, string, str
 	if fileName != "" {
 		payload.Filename = fileName
 	}
-	client := scanner.NewDeepClient(20 * time.Second)
-	r.logf("inject", "上传 webshell 到 %s（类型 %s，字段 %q）", uploadURL, payload.Type, displayOr(fieldName, "raw"))
+	summary["upload_url"] = uploadURL
+	summary["land_url"] = landURL
+	summary["file_name"] = payload.Filename
+	client := r.newDeepClient(20 * time.Second)
+	fieldName, extra = r.probeUploadFormFields(client, uploadURL, fieldName, extra, headers, summary)
+	r.logf("inject", "上传 webshell 到 %s（类型 %s，文件 %s，字段 %q）", uploadURL, payload.Type, payload.Filename, displayOr(fieldName, "raw"))
 	res := scanner.UploadWebshell(r.ctx, client, uploadURL, fieldName, payload.Filename, []byte(payload.Content), extra, headers)
 	summary["upload_status"] = res.StatusCode
 	summary["upload_success"] = res.Success
@@ -1095,6 +1198,20 @@ func (r *deepRun) runWebshellInject(summary map[string]any) (string, string, str
 	alive, note := false, "未提供落地地址，跳过存活验证"
 	if landURL != "" {
 		alive, note = scanner.CheckShellAlive(r.ctx, client, landURL, payload)
+		if !alive {
+			// 上传接口返回 200 只代表页面响应成功；部分应用在响应后才写盘或
+			// 经重写规则分发，立即访问 404。短暂等待后重试一次再下结论。
+			select {
+			case <-r.ctx.Done():
+			case <-time.After(800 * time.Millisecond):
+				var retryNote string
+				if alive, retryNote = scanner.CheckShellAlive(r.ctx, client, landURL, payload); alive {
+					note = retryNote + "（重试后验证成功）"
+				} else {
+					note = retryNote + "；上传接口返回成功但落地地址不可用，请核对 file_name 与落地路径是否一致"
+				}
+			}
+		}
 		r.logf("inject", "落地验证 %s: %s", landURL, note)
 	}
 	name := displayOr(stringParam(r.task.Params, "name"), payload.Filename)
@@ -1124,6 +1241,27 @@ func (r *deepRun) runWebshellInject(summary map[string]any) (string, string, str
 	summary["note"] = note
 	r.setProgress("inject", map[string]any{"webshell_id": ws.ID, "alive": alive})
 	return "done", "done", "", summary
+}
+
+// probeUploadFormFields fetches the upload page and folds the controls its form
+// would submit (submit button, hidden CSRF token, ...) into the upload request.
+// Legacy handlers commonly answer 200 without storing anything when those
+// fields are missing, which made uploads look successful but land 404.
+func (r *deepRun) probeUploadFormFields(client *scanner.DeepClient, uploadURL, fieldName string, extra, headers map[string]string, summary map[string]any) (string, map[string]string) {
+	resp := client.Do(r.ctx, scanner.DeepRequest{Method: http.MethodGet, URL: uploadURL, Headers: headers, Timeout: 15 * time.Second})
+	if resp.Error != "" || resp.StatusCode >= 400 || resp.Body == "" {
+		return fieldName, extra
+	}
+	form := scanner.ParseUploadFormFields(resp.Body)
+	name, merged, added := scanner.MergeUploadFormFields(fieldName, extra, form)
+	if name != fieldName {
+		r.logf("inject", "上传页文件字段为 %q，已替代 %q", name, fieldName)
+	}
+	if len(added) > 0 {
+		r.logf("inject", "上传页要求附加表单字段 %s，已自动携带", strings.Join(added, ", "))
+		summary["upload_form_fields"] = added
+	}
+	return name, merged
 }
 
 // ---------------------------------------------------------------- HTTP API

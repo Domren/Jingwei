@@ -53,6 +53,9 @@ type DiscoverOptions struct {
 	// MaxPortChecks caps the IP x port cross product (default 200000) so one
 	// task cannot launch millions of TCP connects.
 	MaxPortChecks int
+	// Proxy routes port connects and HTTP probes through a proxy (http/https or
+	// socks5), so a scan can reach hosts that only the pivot can see.
+	Proxy string
 	// Logf receives human-readable progress messages.
 	Logf func(format string, args ...any)
 }
@@ -98,7 +101,18 @@ func Discover(ctx context.Context, targets []Target, opts DiscoverOptions) (*Dis
 	if timeout <= 0 {
 		timeout = 900 * time.Millisecond
 	}
-	open, err := ScanPorts(ctx, resolved.IPs, ports, concurrency, timeout, func(done, total int) {
+	proxy, err := NormalizeProxyURL(opts.Proxy)
+	if err != nil {
+		return nil, err
+	}
+	dial, err := ProxyDialFunc(proxy, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if proxy != "" {
+		logf("经代理 %s 扫描端口与 Web 服务", proxy)
+	}
+	open, err := scanPortsWithDial(ctx, resolved.IPs, ports, concurrency, timeout, dial, func(done, total int) {
 		if done == total || done%500 == 0 {
 			logf("端口扫描进度 %d/%d", done, total)
 		}
@@ -108,7 +122,7 @@ func Discover(ctx context.Context, targets []Target, opts DiscoverOptions) (*Dis
 	}
 	logf("端口扫描完成：开放 %d 个端口", len(open))
 
-	prober := NewProber(10 * time.Second)
+	prober := NewProberWithProxy(10*time.Second, proxy)
 	services := probeAll(ctx, resolved, open, prober, opts.MaxProbes, logf)
 	logf("HTTP 探测完成：发现 %d 个 Web 服务", len(services))
 	if err := ctx.Err(); err != nil {
@@ -123,7 +137,7 @@ func Discover(ctx context.Context, targets []Target, opts DiscoverOptions) (*Dis
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	extra := probeExtraPorts(ctx, resolved, open, fingerprints, services, opts.MaxProbes, logf)
+	extra := probeExtraPorts(ctx, resolved, open, fingerprints, services, opts.MaxProbes, proxy, logf)
 	if len(extra) > 0 {
 		services = append(services, extra...)
 		sort.Slice(services, func(i, j int) bool { return services[i].URL < services[j].URL })
@@ -153,7 +167,7 @@ func applyFingerprints(open []PortFinding, fps map[string]ServiceFingerprint) {
 // probeExtraPorts HTTP-probes non-web ports whose fingerprint allows it. Domain
 // (vhost) URLs are tried before the bare IP, mirroring probeAll.
 func probeExtraPorts(ctx context.Context, res *Resolved, open []PortFinding, fps map[string]ServiceFingerprint,
-	services []WebService, maxProbes int, logf func(string, ...any)) []WebService {
+	services []WebService, maxProbes int, proxy string, logf func(string, ...any)) []WebService {
 	covered := CoveredServicePorts(services, res.DomainsByIP)
 	type candidate struct {
 		ip   string
@@ -195,7 +209,7 @@ func probeExtraPorts(ctx context.Context, res *Resolved, open []PortFinding, fps
 		logf("非 Web 端口 HTTP 探测候选 %d 个，超过上限 %d，已截断", len(candidates), maxProbes)
 		candidates = candidates[:maxProbes]
 	}
-	prober := NewProber(4 * time.Second)
+	prober := NewProberWithProxy(4*time.Second, proxy)
 	type result struct {
 		svc *WebService
 	}
@@ -254,6 +268,14 @@ func definitelyNotHTTP(service string) bool {
 
 // ScanPorts performs a TCP connect scan over the cross product of ips and ports.
 func ScanPorts(ctx context.Context, ips []string, ports []int, concurrency int, timeout time.Duration, progress func(done, total int)) ([]PortFinding, error) {
+	return scanPortsWithDial(ctx, ips, ports, concurrency, timeout, nil, progress)
+}
+
+// scanPortsWithDial is ScanPorts with an optional dial override. A non-nil dial
+// sends every connect through a proxy, which is how a scan reaches hosts that
+// are only routable from the pivot.
+func scanPortsWithDial(ctx context.Context, ips []string, ports []int, concurrency int, timeout time.Duration,
+	dial func(ctx context.Context, network, addr string) (net.Conn, error), progress func(done, total int)) ([]PortFinding, error) {
 	if concurrency <= 0 {
 		concurrency = 200
 	}
@@ -281,11 +303,17 @@ func ScanPorts(ctx context.Context, ips []string, ports []int, concurrency int, 
 		go func() {
 			defer wg.Done()
 			dialer := net.Dialer{Timeout: timeout}
+			dialConn := func(ctx context.Context, addr string) (net.Conn, error) {
+				if dial != nil {
+					return dial(ctx, "tcp", addr)
+				}
+				return dialer.DialContext(ctx, "tcp", addr)
+			}
 			for j := range jobs {
 				if ctx.Err() != nil {
 					return
 				}
-				conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(j.ip, fmt.Sprintf("%d", j.port)))
+				conn, err := dialConn(ctx, net.JoinHostPort(j.ip, fmt.Sprintf("%d", j.port)))
 				if err == nil {
 					_ = conn.Close()
 					mu.Lock()
@@ -350,6 +378,11 @@ const (
 // NewProber builds a prober that follows same-host redirects and ignores TLS
 // certificate errors (targets are frequently self-signed).
 func NewProber(timeout time.Duration) *Prober {
+	return NewProberWithProxy(timeout, "")
+}
+
+// NewProberWithProxy is NewProber with every request routed through the proxy.
+func NewProberWithProxy(timeout time.Duration, proxy string) *Prober {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
@@ -358,6 +391,11 @@ func NewProber(timeout time.Duration) *Prober {
 		DisableKeepAlives:   true,
 		TLSHandshakeTimeout: timeout,
 		DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+	}
+	if proxy = strings.TrimSpace(proxy); proxy != "" {
+		if u, err := url.Parse(proxy); err == nil && u.Host != "" {
+			tr.Proxy = http.ProxyURL(u)
+		}
 	}
 	return &Prober{
 		client: &http.Client{

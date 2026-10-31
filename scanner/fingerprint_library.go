@@ -323,10 +323,18 @@ func headerKeywordTooGeneric(kw string) bool {
 	name = strings.TrimSpace(name)
 	value = strings.TrimSpace(value)
 	if !hasValue {
-		return headerGenericValues[kw] || headerGenericNames[kw]
+		return headerGenericValues[kw] || headerGenericNames[kw] || genericMIMEValue(kw)
+	}
+	// Content-Length is a volatile body size, not a product marker: a rule keyed
+	// only on "Content-Length:19" matches unrelated APIs and error pages.
+	if name == "content-length" {
+		return true
 	}
 	if value == "" {
 		return headerGenericNames[name]
+	}
+	if name == "content-type" && genericMIMEValue(value) {
+		return true
 	}
 	for _, tok := range strings.Split(value, ",") {
 		tok = strings.TrimSpace(tok)
@@ -338,6 +346,29 @@ func headerKeywordTooGeneric(kw string) bool {
 		}
 	}
 	return true
+}
+
+// genericMIMEValue reports whether v is a bare, product-neutral MIME type
+// ("text/plain", "application/json", an image/font/... prefix). Rules whose only
+// evidence is such a value match nearly every response.
+func genericMIMEValue(v string) bool {
+	v = strings.TrimSpace(strings.ToLower(v))
+	if i := strings.IndexByte(v, ';'); i >= 0 {
+		v = strings.TrimSpace(v[:i])
+	}
+	switch v {
+	case "text/plain", "text/html", "text/xml", "text/css", "text/javascript",
+		"application/json", "application/xml", "application/javascript",
+		"application/octet-stream", "application/x-www-form-urlencoded",
+		"application/pdf", "application/zip", "application/gzip":
+		return true
+	}
+	for _, prefix := range []string{"image/", "font/", "audio/", "video/", "multipart/"} {
+		if strings.HasPrefix(v, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // fingerprintGenericTokensOnly reports whether every word of the keyword is a

@@ -153,7 +153,7 @@ func TestProbeExtraPortsFindsHTTPOnOddPort(t *testing.T) {
 	fps := map[string]ServiceFingerprint{
 		fingerprintKey(host, port): {IP: host, Port: port},
 	}
-	got := probeExtraPorts(context.Background(), res, open, fps, nil, 10, func(string, ...any) {})
+	got := probeExtraPorts(context.Background(), res, open, fps, nil, 10, "", func(string, ...any) {})
 	if len(got) != 1 {
 		t.Fatalf("want 1 service on odd port, got %d: %+v", len(got), got)
 	}

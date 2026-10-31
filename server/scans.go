@@ -139,6 +139,9 @@ func (m *scanManager) run(parent context.Context, task *db.ScanTask) {
 	if err := m.s.m.pg.FinishScanTask(task.ID, status, stage, errMsg, summary); err != nil {
 		log.Printf("[scan %d] finish: %v", task.ID, err)
 	}
+	// Automatic deep tasks are queued by execute(); record how many exist right
+	// away so the scan list shows deep-dive progress without opening details.
+	syncScanAutoSummary(m.s.m.pg, task.ID)
 	log.Printf("[scan %d] %s (%s)", task.ID, status, stage)
 }
 
@@ -159,6 +162,11 @@ type scanRun struct {
 
 	mu       sync.Mutex
 	progress map[string]any
+
+	// shellHosts records origins that already have a queued webshell upload, so
+	// the weak-pass chain and the POC chain cannot upload twice to one host;
+	// access is confined to the single scan goroutine.
+	shellHosts map[string]bool
 }
 
 func (r *scanRun) logf(stage, format string, args ...any) {
@@ -203,6 +211,16 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 	if reason, blocked := scanTargetBlockReason(rules, targets); blocked {
 		return "failed", "failed", "目标命中资产拦截规则，已拒绝扫描：" + reason, summary
 	}
+	if proxy := strings.TrimSpace(r.task.Proxy); proxy != "" {
+		normalized, err := scanner.NormalizeProxyURL(proxy)
+		if err != nil {
+			return "failed", "failed", "代理地址无效: " + err.Error(), summary
+		}
+		r.task.Proxy = normalized
+		r.logf("discover", "出站代理：%s（资产发现/弱口令/深度利用子任务均经此代理）", redactProxyURL(normalized))
+	} else {
+		r.task.Proxy = ""
+	}
 
 	r.logf("discover", "开始资产发现：%d 个目标，端口策略 %s", len(targets), r.task.Ports)
 	res, err := scanner.Discover(r.ctx, targets, scanner.DiscoverOptions{
@@ -211,6 +229,7 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 		Timeout:       900 * time.Millisecond,
 		MaxProbes:     3000,
 		MaxPortChecks: maxScanPortChecks,
+		Proxy:         r.task.Proxy,
 		Logf:          func(format string, args ...any) { r.logf("discover", format, args...) },
 	})
 	if err != nil {
@@ -284,6 +303,7 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 	nrun := scanner.RunNuclei(r.ctx, templates, scanTargets, scanner.NucleiOptions{
 		RateLimit:   r.task.RateLimit,
 		Concurrency: r.task.Concurrency,
+		Proxy:       r.task.Proxy,
 	})
 	summary["nuclei_elapsed_ms"] = nrun.Elapsed.Milliseconds()
 	if nrun.Chains > 0 {
@@ -293,6 +313,9 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 	if nrun.RawTargets > 0 {
 		r.logf("scan", "非 Web 端口目标 %d 个仅用 network/javascript/ssl 类 POC 直接探测（%d 条模板），HTTP POC 不再包装原始端口",
 			nrun.RawTargets, nrun.RawTemplates)
+	}
+	if nrun.HeadlessSkipped > 0 {
+		r.logf("scan", "跳过 %d 条 headless 浏览器模板（需 -headless 与浏览器，扫描镜像未提供，不影响其余 POC）", nrun.HeadlessSkipped)
 	}
 
 	stored, findings, findingIDs := r.persistResults(nrun.Results, assets)
@@ -712,6 +735,7 @@ func (r *scanRun) runAppDiscovery(res *scanner.DiscoverResult, assets *scanAsset
 		MaxJSFiles:    20,
 		Concurrency:   8,
 		Timeout:       8 * time.Second,
+		Proxy:         r.task.Proxy,
 		Logf:          func(format string, args ...any) { r.logf("app", format, args...) },
 	})
 	if err != nil {
@@ -1320,6 +1344,19 @@ func displayOr(v, fallback string) string {
 	return fallback
 }
 
+// redactProxyURL hides credentials embedded in a proxy URL before it reaches a
+// log line or a UI hint; the address itself stays readable.
+func redactProxyURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	if u.User != nil {
+		u.User = url.User("***")
+	}
+	return u.String()
+}
+
 // ---------- HTTP API ----------
 
 func (s *Server) listScanTasks(w http.ResponseWriter, r *http.Request) {
@@ -1438,6 +1475,15 @@ func (s *Server) createScanTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.TimeoutSeconds > 7200 {
 		req.TimeoutSeconds = 7200
+	}
+	req.Proxy = strings.TrimSpace(req.Proxy)
+	if req.Proxy != "" {
+		normalized, err := scanner.NormalizeProxyURL(req.Proxy)
+		if err != nil {
+			writeErr(w, 400, "代理地址无效："+err.Error())
+			return
+		}
+		req.Proxy = normalized
 	}
 	if err := normalizeScanWebshell(&req); err != nil {
 		writeErr(w, 400, err.Error())

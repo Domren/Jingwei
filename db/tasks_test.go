@@ -3,6 +3,7 @@ package db
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -461,6 +462,69 @@ func TestTaskRelationsAndLLMFailoverChain(t *testing.T) {
 	}
 	if fmt.Sprint(got.SourceTaskIDs) != fmt.Sprint([]int64{sourceB.ID}) {
 		t.Fatalf("source delete did not cascade only its relation: %v", got.SourceTaskIDs)
+	}
+}
+
+func TestMarkTaskLLMProfileUnavailableAdvancesChain(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	suffix := time.Now().UnixNano()
+	ids := make([]int64, 0, 2)
+	for i := 0; i < 2; i++ {
+		id, err := d.SaveProfile(&LLMProfile{
+			Name: fmt.Sprintf("task-unavailable-%d-%d", suffix, i), Format: "openai",
+			Model: fmt.Sprintf("model-%d", i), APIKey: "test-key",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	task, err := d.CreateTaskWithOptions("config failover", "goal", TaskCreateOptions{LLMProfileIDs: ids})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = d.DeleteTask(task.ID)
+		for _, id := range ids {
+			_ = d.DeleteProfile(id)
+		}
+	})
+	got, err := d.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	transition, err := d.MarkTaskLLMProfileFailedAtRevision(task.ID, ids[0], got.LLMChainRevision,
+		TaskLLMProfileUnavailable, "openai: status 403: SUBSCRIPTION_NOT_FOUND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !transition.Advanced || transition.ChainExhausted || transition.NextProfileID == nil || *transition.NextProfileID != ids[1] {
+		t.Fatalf("unexpected unavailable transition: %+v", transition)
+	}
+	var status, lastError string
+	if err := d.QueryRow(`SELECT status, COALESCE(last_error,'') FROM task_llm_profiles WHERE task_id=$1 AND profile_id=$2`,
+		task.ID, ids[0]).Scan(&status, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if status != TaskLLMProfileUnavailable || !strings.Contains(lastError, "SUBSCRIPTION_NOT_FOUND") {
+		t.Fatalf("persisted status=%q last_error=%q", status, lastError)
+	}
+	got, err = d.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ActiveLLMProfileID == nil || *got.ActiveLLMProfileID != ids[1] || got.LLMFailoverState != "ready" {
+		t.Fatalf("chain did not advance past unavailable profile: %+v", got)
+	}
+
+	if _, err := d.MarkTaskLLMProfileFailedAtRevision(task.ID, ids[1], got.LLMChainRevision, "bogus", "x"); err == nil {
+		t.Fatal("invalid failure status must be rejected")
 	}
 }
 

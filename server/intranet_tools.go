@@ -25,6 +25,14 @@ func (s *Server) intranetTools() []actool.CoreTool {
 		s.toolIntranetDownload(),
 		s.toolIntranetBatchExec(),
 		s.toolIntranetTunnel(),
+		s.toolIntranetRecon(),
+		s.toolIntranetCredentials(),
+		s.toolIntranetCredReuse(),
+		s.toolIntranetPersist(),
+		s.toolIntranetArtifacts(),
+		s.toolIntranetArtifactRegister(),
+		s.toolIntranetArtifactRevoke(),
+		s.toolIntranetEvacuate(),
 		s.toolIntranetRequestScope(),
 		s.toolIntranetHandoff(),
 	}
@@ -255,7 +263,7 @@ func (s *Server) toolIntranetBatchExec() actool.CoreTool {
 
 func (s *Server) toolIntranetTunnel() actool.CoreTool {
 	return wrTool("intranet_tunnel",
-		"内网隧道生命周期（两阶段）：action=create 先登记计划（socks5/port_forward/reverse_forward），probe 探测目标环境，plan 生成部署命令（端口转发需要目标有 socat，否则要手写 deploy_command），deploy 后台启动并登记受管资源（TTL 到期自动拆除），verify 校验监听，teardown 拆除并释放资源，status/list 查询。部署到未登记范围的内网主机前，先用 intranet_request_scope 申请并由人审批。",
+		"内网隧道生命周期（两阶段）：action=create 先登记计划（socks5/port_forward/reverse_forward），probe 探测目标环境，plan 生成部署命令（端口转发需要目标有 socat，否则要手写 deploy_command；chisel/ssh 需要平台已配置 JINGWEI_PIVOT_SERVER），deploy 后台启动并登记受管资源（TTL 到期自动拆除），verify 校验监听，teardown 拆除并释放资源，status/list 查询。部署成功后会返回 access 提示（socks5 隧道给出可用的 socks5:// 代理地址）。部署到未登记范围的内网主机前，先用 intranet_request_scope 申请并由人审批。",
 		objSchema(map[string]any{
 			"action":           strParam("create/probe/plan/deploy/verify/teardown/status/list（必填）"),
 			"tunnel_id":        intranetIntParam("隧道 ID（除 create/list 外必填）"),
@@ -349,7 +357,7 @@ func (s *Server) toolIntranetTunnel() actool.CoreTool {
 			}
 			switch action {
 			case "status":
-				return jsonResult(map[string]any{"tunnel": t})
+				return jsonResult(map[string]any{"tunnel": t, "access": s.intranetTunnelAccess(pg, t)})
 			case "probe":
 				if t.SessionID == nil || *t.SessionID <= 0 {
 					return actool.Errorf("隧道未绑定会话"), nil
@@ -371,13 +379,13 @@ func (s *Server) toolIntranetTunnel() actool.CoreTool {
 				if err != nil {
 					return actool.Errorf(err.Error()), nil
 				}
-				return jsonResult(map[string]any{"tunnel": updated, "result": out})
+				return jsonResult(map[string]any{"tunnel": updated, "result": out, "access": s.intranetTunnelAccess(pg, updated)})
 			case "verify":
 				updated, out, err := s.intranetVerifyTunnel(ctx, pg, t)
 				if err != nil {
 					return actool.Errorf(err.Error()), nil
 				}
-				return jsonResult(map[string]any{"tunnel": updated, "result": out})
+				return jsonResult(map[string]any{"tunnel": updated, "result": out, "access": s.intranetTunnelAccess(pg, updated)})
 			case "teardown":
 				if s.resourceMgr != nil {
 					if res, _ := pg.FindActiveManagedResourceByTunnel(t.ID); res != nil {

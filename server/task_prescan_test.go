@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"strconv"
 	"strings"
 	"testing"
@@ -139,35 +140,53 @@ func TestPrescanPersistWritesAssetsAndScope(t *testing.T) {
 	}
 }
 
-func TestPrescanPersistHitsRecordsFindings(t *testing.T) {
+func TestPrescanPersistCandidatesRecordsFacts(t *testing.T) {
 	pg := prescanTestDB(t)
-	task, err := pg.CreateTask("prescan hits fixture", "http://prescan.example.com", nil, 0, 0)
+	task, err := pg.CreateTask("prescan candidates fixture", "http://prescan.example.com", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	purgeTaskFixture(t, pg, task.ID)
 
 	pt := &Task{ID: strconv.FormatInt(task.ID, 10), ExpID: task.ExplorationID, Store: pg.Exploration(task.ExplorationID)}
-	n := prescanPersistHits(context.Background(), pt, task.ID, nil, nil, []scanner.NucleiResult{{
+	n := prescanPersistCandidates(context.Background(), pt, []scanner.NucleiResult{{
 		TemplateID: "CVE-TEST-1", Name: "Fixture POC", Severity: "HIGH",
 		Host: "http://prescan.example.com", MatchedAt: "http://prescan.example.com/x",
 		Request:  "GET /x HTTP/1.1\r\nHost: prescan.example.com\r\n\r\n",
 		Response: "HTTP/1.1 200 OK\r\n\r\nfixture",
+	}, {
+		// No raw exchange: unverifiable, must not produce a candidate.
+		TemplateID: "CVE-TEST-2", Name: "No Packets", Severity: "medium",
+		Host: "http://prescan.example.com", MatchedAt: "http://prescan.example.com/y",
 	}})
 	if n != 1 {
-		t.Fatalf("persisted hits = %d, want 1", n)
+		t.Fatalf("persisted candidates = %d, want 1", n)
 	}
 
-	var vulnclass, name, severity, summary, evidence string
-	if err := pg.QueryRow(`SELECT vulnclass, name, severity, summary, evidence FROM findings WHERE task_id=$1`, task.ID).
-		Scan(&vulnclass, &name, &severity, &summary, &evidence); err != nil {
+	// A POC hit is a lead, not a confirmed vulnerability: no finding row.
+	var findings int
+	if err := pg.QueryRow(`SELECT count(*) FROM findings WHERE task_id=$1`, task.ID).Scan(&findings); err != nil {
 		t.Fatal(err)
 	}
-	if vulnclass != "nuclei-CVE-TEST-1" || name != "Fixture POC" || severity != "high" {
-		t.Fatalf("finding = %q/%q/%q", vulnclass, name, severity)
+	if findings != 0 {
+		t.Fatalf("prescan wrote %d findings, want 0", findings)
 	}
-	if !strings.Contains(summary, "CVE-TEST-1") || evidence == "" {
-		t.Fatalf("summary/evidence = %q/%q", summary, evidence)
+
+	var payloadRaw string
+	if err := pg.QueryRow(`SELECT payload::text FROM exploration_nodes WHERE exploration_id=$1 AND kind='fact' AND origin='prescan'`, task.ExplorationID).Scan(&payloadRaw); err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(payloadRaw), &payload); err != nil {
+		t.Fatal(err)
+	}
+	summary, _ := payload["summary"].(string)
+	if !strings.Contains(summary, "未验证") || !strings.Contains(summary, "Fixture POC") {
+		t.Fatalf("summary = %q", summary)
+	}
+	detail, _ := payload["detail"].(string)
+	if !strings.Contains(detail, "CVE-TEST-1") || !strings.Contains(detail, "GET /x HTTP/1.1") {
+		t.Fatalf("detail missing template id or raw request: %q", detail)
 	}
 }
 

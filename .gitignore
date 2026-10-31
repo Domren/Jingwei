@@ -60,3 +60,7 @@ Thumbs.db
 /bench/
 /Dockerfile.bench
 /Dockerfile.bench.v2
+
+# 本地靶场验收证据（含目标地址/会话细节，仅保留在开发机）
+/evidence/local-linux-p3p4/
+/evidence/zkaq-d54f/

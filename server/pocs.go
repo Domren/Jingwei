@@ -16,6 +16,7 @@ import (
 
 	"github.com/Autumn-27/jingwei/db"
 	"github.com/Autumn-27/jingwei/pocparse"
+	"github.com/Autumn-27/jingwei/scanner"
 )
 
 const (
@@ -289,19 +290,7 @@ func (s *Server) pgRunPOCs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer os.RemoveAll(tmp)
 
-	tplDir := filepath.Join(tmp, "templates")
 	targetFile := filepath.Join(tmp, "targets.txt")
-	if err := os.Mkdir(tplDir, 0o700); err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	for i, tpl := range templates {
-		name := fmt.Sprintf("%03d-%s.yaml", i, safeFilePart(tpl.TemplateID))
-		if err := os.WriteFile(filepath.Join(tplDir, name), []byte(tpl.Content), 0o600); err != nil {
-			writeErr(w, 500, "写入模板失败: "+err.Error())
-			return
-		}
-	}
 	if err := os.WriteFile(targetFile, []byte(strings.Join(targets, "\n")+"\n"), 0o600); err != nil {
 		writeErr(w, 500, "写入目标失败: "+err.Error())
 		return
@@ -309,40 +298,86 @@ func (s *Server) pgRunPOCs(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeout)*time.Second)
 	defer cancel()
-	args := []string{
-		"-t", tplDir,
-		"-l", targetFile,
-		"-jsonl",
-		"-silent",
-		"-no-color",
-		"-disable-update-check",
-		"-no-interactsh",
-		"-rate-limit", "50",
-		"-concurrency", "25",
-		"-timeout", "10",
-		"-retries", "1",
-	}
-	cmd := exec.CommandContext(ctx, nuclei, args...)
+
 	var stdout, stderr limitedBuffer
 	stdout.limit, stderr.limit = maxPOCRunOutput, 256<<10
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	runGroup := func(dir string, tpls []scanner.NucleiTemplate, dast bool) error {
+		tplDir := filepath.Join(tmp, dir)
+		if err := os.Mkdir(tplDir, 0o700); err != nil {
+			return err
+		}
+		for i, tpl := range tpls {
+			name := fmt.Sprintf("%03d-%s.yaml", i, safeFilePart(tpl.ID))
+			if err := os.WriteFile(filepath.Join(tplDir, name), []byte(tpl.Content), 0o600); err != nil {
+				return fmt.Errorf("写入模板失败: %w", err)
+			}
+		}
+		args := []string{
+			"-t", tplDir,
+			"-l", targetFile,
+			"-jsonl",
+			"-silent",
+			"-no-color",
+			"-disable-update-check",
+			"-no-interactsh",
+			"-rate-limit", "50",
+			"-concurrency", "25",
+			"-timeout", "10",
+			"-retries", "1",
+		}
+		// The two template kinds cannot share an invocation: -dast loads only
+		// fuzzing templates, and without it they are disabled as default.
+		if dast {
+			args = append(args, "-dast")
+		}
+		cmd := exec.CommandContext(ctx, nuclei, args...)
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		return cmd.Run()
+	}
+
+	in := make([]scanner.NucleiTemplate, 0, len(templates))
+	for _, tpl := range templates {
+		in = append(in, scanner.NucleiTemplate{ID: tpl.TemplateID, Content: tpl.Content})
+	}
+	// Browser-driven templates load only under -headless, which downloads
+	// Chromium at scan time; drop them instead of letting nuclei exit with
+	// "no templates provided for scan".
+	in, headlessSkipped := scanner.RunnableTemplates(in)
+	if len(in) == 0 {
+		writeErr(w, 400, "所选模板均为 headless 浏览器模板，需安装浏览器并以 -headless 运行，暂不支持在此直接执行")
+		return
+	}
+	legacy, dastTemplates := scanner.SplitDASTTemplates(in)
 
 	started := time.Now()
-	runErr := cmd.Run()
+	var runErr error
+	for _, g := range []struct {
+		dir  string
+		tpls []scanner.NucleiTemplate
+		dast bool
+	}{{"legacy", legacy, false}, {"dast", dastTemplates, true}} {
+		if len(g.tpls) == 0 || ctx.Err() != nil {
+			continue
+		}
+		if err := runGroup(g.dir, g.tpls, g.dast); err != nil && runErr == nil {
+			runErr = err
+		}
+	}
 	elapsed := time.Since(started)
 	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 
 	results := parseNucleiJSONL(stdout.String())
 	resp := map[string]any{
-		"ok":             runErr == nil,
-		"results":        results,
-		"result_count":   len(results),
-		"stdout":         stdout.String(),
-		"stderr":         stderr.String(),
-		"elapsed_ms":     elapsed.Milliseconds(),
-		"timed_out":      timedOut,
-		"template_count": len(templates),
-		"target_count":   len(targets),
+		"ok":               runErr == nil,
+		"results":          results,
+		"result_count":     len(results),
+		"stdout":           stdout.String(),
+		"stderr":           stderr.String(),
+		"elapsed_ms":       elapsed.Milliseconds(),
+		"timed_out":        timedOut,
+		"template_count":   len(in),
+		"target_count":     len(targets),
+		"headless_skipped": headlessSkipped,
 	}
 	if runErr != nil {
 		if timedOut {

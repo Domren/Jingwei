@@ -6,6 +6,7 @@ import {
   ArrowRightLeftIcon,
   CheckIcon,
   DownloadIcon,
+  EraserIcon,
   EyeIcon,
   KeyRoundIcon,
   Loader2Icon,
@@ -41,7 +42,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import type {
+  IntranetArtifact,
   IntranetBatchItem,
+  IntranetEvacuationReport,
   IntranetExecResult,
   IntranetScopeRequest,
   IntranetSession,
@@ -99,6 +102,25 @@ function scopeStatusMeta(status: string) {
   }
 }
 
+const ARTIFACT_KIND_LABEL: Record<string, string> = {
+  file: "文件",
+  cron: "计划任务",
+  systemd: "systemd 服务",
+  ssh_key: "SSH 公钥",
+  other: "其它",
+};
+
+function artifactStatusMeta(status: string) {
+  switch (status) {
+    case "active":
+      return { label: "生效中", className: "border-amber-500/30 bg-amber-500/10 text-amber-600" };
+    case "revoked":
+      return { label: "已撤销", className: "border-emerald-500/30 bg-emerald-500/10 text-emerald-600" };
+    default:
+      return { label: status || "—", className: "" };
+  }
+}
+
 function tunnelEndpoint(t: IntranetTunnel) {
   const listen = `${t.listen_host || "0.0.0.0"}:${t.listen_port}`;
   if (t.kind === "socks5") return listen;
@@ -147,6 +169,7 @@ export default function DeepIntranetPage() {
   const [sessions, setSessions] = React.useState<IntranetSession[]>([]);
   const [tunnels, setTunnels] = React.useState<IntranetTunnel[]>([]);
   const [requests, setRequests] = React.useState<IntranetScopeRequest[]>([]);
+  const [artifacts, setArtifacts] = React.useState<IntranetArtifact[]>([]);
   const [webshells, setWebshells] = React.useState<Webshell[]>([]);
   const [tasks, setTasks] = React.useState<Task[]>([]);
   const [loading, setLoading] = React.useState(false);
@@ -160,15 +183,17 @@ export default function DeepIntranetPage() {
     let alive = true;
     async function load() {
       try {
-        const [s, t, r] = await Promise.all([
+        const [s, t, r, a] = await Promise.all([
           api.intranetSessions({ limit: 200 }),
           api.intranetTunnels({ limit: 200 }),
           api.intranetScopeRequests({ limit: 200 }),
+          api.intranetArtifacts({ limit: 200 }),
         ]);
         if (!alive) return;
         setSessions(s.sessions ?? []);
         setTunnels(t.tunnels ?? []);
         setRequests(r.requests ?? []);
+        setArtifacts(a.artifacts ?? []);
       } catch (e) {
         if (alive) toast.error((e as Error).message);
       } finally {
@@ -697,7 +722,170 @@ export default function DeepIntranetPage() {
     }
   }
 
-  const showLoading = loading && sessions.length === 0 && tunnels.length === 0 && requests.length === 0;
+  // ---- 落地物台账与撤离清理 ----
+  const [artifactOpen, setArtifactOpen] = React.useState(false);
+  const [artifactMode, setArtifactMode] = React.useState<"persist" | "manual">("persist");
+  const [artifactSaving, setArtifactSaving] = React.useState(false);
+  const [artifactFilter, setArtifactFilter] = React.useState<"all" | "active" | "revoked">("all");
+  const [artifactForm, setArtifactForm] = React.useState({
+    session_id: "",
+    task_id: "none",
+    persist_kind: "cron",
+    name: "",
+    description: "",
+    schedule: "*/10 * * * *",
+    command: "",
+    public_key: "",
+    user: "",
+    path: "",
+    revoke_command: "",
+    verify_command: "",
+  });
+
+  const activeArtifacts = artifacts.filter((a) => a.status === "active").length;
+  const shownArtifacts = artifactFilter === "all" ? artifacts : artifacts.filter((a) => a.status === artifactFilter);
+
+  function openCreateArtifact() {
+    const active = sessions.find((s) => s.status === "active");
+    setArtifactMode("persist");
+    setArtifactForm({
+      session_id: active ? String(active.id) : "",
+      task_id: active?.task_id ? String(active.task_id) : "none",
+      persist_kind: "cron",
+      name: "",
+      description: "",
+      schedule: "*/10 * * * *",
+      command: "",
+      public_key: "",
+      user: "",
+      path: "",
+      revoke_command: "",
+      verify_command: "",
+    });
+    setArtifactOpen(true);
+  }
+
+  async function saveArtifact() {
+    const sessionId = Number(artifactForm.session_id);
+    if (!sessionId) {
+      toast.error("请选择内网会话");
+      return;
+    }
+    setArtifactSaving(true);
+    try {
+      const taskId = artifactForm.task_id === "none" ? undefined : Number(artifactForm.task_id);
+      if (artifactMode === "persist") {
+        const r = await api.persistIntranetSession(sessionId, {
+          kind: artifactForm.persist_kind,
+          name: artifactForm.name.trim(),
+          description: artifactForm.description.trim(),
+          schedule: artifactForm.persist_kind === "cron" ? artifactForm.schedule.trim() : undefined,
+          command: artifactForm.persist_kind === "ssh_key" ? undefined : artifactForm.command.trim(),
+          public_key: artifactForm.persist_kind === "ssh_key" ? artifactForm.public_key.trim() : undefined,
+          user: artifactForm.persist_kind === "ssh_key" ? artifactForm.user.trim() : undefined,
+          task_id: taskId,
+        });
+        if (!r.deployed) {
+          toast.error(r.error || "部署未通过验证，已登记台账供撤离清理");
+        } else {
+          toast.success(`已部署并登记落地物 #${r.artifact.id}`);
+        }
+      } else {
+        const revoke = artifactForm.revoke_command.trim();
+        if (!revoke) {
+          toast.error("撤销命令必填：无法撤销的落地物不允许登记");
+          return;
+        }
+        await api.registerIntranetArtifact({
+          session_id: sessionId,
+          task_id: taskId,
+          kind: "other",
+          name: artifactForm.name.trim(),
+          path: artifactForm.path.trim(),
+          description: artifactForm.description.trim(),
+          revoke_command: revoke,
+          verify_command: artifactForm.verify_command.trim(),
+        });
+        toast.success("已登记落地物");
+      }
+      setArtifactOpen(false);
+      refresh();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setArtifactSaving(false);
+    }
+  }
+
+  async function revokeArtifact(art: IntranetArtifact) {
+    if (!window.confirm(`撤销落地物 #${art.id}「${art.name || art.path}」？会执行撤销命令并验证痕迹消失。`)) return;
+    setBusyId(`artifact-${art.id}`);
+    try {
+      const r = await api.revokeIntranetArtifact(art.id);
+      if (!r.revoked) toast.error(r.error || "撤销未通过验证");
+      else toast.success(`落地物 #${art.id} 已撤销`);
+      refresh();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  const [evacuateOpen, setEvacuateOpen] = React.useState(false);
+  const [evacuateTask, setEvacuateTask] = React.useState("none");
+  const [evacuateCloseSessions, setEvacuateCloseSessions] = React.useState(true);
+  const [evacuateBusy, setEvacuateBusy] = React.useState<"preview" | "run" | null>(null);
+  const [evacuateReport, setEvacuateReport] = React.useState<IntranetEvacuationReport | null>(null);
+
+  function openEvacuate() {
+    const withArtifacts = tasks.find((t) =>
+      artifacts.some((a) => a.task_id != null && String(a.task_id) === t.id && a.status === "active"),
+    );
+    const fallbackTask = tasks[0] ? String(tasks[0].id) : "none";
+    setEvacuateTask(withArtifacts ? String(withArtifacts.id) : fallbackTask);
+    setEvacuateReport(null);
+    setEvacuateOpen(true);
+  }
+
+  async function runEvacuate(dryRun: boolean) {
+    if (evacuateTask === "none") {
+      toast.error("请选择任务");
+      return;
+    }
+    if (
+      !dryRun &&
+      !window.confirm(
+        `对任务 #${evacuateTask} 执行撤离清理？将按台账逆序撤销落地物、拆除隧道并${evacuateCloseSessions ? "关闭会话" : "保留会话"}。`,
+      )
+    ) {
+      return;
+    }
+    setEvacuateBusy(dryRun ? "preview" : "run");
+    try {
+      const r = await api.evacuateIntranetTask({
+        task_id: Number(evacuateTask),
+        dry_run: dryRun,
+        close_sessions: evacuateCloseSessions,
+      });
+      setEvacuateReport(r.report);
+      if (dryRun) {
+        toast.success("撤离预览已生成");
+      } else {
+        const residual = r.report.residual.length;
+        if (residual > 0) toast.warning(`撤离完成，仍有 ${residual} 项残留`);
+        else toast.success("撤离完成，未发现残留");
+        refresh();
+      }
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setEvacuateBusy(null);
+    }
+  }
+
+  const showLoading =
+    loading && sessions.length === 0 && tunnels.length === 0 && requests.length === 0 && artifacts.length === 0;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4">
@@ -747,6 +935,7 @@ export default function DeepIntranetPage() {
         <TabsList className="w-fit">
           <TabsTrigger value="sessions">会话 ({sessions.length})</TabsTrigger>
           <TabsTrigger value="tunnels">隧道 ({tunnels.length})</TabsTrigger>
+          <TabsTrigger value="artifacts">落地物 ({activeArtifacts})</TabsTrigger>
           <TabsTrigger value="scopes">范围审批 ({requests.length})</TabsTrigger>
         </TabsList>
 
@@ -953,6 +1142,104 @@ export default function DeepIntranetPage() {
                             <Trash2Icon className="size-3.5" />
                           </Button>
                         </div>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          )}
+        </TabsContent>
+
+        <TabsContent value="artifacts" className="flex min-h-0 flex-1 flex-col gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-muted-foreground text-sm">
+              目标侧落地物（上传文件 / 计划任务 / systemd 服务 / SSH 公钥）统一登记在这里，每条都带撤销与验证命令；
+              撤离清理按台账逆序执行撤销并输出报告。
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Select
+                value={artifactFilter}
+                onValueChange={(v) => setArtifactFilter(v as "all" | "active" | "revoked")}
+              >
+                <SelectTrigger className="w-28">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">全部</SelectItem>
+                  <SelectItem value="active">生效中</SelectItem>
+                  <SelectItem value="revoked">已撤销</SelectItem>
+                </SelectContent>
+              </Select>
+              <Button variant="outline" size="sm" onClick={openEvacuate}>
+                <EraserIcon className="size-4" />
+                撤离清理
+              </Button>
+              <Button size="sm" onClick={openCreateArtifact}>
+                <PlusIcon className="size-4" />
+                部署 / 登记
+              </Button>
+            </div>
+          </div>
+          {shownArtifacts.length === 0 ? (
+            <div className="rounded-md border border-dashed py-12 text-center text-muted-foreground text-sm">
+              暂无落地物记录。通过会话上传的新文件会自动登记；计划任务、systemd 服务与 SSH 公钥可用右上角「部署 /
+              登记」创建。
+            </div>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-16">ID</TableHead>
+                  <TableHead className="w-28">类型</TableHead>
+                  <TableHead className="w-36">主机</TableHead>
+                  <TableHead>名称 / 路径</TableHead>
+                  <TableHead className="w-24">状态</TableHead>
+                  <TableHead className="w-32">登记时间</TableHead>
+                  <TableHead className="w-28 text-right">操作</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {shownArtifacts.map((a) => {
+                  const meta = artifactStatusMeta(a.status);
+                  return (
+                    <TableRow key={a.id}>
+                      <TableCell className="font-mono text-xs">#{a.id}</TableCell>
+                      <TableCell>
+                        <Badge variant="outline">{ARTIFACT_KIND_LABEL[a.kind] ?? a.kind}</Badge>
+                      </TableCell>
+                      <TableCell className="font-mono text-xs">{a.host || "—"}</TableCell>
+                      <TableCell>
+                        <div className="text-sm">{a.name || a.path || "—"}</div>
+                        <div className="max-w-md truncate font-mono text-muted-foreground text-xs" title={a.evidence}>
+                          {a.path || a.description || "—"}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant="outline" className={meta.className}>
+                          {meta.label}
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="text-muted-foreground text-xs">{fmtTime(a.created_at)}</TableCell>
+                      <TableCell className="text-right">
+                        {a.status === "active" ? (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="text-red-600"
+                            disabled={busyId === `artifact-${a.id}`}
+                            onClick={() => void revokeArtifact(a)}
+                          >
+                            {busyId === `artifact-${a.id}` ? (
+                              <Loader2Icon className="size-3.5 animate-spin" />
+                            ) : (
+                              <Trash2Icon className="size-3.5" />
+                            )}
+                            撤销
+                          </Button>
+                        ) : (
+                          <span className="text-muted-foreground text-xs">{fmtTime(a.revoked_at)}</span>
+                        )}
                       </TableCell>
                     </TableRow>
                   );
@@ -1702,6 +1989,306 @@ export default function DeepIntranetPage() {
               </Button>
             </DialogFooter>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      {/* 部署标准模块 / 登记落地物 */}
+      <Dialog open={artifactOpen} onOpenChange={setArtifactOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>部署标准模块 / 登记落地物</DialogTitle>
+            <DialogDescription>
+              标准模块由平台生成「部署 + 撤销 + 验证」命令并自动登记台账；手工登记必须提供撤销命令。
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            className="flex max-h-[70vh] flex-col gap-4 overflow-y-auto pr-1"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void saveArtifact();
+            }}
+          >
+            <FieldRow label="方式">
+              <Select value={artifactMode} onValueChange={(v) => setArtifactMode(v as "persist" | "manual")}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="persist">标准模块（cron / systemd / ssh_key）</SelectItem>
+                  <SelectItem value="manual">手工登记（任意落地物）</SelectItem>
+                </SelectContent>
+              </Select>
+            </FieldRow>
+            <FieldRow label="会话" hint="命令与撤销都通过该会话执行">
+              <Select
+                value={artifactForm.session_id}
+                onValueChange={(v) => setArtifactForm({ ...artifactForm, session_id: v })}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="选择活跃会话" />
+                </SelectTrigger>
+                <SelectContent>
+                  {sessions
+                    .filter((s) => s.status === "active")
+                    .map((s) => (
+                      <SelectItem key={s.id} value={String(s.id)}>
+                        #{s.id} {s.name || s.host || "会话"}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+            </FieldRow>
+            <FieldRow label="所属任务">
+              <Select
+                value={artifactForm.task_id}
+                onValueChange={(v) => setArtifactForm({ ...artifactForm, task_id: v })}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">不关联任务</SelectItem>
+                  {tasks.map((t) => (
+                    <SelectItem key={t.id} value={String(t.id)}>
+                      #{t.id} {taskLabel(t)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </FieldRow>
+            {artifactMode === "persist" ? (
+              <>
+                <FieldRow label="模块">
+                  <Select
+                    value={artifactForm.persist_kind}
+                    onValueChange={(v) => setArtifactForm({ ...artifactForm, persist_kind: v })}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="cron">cron 计划任务</SelectItem>
+                      <SelectItem value="systemd">systemd 服务</SelectItem>
+                      <SelectItem value="ssh_key">SSH 公钥</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </FieldRow>
+                {artifactForm.persist_kind === "cron" ? (
+                  <FieldRow label="cron 表达式" hint="5 段或 @reboot/@daily 等">
+                    <Input
+                      value={artifactForm.schedule}
+                      onChange={(e) => setArtifactForm({ ...artifactForm, schedule: e.target.value })}
+                      placeholder="*/10 * * * *"
+                    />
+                  </FieldRow>
+                ) : null}
+                {artifactForm.persist_kind === "ssh_key" ? (
+                  <>
+                    <FieldRow label="公钥">
+                      <Textarea
+                        value={artifactForm.public_key}
+                        onChange={(e) => setArtifactForm({ ...artifactForm, public_key: e.target.value })}
+                        rows={2}
+                        placeholder="ssh-ed25519 AAAA..."
+                      />
+                    </FieldRow>
+                    <FieldRow label="目标账号" hint="留空使用当前用户">
+                      <Input
+                        value={artifactForm.user}
+                        onChange={(e) => setArtifactForm({ ...artifactForm, user: e.target.value })}
+                        placeholder="root"
+                      />
+                    </FieldRow>
+                  </>
+                ) : (
+                  <FieldRow label="执行命令">
+                    <Textarea
+                      value={artifactForm.command}
+                      onChange={(e) => setArtifactForm({ ...artifactForm, command: e.target.value })}
+                      rows={2}
+                      placeholder="要维持执行的命令"
+                    />
+                  </FieldRow>
+                )}
+              </>
+            ) : (
+              <>
+                <FieldRow label="路径 / 标识">
+                  <Input
+                    value={artifactForm.path}
+                    onChange={(e) => setArtifactForm({ ...artifactForm, path: e.target.value })}
+                    placeholder="/tmp/tool 或 crontab:xyz"
+                  />
+                </FieldRow>
+                <FieldRow label="撤销命令" hint="必填；撤离时按此删除痕迹">
+                  <Textarea
+                    value={artifactForm.revoke_command}
+                    onChange={(e) => setArtifactForm({ ...artifactForm, revoke_command: e.target.value })}
+                    rows={2}
+                    placeholder="rm -f /tmp/tool && echo JW_ARTIFACT_OK"
+                  />
+                </FieldRow>
+                <FieldRow label="验证命令" hint="撤销后应输出 JW_ARTIFACT_GONE">
+                  <Textarea
+                    value={artifactForm.verify_command}
+                    onChange={(e) => setArtifactForm({ ...artifactForm, verify_command: e.target.value })}
+                    rows={2}
+                    placeholder="test -e /tmp/tool && echo JW_ARTIFACT_PRESENT || echo JW_ARTIFACT_GONE"
+                  />
+                </FieldRow>
+              </>
+            )}
+            <FieldRow label="名称">
+              <Input
+                value={artifactForm.name}
+                onChange={(e) => setArtifactForm({ ...artifactForm, name: e.target.value })}
+                placeholder="留空自动生成"
+              />
+            </FieldRow>
+            <FieldRow label="说明">
+              <Input
+                value={artifactForm.description}
+                onChange={(e) => setArtifactForm({ ...artifactForm, description: e.target.value })}
+                placeholder="可选"
+              />
+            </FieldRow>
+            <DialogFooter>
+              <Button type="submit" disabled={artifactSaving}>
+                {artifactSaving ? <Loader2Icon className="size-4 animate-spin" /> : <PlusIcon className="size-4" />}
+                {artifactMode === "persist" ? "部署并登记" : "登记落地物"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      {/* 撤离清理 */}
+      <Dialog open={evacuateOpen} onOpenChange={setEvacuateOpen}>
+        <DialogContent className="sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>撤离清理</DialogTitle>
+            <DialogDescription>
+              按落地物台账 id 倒序撤销并验证，随后拆除任务隧道、释放受管资源并关闭会话。webshell
+              不会自动删除，会列入残留提醒。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-4">
+            <FieldRow label="任务">
+              <Select value={evacuateTask} onValueChange={setEvacuateTask}>
+                <SelectTrigger>
+                  <SelectValue placeholder="选择要撤离的任务" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">选择任务</SelectItem>
+                  {tasks.map((t) => (
+                    <SelectItem key={t.id} value={String(t.id)}>
+                      #{t.id} {taskLabel(t)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </FieldRow>
+            <label htmlFor="evac-close-sessions" className="flex items-center gap-2 text-sm">
+              <Checkbox
+                id="evac-close-sessions"
+                checked={evacuateCloseSessions}
+                onCheckedChange={(v) => setEvacuateCloseSessions(Boolean(v))}
+              />
+              关闭该任务的活跃会话
+            </label>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={evacuateBusy !== null}
+                onClick={() => void runEvacuate(true)}
+              >
+                {evacuateBusy === "preview" ? (
+                  <Loader2Icon className="size-4 animate-spin" />
+                ) : (
+                  <EyeIcon className="size-4" />
+                )}
+                预览
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
+                disabled={evacuateBusy !== null}
+                onClick={() => void runEvacuate(false)}
+              >
+                {evacuateBusy === "run" ? (
+                  <Loader2Icon className="size-4 animate-spin" />
+                ) : (
+                  <EraserIcon className="size-4" />
+                )}
+                执行撤离
+              </Button>
+            </div>
+            {evacuateReport ? (
+              <div className="flex flex-col gap-3 rounded-md border p-3">
+                <div className="text-sm">
+                  {evacuateReport.dry_run ? <Badge variant="outline">预览</Badge> : null} {evacuateReport.summary}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Badge variant="outline">
+                    落地物 {evacuateReport.artifacts.done}/{evacuateReport.artifacts.total}
+                  </Badge>
+                  <Badge variant="outline">
+                    隧道 {evacuateReport.tunnels.done}/{evacuateReport.tunnels.total}
+                  </Badge>
+                  <Badge variant="outline">
+                    资源 {evacuateReport.resources.done}/{evacuateReport.resources.total}
+                  </Badge>
+                  <Badge variant="outline">
+                    会话 {evacuateReport.sessions.done}/{evacuateReport.sessions.total}
+                  </Badge>
+                </div>
+                {evacuateReport.residual.length > 0 ? (
+                  <div className="rounded-md border border-red-500/30 bg-red-500/5 p-2">
+                    <div className="mb-1 font-medium text-red-600 text-xs">
+                      残留（{evacuateReport.residual.length}）
+                    </div>
+                    <ul className="list-disc space-y-1 pl-4 text-xs">
+                      {evacuateReport.residual.map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+                {evacuateReport.items.length > 0 ? (
+                  <ScrollArea className="max-h-64">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead className="w-24">类型</TableHead>
+                          <TableHead className="w-16">ID</TableHead>
+                          <TableHead className="w-24">状态</TableHead>
+                          <TableHead>详情</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {evacuateReport.items.map((item) => (
+                          <TableRow key={`${item.type}-${item.id}`}>
+                            <TableCell className="text-xs">{item.type}</TableCell>
+                            <TableCell className="font-mono text-xs">#{item.id}</TableCell>
+                            <TableCell className="text-xs">{item.status}</TableCell>
+                            <TableCell className="max-w-md truncate text-muted-foreground text-xs" title={item.detail}>
+                              {item.detail || item.name || item.host || "—"}
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </ScrollArea>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEvacuateOpen(false)}>
+              关闭
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>

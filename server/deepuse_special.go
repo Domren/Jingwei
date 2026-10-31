@@ -64,6 +64,9 @@ type probeResult struct {
 	Name       string
 	Detail     string
 	Injections []probeInjection
+	// Escalation is what the proven SQL injection revealed about the DB account
+	// (user, database, DBA flag). It only exists after a confirmed SQLi point.
+	Escalation *scanner.SQLMapEscalation
 	// Baseline holds the untouched request/response of a point the tool could not
 	// reproduce, so the negative verdict is reproducible from packets as well.
 	Baseline baselineExchange
@@ -274,6 +277,7 @@ func (r *deepRun) runInjectionProbe(class string, summary map[string]any) (strin
 	r.logf(stage, "开始 %s 专项验证：%d 个注入点（版本 %s）", tool, len(points), displayOr(r.probeToolVersion(class), "未知"))
 
 	confirmed, review, notReproduced, skipped, kept := 0, 0, 0, 0, 0
+	escalated, dba := 0, 0
 	uncovered := 0
 	reopened := 0
 	timedOut := false
@@ -297,6 +301,12 @@ func (r *deepRun) runInjectionProbe(class string, summary map[string]any) (strin
 		res = sessionBlockedNegative(res)
 		if res.Verdict == "not_reproduced" && probePointReachable(res) {
 			res = r.rejudgeProbeNegative(class, p, res, r.credsForPoint(creds, p))
+		}
+		if res.Escalation != nil {
+			escalated++
+			if res.Escalation.IsDBA {
+				dba++
+			}
 		}
 		rec := r.recordProbeResult(class, p, res)
 		switch res.Verdict {
@@ -340,6 +350,8 @@ func (r *deepRun) runInjectionProbe(class string, summary map[string]any) (strin
 	summary["skipped"] = skipped
 	summary["session_needed"] = kept
 	summary["tool_uncovered"] = uncovered
+	summary["escalated"] = escalated
+	summary["dba"] = dba
 	if wedged {
 		left := len(points) - processed
 		summary["target_unreachable"] = left
@@ -367,6 +379,9 @@ func (r *deepRun) runInjectionProbe(class string, summary map[string]any) (strin
 	}
 	if kept > 0 {
 		r.logf(stage, "%d 个注入点因缺少登录会话无法判定，原判定保持不变（提供 cookie 后可复测）", kept)
+	}
+	if escalated > 0 {
+		r.logf(stage, "%d 个注入点完成影响评估，其中 %d 个数据库账户具备 DBA 权限", escalated, dba)
 	}
 	return "done", stage, "", summary
 }
@@ -496,7 +511,7 @@ func (r *deepRun) rejudgeWideByteSQLi(payload scanner.DeepRequest, res probeResu
 		res.Detail = "宽字节注入点无法构造中性对照请求（参数不可解析），sqlmap 的阴性结论不作为反证。" + res.Detail
 		return res
 	}
-	client := scanner.NewDeepClient(r.probeTimeout())
+	client := r.newDeepClient(r.probeTimeout())
 	payload.Timeout = r.probeTimeout()
 	control := probeControlVariant(payload, ctlURL, ctlBody)
 	ctl := client.Do(r.ctx, control)
@@ -645,7 +660,7 @@ func (r *deepRun) probeParamEcho(p probePoint, creds probeCreds) (bool, string, 
 	if !ok {
 		return true, marker, 0
 	}
-	resp := scanner.NewDeepClient(r.probeTimeout()).Do(r.ctx, r.probeRequest(echo.URL, echo.Method, echo.Body, creds))
+	resp := r.newDeepClient(r.probeTimeout()).Do(r.ctx, r.probeRequest(echo.URL, echo.Method, echo.Body, creds))
 	if resp.Error != "" {
 		return true, marker, resp.StatusCode
 	}
@@ -767,6 +782,7 @@ func (r *deepRun) sqlmapProbeOptions(p probePoint, creds probeCreds) scanner.SQL
 		Cookie:         creds.Cookie,
 		Headers:        creds.Headers,
 		Params:         p.Params,
+		Proxy:          r.taskProxy(),
 		WallSeconds:    intParam(r.task.Params, "wall_seconds", 240),
 	}
 	if p.Body != "" || !strings.EqualFold(p.Method, "GET") {
@@ -822,12 +838,70 @@ func (r *deepRun) verifySQLiPoint(p probePoint, creds probeCreds) probeResult {
 	if proved > 0 {
 		res.Verdict = verdict.Confirmed
 		res.Name = fmt.Sprintf("sqlmap 确认 SQL 注入：%s", strings.Join(injectionLabels(res.Injections), "、"))
+		res.Escalation = r.escalateSQLiPoint(p, opts, run)
 	} else {
 		res.Verdict = verdict.NeedsReview
 		res.Name = fmt.Sprintf("sqlmap 判定可注入但复放未见特征：%s", strings.Join(injectionLabels(res.Injections), "、"))
 	}
-	res.Detail = sqlmapEvidence(run, p, res.Injections)
+	res.Detail = sqlmapEvidence(run, p, res.Injections) + sqlmapImpactLines(res.Escalation)
 	return res
+}
+
+// escalateSQLiPoint queries what the injected DB account can see. A confirmed
+// injection is already a finding; the metadata query says how far it reaches
+// (which DB user, which database, DBA or not) so the finding severity follows
+// the proven impact instead of a fixed guess. The run only reads the database's
+// self-description, never table data, and the number of paid escalations is
+// bounded per task so a report full of injection points cannot stall the run.
+func (r *deepRun) escalateSQLiPoint(p probePoint, opts scanner.SQLMapOptions, run scanner.SQLMapRun) *scanner.SQLMapEscalation {
+	if !paramDefaultTrue(r.task.Params, "escalate") {
+		return nil
+	}
+	limit := intParam(r.task.Params, "max_escalations", 1)
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 8 {
+		limit = 8
+	}
+	if r.sqliEscalations >= limit {
+		r.logf("probe", "SQL 注入已确认，但本次任务的影响评估次数已达上限 %d，跳过 %s", limit, p.URL)
+		return nil
+	}
+	escOpts := opts
+	escOpts.Threads = 1
+	escOpts.WallSeconds = intParam(r.task.Params, "escalate_seconds", 60)
+	if escOpts.WallSeconds < 10 {
+		escOpts.WallSeconds = 10
+	}
+	if escOpts.WallSeconds > 300 {
+		escOpts.WallSeconds = 300
+	}
+	// Pin the run to the parameter sqlmap already proved: otherwise the metadata
+	// query pays for a full detection pass on every parameter first.
+	if len(escOpts.Params) == 0 && len(run.Injections) > 0 {
+		escOpts.Params = []string{run.Injections[0].Param}
+	}
+	r.sqliEscalations++
+	r.logf("probe", "SQL 注入已确认，开始影响评估（DB 用户/库/DBA/主机名，上限 %ds，不读取业务数据）：%s", escOpts.WallSeconds, p.URL)
+	esc := scanner.RunSQLMapEscalation(r.ctx, p.URL, escOpts)
+	if esc.Missing {
+		r.logf("probe", "sqlmap 不可用，跳过影响评估")
+		return nil
+	}
+	if !esc.HasFindings() {
+		reason := "未取到元数据"
+		switch {
+		case esc.TimedOut:
+			reason = "超过时限"
+		case esc.Err != nil:
+			reason = esc.Err.Error()
+		}
+		r.logf("probe", "影响评估未取到信息（%s），注入确认不受影响", reason)
+		return nil
+	}
+	r.logf("probe", "影响评估完成：%s（耗时 %s）", esc.Summary(), esc.Elapsed.Round(time.Second))
+	return &esc
 }
 
 func (r *deepRun) verifyXSSPoint(p probePoint, creds probeCreds) probeResult {
@@ -847,6 +921,7 @@ func (r *deepRun) verifyXSSPoint(p probePoint, creds probeCreds) probeResult {
 		Stored:              boolParam(r.task.Params, "stored"),
 		StoredURL:           stringParam(r.task.Params, "stored_url"),
 		BlindURL:            stringParam(r.task.Params, "blind_url"),
+		Proxy:               r.taskProxy(),
 		WallSeconds:         intParam(r.task.Params, "wall_seconds", 240),
 	}
 	if host, err := url.Parse(p.URL); err == nil {
@@ -928,7 +1003,7 @@ type baselineExchange struct {
 // the tool based its verdict on.
 func (r *deepRun) replayBaseline(p probePoint, creds probeCreds) baselineExchange {
 	req := r.probeRequest(p.URL, p.Method, p.Body, creds)
-	resp := scanner.NewDeepClient(r.probeTimeout()).Do(r.ctx, req)
+	resp := r.newDeepClient(r.probeTimeout()).Do(r.ctx, req)
 	if resp.Error != "" {
 		return baselineExchange{}
 	}
@@ -968,7 +1043,7 @@ func (r *deepRun) replaySQLiInjection(p probePoint, inj scanner.SQLMapInjection,
 		}
 		req.Headers[inj.Where] = inj.Payload
 	}
-	resp := scanner.NewDeepClient(r.probeTimeout()).Do(r.ctx, req)
+	resp := r.newDeepClient(r.probeTimeout()).Do(r.ctx, req)
 	if resp.Error != "" {
 		return probeRequestText(req), "", 0, "复放请求失败: " + resp.Error
 	}
@@ -1202,7 +1277,7 @@ func (r *deepRun) replayXSSFinding(p probePoint, f scanner.DalfoxFinding, creds 
 			req = parsed
 		}
 	}
-	resp := scanner.NewDeepClient(r.probeTimeout()).Do(r.ctx, req)
+	resp := r.newDeepClient(r.probeTimeout()).Do(r.ctx, req)
 	if resp.Error != "" {
 		return probeRequestText(req), "", 0, "复放请求失败: " + resp.Error
 	}
@@ -1325,6 +1400,10 @@ func (r *deepRun) recordProbeResult(class string, p probePoint, res probeResult)
 	if class == scanner.InjectionXSS && res.Verdict != verdict.Confirmed {
 		severity = "medium"
 	}
+	if class == scanner.InjectionSQLi && sqlmapImpactCritical(res.Escalation) {
+		severity = "critical"
+		name += "（DBA 权限，影响升级）"
+	}
 	rec := db.ExploitRecord{
 		TaskID:     r.task.ID,
 		Mode:       r.task.Kind,
@@ -1350,6 +1429,9 @@ func (r *deepRun) recordProbeResult(class string, p probePoint, res probeResult)
 		}
 		rec.Extracted = append(rec.Extracted, fmt.Sprintf("%s 参数 %s：%s（payload %s）",
 			displayOr(inj.Where, "位置"), inj.Param, inj.Kind, truncateText(inj.Payload, 200)))
+	}
+	if res.Escalation != nil {
+		rec.Extracted = append(rec.Extracted, "影响评估: "+res.Escalation.Summary())
 	}
 	if len(rec.Extracted) == 0 && res.Err != nil {
 		rec.Extracted = append(rec.Extracted, "错误: "+res.Err.Error())
@@ -1378,6 +1460,9 @@ func (r *deepRun) applyProbeConfirmation(class string, p probePoint, res probeRe
 		note += fmt.Sprintf("\n注入参数: %s（%s）\n类型: %s\n标题: %s\npayload: %s",
 			inj.Param, displayOr(inj.Where, "-"), inj.Kind, displayOr(inj.Title, "-"), truncateText(inj.Payload, 400))
 	}
+	if res.Escalation != nil {
+		note += "\n影响评估: " + res.Escalation.Summary()
+	}
 	exchanges := probeExchanges(res)
 	ids := r.probeLinkedFindings(p)
 	if len(ids) == 0 && boolParam(r.task.Params, "write_finding") {
@@ -1392,6 +1477,9 @@ func (r *deepRun) applyProbeConfirmation(class string, p probePoint, res probeRe
 			continue
 		}
 		r.markConfirmed(id)
+		if sqlmapImpactCritical(res.Escalation) {
+			r.upgradeFindingSeverity(id, "critical")
+		}
 		if len(exchanges) > 0 {
 			if err := r.s.evidenceStore().SaveRawExchanges(r.ctx, id, exchanges); err != nil {
 				r.logf("probe", "绑定专项验证报文失败 #%d: %v", id, err)
@@ -1399,6 +1487,23 @@ func (r *deepRun) applyProbeConfirmation(class string, p probePoint, res probeRe
 		}
 		r.applyProbeArtifacts(id, rec, exchanges)
 	}
+}
+
+// upgradeFindingSeverity raises a confirmed finding to the severity its proven
+// impact justifies. A finding triage already ranked higher is left alone.
+func (r *deepRun) upgradeFindingSeverity(id int64, severity string) {
+	f, err := r.pg.GetFinding(id)
+	if err != nil || f == nil {
+		return
+	}
+	if severityRank(f.Severity) >= severityRank(severity) {
+		return
+	}
+	if _, err := r.pg.SetFindingSeverity(id, severity); err != nil {
+		r.logf("probe", "升级发现 #%d 严重级别失败: %v", id, err)
+		return
+	}
+	r.logf("probe", "发现 #%d 按影响评估升级严重级别：%s → %s", id, displayOr(f.Severity, "-"), severity)
 }
 
 // applyProbeArtifacts replaces the POC packet on the finding with the
@@ -1568,6 +1673,44 @@ func sqlmapEvidence(run scanner.SQLMapRun, p probePoint, injections []probeInjec
 	}
 	b.WriteString("\nsqlmap 原始输出（节选）:\n" + sqlmapLogDigest(run.Log))
 	return b.String()
+}
+
+// sqlmapImpactLines renders the escalation's metadata for the finding evidence.
+// Nothing here comes from table data: the lines are the database's own
+// self-description as returned to the injected account.
+func sqlmapImpactLines(esc *scanner.SQLMapEscalation) string {
+	if esc == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n影响评估（sqlmap 元数据查询，未读取业务数据）:\n")
+	if esc.Banner != "" {
+		fmt.Fprintf(&b, "  数据库版本: %s\n", esc.Banner)
+	}
+	if esc.CurrentUser != "" {
+		fmt.Fprintf(&b, "  当前数据库用户: %s\n", esc.CurrentUser)
+	}
+	if esc.CurrentDB != "" {
+		fmt.Fprintf(&b, "  当前数据库: %s\n", esc.CurrentDB)
+	}
+	if esc.Hostname != "" {
+		fmt.Fprintf(&b, "  数据库主机名: %s\n", esc.Hostname)
+	}
+	if esc.DBAText != "" {
+		fmt.Fprintf(&b, "  DBA 权限: %s\n", esc.DBAText)
+	}
+	if esc.TimedOut {
+		b.WriteString("  （评估超出时限，以上为已取到的部分）\n")
+	}
+	return b.String()
+}
+
+// sqlmapImpactCritical promotes a confirmed SQLi finding only when the injected
+// account itself is an administrator: that is the one escalation claim the run
+// proved, and it is the difference between "can run queries" and "can own the
+// database server".
+func sqlmapImpactCritical(esc *scanner.SQLMapEscalation) bool {
+	return esc != nil && esc.IsDBA
 }
 
 func dalfoxEvidence(run scanner.DalfoxRun, p probePoint, injections []probeInjection) string {

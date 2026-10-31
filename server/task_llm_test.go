@@ -238,6 +238,45 @@ func TestTaskLLMStateRejectsOlderRevision(t *testing.T) {
 	}
 }
 
+func TestTaskProfileFailoverErrorClassification(t *testing.T) {
+	t.Parallel()
+	failover := []string{
+		`openai: status 401: invalid api key`,
+		`openai: status 402: payment required`,
+		`openai: status 403: SUBSCRIPTION_NOT_FOUND`,
+		`anthropic: status 404: model not found`,
+		`HTTP status 403: billing_hard_limit_reached`,
+		`openai: status 429: insufficient_quota`,
+		`账户余额不足，请充值`,
+	}
+	for _, message := range failover {
+		if !isTaskProfileFailoverError(errors.New(message)) {
+			t.Errorf("expected profile failover for %q", message)
+		}
+	}
+	ordinary := []string{
+		`openai: status 429: rate limit exceeded`,
+		`openai: status 500: internal server error`,
+		`openai: status 400: invalid request`,
+		`dial tcp: network is unreachable`,
+		`context length exceeded`,
+	}
+	for _, message := range ordinary {
+		if isTaskProfileFailoverError(errors.New(message)) {
+			t.Errorf("unexpected profile failover for %q", message)
+		}
+	}
+	if isTaskProfileFailoverError(nil) {
+		t.Error("nil error must not trigger profile failover")
+	}
+	if got := taskProfileFailoverStatus(errors.New("openai: status 403: forbidden")); got != db.TaskLLMProfileUnavailable {
+		t.Errorf("config-class status=%q, want %q", got, db.TaskLLMProfileUnavailable)
+	}
+	if got := taskProfileFailoverStatus(errors.New("openai: status 402: insufficient_quota")); got != db.TaskLLMProfileQuotaExhausted {
+		t.Errorf("quota status=%q, want %q", got, db.TaskLLMProfileQuotaExhausted)
+	}
+}
+
 func TestTaskLLMStreamRetriesPreStreamQuotaOnNextProfile(t *testing.T) {
 	t.Parallel()
 	quota := errors.New("openai: status 402: insufficient_quota")
@@ -344,8 +383,8 @@ func TestTaskLLMStreamDoesNotSwitchForOrdinaryErrors(t *testing.T) {
 	defer withZeroRetryBackoff()()
 	tests := []string{
 		"openai: status 429: rate limit exceeded",
-		"openai: status 401: invalid api key",
 		"openai: status 500: internal server error",
+		"openai: status 400: invalid request",
 		"dial tcp: network is unreachable",
 	}
 	for _, message := range tests {
@@ -369,6 +408,89 @@ func TestTaskLLMStreamDoesNotSwitchForOrdinaryErrors(t *testing.T) {
 				t.Fatalf("ordinary error changed failover state %d times", exhausted)
 			}
 		})
+	}
+}
+
+// A configuration-class rejection before any output is committed retires the
+// profile and replays the same request on the next one — the exact case where a
+// 403 SUBSCRIPTION_NOT_FOUND used to pin the task to a dead profile.
+func TestTaskLLMStreamSwitchesOnConfigClassErrors(t *testing.T) {
+	t.Parallel()
+	for _, message := range []string{
+		"openai: status 401: invalid api key",
+		"openai: status 402: payment required",
+		"openai: status 403: SUBSCRIPTION_NOT_FOUND",
+		"anthropic: status 404: model not found",
+	} {
+		t.Run(message, func(t *testing.T) {
+			first := &scriptedLLMProvider{err: errors.New(message)}
+			second := &scriptedLLMProvider{events: []llm.StreamEvent{{Type: llm.SETextDelta, Text: "fallback"}}}
+			active := int64(11)
+			var statuses []string
+			hooks := taskLLMStreamHooks{
+				current: func() (taskLLMSelection, error) {
+					if active == 11 {
+						return taskLLMSelection{profileID: 11, provider: first}, nil
+					}
+					return taskLLMSelection{profileID: 22, provider: second}, nil
+				},
+				exhaust: func(selection taskLLMSelection, cause error) (db.TaskLLMTransition, error) {
+					if selection.profileID != 11 {
+						t.Fatalf("unexpected exhausted profile %d", selection.profileID)
+					}
+					statuses = append(statuses, taskProfileFailoverStatus(cause))
+					active = 22
+					next := active
+					return db.TaskLLMTransition{PreviousProfileID: 11, NextProfileID: &next, Advanced: true}, nil
+				},
+			}
+			events, err := collectTaskLLMStream(streamTaskLLM(context.Background(), "7", llm.CompletionRequest{}, hooks))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(events) != 1 || events[0].Text != "fallback" {
+				t.Fatalf("unexpected fallback events: %+v", events)
+			}
+			if first.calls != 1 || second.calls != 1 {
+				t.Fatalf("calls first=%d second=%d", first.calls, second.calls)
+			}
+			want := db.TaskLLMProfileUnavailable
+			if strings.Contains(message, "402") {
+				want = db.TaskLLMProfileQuotaExhausted
+			}
+			if len(statuses) != 1 || statuses[0] != want {
+				t.Fatalf("exhaust statuses=%v, want [%s]", statuses, want)
+			}
+		})
+	}
+}
+
+// Non-streaming calls are atomic, so a config-class failure also advances the
+// chain instead of surfacing immediately.
+func TestTaskLLMCompleteSwitchesOnConfigClassError(t *testing.T) {
+	t.Parallel()
+	first := &scriptedLLMProvider{err: errors.New("openai: status 403: SUBSCRIPTION_NOT_FOUND")}
+	second := &scriptedLLMProvider{events: []llm.StreamEvent{{Type: llm.SETextDelta, Text: "ok"}}}
+	active := int64(11)
+	hooks := taskLLMStreamHooks{
+		current: func() (taskLLMSelection, error) {
+			if active == 11 {
+				return taskLLMSelection{profileID: 11, provider: first}, nil
+			}
+			return taskLLMSelection{profileID: 22, provider: second}, nil
+		},
+		exhaust: func(taskLLMSelection, error) (db.TaskLLMTransition, error) {
+			active = 22
+			next := active
+			return db.TaskLLMTransition{PreviousProfileID: 11, NextProfileID: &next, Advanced: true}, nil
+		},
+	}
+	msg, _, _, err := completeTaskLLM(context.Background(), "7", llm.CompletionRequest{}, hooks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Text() != "ok" || first.calls != 1 || second.calls != 1 {
+		t.Fatalf("complete fallback msg=%q calls first=%d second=%d", msg.Text(), first.calls, second.calls)
 	}
 }
 

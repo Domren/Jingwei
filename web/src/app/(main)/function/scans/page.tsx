@@ -501,6 +501,7 @@ export default function ScansPage() {
   const pocPages = Math.max(1, Math.ceil(pocTotal / POC_PAGE_SIZE));
   const running = scans.some((s) => s.status === "running" || s.status === "queued");
   const detailRunning = detailTask?.status === "running" || detailTask?.status === "queued";
+  const detailAutoConfirmed = (detailAuto?.records ?? []).filter((r) => r.verdict === "confirmed").length;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4">
@@ -598,6 +599,14 @@ export default function ScansPage() {
                       <span className="text-foreground">结果 {num(task.progress.results ?? task.summary.results)}</span>
                       {num(task.summary.findings) > 0 && (
                         <span className="ml-1 text-orange-600">发现 {num(task.summary.findings)}</span>
+                      )}
+                      {num(task.summary.auto_tasks) > 0 && (
+                        <span className="ml-1 text-sky-600">
+                          深挖 {num(task.summary.auto_done)}/{num(task.summary.auto_tasks)}
+                        </span>
+                      )}
+                      {num(task.summary.auto_confirmed) > 0 && (
+                        <span className="ml-1 text-orange-600">深挖确认 {num(task.summary.auto_confirmed)}</span>
                       )}
                     </TableCell>
                     <TableCell className="text-xs text-muted-foreground">{fmtTime(task.created_at)}</TableCell>
@@ -1153,6 +1162,15 @@ export default function ScansPage() {
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge variant="secondary">自动主机 {num(detailTask.summary.auto_hosts)}</Badge>
                       <Badge variant="secondary">模板 {num(detailTask.summary.auto_templates)}</Badge>
+                      <Badge variant="secondary">
+                        任务 {num(detailTask.summary.auto_done)}/{num(detailTask.summary.auto_tasks)}
+                      </Badge>
+                      <Badge
+                        variant="outline"
+                        className={detailAutoConfirmed > 0 ? severityClass("high") : undefined}
+                      >
+                        深挖确认 {detailAutoConfirmed}
+                      </Badge>
                       <Badge variant="secondary">基线注入点 {num(detailTask.summary.baseline_points)}</Badge>
                       <Badge variant="secondary">基线任务 {num(detailTask.summary.baseline_tasks)}</Badge>
                       <Badge

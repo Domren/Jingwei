@@ -692,14 +692,15 @@ CROSS JOIN LATERAL unnest(asset.task_ids) AS requested(task_id)
 JOIN tasks task ON task.id=requested.task_id AND task.deleted_at IS NULL
 ON CONFLICT (task_id, asset_id) DO NOTHING;
 
--- Ordered task-level LLM failover chain. A quota-exhausted entry is skipped
--- until the user saves/resets the chain, which clears all failure state.
+-- Ordered task-level LLM failover chain. A failed entry (quota exhausted, or a
+-- configuration-class rejection such as 401/403/404) is skipped until the user
+-- saves/resets the chain, which clears all failure state.
 CREATE TABLE IF NOT EXISTS task_llm_profiles (
     task_id          BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     profile_id       BIGINT NOT NULL REFERENCES llm_profiles(id) ON DELETE CASCADE,
     position         INTEGER NOT NULL CHECK (position >= 0),
     status           TEXT NOT NULL DEFAULT 'ready'
-                       CHECK (status IN ('ready','quota_exhausted')),
+                       CHECK (status IN ('ready','quota_exhausted','unavailable')),
     last_error       TEXT,
     exhausted_at     TIMESTAMPTZ,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -707,6 +708,11 @@ CREATE TABLE IF NOT EXISTS task_llm_profiles (
     PRIMARY KEY (task_id, profile_id),
     UNIQUE (task_id, position)
 );
+-- Existing installations predate the 'unavailable' status: recreate the check
+-- constraint idempotently on every startup.
+ALTER TABLE task_llm_profiles DROP CONSTRAINT IF EXISTS task_llm_profiles_status_check;
+ALTER TABLE task_llm_profiles ADD CONSTRAINT task_llm_profiles_status_check
+    CHECK (status IN ('ready','quota_exhausted','unavailable'));
 CREATE INDEX IF NOT EXISTS idx_task_llm_profiles_order ON task_llm_profiles(task_id, position);
 CREATE INDEX IF NOT EXISTS idx_task_llm_profiles_profile ON task_llm_profiles(profile_id, task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_llm_profile ON tasks(llm_profile_id) WHERE llm_profile_id IS NOT NULL;
@@ -1670,6 +1676,9 @@ CREATE INDEX IF NOT EXISTS idx_scan_tasks_status ON scan_tasks(status, id);
 ALTER TABLE scan_tasks ADD COLUMN IF NOT EXISTS webshell_inject BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE scan_tasks ADD COLUMN IF NOT EXISTS webshell_params JSONB NOT NULL DEFAULT '{}';
 
+-- 可选代理：http(s):// 或 socks5(h)://，整轮扫描（发现/nuclei/弱口令/深度利用子任务）都经它出站。
+ALTER TABLE scan_tasks ADD COLUMN IF NOT EXISTS proxy TEXT NOT NULL DEFAULT '';
+
 CREATE TABLE IF NOT EXISTS scan_task_assets (
     scan_task_id BIGINT NOT NULL REFERENCES scan_tasks(id) ON DELETE CASCADE,
     asset_id     BIGINT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
@@ -1902,3 +1911,60 @@ CREATE INDEX IF NOT EXISTS idx_intranet_scope_status ON intranet_scope_requests(
 CREATE INDEX IF NOT EXISTS idx_intranet_scope_task ON intranet_scope_requests(task_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_intranet_scope_pending_unique
     ON intranet_scope_requests(task_id, host, port) WHERE status = 'pending';
+
+-- 凭据复用台账：WebCrack 弱口令命中登记于此，内网横向时按目标挑选复用。
+-- task_id 可能是 tasks（内网任务）或 scan_tasks 的编号，故不做外键；scan_task_id 明确指向漏扫。
+CREATE TABLE IF NOT EXISTS intranet_credentials (
+    id           BIGSERIAL PRIMARY KEY,
+    host         TEXT NOT NULL,
+    port         INTEGER NOT NULL DEFAULT 0,
+    protocol     TEXT NOT NULL DEFAULT 'http',
+    url          TEXT NOT NULL DEFAULT '',
+    username     TEXT NOT NULL,
+    password     TEXT NOT NULL,
+    source       TEXT NOT NULL DEFAULT 'weakpass',
+    task_id      BIGINT,
+    scan_task_id BIGINT REFERENCES scan_tasks(id) ON DELETE SET NULL,
+    finding_id   BIGINT REFERENCES findings(id) ON DELETE SET NULL,
+    status       TEXT NOT NULL DEFAULT 'untested',
+    evidence     TEXT NOT NULL DEFAULT '',
+    last_used_at TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (host, username, password)
+);
+CREATE INDEX IF NOT EXISTS idx_intranet_creds_host ON intranet_credentials(host, id DESC);
+CREATE INDEX IF NOT EXISTS idx_intranet_creds_task ON intranet_credentials(task_id) WHERE task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_intranet_creds_status ON intranet_credentials(status, id DESC);
+DROP TRIGGER IF EXISTS trg_intranet_credentials_upd ON intranet_credentials;
+CREATE TRIGGER trg_intranet_credentials_upd BEFORE UPDATE ON intranet_credentials
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 内网落地物台账：目标侧的一切持久化痕迹（上传文件、计划任务、systemd 服务、
+-- SSH 公钥等）。每条记录自带撤销命令与验证命令，撤离时按 id 逆序逐条执行并核验。
+-- task_id 与 intranet_sessions 一致，可能是 tasks 或 scan_tasks 的编号，故不做外键。
+CREATE TABLE IF NOT EXISTS intranet_artifacts (
+    id             BIGSERIAL PRIMARY KEY,
+    task_id        BIGINT,
+    session_id     BIGINT REFERENCES intranet_sessions(id) ON DELETE SET NULL,
+    host           TEXT NOT NULL DEFAULT '',
+    kind           TEXT NOT NULL,
+    name           TEXT NOT NULL DEFAULT '',
+    path           TEXT NOT NULL DEFAULT '',
+    description    TEXT NOT NULL DEFAULT '',
+    deploy_command TEXT NOT NULL DEFAULT '',
+    revoke_command TEXT NOT NULL,
+    verify_command TEXT NOT NULL DEFAULT '',
+    status         TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','revoked')),
+    evidence       TEXT NOT NULL DEFAULT '',
+    metadata       JSONB NOT NULL DEFAULT '{}',
+    revoked_at     TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_intranet_artifacts_task ON intranet_artifacts(task_id, status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_intranet_artifacts_session ON intranet_artifacts(session_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_intranet_artifacts_host ON intranet_artifacts(host, kind, id DESC);
+DROP TRIGGER IF EXISTS trg_intranet_artifacts_upd ON intranet_artifacts;
+CREATE TRIGGER trg_intranet_artifacts_upd BEFORE UPDATE ON intranet_artifacts
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();

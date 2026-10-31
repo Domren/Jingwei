@@ -10,6 +10,15 @@ import (
 
 const IntentBlockedLLMQuota = "llm_quota_exhausted"
 
+// Task-level LLM chain entry statuses. 'unavailable' covers configuration-class
+// rejections (bad key, missing subscription, wrong endpoint/model) that will keep
+// failing until a human fixes the profile, just like quota exhaustion.
+const (
+	TaskLLMProfileReady          = "ready"
+	TaskLLMProfileQuotaExhausted = "quota_exhausted"
+	TaskLLMProfileUnavailable    = "unavailable"
+)
+
 // TaskLLMProfile is one ordered entry in a task's explicit failover chain.
 type TaskLLMProfile struct {
 	ProfileID   int64      `json:"profile_id"`
@@ -456,16 +465,27 @@ WHERE id=$1`, taskID, active); err != nil {
 // in-flight error from an older profile records that entry as exhausted but does
 // not advance past the profile another call already selected.
 func (d *DB) MarkTaskLLMProfileQuotaExhausted(taskID, profileID int64, reason string) (TaskLLMTransition, error) {
-	return d.markTaskLLMProfileQuotaExhausted(taskID, profileID, 0, false, reason)
+	return d.markTaskLLMProfileFailed(taskID, profileID, 0, false, TaskLLMProfileQuotaExhausted, reason)
 }
 
 // MarkTaskLLMProfileQuotaExhaustedAtRevision applies a provider failure only
 // when it belongs to the chain snapshot used to start that call.
 func (d *DB) MarkTaskLLMProfileQuotaExhaustedAtRevision(taskID, profileID, revision int64, reason string) (TaskLLMTransition, error) {
-	return d.markTaskLLMProfileQuotaExhausted(taskID, profileID, revision, true, reason)
+	return d.markTaskLLMProfileFailed(taskID, profileID, revision, true, TaskLLMProfileQuotaExhausted, reason)
 }
 
-func (d *DB) markTaskLLMProfileQuotaExhausted(taskID, profileID, revision int64, checkRevision bool, reason string) (TaskLLMTransition, error) {
+// MarkTaskLLMProfileFailedAtRevision is the generalized failover marker: status
+// is either quota_exhausted or unavailable. A configuration-class rejection
+// (401/403/404) retires the entry exactly like quota exhaustion, so the task
+// advances to the next profile instead of retrying a permanently broken one.
+func (d *DB) MarkTaskLLMProfileFailedAtRevision(taskID, profileID, revision int64, status, reason string) (TaskLLMTransition, error) {
+	return d.markTaskLLMProfileFailed(taskID, profileID, revision, true, status, reason)
+}
+
+func (d *DB) markTaskLLMProfileFailed(taskID, profileID, revision int64, checkRevision bool, status, reason string) (TaskLLMTransition, error) {
+	if status != TaskLLMProfileQuotaExhausted && status != TaskLLMProfileUnavailable {
+		return TaskLLMTransition{}, fmt.Errorf("invalid task LLM profile failure status %q", status)
+	}
 	var out TaskLLMTransition
 	tx, err := d.Begin()
 	if err != nil {
@@ -505,10 +525,10 @@ func (d *DB) markTaskLLMProfileQuotaExhausted(taskID, profileID, revision int64,
 		return out, tx.Commit()
 	}
 	reason = truncateUTF8(strings.TrimSpace(reason), 1000)
-	if entryStatus != "quota_exhausted" {
+	if entryStatus == TaskLLMProfileReady {
 		if _, err := tx.Exec(`UPDATE task_llm_profiles
-SET status='quota_exhausted', last_error=$3, exhausted_at=now()
-WHERE task_id=$1 AND profile_id=$2`, taskID, profileID, reason); err != nil {
+SET status=$4, last_error=$3, exhausted_at=now()
+WHERE task_id=$1 AND profile_id=$2`, taskID, profileID, reason, status); err != nil {
 			return out, err
 		}
 	}

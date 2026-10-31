@@ -3472,7 +3472,7 @@ function CreateTaskSheet({
                 inputId="llm-profiles"
                 portalContainer={sheetContentRef}
               />
-              <FieldDescription>按列表顺序故障转移；第一项为当前配置，仅在明确额度不足时切换下一项。</FieldDescription>
+              <FieldDescription>按列表顺序故障转移；第一项为当前配置，仅在额度不足或配置不可用（401/403/404）时切换下一项。</FieldDescription>
             </Field>
 
             {/* 高级参数默认折叠:超时/心跳/首个意图,展开才占空间,常用路径保持清爽。 */}

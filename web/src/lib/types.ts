@@ -510,7 +510,8 @@ export interface FindingReproduction {
 }
 
 export interface Finding {
-  case_id?: string;  traffic_count?: number;
+  case_id?: string;
+  traffic_count?: number;
   evidence_version?: number;
   report_evidence_version?: number;
   report_stale?: boolean;
@@ -1891,6 +1892,88 @@ export interface IntranetHandoffInput {
   goal?: string;
   session_ids?: number[];
   tunnel_ids?: number[];
+}
+
+// ---- 内网落地物台账与撤离清理 ----
+export interface IntranetArtifact {
+  id: number;
+  task_id?: number;
+  session_id?: number;
+  host: string;
+  kind: "file" | "cron" | "systemd" | "ssh_key" | "other" | string;
+  name: string;
+  path: string;
+  description: string;
+  deploy_command: string;
+  revoke_command: string;
+  verify_command: string;
+  status: "active" | "revoked" | string;
+  evidence: string;
+  metadata: Record<string, unknown>;
+  revoked_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface IntranetArtifactInput {
+  session_id?: number;
+  task_id?: number;
+  host?: string;
+  kind?: string;
+  name?: string;
+  path?: string;
+  description?: string;
+  revoke_command: string;
+  verify_command?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface IntranetPersistInput {
+  kind: "cron" | "systemd" | "ssh_key" | string;
+  name?: string;
+  schedule?: string;
+  command?: string;
+  public_key?: string;
+  user?: string;
+  description?: string;
+  task_id?: number;
+}
+
+export interface IntranetEvacuationItem {
+  type: "artifact" | "tunnel" | "resource" | "session" | string;
+  id: number;
+  kind: string;
+  name: string;
+  host: string;
+  status: string;
+  detail?: string;
+}
+
+export interface IntranetEvacuationTotals {
+  total: number;
+  done: number;
+  failed: number;
+}
+
+export interface IntranetEvacuationReport {
+  task_id: number;
+  dry_run: boolean;
+  started_at: string;
+  finished_at: string;
+  artifacts: IntranetEvacuationTotals;
+  tunnels: IntranetEvacuationTotals;
+  resources: IntranetEvacuationTotals;
+  sessions: IntranetEvacuationTotals;
+  items: IntranetEvacuationItem[];
+  residual: string[];
+  summary: string;
+}
+
+export interface IntranetEvacuationInput {
+  task_id: number;
+  dry_run?: boolean;
+  close_sessions?: boolean;
+  note?: string;
 }
 
 // ---- Managed resource ledger & port audit ----

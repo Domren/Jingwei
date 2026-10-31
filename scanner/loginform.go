@@ -26,6 +26,7 @@ type LoginFormOptions struct {
 	MaxPages    int
 	Concurrency int
 	Timeout     time.Duration
+	Proxy       string
 	Logf        func(format string, args ...any)
 }
 
@@ -52,7 +53,7 @@ func loginFormDefault(o LoginFormOptions) LoginFormOptions {
 // entry as a login page.
 func DiscoverLoginForms(ctx context.Context, services []WebService, apps []AppSystem, opts LoginFormOptions) []string {
 	opts = loginFormDefault(opts)
-	prober := NewProber(opts.Timeout)
+	prober := NewProberWithProxy(opts.Timeout, opts.Proxy)
 
 	type item struct {
 		rawURL string
@@ -97,8 +98,8 @@ func DiscoverLoginForms(ctx context.Context, services []WebService, apps []AppSy
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				resp := appFetch(ctx, prober, it.rawURL, it.ip)
-				if resp == nil || len(resp.body) == 0 {
+				resp := appRawFetch(ctx, prober, it.rawURL, it.ip)
+				if resp == nil || resp.status >= 400 || len(resp.body) == 0 {
 					return
 				}
 				body := string(resp.body)

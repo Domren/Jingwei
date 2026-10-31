@@ -47,6 +47,7 @@ type HarvestOptions struct {
 	Concurrency  int
 	Timeout      time.Duration
 	MaxBodyBytes int64
+	Proxy        string
 	Logf         func(format string, args ...any)
 }
 
@@ -93,6 +94,10 @@ var (
 	// harvestSkipField drops credential and anti-CSRF fields: a token is not an
 	// injection point, and a login form already has its own baseline step.
 	harvestSkipField = regexp.MustCompile(`(?i)(pass(word|wd)?|pwd|csrf|xsrf|token|captcha|verif|auth|secret|signature|otp|nonce)`)
+	// harvestCaptchaForm drops whole forms gated by an image captcha: sqlmap and
+	// dalfox cannot solve it, so probing the remaining fields only burns captcha
+	// guesses (and risks locking the account) without ever testing the parameter.
+	harvestCaptchaForm = regexp.MustCompile(`(?is)(captcha|验证码|checkcode|codeimg|verifycode|vcode|验证图片)`)
 	// harvestHotParam marks names that reach a query, a file or a template, so
 	// the bounded budget lands on the parameters worth a tool run.
 	harvestHotParam = regexp.MustCompile(`(?i)^(id|ids|uid|user|username|name|q|query|search|s|k|key|keyword|keywords|page|p|cat|category|product|item|file|path|dir|url|uri|redirect|return|next|lang|locale|order|sort|by|limit|offset|num|no|code|table|col|column|content|text|value|input|msg|message|title|host|ip|port|year|month|date)$`)
@@ -112,6 +117,17 @@ var (
 func HarvestParams(ctx context.Context, seeds []string, opts HarvestOptions) []ParamPoint {
 	opts = harvestDefault(opts)
 	client := newHarvestClient(opts.Timeout)
+	// 代理无效时不能静默直连：内网目标只应经隧道出站。
+	if proxy := strings.TrimSpace(opts.Proxy); proxy != "" {
+		u, err := NormalizeProxyURL(proxy)
+		if err != nil {
+			opts.Logf("代理不可用（%v），跳过注入点枚举", err)
+			return nil
+		}
+		if parsed, err := url.Parse(u); err == nil {
+			client.Transport.(*http.Transport).Proxy = http.ProxyURL(parsed)
+		}
+	}
 	sem := make(chan struct{}, opts.Concurrency)
 	var mu sync.Mutex
 	var out []ParamPoint
@@ -238,6 +254,9 @@ func harvestForms(pageURL, body string) []ParamPoint {
 		}
 		if len(chunk) > maxFormChunk {
 			chunk = chunk[:maxFormChunk]
+		}
+		if harvestCaptchaForm.MatchString(chunk) {
+			continue
 		}
 		fields := harvestFieldNames(chunk)
 		if len(fields) == 0 {

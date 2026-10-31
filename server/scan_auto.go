@@ -128,6 +128,7 @@ func (r *scanRun) autoExploit(results []scanner.NucleiResult, findingIDs map[str
 					"java_chains":             "auto",
 					"java_cmd":                "id",
 					"source":                  "scan",
+					"proxy":                   r.task.Proxy,
 				},
 				ScanTaskID: &scanID,
 				AutoRun:    true,
@@ -152,6 +153,7 @@ func (r *scanRun) autoExploit(results []scanner.NucleiResult, findingIDs map[str
 					"param":            g.wafParam,
 					"only_if_detected": true,
 					"source":           "scan",
+					"proxy":            r.task.Proxy,
 				},
 				ScanTaskID: &scanID,
 				AutoRun:    true,
@@ -271,6 +273,7 @@ func (r *scanRun) queueAutoInjections(g autoHostGroup, scanID int64, source stri
 				"max_points":              len(batch),
 				"wall_seconds":            wall,
 				"source":                  source,
+				"proxy":                   r.task.Proxy,
 			}
 			if source == "baseline" {
 				params["write_finding"] = r.task.CreateFindings
@@ -362,33 +365,20 @@ func autoProbeParams(pts []probePoint) []any {
 }
 
 func (r *scanRun) queueAutoWebshell(g autoHostGroup, scanID int64) (int64, bool) {
-	params := r.task.WebshellParams
-	uploadPath := strings.TrimSpace(stringParam(params, "upload_path"))
-	if uploadPath == "" {
-		r.logf("auto", "%s：已启用 Webshell 注入但未配置上传路径，跳过", g.target)
+	if r.shellQueued(g.target) {
+		r.logf("auto", "%s：该主机已排队过 Webshell 注入，跳过这次重复上传", g.target)
 		return 0, false
 	}
-	uploadURL := joinHostPath(g.target, uploadPath)
-	if uploadURL == "" {
-		r.logf("auto", "%s：无法拼接 Webshell 上传地址", g.target)
+	params, errMsg := r.webshellTaskParams(g.target, nil, "scan")
+	if errMsg != "" {
+		r.logf("auto", "%s：%s，跳过", g.target, errMsg)
 		return 0, false
-	}
-	landURL := ""
-	if landPath := strings.TrimSpace(stringParam(params, "land_path")); landPath != "" {
-		landURL = joinHostPath(g.target, landPath)
 	}
 	task, err := r.pg.CreateDeepTask(db.DeepTaskInput{
-		Name:   "自动 Webshell 注入 · " + g.target,
-		Kind:   db.DeepTaskWebshellInject,
-		Target: g.target,
-		Params: map[string]any{
-			"upload_url": uploadURL,
-			"land_url":   landURL,
-			"shell_type": displayOr(stringParam(params, "shell_type"), "php"),
-			"password":   stringParam(params, "password"),
-			"field_name": displayOr(stringParam(params, "field_name"), "file"),
-			"source":     "scan",
-		},
+		Name:       "自动 Webshell 注入 · " + g.target,
+		Kind:       db.DeepTaskWebshellInject,
+		Target:     g.target,
+		Params:     params,
 		ScanTaskID: &scanID,
 		AutoRun:    true,
 	})
@@ -396,6 +386,7 @@ func (r *scanRun) queueAutoWebshell(g autoHostGroup, scanID int64) (int64, bool)
 		r.logf("auto", "创建自动 Webshell 任务失败 %s: %v", g.target, err)
 		return 0, false
 	}
+	r.markShellQueued(g.target)
 	return task.ID, true
 }
 

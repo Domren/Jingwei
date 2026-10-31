@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/jingwei/db"
 	"github.com/Autumn-27/jingwei/scanner"
@@ -83,19 +84,19 @@ func (s *Server) prescanTask(ctx context.Context, t *Task) {
 	summary := prescanPersist(t, as, taskID, host, res, apps)
 
 	templates := prescanTemplates(s.m.PG(), res.Services, apps)
-	pocHits := 0
+	pocCandidates := 0
 	if len(templates) > 0 {
 		nrun := scanner.RunNuclei(ctx, templates, prescanNucleiTargets(res, targets, apps), scanner.NucleiOptions{
 			RateLimit: 100, Concurrency: 8, TimeoutSeconds: 120,
 		})
-		pocHits = prescanPersistHits(ctx, t, taskID, res, apps, nrun.Results)
+		pocCandidates = prescanPersistCandidates(ctx, t, nrun.Results)
 	}
 
-	summary["poc_hits"] = pocHits
+	summary["poc_candidates"] = pocCandidates
 	if origin, err := t.Store.OriginFactID(); err == nil && origin > 0 {
 		_, _ = t.Store.AddNode(db.KindFact, map[string]any{
-			"text": fmt.Sprintf("预扫完成：开放端口 %d、Web 服务 %d、应用系统 %d、POC 命中 %d",
-				summary["open_ports"], summary["services"], summary["app_systems"], pocHits),
+			"text": fmt.Sprintf("预扫完成：开放端口 %d、Web 服务 %d、应用系统 %d、POC 初筛候选 %d（未验证，需专项工具确认）",
+				summary["open_ports"], summary["services"], summary["app_systems"], pocCandidates),
 			"prescan": summary,
 		}, 5, "confirmed", "system", []int64{origin})
 	}
@@ -264,37 +265,67 @@ func prescanNucleiTargets(res *scanner.DiscoverResult, raw []scanner.Target, app
 	return out
 }
 
-// prescanPersistHits records nuclei POC hits as findings in the exploration graph
-// so the planner's list_findings can see them.
-func prescanPersistHits(ctx context.Context, t *Task, taskID int64, res *scanner.DiscoverResult, apps []scanner.AppSystem, results []scanner.NucleiResult) int {
+// prescanPersistCandidates records nuclei POC hits as exploration facts instead
+// of findings. A template hit only says a response looked interesting —
+// product-tagged POCs routinely match pages that merely load the product's
+// front-end assets — and the prescan has no specialized verifier, so promoting
+// a hit straight to a finding let a mismatched medium POC enter the confirmed
+// list with nothing but a curl command as evidence. A candidate keeps the raw
+// request/response (bounded) so the lead can be replayed; the planner upgrades
+// a lead through report_finding only after verification.
+func prescanPersistCandidates(ctx context.Context, t *Task, results []scanner.NucleiResult) int {
 	if t == nil || t.Store == nil {
 		return 0
 	}
 	count := 0
 	for _, r := range results {
+		req, resp := strings.TrimSpace(r.Request), strings.TrimSpace(r.Response)
+		if req == "" || resp == "" {
+			log.Printf("[prescan] task %s: POC %s 命中缺少原始请求/响应，按不可复现跳过", t.ID, r.TemplateID)
+			continue
+		}
 		sev := strings.ToLower(strings.TrimSpace(r.Severity))
 		if sev == "" {
 			sev = "info"
 		}
-		in := db.RecordFindingInput{
-			TaskID: taskID, ExplorationID: t.ExpID,
-			VulnClass:   "nuclei-" + r.TemplateID,
-			Name:        firstNonEmpty(r.Name, r.TemplateID),
-			Severity:    sev,
-			Summary:     fmt.Sprintf("POC 初筛命中：%s 于 %s", r.TemplateID, r.Host),
-			Evidence:    firstNonEmpty(r.Curl, r.MatchedAt),
-			Worker:      "prescan",
-			Protocol:    "http",
-			RawRequest:  r.Request,
-			RawResponse: r.Response,
+		name := firstNonEmpty(r.Name, r.TemplateID)
+		target := firstNonEmpty(r.MatchedAt, r.Host)
+		detail := fmt.Sprintf("模板：%s\n危险等级：%s\n命中：%s\n结论：POC 初筛命中，未经专项工具或人工验证；组件指纹命中不代表目标存在该漏洞。\n",
+			r.TemplateID, sev, target)
+		if len(r.Extracted) > 0 {
+			detail += "提取：\n- " + strings.Join(r.Extracted, "\n- ") + "\n"
 		}
-		if _, err := t.Store.RecordFinding(ctx, in); err != nil {
-			log.Printf("[prescan] task %s: 写入 POC 命中失败 %s: %v", t.ID, r.TemplateID, err)
+		detail += "\n原始请求：\n" + prescanClipPacket(req) + "\n\n原始响应：\n" + prescanClipPacket(resp)
+		if _, err := t.Store.AddNode(db.KindFact, map[string]any{
+			"summary":    fmt.Sprintf("POC 初筛候选（未验证）：%s 于 %s", name, target),
+			"detail":     detail,
+			"evidence":   fmt.Sprintf("nuclei 模板 %s 命中 %s（%s）", r.TemplateID, target, sev),
+			"confidence": "inferred",
+			"template":   r.TemplateID,
+			"severity":   sev,
+			"matched_at": target,
+		}, 5, "confirmed", "prescan", nil); err != nil {
+			log.Printf("[prescan] task %s: 写入 POC 候选失败 %s: %v", t.ID, r.TemplateID, err)
 			continue
 		}
 		count++
 	}
 	return count
+}
+
+// prescanClipPacket bounds one raw packet carried inside a candidate fact; the
+// full exchange can always be replayed from the target, and a fact is a lead,
+// not the evidence of record.
+func prescanClipPacket(s string) string {
+	const maxPrescanPacket = 16 << 10
+	if len(s) <= maxPrescanPacket {
+		return s
+	}
+	cut := maxPrescanPacket
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "\n…（已截断，可对目标复放）"
 }
 
 func firstNonEmpty(a, b string) string {

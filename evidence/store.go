@@ -255,14 +255,69 @@ func (s *Store) StageFindingsExport(ctx context.Context, findings []*db.DBFindin
 	})
 }
 
-func (s *Store) prepare(ctx context.Context, refs []db.TrafficRef) ([]db.PreparedTrafficEvidence, error) {
-	refs, err := db.NormalizeTrafficRefs(refs)
-	if err != nil {
-		return nil, err
+// rawPacket is the complete wire text of the exchange chosen to prove a
+// finding, captured while its bodies stream to the evidence store.
+type rawPacket struct {
+	Request  string
+	Response string
+}
+
+// maxCapturedPacketBody bounds the per-side body copied for the stored packet.
+// The full body still reaches the blob file through the tee; this copy only
+// feeds findings.http_request/http_response.
+const maxCapturedPacketBody = 128 << 10
+
+// cappedBuffer keeps the first limit bytes written and drops the rest without
+// failing the writer, so the streamed blob copy stays complete.
+type cappedBuffer struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if n := c.limit - c.buf.Len(); n > 0 {
+		if len(p) < n {
+			n = len(p)
+		}
+		c.buf.Write(p[:n])
 	}
-	out := make([]db.PreparedTrafficEvidence, 0, len(refs))
+	return len(p), nil
+}
+
+// primaryTrafficRef picks the binding that best proves the finding. Refs keep
+// the agent's reproduction order, so role rank (then that order) decides.
+func primaryTrafficRef(refs []db.TrafficRef) string {
+	rank := map[string]int{"proof": 0, "verification": 1, "supporting": 2, "baseline": 3}
+	best, bestRank := "", len(rank)
+	for _, ref := range refs {
+		r, ok := rank[ref.Role]
+		if !ok {
+			r = 2
+		}
+		if best == "" || r < bestRank {
+			best, bestRank = ref.TrafficID, r
+		}
+	}
+	return best
+}
+
+func joinRawPacket(head string, body []byte) string {
+	head = strings.TrimRight(strings.ReplaceAll(head, "\r\n", "\n"), "\n")
+	body = []byte(strings.ToValidUTF8(string(body), "\uFFFD"))
+	if head == "" && len(body) == 0 {
+		return ""
+	}
+	return head + "\r\n\r\n" + string(body)
+}
+
+func (s *Store) prepare(ctx context.Context, refs []db.TrafficRef) (out []db.PreparedTrafficEvidence, packet rawPacket, err error) {
+	refs, err = db.NormalizeTrafficRefs(refs)
+	if err != nil {
+		return nil, rawPacket{}, err
+	}
+	out = make([]db.PreparedTrafficEvidence, 0, len(refs))
 	if len(refs) == 0 {
-		return out, nil
+		return out, rawPacket{}, nil
 	}
 	ids := make([]string, len(refs))
 	byID := map[string]db.TrafficRef{}
@@ -270,12 +325,21 @@ func (s *Store) prepare(ctx context.Context, refs []db.TrafficRef) ([]db.Prepare
 		ids[i] = ref.TrafficID
 		byID[ref.TrafficID] = ref
 	}
+	primary := primaryTrafficRef(refs)
+	var primaryHead, primaryRespHead string
+	var reqBody, respBody cappedBuffer
+	reqBody.limit, respBody.limit = maxCapturedPacketBody, maxCapturedPacketBody
 	err = s.Traffic.ReadEvidence(ctx, ids, func(e traffic.EvidenceExchange) error {
-		rh, err := s.writeBody(e.Request, e.ReqLen, e.ReqHash)
+		reqSrc, respSrc := e.Request, e.Response
+		if e.ID == primary {
+			reqSrc = io.TeeReader(e.Request, &reqBody)
+			respSrc = io.TeeReader(e.Response, &respBody)
+		}
+		rh, err := s.writeBody(reqSrc, e.ReqLen, e.ReqHash)
 		if err != nil {
 			return err
 		}
-		ph, err := s.writeBody(e.Response, e.RespLen, e.RespHash)
+		ph, err := s.writeBody(respSrc, e.RespLen, e.RespHash)
 		if err != nil {
 			return err
 		}
@@ -285,10 +349,20 @@ func (s *Store) prepare(ctx context.Context, refs []db.TrafficRef) ([]db.Prepare
 		// downstream consumer (archive, API responses) all see the same text.
 		v = v.Normalize()
 		v.ID = db.TrafficSnapshotID(v)
+		if e.ID == primary {
+			primaryHead, primaryRespHead = v.ReqHead, v.RespHead
+		}
 		out = append(out, db.PreparedTrafficEvidence{Ref: byID[e.ID], Snapshot: v})
 		return nil
 	})
-	return out, err
+	if err != nil {
+		return nil, rawPacket{}, err
+	}
+	packet = rawPacket{
+		Request:  joinRawPacket(primaryHead, reqBody.buf.Bytes()),
+		Response: joinRawPacket(primaryRespHead, respBody.buf.Bytes()),
+	}
+	return out, packet, nil
 }
 
 func (s *Store) Record(ctx context.Context, in db.RecordFindingInput, refs []db.TrafficRef) (out *db.RecordedFinding, err error) {
@@ -296,9 +370,20 @@ func (s *Store) Record(ctx context.Context, in db.RecordFindingInput, refs []db.
 		if err := db.LockTaskEvidenceTx(tx, in.TaskID); err != nil {
 			return err
 		}
-		prepared, err := s.prepare(ctx, refs)
+		prepared, packet, err := s.prepare(ctx, refs)
 		if err != nil {
 			return err
+		}
+		// HTTP findings carry their proof as bound traffic; persist the decisive
+		// exchange's wire bytes so the detail page and report never have to say
+		// "no raw packet captured" while a binding exists.
+		if strings.TrimSpace(in.Protocol) == "" {
+			if strings.TrimSpace(in.RawRequest) == "" {
+				in.RawRequest = packet.Request
+			}
+			if strings.TrimSpace(in.RawResponse) == "" {
+				in.RawResponse = packet.Response
+			}
 		}
 		out, err = db.RecordFindingTx(ctx, tx, in, prepared)
 		return err
@@ -307,15 +392,17 @@ func (s *Store) Record(ctx context.Context, in db.RecordFindingInput, refs []db.
 		// 先落一份无 LLM 的确定性报告；报告 Agent 若启用，会在随后用更完整的
 		// 证据覆盖它。写入失败不影响漏洞本身。
 		auto := report.BuildFindingReport(report.FindingReportInput{
-			FindingID:   out.FindingID,
-			Name:        in.Name,
-			VulnClass:   in.VulnClass,
-			Severity:    in.Severity,
-			Status:      db.FindingPending,
-			Summary:     in.Summary,
-			Evidence:    in.Evidence,
-			Source:      "Agent 上报（" + in.Worker + "）",
-			GeneratedAt: time.Now(),
+			FindingID:    out.FindingID,
+			Name:         in.Name,
+			VulnClass:    in.VulnClass,
+			Severity:     in.Severity,
+			Status:       db.FindingPending,
+			Summary:      in.Summary,
+			Evidence:     in.Evidence,
+			Source:       "Agent 上报（" + in.Worker + "）",
+			HTTPRequest:  reportPacketText(in.RawRequest),
+			HTTPResponse: reportPacketText(in.RawResponse),
+			GeneratedAt:  time.Now(),
 		})
 		if reportErr := s.DB.SetFindingAutoReport(out.FindingID, auto); reportErr != nil {
 			log.Printf("[evidence] 生成自动报告失败 finding=%d: %v", out.FindingID, reportErr)
@@ -324,16 +411,25 @@ func (s *Store) Record(ctx context.Context, in db.RecordFindingInput, refs []db.
 	return
 }
 
+// reportPacketText makes a stored packet safe to embed in the markdown report.
+func reportPacketText(s string) string {
+	s = strings.ReplaceAll(s, "\x00", "")
+	return strings.ToValidUTF8(s, "\uFFFD")
+}
+
 func (s *Store) Bind(ctx context.Context, findingID int64, refs []db.TrafficRef) (out *db.FindingTraffic, err error) {
 	err = s.DB.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
 		if err := db.LockFindingEvidenceTx(tx, findingID, nil); err != nil {
 			return err
 		}
-		prepared, err := s.prepare(ctx, refs)
+		prepared, packet, err := s.prepare(ctx, refs)
 		if err != nil {
 			return err
 		}
 		if err = db.AddFindingTrafficTx(tx, findingID, prepared); err != nil {
+			return err
+		}
+		if _, err = db.FillFindingRawPacketsTx(tx, findingID, packet.Request, packet.Response); err != nil {
 			return err
 		}
 		out, err = db.FindingTrafficTx(tx, findingID)

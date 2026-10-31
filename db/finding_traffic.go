@@ -369,6 +369,26 @@ const (
 	maxRawPacketResponse = 128 << 10
 )
 
+// FillFindingRawPacketsTx stores captured wire packets on a finding that has
+// none yet. Bind-time traffic is often the first replayable capture a finding
+// gets, so the detail page and auto report can show it without a re-record.
+func FillFindingRawPacketsTx(tx *sql.Tx, findingID int64, request, response string) (bool, error) {
+	req := safePacketText(request, maxRawPacketRequest)
+	resp := safePacketText(response, maxRawPacketResponse)
+	if req == "" && resp == "" {
+		return false, nil
+	}
+	res, err := tx.Exec(`UPDATE findings SET
+		http_request  = CASE WHEN http_request  = '' THEN $2 ELSE http_request  END,
+		http_response = CASE WHEN http_response = '' THEN $3 ELSE http_response END
+		WHERE id=$1`, findingID, req, resp)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // safePacketText drops only the bytes a Postgres text column cannot store (NUL,
 // invalid UTF-8). Line terminators and trailing CRLF are kept because the saved
 // bytes must replay identically on the wire.

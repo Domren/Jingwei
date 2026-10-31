@@ -23,6 +23,7 @@ type ScanTask struct {
 	CreateFindings bool           `json:"create_findings"`
 	WebshellInject bool           `json:"webshell_inject"`
 	WebshellParams map[string]any `json:"webshell_params"`
+	Proxy          string         `json:"proxy"`
 	RateLimit      int            `json:"rate_limit"`
 	Concurrency    int            `json:"concurrency"`
 	TimeoutSeconds int            `json:"timeout_seconds"`
@@ -49,6 +50,7 @@ type ScanTaskInput struct {
 	CreateFindings bool           `json:"create_findings"`
 	WebshellInject bool           `json:"webshell_inject"`
 	WebshellParams map[string]any `json:"webshell_params"`
+	Proxy          string         `json:"proxy"`
 	RateLimit      int            `json:"rate_limit"`
 	Concurrency    int            `json:"concurrency"`
 	TimeoutSeconds int            `json:"timeout_seconds"`
@@ -86,7 +88,7 @@ type ScanTaskResult struct {
 }
 
 const scanTaskCols = `id, name, targets::text, mode, poc_ids::text, ports, min_severity,
-       fingerprint, create_findings, webshell_inject, webshell_params::text,
+       fingerprint, create_findings, webshell_inject, webshell_params::text, proxy,
        rate_limit, concurrency, timeout_seconds,
        status, stage, progress::text, summary::text, log, error,
        created_at, started_at, finished_at`
@@ -95,7 +97,7 @@ func scanOneScanTask(row interface{ Scan(...any) error }) (*ScanTask, error) {
 	var t ScanTask
 	var targetsRaw, pocRaw, webshellRaw, progressRaw, summaryRaw string
 	if err := row.Scan(&t.ID, &t.Name, &targetsRaw, &t.Mode, &pocRaw, &t.Ports, &t.MinSeverity,
-		&t.Fingerprint, &t.CreateFindings, &t.WebshellInject, &webshellRaw,
+		&t.Fingerprint, &t.CreateFindings, &t.WebshellInject, &webshellRaw, &t.Proxy,
 		&t.RateLimit, &t.Concurrency, &t.TimeoutSeconds,
 		&t.Status, &t.Stage, &progressRaw, &summaryRaw, &t.Log, &t.Error,
 		&t.CreatedAt, &t.StartedAt, &t.FinishedAt); err != nil {
@@ -161,13 +163,13 @@ func (d *DB) CreateScanTask(in ScanTaskInput) (*ScanTask, error) {
 	}
 	row := d.QueryRow(`
 INSERT INTO scan_tasks(name, targets, mode, poc_ids, ports, min_severity, fingerprint,
-                       create_findings, webshell_inject, webshell_params,
+                       create_findings, webshell_inject, webshell_params, proxy,
                        rate_limit, concurrency, timeout_seconds)
-VALUES ($1, $2::jsonb, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13)
+VALUES ($1, $2::jsonb, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14)
 RETURNING `+scanTaskCols,
 		strings.TrimSpace(in.Name), jsonStringArray(in.Targets), in.Mode, jsonInt64Array(in.POCIDs),
 		in.Ports, in.MinSeverity, in.Fingerprint, in.CreateFindings,
-		in.WebshellInject, jsonObject(in.WebshellParams),
+		in.WebshellInject, jsonObject(in.WebshellParams), strings.TrimSpace(in.Proxy),
 		in.RateLimit, in.Concurrency, in.TimeoutSeconds)
 	return scanOneScanTask(row)
 }
@@ -272,6 +274,16 @@ func (d *DB) FinishScanTask(id int64, status, stage, errMsg string, summary map[
 SET status=$2, stage=$3, error=$4, summary=$5::jsonb, finished_at=now()
 WHERE id=$1 AND status='running'`,
 		id, status, stage, errMsg, jsonObject(summary))
+	return err
+}
+
+// MergeScanTaskSummary adds fields to a finished scan's summary. Automatic
+// deep-dive results land after the scan itself is done, so the scan list would
+// otherwise keep showing the snapshot taken at completion.
+func (d *DB) MergeScanTaskSummary(id int64, fields map[string]any) error {
+	_, err := d.Exec(`UPDATE scan_tasks
+SET summary = COALESCE(summary, '{}'::jsonb) || $2::jsonb
+WHERE id=$1`, id, jsonObject(fields))
 	return err
 }
 
@@ -390,17 +402,21 @@ FROM scan_task_assets WHERE scan_task_id=$1 ORDER BY asset_type, asset_id LIMIT 
 	return out, rows.Err()
 }
 
-// AddScanTaskResult inserts a nuclei match; a duplicate returns id=0.
-func (d *DB) AddScanTaskResult(taskID int64, findingID int64, r ScanTaskResult) (int64, error) {
-	extracted := r.Extracted
-	if extracted == nil {
-		extracted = []string{}
+func scanTaskResultJSON(r ScanTaskResult) (extracted, raw string) {
+	if r.Extracted == nil {
+		r.Extracted = []string{}
 	}
-	extJSON, _ := json.Marshal(extracted)
+	extJSON, _ := json.Marshal(r.Extracted)
 	rawJSON, _ := json.Marshal(r.Raw)
 	if len(rawJSON) == 0 || string(rawJSON) == "null" {
 		rawJSON = []byte("{}")
 	}
+	return string(extJSON), string(rawJSON)
+}
+
+// AddScanTaskResult inserts a nuclei match; a duplicate returns id=0.
+func (d *DB) AddScanTaskResult(taskID int64, findingID int64, r ScanTaskResult) (int64, error) {
+	extracted, raw := scanTaskResultJSON(r)
 	var fid any
 	if findingID > 0 {
 		fid = findingID
@@ -411,11 +427,40 @@ INSERT INTO scan_task_results(scan_task_id, finding_id, template_id, name, sever
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb)
 ON CONFLICT (scan_task_id, template_id, matched_at) DO NOTHING
 RETURNING id`,
-		taskID, fid, r.TemplateID, r.Name, r.Severity, r.Host, r.MatchedAt, r.Type, r.Curl, string(extJSON), string(rawJSON)).Scan(&id)
+		taskID, fid, r.TemplateID, r.Name, r.Severity, r.Host, r.MatchedAt, r.Type, r.Curl, extracted, raw).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
 	return id, err
+}
+
+// LinkScanTaskResult binds a finding to the result row for the same template
+// and match location. A deep-dive task runs after the scan finished and often
+// proves an issue the POC pass could not (SQLi/XSS by sqlmap/dalfox), so the row
+// may not exist yet; in that case it is inserted. When the scan already stored
+// the same match without a finding, the finding is attached to that row instead
+// of creating a duplicate.
+func (d *DB) LinkScanTaskResult(taskID, findingID int64, r ScanTaskResult) error {
+	if taskID <= 0 || findingID <= 0 || strings.TrimSpace(r.TemplateID) == "" {
+		return nil
+	}
+	extracted, raw := scanTaskResultJSON(r)
+	_, err := d.Exec(`
+INSERT INTO scan_task_results(scan_task_id, finding_id, template_id, name, severity, host, matched_at, type, curl_command, extracted, raw)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb)
+ON CONFLICT (scan_task_id, template_id, matched_at) DO UPDATE
+SET finding_id = COALESCE(scan_task_results.finding_id, EXCLUDED.finding_id)`,
+		taskID, findingID, r.TemplateID, r.Name, r.Severity, r.Host, r.MatchedAt, r.Type, r.Curl, extracted, raw)
+	return err
+}
+
+// ScanTaskResultCounts reports how many results a scan has stored and how many
+// of them are bound to a finding. Deep-dive tasks append rows after the scan
+// finished, so the completion-time summary snapshot needs recomputing.
+func (d *DB) ScanTaskResultCounts(taskID int64) (results, findings int, err error) {
+	err = d.QueryRow(`SELECT count(*), count(*) FILTER (WHERE finding_id IS NOT NULL)
+FROM scan_task_results WHERE scan_task_id=$1`, taskID).Scan(&results, &findings)
+	return results, findings, err
 }
 
 // ListScanTaskResults returns matches newest-first with finding triage state.

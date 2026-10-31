@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -101,7 +102,8 @@ func (r *scanRun) runWeakPassBaseline(services []scanner.WebService, apps []scan
 	// 找不到表单页时退回「根 + 系统入口」候选（WebCrack 会自行判空跳过）。
 	formURLs := scanner.DiscoverLoginForms(r.ctx, services, apps, scanner.LoginFormOptions{
 		MaxPages: 120, Concurrency: 8, Timeout: 8 * time.Second,
-		Logf: func(format string, args ...any) { r.logf("weakpass", format, args...) },
+		Proxy: r.task.Proxy,
+		Logf:  func(format string, args ...any) { r.logf("weakpass", format, args...) },
 	})
 	if len(formURLs) > 0 {
 		forms := make([]weakPassCandidate, 0, len(formURLs))
@@ -139,6 +141,7 @@ func (r *scanRun) runWeakPassBaseline(services []scanner.WebService, apps []scan
 		PerURLSeconds: weakPassPerURLSeconds,
 		DelayMS:       weakPassDelayMS,
 		TimeoutSecond: len(urls)*weakPassPerURLSeconds + 30,
+		Proxy:         r.task.Proxy,
 	})
 	if run.Missing {
 		r.logf("weakpass", "webcrack 不可用：%v", run.Err)
@@ -158,7 +161,24 @@ func (r *scanRun) runWeakPassBaseline(services []scanner.WebService, apps []scan
 	}
 	summary["weak_pass_failed"] = failed
 
+	captchaTargets, captchaRetries, captchaFails := 0, 0, 0
+	for _, res := range run.Results {
+		if res.Captcha {
+			captchaTargets++
+		}
+		captchaRetries += res.CaptchaRetries
+		captchaFails += res.CaptchaOCRFails
+	}
+	if captchaTargets > 0 {
+		r.logf("weakpass", "%d 个候选带图片验证码：逐次 OCR 识别，换码重试 %d 次，识别失败 %d 次",
+			captchaTargets, captchaRetries, captchaFails)
+	}
+	summary["weak_pass_captcha"] = captchaTargets
+	summary["weak_captcha_retries"] = captchaRetries
+	summary["weak_captcha_ocr_failures"] = captchaFails
+
 	found := 0
+	shellTasks := 0
 	for _, res := range run.Results {
 		if !res.Found || r.ctx.Err() != nil {
 			continue
@@ -166,9 +186,20 @@ func (r *scanRun) runWeakPassBaseline(services []scanner.WebService, apps []scan
 		if r.recordWeakPass(res, assets) {
 			found++
 		}
+		cookie := res.Cookie
+		if cookie == "" {
+			// Older bridges do not hand over the jar; the final response's
+			// Set-Cookie headers are the remaining session material.
+			cookie = loginCookieFromResponse(res.Response)
+		}
+		if _, queued := r.queueWeakPassWebshell(res.URL, cookie); queued {
+			shellTasks++
+		}
 	}
 	summary["weak_pass_found"] = found
-	r.logf("weakpass", "弱口令基线完成：%d 个候选，%d 个确认凭据（耗时 %s）", len(urls), found, run.Elapsed.Round(time.Second))
+	summary["weak_shell_tasks"] = shellTasks
+	r.logf("weakpass", "弱口令基线完成：%d 个候选，%d 个确认凭据，%d 个 Webshell 注入任务（耗时 %s）",
+		len(urls), found, shellTasks, run.Elapsed.Round(time.Second))
 	return found
 }
 
@@ -187,6 +218,19 @@ func (r *scanRun) recordWeakPass(res scanner.WebCrackResult, assets *scanAssetIn
 	if u, err := url.Parse(res.URL); err == nil {
 		host = u.Host
 	}
+	// 凭据台账按裸主机去重；端口/协议从登录地址还原，便于内网按目标挑选复用。
+	credHost, credPort, credScheme := host, 0, "http"
+	if u, err := url.Parse(res.URL); err == nil {
+		if h := u.Hostname(); h != "" {
+			credHost = h
+		}
+		if p, err := strconv.Atoi(u.Port()); err == nil && p > 0 {
+			credPort = p
+		}
+		if u.Scheme != "" {
+			credScheme = u.Scheme
+		}
+	}
 	if minRank := severityRank(r.task.MinSeverity); minRank > 0 && severityRank(severity) < minRank {
 		return false
 	}
@@ -197,7 +241,16 @@ func (r *scanRun) recordWeakPass(res scanner.WebCrackResult, assets *scanAssetIn
 	fmt.Fprintf(&b, "验证通过的凭据: %s / %s\n", res.Username, res.Password)
 	fmt.Fprintf(&b, "检测类型: %s\n", kindLabel)
 	fmt.Fprintf(&b, "登录地址: %s\n", res.URL)
+	// The report is rebuilt from stored evidence on read; without these two
+	// lines the rebuilt report degrades to a bare request path ("/") because
+	// the Host row can only come from the evidence or a Host header.
+	fmt.Fprintf(&b, "匹配地址: %s\n", res.URL)
+	fmt.Fprintf(&b, "主机: %s\n", host)
 	fmt.Fprintf(&b, "尝试组合: %d 次 · 耗时 %dms\n", res.Attempts, res.ElapsedMS)
+	if res.Captcha {
+		fmt.Fprintf(&b, "验证码: 登录页带图片验证码，已逐次 OCR 识别并换码重试（重试 %d 次，识别失败 %d 次）\n",
+			res.CaptchaRetries, res.CaptchaOCRFails)
+	}
 	b.WriteString("判定方式: 失败响应长度基线对比 + 失败关键字黑名单 + 成功后二次复验（WebCrack 引擎）\n")
 	b.WriteString("风险说明: 登录接口存在可直接登入的凭据（或万能密码绕过），攻击者可获得后台业务权限。\n")
 	if len(res.Log) > 0 {
@@ -265,18 +318,31 @@ func (r *scanRun) recordWeakPass(res scanner.WebCrackResult, assets *scanAssetIn
 		Type:       "http",
 		Extracted:  []string{fmt.Sprintf("%s/%s", res.Username, res.Password)},
 		Raw: map[string]any{
-			"tool":       "webcrack",
-			"kind":       res.Kind,
-			"attempts":   res.Attempts,
-			"elapsed_ms": res.ElapsedMS,
-			"login_url":  res.URL,
-			"username":   res.Username,
-			"password":   res.Password,
-			"source":     "baseline",
+			"tool":                 "webcrack",
+			"kind":                 res.Kind,
+			"attempts":             res.Attempts,
+			"elapsed_ms":           res.ElapsedMS,
+			"login_url":            res.URL,
+			"username":             res.Username,
+			"password":             res.Password,
+			"source":               "baseline",
+			"captcha":              res.Captcha,
+			"captcha_retries":      res.CaptchaRetries,
+			"captcha_ocr_failures": res.CaptchaOCRFails,
 		},
 	}); err != nil {
 		r.logf("weakpass", "保存弱口令扫描结果失败 %s: %v", res.URL, err)
 		return findingID > 0
+	}
+	if cred, err := r.pg.UpsertIntranetCredential(db.IntranetCredentialInput{
+		Host: credHost, Port: credPort, Protocol: credScheme, URL: res.URL,
+		Username: res.Username, Password: res.Password, Source: "weakpass",
+		ScanTaskID: r.task.ID, FindingID: findingID,
+		Evidence: fmt.Sprintf("%s：WebCrack %s命中（自动化漏扫 #%d）", res.URL, kindLabel, r.task.ID),
+	}); err != nil {
+		r.logf("weakpass", "登记凭据台账失败 %s: %v", res.URL, err)
+	} else if cred != nil {
+		r.logf("weakpass", "凭据已登记 #%d（%s @ %s），内网横向可复用", cred.ID, cred.Username, credHost)
 	}
 	return findingID > 0
 }
@@ -343,6 +409,7 @@ func (r *scanRun) runInjectionBaseline(services []scanner.WebService, apps []sca
 		MaxPoints:   baselineHarvestPoints,
 		Concurrency: baselineConcurrency(r.task.Concurrency),
 		Timeout:     time.Duration(baselineHarvestSecs) * time.Second,
+		Proxy:       r.task.Proxy,
 		Logf:        func(format string, args ...any) { r.logf("baseline", format, args...) },
 	})
 	if r.ctx.Err() != nil {

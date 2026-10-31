@@ -39,19 +39,20 @@ type deepToolInput struct {
 	WaitSeconds int      `json:"wait_seconds"`
 	QueueOnly   bool     `json:"queue_only"`
 
-	URLs       []string `json:"urls"`
-	Params     []string `json:"params"`
-	Cookie     string   `json:"cookie"`
-	Headers    []string `json:"headers"`
-	MaxPoint   int      `json:"max_points"`
-	Level      int      `json:"level"`
-	Risk       int      `json:"risk"`
-	Techniques string   `json:"techniques"`
-	DBMS       string   `json:"dbms"`
-	Workers    int      `json:"workers"`
-	RateLimit  int      `json:"rate_limit"`
-	Stored     bool     `json:"stored"`
-	StoredURL  string   `json:"stored_url"`
+	URLs       []string          `json:"urls"`
+	Params     []string          `json:"params"`
+	Cookie     string            `json:"cookie"`
+	Headers    []string          `json:"headers"`
+	Extra      map[string]string `json:"extra"`
+	MaxPoint   int               `json:"max_points"`
+	Level      int               `json:"level"`
+	Risk       int               `json:"risk"`
+	Techniques string            `json:"techniques"`
+	DBMS       string            `json:"dbms"`
+	Workers    int               `json:"workers"`
+	RateLimit  int               `json:"rate_limit"`
+	Stored     bool              `json:"stored"`
+	StoredURL  string            `json:"stored_url"`
 	Points     []struct {
 		URL        string   `json:"url"`
 		Method     string   `json:"method"`
@@ -71,6 +72,7 @@ type deepToolInput struct {
 	ShellType string `json:"shell_type"`
 	Password  string `json:"password"`
 	FieldName string `json:"field_name"`
+	FileName  string `json:"file_name"`
 
 	TaskID int64 `json:"task_id"`
 }
@@ -213,12 +215,19 @@ func (s *Server) toolInjectWebshell() actool.CoreTool {
 	return wrTool("inject_webshell",
 		"向已授权目标的上传接口尝试投放 webshell，并在提供落地地址时验证存活；成功后会登记到 Webshell 管理。仅在明确授权且可控的测试环境使用。",
 		objSchema(map[string]any{
-			"upload_url":   strParam("上传接口完整 URL"),
-			"land_url":     strParam("webshell 落地 URL（可选，用于存活验证）"),
-			"target":       strParam("任务归属目标（可选，默认上传地址）"),
-			"shell_type":   strParam("php / jsp / aspx，默认 php"),
-			"password":     strParam("连接密码（可选，留空自动生成）"),
-			"field_name":   strParam("上传表单字段名，默认 file"),
+			"upload_url": strParam("上传接口完整 URL"),
+			"land_url":   strParam("webshell 落地 URL（可选，用于存活验证）"),
+			"target":     strParam("任务归属目标（可选，默认上传地址）"),
+			"shell_type": strParam("php / jsp / aspx，默认 php"),
+			"password":   strParam("连接密码（可选，留空自动生成）"),
+			"field_name": strParam("上传表单字段名，默认 file；留空时会从上传页自动探测 <input type=file> 的 name"),
+			"file_name":  strParam("上传文件名（可选，默认按 shell_type 生成，例如 shell.php；落地路径依赖文件名的题必须显式指定）"),
+			"extra": map[string]any{
+				"type":                 "object",
+				"additionalProperties": map[string]any{"type": "string"},
+				"description":          "额外表单字段（如 {\"submit\":\"Submit\"}）；上传页的 submit/hidden 字段会自动探测并携带，显式给出的键优先",
+			},
+			"headers":      strArrayParam("附加请求头，形如 Cookie: a=1（可选；探测上传页与上传请求都会带上）"),
 			"wait_seconds": map[string]any{"type": "integer", "description": "等待秒数，默认 120，最大 600"},
 		}, "upload_url"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
@@ -374,6 +383,15 @@ func (s *Server) runDeepTool(ctx context.Context, in json.RawMessage, kind strin
 		params["shell_type"] = shellType
 		params["password"] = password
 		params["field_name"] = displayOr(strings.TrimSpace(a.FieldName), "file")
+		if fileName := strings.TrimSpace(a.FileName); fileName != "" {
+			params["file_name"] = fileName
+		}
+		if extra := cleanExtraFields(a.Extra); len(extra) > 0 {
+			params["extra"] = extra
+		}
+		if hs := headerLinesToMap(a.Headers); len(hs) > 0 {
+			params["headers"] = hs
+		}
 	default:
 		return actool.Errorf("未知的深度任务类型"), nil
 	}
@@ -505,6 +523,45 @@ func cleanArgList(items []string, max int) []string {
 		if len(out) >= max {
 			break
 		}
+	}
+	return out
+}
+
+// cleanExtraFields keeps agent-supplied upload form fields bounded and sane:
+// empty names/control characters are dropped, and oversized values are cut so
+// one tool call cannot stuff megabytes into the multipart body.
+func cleanExtraFields(in map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range in {
+		k = strings.TrimSpace(k)
+		if k == "" || len(k) > 128 || strings.ContainsAny(k, "\r\n\x00") {
+			continue
+		}
+		if len(v) > 8<<10 {
+			v = v[:8<<10]
+		}
+		if strings.ContainsRune(v, 0) {
+			v = strings.ReplaceAll(v, "\x00", "")
+		}
+		out[k] = v
+		if len(out) >= 32 {
+			break
+		}
+	}
+	return out
+}
+
+// headerLinesToMap converts "Name: value" lines into the header map the
+// webshell-inject task expects (probe and upload share it).
+func headerLinesToMap(items []string) map[string]string {
+	out := map[string]string{}
+	for _, line := range cleanArgList(items, 16) {
+		name, value, ok := strings.Cut(line, ":")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			continue
+		}
+		out[name] = strings.TrimSpace(value)
 	}
 	return out
 }

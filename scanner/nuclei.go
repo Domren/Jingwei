@@ -31,6 +31,9 @@ type NucleiOptions struct {
 	RateLimit      int
 	Concurrency    int
 	TimeoutSeconds int
+	// Proxy routes every template request through the proxy (http/https or
+	// socks5), e.g. the SOCKS5 listener of an intranet tunnel.
+	Proxy string
 }
 
 // NucleiResult is one parsed nuclei JSONL match.
@@ -79,6 +82,9 @@ type NucleiRun struct {
 	// templates that left for them.
 	RawTargets   int
 	RawTemplates int
+	// HeadlessSkipped counts browser-driven templates dropped before the run;
+	// nuclei would exclude them anyway without -headless.
+	HeadlessSkipped int
 }
 
 // maxNucleiOutput caps the raw JSONL stdout retained per scan. 8 MiB was enough
@@ -123,18 +129,30 @@ var unsafeFilePart = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
 // RunNuclei writes templates/targets to a temp dir and runs nuclei with the same
 // safety flags used by the manual POC runner.
 func RunNuclei(ctx context.Context, templates []NucleiTemplate, targets []string, opts NucleiOptions) NucleiRun {
-	run := NucleiRun{TemplateCount: len(templates), TargetCount: len(targets), Results: []NucleiResult{}}
+	run := NucleiRun{Results: []NucleiResult{}}
 	if len(templates) == 0 {
 		run.Err = fmt.Errorf("没有可执行的 POC 模板")
+		return run
+	}
+	templates, run.HeadlessSkipped = RunnableTemplates(templates)
+	run.TemplateCount = len(templates)
+	if len(templates) == 0 {
+		run.Err = fmt.Errorf("所选 POC 均为 headless 浏览器模板，需安装浏览器并以 -headless 运行，已全部跳过")
 		return run
 	}
 	if len(targets) == 0 {
 		run.Err = fmt.Errorf("没有可扫描的目标")
 		return run
 	}
+	run.TargetCount = len(targets)
 	nuclei, err := exec.LookPath("nuclei")
 	if err != nil {
 		run.Err = fmt.Errorf("nuclei 未安装")
+		return run
+	}
+	proxy, err := NormalizeProxyURL(opts.Proxy)
+	if err != nil {
+		run.Err = err
 		return run
 	}
 	tmp, err := os.MkdirTemp("", "jingwei-scan-*")
@@ -171,7 +189,7 @@ func RunNuclei(ctx context.Context, templates []NucleiTemplate, targets []string
 	// requests keep the configured speed.
 	groups := buildNucleiGroups(templates, targets, conc, rate)
 	for _, g := range groups {
-		if strings.HasSuffix(g.dir, "chains") {
+		if strings.Contains(g.dir, "chains") {
 			run.Chains += len(g.templates)
 		} else {
 			run.Singles += len(g.templates)
@@ -214,6 +232,15 @@ func RunNuclei(ctx context.Context, templates []NucleiTemplate, targets []string
 			"-retries", "1",
 			"-store-resp", "-store-resp-dir", rrDir,
 		}
+		if proxy != "" {
+			args = append(args, "-proxy", proxy)
+		}
+		if g.dast {
+			// -dast switches nuclei's loader into fuzzing mode: only templates
+			// with a fuzzing section load, and without the flag they are excluded
+			// by default. Groups are split by kind so neither side is dropped.
+			args = append(args, "-dast")
+		}
 		cmd := exec.CommandContext(runCtx, nuclei, args...)
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 		if err := cmd.Run(); err != nil && run.Err == nil {
@@ -244,6 +271,7 @@ type nucleiGroup struct {
 	rateLimit   int
 	dir         string
 	raw         bool // non-HTTP-port targets probed with raw-protocol POCs only
+	dast        bool // fuzzing-engine group; nuclei must run with -dast
 }
 
 func minInt(a, b int) int {
@@ -254,10 +282,11 @@ func minInt(a, b int) int {
 }
 
 // buildNucleiGroups splits one scan into the nuclei invocations the engine
-// runs, on two axes. By statefulness (multi-request templates need capped
-// concurrency so they cannot clobber each other's server-side state), and by
-// target kind: a raw host:port that discovery did not fingerprint as HTTP is
-// probed only with raw-protocol POCs.
+// runs. By template kind, because legacy payload templates and fuzzing-engine
+// DAST templates load under opposite nuclei flags; by statefulness
+// (multi-request templates need capped concurrency so they cannot clobber each
+// other's server-side state); and by target kind: a raw host:port that
+// discovery did not fingerprint as HTTP is probed only with raw-protocol POCs.
 func buildNucleiGroups(templates []NucleiTemplate, targets []string, conc, rate int) []nucleiGroup {
 	webTargets, rawTargets := splitNucleiTargets(targets)
 	chainConc := conc
@@ -270,10 +299,10 @@ func buildNucleiGroups(templates []NucleiTemplate, targets []string, conc, rate 
 	for i, tpl := range templates {
 		classified[i] = analyzeTemplate(tpl.Content)
 	}
-	pickStateful := func(stateful bool) []NucleiTemplate {
+	pick := func(stateful, dast bool) []NucleiTemplate {
 		out := []NucleiTemplate{}
 		for i, tpl := range templates {
-			if classified[i].stateful == stateful {
+			if classified[i].stateful == stateful && classified[i].dast == dast {
 				out = append(out, tpl)
 			}
 		}
@@ -282,19 +311,31 @@ func buildNucleiGroups(templates []NucleiTemplate, targets []string, conc, rate 
 
 	var groups []nucleiGroup
 	if len(webTargets) > 0 {
-		if chains := pickStateful(true); len(chains) > 0 {
-			groups = append(groups, nucleiGroup{templates: chains, targets: webTargets,
-				concurrency: chainConc, rateLimit: chainRate, dir: "chains"})
-		}
-		if singles := pickStateful(false); len(singles) > 0 {
-			groups = append(groups, nucleiGroup{templates: singles, targets: webTargets,
-				concurrency: conc, rateLimit: rate, dir: "single"})
+		// Legacy payload templates and fuzzing-engine DAST templates cannot
+		// share one nuclei invocation: -dast makes the loader keep only the
+		// fuzzing templates, and without it the fuzzing ones are excluded.
+		for _, kind := range []struct {
+			dast    bool
+			chains  string
+			singles string
+		}{
+			{false, "chains", "single"},
+			{true, "dast-chains", "dast-single"},
+		} {
+			if chains := pick(true, kind.dast); len(chains) > 0 {
+				groups = append(groups, nucleiGroup{templates: chains, targets: webTargets,
+					concurrency: chainConc, rateLimit: chainRate, dir: kind.chains, dast: kind.dast})
+			}
+			if singles := pick(false, kind.dast); len(singles) > 0 {
+				groups = append(groups, nucleiGroup{templates: singles, targets: webTargets,
+					concurrency: conc, rateLimit: rate, dir: kind.singles, dast: kind.dast})
+			}
 		}
 	}
 	if len(rawTargets) > 0 {
 		var rawChains, rawSingles []NucleiTemplate
 		for i, tpl := range templates {
-			if !classified[i].rawOK {
+			if !classified[i].rawOK || classified[i].dast {
 				continue
 			}
 			if classified[i].stateful {
@@ -346,14 +387,21 @@ func isWebTarget(t string) bool {
 type templateClass struct {
 	stateful bool // keeps server-side state across its own requests
 	rawOK    bool // safe and meaningful against a non-HTTP port
+	dast     bool // fuzzing-engine template; only loads when nuclei runs with -dast
+	headless bool // browser-driven template; only loads when nuclei runs with -headless
 }
 
 // rawProtocolKeyRe / webOnlyProtocolRe classify templates whose YAML is too
 // malformed to parse: the raw set needs a raw-protocol section and must not
-// carry a protocol whose client would wrap the target in HTTP.
+// carry a protocol whose client would wrap the target in HTTP. fuzzingKeyRe
+// flags a fuzzing section the same way, so a malformed DAST template is still
+// routed to the -dast invocation. headlessKeyRe catches the browser protocol,
+// which is dropped before any run.
 var (
 	rawProtocolKeyRe  = regexp.MustCompile(`(?m)^(tcp|network|javascript|ssl|dns)\s*:`)
 	webOnlyProtocolRe = regexp.MustCompile(`(?m)^(http|headless|code|file|workflow)\s*:`)
+	fuzzingKeyRe      = regexp.MustCompile(`(?m)^\s*(?:-\s+)?fuzzing\s*:`)
+	headlessKeyRe     = regexp.MustCompile(`(?m)^headless\s*:`)
 )
 
 // analyzeTemplate reports whether a template keeps server-side state across
@@ -367,7 +415,8 @@ var (
 func analyzeTemplate(content string) templateClass {
 	var top map[string]yaml.Node
 	if err := yaml.Unmarshal([]byte(content), &top); err == nil {
-		tc := templateClass{rawOK: rawCapable(top)}
+		_, hasHeadless := top["headless"]
+		tc := templateClass{rawOK: rawCapable(top), dast: httpSectionFuzzing(top["http"]), headless: hasHeadless}
 		tc.stateful = httpSectionStateful(top["http"]) || inputsStateful(top["network"]) ||
 			inputsStateful(top["tcp"])
 		return tc
@@ -376,8 +425,57 @@ func analyzeTemplate(content string) templateClass {
 	return templateClass{
 		stateful: strings.Contains(lower, "cookie-reuse") || strings.Contains(lower, "req-condition") ||
 			strings.Count(lower, "http/1.") > 1,
-		rawOK: rawProtocolKeyRe.MatchString(content) && !webOnlyProtocolRe.MatchString(content),
+		rawOK:    rawProtocolKeyRe.MatchString(content) && !webOnlyProtocolRe.MatchString(content),
+		dast:     fuzzingKeyRe.MatchString(content),
+		headless: headlessKeyRe.MatchString(content),
 	}
+}
+
+// RunnableTemplates removes browser-driven templates. nuclei loads them only
+// with -headless, a mode that downloads Chromium at scan time when the image
+// lacks a browser, so they are reported instead of being handed to a run that
+// would end with "no templates provided for scan".
+func RunnableTemplates(templates []NucleiTemplate) (runnable []NucleiTemplate, headless int) {
+	runnable = make([]NucleiTemplate, 0, len(templates))
+	for _, tpl := range templates {
+		if analyzeTemplate(tpl.Content).headless {
+			headless++
+			continue
+		}
+		runnable = append(runnable, tpl)
+	}
+	return runnable, headless
+}
+
+// SplitDASTTemplates separates templates that need nuclei's fuzzing loader from
+// legacy payload templates. Both kinds are silently skipped when handed to the
+// wrong invocation: -dast loads only fuzzing templates, and without it they are
+// disabled as default.
+func SplitDASTTemplates(templates []NucleiTemplate) (legacy, dast []NucleiTemplate) {
+	for _, tpl := range templates {
+		if analyzeTemplate(tpl.Content).dast {
+			dast = append(dast, tpl)
+		} else {
+			legacy = append(legacy, tpl)
+		}
+	}
+	return legacy, dast
+}
+
+func httpSectionFuzzing(node yaml.Node) bool {
+	if node.Kind == 0 {
+		return false
+	}
+	var sections []map[string]any
+	if err := node.Decode(&sections); err != nil {
+		return false
+	}
+	for _, h := range sections {
+		if _, ok := h["fuzzing"]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func rawCapable(top map[string]yaml.Node) bool {

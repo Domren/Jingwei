@@ -250,6 +250,21 @@ func (d *DB) SetIntranetSessionTask(id, taskID int64) error {
 	return err
 }
 
+// SetIntranetSessionMetadata merges patch into the session metadata object.
+func (d *DB) SetIntranetSessionMetadata(id int64, patch map[string]any) (*IntranetSession, error) {
+	if id <= 0 {
+		return nil, errors.New("无效的会话 ID")
+	}
+	raw, err := json.Marshal(patch)
+	if err != nil {
+		return nil, err
+	}
+	return scanIntranetSession(d.QueryRow(`
+UPDATE intranet_sessions SET metadata = metadata || $2::jsonb
+WHERE id=$1
+RETURNING `+intranetSessionReturningCols+``, id, string(raw)))
+}
+
 func (d *DB) DeleteIntranetSession(id int64) (bool, error) {
 	res, err := d.Exec(`DELETE FROM intranet_sessions WHERE id=$1`, id)
 	if err != nil {
