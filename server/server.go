@@ -888,6 +888,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/commands", s.pgListCommands)
 	mux.HandleFunc("GET /api/commands/stats", s.pgToolStats) // 按工具聚合调用次数
 
+	// 通用滑块验证码求解（纯图像，扫描基线 / 深度利用 / agent 共用）
+	mux.HandleFunc("POST /api/captcha/slider", s.solveSliderCaptcha)
+
 	// POC 模板库（Jingwei 二开）
 	mux.HandleFunc("GET /api/pocs", s.pgListPOCs)
 	mux.HandleFunc("GET /api/pocs/stats", s.pgPOCStats)

@@ -24,6 +24,7 @@ func (s *Server) deepTools() []actool.CoreTool {
 		s.toolWAFBypass(),
 		s.toolInjectWebshell(),
 		s.toolGetDeepTask(),
+		s.toolSolveSliderCaptcha(),
 	}, append(s.intranetTools(), s.resourceTools()...)...)
 }
 
