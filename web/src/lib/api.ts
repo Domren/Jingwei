@@ -150,32 +150,42 @@ import type {
   WorkspaceListing,
 } from "@/lib/types";
 
-function getToken(): string | null {
-  if (typeof window === "undefined") return null;
-  return localStorage.getItem("jingwei_token");
+export type ApiInit = RequestInit & { skipAuthRedirect?: boolean };
+
+// 滑块验证码图片与几何信息。答案 (answerX) 只存在服务端，客户端提交拖动后的
+// 拼图左边缘像素坐标，由 /api/auth/login 一次性校验。
+export interface SliderCaptchaChallenge {
+  id: string;
+  background: string;
+  piece: string;
+  width: number;
+  height: number;
+  piece_x: number;
+  piece_y: number;
+  piece_size: number;
+  max_x: number;
+  expires_in: number;
 }
 
-export async function http<T>(path: string, init?: RequestInit): Promise<T> {
+export interface SliderCaptchaAnswer {
+  id: string;
+  x: number;
+}
+
+export async function http<T>(path: string, init?: ApiInit): Promise<T> {
   if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
-  const token = getToken();
+  const { skipAuthRedirect, ...fetchInit } = init ?? {};
+  // 会话凭据是 HttpOnly Cookie，浏览器自动携带；不再读取或注入 Bearer token。
   const r = await fetch(`/api${path}`, {
-    ...init,
+    ...fetchInit,
+    credentials: "same-origin",
     headers: {
-      ...(init?.body ? { "Content-Type": "application/json" } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(init?.headers as Record<string, string> | undefined),
+      ...(fetchInit.body ? { "Content-Type": "application/json" } : {}),
+      ...(fetchInit.headers as Record<string, string> | undefined),
     },
   });
-  if (r.status === 401) {
-    if (typeof window !== "undefined") {
-      localStorage.removeItem("jingwei_token");
-      document.cookie = "jingwei_token=; path=/; max-age=0";
-      window.location.href = "/login";
-    }
-    throw new Error("未授权");
-  }
   if (!r.ok) {
-    const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
+    const fallback = `${fetchInit.method ?? "GET"} ${path}: ${r.status}`;
     let message = fallback;
     try {
       const payload = (await r.json()) as { error?: unknown };
@@ -184,6 +194,11 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       }
     } catch {
       // Keep the status-based fallback for empty or non-JSON error responses.
+    }
+    // 认证端点自己处理 401（例如密码错误）；其余接口的 401 表示会话失效。
+    // 失效 cookie 已由服务端在响应中清除，整页跳转后 proxy 不会再弹回主界面。
+    if (r.status === 401 && !skipAuthRedirect && !path.startsWith("/auth/") && typeof window !== "undefined") {
+      window.location.replace("/login");
     }
     throw new Error(message);
   }
@@ -206,7 +221,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
 // to the Go backend on :8787, whose CORS is open.
 //
 // Override either default with NEXT_PUBLIC_SSE_BASE (set it to "" to force same-origin).
-// Token is appended as ?token= because SSE can't carry cookies cross-origin.
+// 浏览器会自动携带同站 Cookie；token 绝不放进 URL（会进入代理日志和浏览历史）。
 // mockReport returns a canned Markdown report for the demo.
 function mockReport(_task?: string): string {
   return `# Jingwei（精卫）渗透测试报告 — Acme Corp
@@ -236,9 +251,7 @@ export function sseUrl(path: string): string {
     (process.env.NODE_ENV !== "production" && typeof window !== "undefined"
       ? `${window.location.protocol}//${window.location.hostname}:8787`
       : "");
-  const token = getToken();
-  const sep = path.includes("?") ? "&" : "?";
-  return token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
+  return `${base}${path}`;
 }
 
 export function openSSE(path: string): EventSource {
@@ -250,9 +263,9 @@ export function openSSE(path: string): EventSource {
   return new EventSource(url, { withCredentials: local && target.hostname === window.location.hostname });
 }
 
-const get = <T>(p: string) => http<T>(p);
-const post = <T>(p: string, body?: unknown) =>
-  http<T>(p, { method: "POST", body: body ? JSON.stringify(body) : undefined });
+const get = <T>(p: string, init?: ApiInit) => http<T>(p, init);
+const post = <T>(p: string, body?: unknown, init?: ApiInit) =>
+  http<T>(p, { ...init, method: "POST", body: body ? JSON.stringify(body) : undefined });
 const put = <T>(p: string, body?: unknown) =>
   http<T>(p, { method: "PUT", body: body ? JSON.stringify(body) : undefined });
 const patch = <T>(p: string, body?: unknown) =>
@@ -326,8 +339,21 @@ export const api = {
 
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
-  login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
-  initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
+  authSession: () => get<{ authenticated: boolean; username: string }>("/auth/session", { skipAuthRedirect: true }),
+  authCaptcha: () => get<SliderCaptchaChallenge>("/auth/captcha"),
+  login: (password: string, captcha: SliderCaptchaAnswer) =>
+    post<{ ok: boolean }>(
+      "/auth/login",
+      { username: "Jingwei", password, captcha_id: captcha.id, captcha_x: captcha.x },
+      { skipAuthRedirect: true },
+    ),
+  initPassword: (password: string, captcha: SliderCaptchaAnswer) =>
+    post<{ ok: boolean }>(
+      "/auth/init",
+      { password, captcha_id: captcha.id, captcha_x: captcha.x },
+      { skipAuthRedirect: true },
+    ),
+  logout: () => post<{ ok: boolean }>("/auth/logout", {}, { skipAuthRedirect: true }),
   changePassword: (oldPassword: string, newPassword: string) =>
     post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
 
@@ -547,10 +573,8 @@ export const api = {
     if (MOCK) return { uploaded: files.length };
     const fd = new FormData();
     for (const f of files) fd.append("file", f);
-    const token = getToken();
     const r = await fetch(`/api/workspace/upload?path=${encodeURIComponent(dir)}`, {
       method: "POST",
-      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
     });
     if (!r.ok) throw new Error(`上传失败: ${r.status}`);
@@ -561,10 +585,7 @@ export const api = {
     if (MOCK) {
       blob = new Blob([`（demo）${path} 的下载内容示例。`], { type: "text/plain" });
     } else {
-      const token = getToken();
-      const r = await fetch(`/api/workspace/download?path=${encodeURIComponent(path)}`, {
-        headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-      });
+      const r = await fetch(`/api/workspace/download?path=${encodeURIComponent(path)}`);
       if (!r.ok) throw new Error(`下载失败: ${r.status}`);
       blob = await r.blob();
     }
@@ -731,10 +752,7 @@ export const api = {
     } else if (opts.scope === "filtered" && opts.filters) {
       for (const [k, v] of findingFilterParams(opts.filters)) p.set(k, v);
     }
-    const token = getToken();
-    const r = await fetch(`/api/exploration/findings/export?${p.toString()}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    });
+    const r = await fetch(`/api/exploration/findings/export?${p.toString()}`);
     if (!r.ok) throw new Error(`export: ${r.status}`);
     const blob = await r.blob();
     // 文件名优先取后端 Content-Disposition,取不到则用默认名。
@@ -806,10 +824,8 @@ export const api = {
     side: "request" | "response",
     contextTask?: string,
   ) => {
-    const token = getToken();
     const response = await fetch(
       `/api/exploration/findings/${id}/traffic/${bindingId}/body?side=${side}&download=1${contextTask ? `&context_task=${encodeURIComponent(contextTask)}` : ""}`,
-      { headers: token ? { Authorization: `Bearer ${token}` } : {} },
     );
     if (!response.ok) {
       const error = await response.json().catch(() => ({ error: "下载失败" }));
@@ -1090,10 +1106,7 @@ export const api = {
   notifyRetryDelivery: (id: number) => post<{ ok: boolean }>(`/notify/deliveries/${id}/retry`),
   report: async (task?: string) => {
     if (MOCK) return mockReport(task);
-    const token = getToken();
-    const r = await fetch(`/api/report${tq(task)}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    });
+    const r = await fetch(`/api/report${tq(task)}`);
     if (!r.ok) throw new Error(`report: ${r.status}`);
     return r.text();
   },
@@ -1118,10 +1131,8 @@ export const api = {
       };
     const fd = new FormData();
     for (const f of files) fd.append("file", f);
-    const token = getToken();
     const r = await fetch(`/api/chat/upload?scope=${scope}&id=${encodeURIComponent(id)}`, {
       method: "POST",
-      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
     });
     if (!r.ok) throw new Error(`上传失败: ${r.status} ${await r.text()}`);
@@ -1349,11 +1360,9 @@ export const api = {
     if (MOCK) return { name: file.name.replace(/\.zip$/i, ""), files: 1 };
     const fd = new FormData();
     fd.append("file", file);
-    const token = getToken();
     const r = await fetch(`/api/skills/upload${overwrite ? "?overwrite=true" : ""}`, {
       method: "POST",
       body: fd,
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(body?.error || `上传失败(${r.status})`);
@@ -1438,22 +1447,15 @@ export const api = {
   // ---- intercept tool-config (全局工具拦截范围) ----
   interceptGetToolConfig: async (): Promise<{ enabled_tools: string[] }> => {
     if (MOCK) return { enabled_tools: ["bash"] };
-    const token = getToken();
-    const r = await fetch("/api/intercept/tool-config", {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    });
+    const r = await fetch("/api/intercept/tool-config");
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   },
   interceptSetToolConfig: async (enabledTools: string[]): Promise<void> => {
     if (MOCK) return;
-    const token = getToken();
     const r = await fetch("/api/intercept/tool-config", {
       method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled_tools: enabledTools }),
     });
     if (!r.ok) throw new Error(await r.text());

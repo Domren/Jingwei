@@ -23,7 +23,7 @@ func TestTaskCategoryBatchRoute(t *testing.T) {
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
 	h := s.Handler()
-	token, err := signJWT(s.jwtKey)
+	token, err := testAuthToken(t, s)
 	if err != nil {
 		t.Fatalf("sign jwt: %v", err)
 	}

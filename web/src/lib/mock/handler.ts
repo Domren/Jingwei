@@ -1056,7 +1056,26 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
 
   // ── auth：让 demo 直接进主界面 ──
   if (path === "/auth/status") return { initialized: true };
-  if (path === "/auth/login" || path === "/auth/init") return { token: "mock-demo" };
+  if (path === "/auth/session") return { authenticated: true, username: "Jingwei" };
+  if (path === "/auth/captcha")
+    return {
+      id: "mock-captcha",
+      background: `data:image/svg+xml,${encodeURIComponent(
+        `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="160"><rect width="320" height="160" fill="#1e293b"/><circle cx="90" cy="60" r="46" fill="#334155"/><path d="M0 130 L120 70 L210 140 L320 80 V160 H0Z" fill="#475569"/><rect x="152" y="64" width="48" height="48" fill="#0f172a" opacity=".45" stroke="#e2e8f0" stroke-width="2"/></svg>`,
+      )}`,
+      piece: `data:image/svg+xml,${encodeURIComponent(
+        `<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48"><rect width="48" height="48" fill="#64748b"/><path d="M0 34 L24 10 L48 30 V48 H0Z" fill="#94a3b8"/></svg>`,
+      )}`,
+      width: 320,
+      height: 160,
+      piece_x: 0,
+      piece_y: 64,
+      piece_size: 48,
+      max_x: 272,
+      expires_in: 180,
+    };
+  if (path === "/auth/login" || path === "/auth/init") return { ok: true };
+  if (path === "/auth/logout") return { ok: true };
   if (path === "/auth/change-password") return { ok: true };
 
   // ── task cold archives ──

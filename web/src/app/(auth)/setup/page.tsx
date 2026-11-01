@@ -1,15 +1,15 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { useRouter } from "next/navigation";
 
 import { JingweiFooter } from "@/components/jingwei-footer";
+import { SliderCaptcha } from "@/components/slider-captcha";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { api } from "@/lib/api";
-import { auth } from "@/lib/auth";
+import { api, type SliderCaptchaChallenge } from "@/lib/api";
 
 export default function SetupPage() {
   const router = useRouter();
@@ -18,22 +18,50 @@ export default function SetupPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [checking, setChecking] = useState(true);
+  const [captcha, setCaptcha] = useState<SliderCaptchaChallenge | null>(null);
+  const [captchaX, setCaptchaX] = useState(0);
+  const [captchaMoved, setCaptchaMoved] = useState(false);
+  const [captchaLoading, setCaptchaLoading] = useState(false);
   // 查不到初始化状态时不能默认当成"未初始化"——那样会把初始化表单摆给一个
   // 其实已经设过密码的实例，用户照着填就会覆盖掉原密码。此时关闭入口。
   const [unavailable, setUnavailable] = useState(false);
 
+  const loadCaptcha = useCallback(async () => {
+    setCaptchaLoading(true);
+    setCaptchaMoved(false);
+    setCaptchaX(0);
+    try {
+      setCaptcha(await api.authCaptcha());
+    } catch (err) {
+      setCaptcha(null);
+      setError(err instanceof Error ? err.message : "验证码加载失败");
+    } finally {
+      setCaptchaLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
+    let cancelled = false;
     api
       .authStatus()
       .then(({ initialized }) => {
-        if (initialized) router.replace("/login");
+        if (initialized) {
+          router.replace("/login");
+          return;
+        }
+        void loadCaptcha();
       })
       .catch((err) => {
         setError(err instanceof Error ? err.message : "无法连接到后端服务");
         setUnavailable(true);
       })
-      .finally(() => setChecking(false));
-  }, [router]);
+      .finally(() => {
+        if (!cancelled) setChecking(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [router, loadCaptcha]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -45,14 +73,23 @@ export default function SetupPage() {
       setError("密码长度至少 8 位");
       return;
     }
+    if (!captcha) {
+      setError("验证码尚未加载，请刷新后重试");
+      return;
+    }
+    if (!captchaMoved) {
+      setError("请先拖动滑块完成验证");
+      return;
+    }
     setLoading(true);
     setError("");
     try {
-      const { token } = await api.initPassword(password);
-      auth.setToken(token);
-      router.replace("/function/tasks");
+      await api.initPassword(password, { id: captcha.id, x: captchaX });
+      window.location.replace("/function/tasks");
     } catch (err) {
       setError(err instanceof Error ? err.message : "初始化失败");
+      // 验证码是一次性的，提交后必须换一张。
+      await loadCaptcha();
     } finally {
       setLoading(false);
     }
@@ -117,8 +154,27 @@ export default function SetupPage() {
                     autoComplete="new-password"
                   />
                 </div>
+                <div className="space-y-1.5">
+                  <Label>安全验证</Label>
+                  <SliderCaptcha
+                    challenge={captcha}
+                    value={captchaX}
+                    onValueChange={setCaptchaX}
+                    onInteract={() => setCaptchaMoved(true)}
+                    onRefresh={() => {
+                      setError("");
+                      void loadCaptcha();
+                    }}
+                    disabled={loading}
+                    refreshing={captchaLoading}
+                  />
+                </div>
                 {error && <p className="text-sm text-destructive">{error}</p>}
-                <Button type="submit" className="w-full" disabled={loading || !password || !confirm}>
+                <Button
+                  type="submit"
+                  className="w-full"
+                  disabled={loading || !password || !confirm || !captcha || !captchaMoved}
+                >
                   {loading ? "保存中..." : "设置密码并登录"}
                 </Button>
               </form>

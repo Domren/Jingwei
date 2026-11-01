@@ -1,19 +1,19 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useRouter } from "next/navigation";
 
 import { AlertTriangle, ShieldCheck } from "lucide-react";
 
 import { JingweiFooter } from "@/components/jingwei-footer";
+import { SliderCaptcha } from "@/components/slider-captcha";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogClose, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { api } from "@/lib/api";
-import { auth } from "@/lib/auth";
+import { api, type SliderCaptchaChallenge } from "@/lib/api";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -24,7 +24,25 @@ export default function LoginPage() {
   const [agreed, setAgreed] = useState(false);
   const [termsOpen, setTermsOpen] = useState(false);
   const [readToEnd, setReadToEnd] = useState(false);
+  const [captcha, setCaptcha] = useState<SliderCaptchaChallenge | null>(null);
+  const [captchaX, setCaptchaX] = useState(0);
+  const [captchaMoved, setCaptchaMoved] = useState(false);
+  const [captchaLoading, setCaptchaLoading] = useState(false);
   const termsBodyRef = useRef<HTMLDivElement>(null);
+
+  const loadCaptcha = useCallback(async () => {
+    setCaptchaLoading(true);
+    setCaptchaMoved(false);
+    setCaptchaX(0);
+    try {
+      setCaptcha(await api.authCaptcha());
+    } catch (err) {
+      setCaptcha(null);
+      setError(err instanceof Error ? err.message : "验证码加载失败");
+    } finally {
+      setCaptchaLoading(false);
+    }
+  }, []);
 
   // 滚动到条款底部（含无需滚动即可完整展示的情况）方可点击「同意」。
   function handleTermsScroll() {
@@ -42,23 +60,35 @@ export default function LoginPage() {
   }, [termsOpen]);
 
   useEffect(() => {
-    // 已登录直接进主界面（静态导出下无 middleware 代劳这层跳转）。
-    const token = auth.getToken();
-    if (token) {
-      // localStorage 可能仍有凭据但 cookie 已丢失。先同步，再发起全新请求，
-      // 避免服务端守卫或路由缓存把跳转送回仍处于 checking 状态的登录页。
-      auth.setToken(token);
-      window.location.replace("/function/tasks");
-      return;
-    }
-    api
-      .authStatus()
-      .then(({ initialized }) => {
-        if (!initialized) router.replace("/setup");
-      })
-      .catch(() => setError("无法连接到后端服务"))
-      .finally(() => setChecking(false));
-  }, [router]);
+    let cancelled = false;
+    void (async () => {
+      // 已有有效会话（HttpOnly Cookie）时直接进入主界面。静态导出下没有
+      // 服务端中间件替我们做这层判断，只能问后端。
+      try {
+        await api.authSession();
+        if (!cancelled) window.location.replace("/function/tasks");
+        return;
+      } catch {
+        // 401 = 未登录；503 = 后端暂不可用，统一按未登录继续走初始化检查。
+      }
+      try {
+        const { initialized } = await api.authStatus();
+        if (cancelled) return;
+        if (!initialized) {
+          router.replace("/setup");
+          return;
+        }
+        await loadCaptcha();
+      } catch {
+        if (!cancelled) setError("无法连接到后端服务");
+      } finally {
+        if (!cancelled) setChecking(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [router, loadCaptcha]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -66,14 +96,23 @@ export default function LoginPage() {
       setError("请先阅读并同意《使用须知》");
       return;
     }
+    if (!captcha) {
+      setError("验证码尚未加载，请刷新后重试");
+      return;
+    }
+    if (!captchaMoved) {
+      setError("请先拖动滑块完成验证");
+      return;
+    }
     setLoading(true);
     setError("");
     try {
-      const { token } = await api.login("Jingwei", password);
-      auth.setToken(token);
+      await api.login(password, { id: captcha.id, x: captchaX });
       window.location.replace("/function/tasks");
-    } catch {
-      setError("用户名或密码错误");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "登录失败");
+      // 验证码是一次性的：无论密码是否错误，这次提交都已经消费了它。
+      await loadCaptcha();
     } finally {
       setLoading(false);
     }
@@ -125,6 +164,21 @@ export default function LoginPage() {
                   autoComplete="current-password"
                 />
               </div>
+              <div className="space-y-1.5">
+                <Label>安全验证</Label>
+                <SliderCaptcha
+                  challenge={captcha}
+                  value={captchaX}
+                  onValueChange={setCaptchaX}
+                  onInteract={() => setCaptchaMoved(true)}
+                  onRefresh={() => {
+                    setError("");
+                    void loadCaptcha();
+                  }}
+                  disabled={loading}
+                  refreshing={captchaLoading}
+                />
+              </div>
               <div className="flex items-start gap-2">
                 <Checkbox
                   id="agree-terms"
@@ -144,7 +198,11 @@ export default function LoginPage() {
                 </Label>
               </div>
               {error && <p className="text-sm text-destructive">{error}</p>}
-              <Button type="submit" className="w-full" disabled={loading || !password || !agreed}>
+              <Button
+                type="submit"
+                className="w-full"
+                disabled={loading || !password || !agreed || !captcha || !captchaMoved}
+              >
                 {loading ? "登录中..." : "登录"}
               </Button>
             </form>

@@ -1,6 +1,6 @@
-const TOKEN_KEY = "jingwei_token";
-const COOKIE_MAX_AGE = 7 * 24 * 60 * 60; // 7 天（秒）
-
+// 登录凭据只存在于服务器签发的 HttpOnly Cookie 中，JavaScript 无法读取，
+// 因此这里不再有 token 的读写接口。当前实例只有一个固定账户，用户信息
+// 用于侧栏展示，会话是否有效由 /api/auth/session 判定。
 export interface CurrentUser {
   id: string;
   name: string;
@@ -10,37 +10,30 @@ export interface CurrentUser {
   role: string;
 }
 
+const CURRENT_USER: CurrentUser = {
+  id: "1",
+  name: "Jingwei",
+  username: "jingwei",
+  email: "",
+  avatar: "",
+  role: "operator",
+};
+
 export const auth = {
-  getToken(): string | null {
-    if (typeof window === "undefined") return null;
-    // Mock demo：无真实登录，返回一个假 token 让路由守卫放行、直接进主界面。
-    return localStorage.getItem(TOKEN_KEY) ?? (process.env.NEXT_PUBLIC_MOCK === "1" ? "mock-demo" : null);
+  getCurrentUser(): CurrentUser {
+    return CURRENT_USER;
   },
 
-  setToken(token: string): void {
-    localStorage.setItem(TOKEN_KEY, token);
-    // 同步写 cookie，供 Next.js middleware 服务端读取
-    document.cookie = `${TOKEN_KEY}=${encodeURIComponent(token)}; path=/; max-age=${COOKIE_MAX_AGE}; SameSite=Lax`;
-  },
-
-  clearToken(): void {
-    localStorage.removeItem(TOKEN_KEY);
-    document.cookie = `${TOKEN_KEY}=; path=/; max-age=0`;
-  },
-
-  // 从 JWT payload 的 sub 字段解析当前用户，仅用于展示，不做签名验证。
-  getCurrentUser(): CurrentUser | null {
-    const token = this.getToken();
-    if (!token) return null;
+  async logout(): Promise<void> {
     try {
-      const parts = token.split(".");
-      if (parts.length !== 3) return null;
-      // base64url → base64
-      const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
-      const username: string = payload.sub ?? "Jingwei";
-      return { id: "1", name: username, username, email: "", avatar: "", role: "operator" };
+      await fetch("/api/auth/logout", {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+      });
     } catch {
-      return null;
+      // 网络故障时仍然跳转：proxy 会依据仍然存在的 cookie 把请求送回这里，
+      // 随后 session 校验失败的 401 会清除 cookie。
     }
   },
 };

@@ -2,6 +2,44 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.3.1] - 2026-11-01
+
+本版修复 1.3.0 自测发现的两项平台认证问题：登录入口缺少验证码、速率限制与请求超时；
+JWT 长期有效且无法撤销，并可通过 URL 查询参数传递、由前端存入 localStorage。修复后
+登录面具备一次性滑块验证码、按 IP 失败锁定与请求体/读取时限，会话改为可撤销的
+HttpOnly Cookie，修改密码会立即吊销全部旧会话。
+
+### 安全修复
+
+- **登录防护**：登录与首次初始化必须完成服务端生成的一次性滑块验证码；挑战绑定客户端
+  IP、3 分钟过期、单次使用、容差 ±6px，并按 IP 限制签发频率。
+- **失败锁定**：同一 IP 在 15 分钟内失败 5 次后锁定 15 分钟，返回 `429` 与
+  `Retry-After`；锁定期间不再校验密码或下发会话。
+- **请求边界**：认证接口请求体上限 16 KiB（超出返回 `413`），认证读取超时 10 秒；
+  HTTP 服务增加 `ReadHeaderTimeout` 10s、`ReadTimeout` 5m、`IdleTimeout` 2m、
+  `MaxHeaderBytes` 1 MiB（不设 `WriteTimeout`，避免截断 SSE）。
+- **会话可撤销**：JWT 增加 `ver` 声明并与数据库中的 token version 比对；token version
+  与密码哈希在同一事务中轮换，修改密码后所有旧会话立即失效，当前会话换发新 Cookie。
+  升级到 1.3.1 后，1.3.0 签发的无版本 token 全部失效。
+- **凭据不再暴露给 JavaScript**：会话 Cookie 为 `HttpOnly`、`SameSite=Strict`，
+  HTTPS 下带 `Secure`，有效期 24 小时；不再接受 `?token=`，前端不再把 JWT 写入
+  localStorage，SSE 通过同站 Cookie 鉴权。
+- 为兼容 CLI/自动化，继续接受 `Authorization: Bearer`，登录响应仍返回 token。
+
+### 新增
+
+- `/api/auth/session`、`/api/auth/logout`、`/api/auth/captcha` 端点。
+- 登录与初始化页面加入滑块验证码；失败后自动换图，支持手动刷新。
+- 侧栏退出登录改为调用服务端注销并清除 Cookie。
+- 修改密码提示更新为“其他设备会话立即失效”。
+
+### 兼容性
+
+- 从 1.3.0 升级后需要重新登录（旧 token 没有版本声明）。
+- HTTPS 反向代理需传递 `X-Forwarded-Proto: https`，否则不会设置 `Secure` Cookie；
+  HTTP 部署不受影响。
+- 登录锁定为进程内按 IP 计数，服务重启后清零；多副本部署不共享锁定状态。
+
 ## [1.3.0] - 2026-11-01
 
 本版把利用闭环从「单点验证」扩展到「横向、维持、撤离」：SQL 注入确认后做权限影响评估，

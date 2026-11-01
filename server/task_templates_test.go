@@ -23,7 +23,7 @@ func TestTaskTemplateHTTPCRUD(t *testing.T) {
 	t.Cleanup(func() { _ = m.Close() })
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
 	h := s.Handler()
-	token, err := signJWT(s.jwtKey)
+	token, err := testAuthToken(t, s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.pg.DeleteConversation(conversation.ID) })
-	token, err := signJWT(s.jwtKey)
+	token, err := testAuthToken(t, s)
 	if err != nil {
 		t.Fatal(err)
 	}

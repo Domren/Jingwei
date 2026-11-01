@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -38,6 +39,9 @@ func basicAuthTestServer(t *testing.T) (*Server, *basicAuthMemoryStore) {
 	t.Helper()
 	store := &basicAuthMemoryStore{}
 	s := &Server{jwtKey: []byte("test-only-signing-key-32-characters")}
+	// 该夹具没有数据库；给服务器一个固定版本，使 testAuthToken 能签发
+	// 会话 JWT，而不必走 ensureAuthTokenVersion 的数据库读取。
+	s.setAuthVersion("basic-auth-test-version")
 	if err := s.basicAuth.load(store); err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +240,10 @@ func TestBasicAuthGate(t *testing.T) {
 	if verifyJWT(cookie.Value, s.jwtKey) {
 		t.Fatal("gate cookie accepted as admin JWT")
 	}
-	adminJWT, _ := signJWT(s.jwtKey)
+	adminJWT, err := testAuthToken(t, s)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		name, path, user, pass, bearer string
 		cookie                         *http.Cookie
@@ -448,7 +455,7 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 	if err := s.basicAuth.load(m.pg); err != nil {
 		t.Fatal(err)
 	}
-	adminJWT, err := signJWT(s.jwtKey)
+	adminJWT, err := testAuthToken(t, s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +478,8 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 	if err := restarted.basicAuth.load(m.pg); err != nil {
 		t.Fatal(err)
 	}
-	loginBody := `{"username":"Jingwei","password":"admin-password"}`
+	captchaID, captchaX := issueTestCaptcha(t, restarted)
+	loginBody := fmt.Sprintf(`{"username":"Jingwei","password":"admin-password","captcha_id":%q,"captcha_x":%d}`, captchaID, captchaX)
 	r = httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(loginBody))
 	w = httptest.NewRecorder()
 	restarted.Handler().ServeHTTP(w, r)

@@ -43,7 +43,7 @@ func TestRemarksRoundTripPreservesExecutionState(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
-	token, err := signJWT(s.jwtKey)
+	token, err := testAuthToken(t, s)
 	if err != nil {
 		t.Fatal(err)
 	}

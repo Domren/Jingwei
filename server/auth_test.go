@@ -7,6 +7,40 @@ import (
 	"testing"
 )
 
+// testAuthToken mints a token with the current server-side version so handler
+// tests exercise the same revocation check as production.
+func testAuthToken(t *testing.T, s *Server) (string, error) {
+	t.Helper()
+	version, err := s.ensureAuthTokenVersion()
+	if err != nil {
+		return "", err
+	}
+	return signJWT(s.jwtKey, version)
+}
+
+// issueTestCaptcha asks the real handler for a puzzle and then reads the answer
+// out of the in-memory store. Tests need the solved coordinate; production
+// callers only ever receive the images.
+func issueTestCaptcha(t *testing.T, s *Server) (string, int) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	s.authCaptcha(rec, httptest.NewRequest("GET", "/api/auth/captcha", nil))
+	if rec.Code != 200 {
+		t.Fatalf("captcha: %d %s", rec.Code, rec.Body.String())
+	}
+	var resp sliderChallengeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	s.captchaStore.mu.Lock()
+	defer s.captchaStore.mu.Unlock()
+	c := s.captchaStore.items[resp.ID]
+	if c == nil {
+		t.Fatalf("captcha %s missing from store", resp.ID)
+	}
+	return resp.ID, c.answerX
+}
+
 // GetSetting 对"键不存在"和"读取出错"的返回值只差一个 error：两种情况 value 都是
 // 空串。密码相关的 handler 一旦把 error 当成"还没设置密码"，就会在数据库抖动期间
 // 敞开初始化入口——authInit 会放行一个未认证请求去覆盖已有的管理员密码，

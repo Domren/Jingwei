@@ -32,7 +32,7 @@ func TestUpdateSettingsHTTPPersistence(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s := New(ctx, m, dir, dir, dir)
-	token, err := signJWT(s.jwtKey)
+	token, err := testAuthToken(t, s)
 	if err != nil {
 		t.Fatal(err)
 	}

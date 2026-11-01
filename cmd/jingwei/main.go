@@ -116,9 +116,17 @@ func run() int {
 	log.Printf("[config] skill 目录: %s", skillDir)
 	srv := server.New(ctx, mgr, skillDir, *dataDir, config.BaseDir())
 	httpSrv := &http.Server{
-		Addr:              *addr,
-		Handler:           srv.Handler(),
+		Addr:    *addr,
+		Handler: srv.Handler(),
+		// Headers are slowloris-prone and cheap to bound; bodies also get an
+		// absolute cap so a client cannot hold a connection open forever. The
+		// auth handlers tighten this further to 10s for their tiny JSON bodies.
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute, // large multipart uploads still fit
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+		// No WriteTimeout: SSE log/update streams intentionally stay open for
+		// the lifetime of a page and must not be cut by a global deadline.
 	}
 
 	go func() {

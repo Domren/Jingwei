@@ -5,7 +5,7 @@ import * as React from "react";
 
 import { AppSidebar } from "@/app/(main)/_components/sidebar/app-sidebar";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
-import { auth } from "@/lib/auth";
+import { api } from "@/lib/api";
 import { getClientCookie } from "@/lib/cookie.client";
 import {
   SIDEBAR_COLLAPSIBLE_VALUES,
@@ -30,19 +30,25 @@ function readPref<T extends string>(key: string, allowed: readonly T[], fallback
 
 export default function Layout({ children }: Readonly<{ children: ReactNode }>) {
   // Client-side auth gate — replaces the Next proxy/middleware that static export
-  // disables. No token → bounce to /login; render nothing until confirmed so no
-  // protected UI (or its API calls) flashes for a logged-out visitor.
+  // disables. The session cookie is HttpOnly, so the only reliable check is
+  // /api/auth/session; nothing protected renders until it succeeds.
   const [authed, setAuthed] = React.useState(false);
   React.useEffect(() => {
-    if (auth.getToken()) {
-      setAuthed(true);
-    } else {
-      // 客户端守卫认为未登录时，必须同时清掉 cookie：否则 proxy.ts 仅凭
-      // “cookie 存在”就把我们从 /login 又重定向回主界面，与本守卫来回弹跳
-      // 形成无限重定向 → 白屏（cookie 与 localStorage 不一致时触发）。
-      auth.clearToken();
-      window.location.href = "/login";
-    }
+    let cancelled = false;
+    api
+      .authSession()
+      .then(() => {
+        if (!cancelled) setAuthed(true);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // 401 时后端已在响应里清除失效 cookie；整页跳转让 proxy 看到干净的
+        // cookie，不会再把 /login 弹回主界面。
+        window.location.replace("/login");
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const defaultOpen = typeof document === "undefined" ? true : getClientCookie("sidebar_state") !== "false";

@@ -52,6 +52,20 @@ type Server struct {
 	jwtKey    []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
 	basicAuth basicAuthGate
 
+	// Admin sessions are JWT + a server-side token version. The version is
+	// cached here because it is read on every authenticated request; password
+	// changes replace it in the database and the cache atomically enough for the
+	// single-process deployment model.
+	authVerMu sync.RWMutex
+	authVer   string
+
+	// Login throttling and one-shot slider challenges are process-local. A
+	// restart resets the counters, but every login attempt still needs a fresh
+	// captcha and the password itself remains the gate.
+	loginLimiter authLoginLimiter
+	captchaRate  authWindowLimiter
+	captchaStore sliderChallengeStore
+
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
 	// free slots off the same snapshot and over-promote past the limit.
@@ -167,6 +181,12 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if m.pg != nil {
 		if err := s.basicAuth.load(m.pg); err != nil {
 			log.Fatalf("[auth] load HTTP Basic Auth: %v", err)
+		}
+		// Generate the revocable token version at startup, not on the first
+		// authenticated request: an upgrade from 1.3.0 must invalidate legacy
+		// seven-day tokens immediately.
+		if _, err := s.ensureAuthTokenVersion(); err != nil {
+			log.Printf("[auth] 初始化会话版本失败（认证请求将返回 503）: %v", err)
 		}
 	}
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
@@ -707,6 +727,9 @@ func (s *Server) Handler() http.Handler {
 
 	// Auth routes — exempt from JWT check (handled in requireAuth)
 	mux.HandleFunc("GET /api/auth/status", s.authStatus)
+	mux.HandleFunc("GET /api/auth/captcha", s.authCaptcha)
+	mux.HandleFunc("GET /api/auth/session", s.authSession)
+	mux.HandleFunc("POST /api/auth/logout", s.authLogout)
 	mux.HandleFunc("POST /api/auth/init", s.authInit)
 	mux.HandleFunc("POST /api/auth/login", s.authLogin)
 	mux.HandleFunc("POST /api/auth/change-password", s.authChangePassword)
