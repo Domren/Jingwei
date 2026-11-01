@@ -52,6 +52,17 @@ type WebCrackResult struct {
 	Captcha         bool `json:"captcha"`
 	CaptchaRetries  int  `json:"captcha_retries"`
 	CaptchaOCRFails int  `json:"captcha_ocr_failures"`
+	// Slider reports that the login page carried a slider captcha and the pure
+	// HTTP engine solved it on every attempt. Kind is the matched protocol
+	// (aj-captcha or a profile name).
+	Slider              bool   `json:"slider"`
+	SliderKind          string `json:"slider_kind"`
+	SliderSolves        int    `json:"slider_solves"`
+	SliderRetries       int    `json:"slider_retries"`
+	SliderFailures      int    `json:"slider_failures"`
+	SliderLoginRetries  int    `json:"slider_login_retries"`
+	SliderLoginFailures int    `json:"slider_login_failures"`
+	SliderError         string `json:"slider_error"`
 }
 
 // WebCrackRun is the outcome of one bridge invocation.

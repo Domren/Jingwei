@@ -177,6 +177,24 @@ func (r *scanRun) runWeakPassBaseline(services []scanner.WebService, apps []scan
 	summary["weak_captcha_retries"] = captchaRetries
 	summary["weak_captcha_ocr_failures"] = captchaFails
 
+	sliderTargets, sliderSolves, sliderFails, sliderLoginFails := 0, 0, 0, 0
+	for _, res := range run.Results {
+		if res.Slider {
+			sliderTargets++
+		}
+		sliderSolves += res.SliderSolves
+		sliderFails += res.SliderFailures
+		sliderLoginFails += res.SliderLoginFailures
+	}
+	if sliderTargets > 0 {
+		r.logf("weakpass", "%d 个候选带滑块验证码：纯 HTTP 自动求解 %d 次，取图/校验失败 %d 次，登录端拒绝 %d 次",
+			sliderTargets, sliderSolves, sliderFails, sliderLoginFails)
+	}
+	summary["weak_pass_slider"] = sliderTargets
+	summary["weak_slider_solves"] = sliderSolves
+	summary["weak_slider_failures"] = sliderFails
+	summary["weak_slider_login_failures"] = sliderLoginFails
+
 	found := 0
 	shellTasks := 0
 	for _, res := range run.Results {
@@ -318,17 +336,22 @@ func (r *scanRun) recordWeakPass(res scanner.WebCrackResult, assets *scanAssetIn
 		Type:       "http",
 		Extracted:  []string{fmt.Sprintf("%s/%s", res.Username, res.Password)},
 		Raw: map[string]any{
-			"tool":                 "webcrack",
-			"kind":                 res.Kind,
-			"attempts":             res.Attempts,
-			"elapsed_ms":           res.ElapsedMS,
-			"login_url":            res.URL,
-			"username":             res.Username,
-			"password":             res.Password,
-			"source":               "baseline",
-			"captcha":              res.Captcha,
-			"captcha_retries":      res.CaptchaRetries,
-			"captcha_ocr_failures": res.CaptchaOCRFails,
+			"tool":                  "webcrack",
+			"kind":                  res.Kind,
+			"attempts":              res.Attempts,
+			"elapsed_ms":            res.ElapsedMS,
+			"login_url":             res.URL,
+			"username":              res.Username,
+			"password":              res.Password,
+			"source":                "baseline",
+			"captcha":               res.Captcha,
+			"captcha_retries":       res.CaptchaRetries,
+			"captcha_ocr_failures":  res.CaptchaOCRFails,
+			"slider":                res.Slider,
+			"slider_kind":           res.SliderKind,
+			"slider_solves":         res.SliderSolves,
+			"slider_failures":       res.SliderFailures,
+			"slider_login_failures": res.SliderLoginFailures,
 		},
 	}); err != nil {
 		r.logf("weakpass", "保存弱口令扫描结果失败 %s: %v", res.URL, err)

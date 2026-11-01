@@ -27,6 +27,7 @@ sys.path.insert(0, str(HERE))
 
 from src.utils.config import load_config
 from src.utils.logger import init_logger
+from src.core.slider_captcha import SLIDER_FAIL_MARKERS
 
 # A captcha rejection means the credential was never actually evaluated. The
 # engine solves a fresh image per attempt, so a rejected attempt is retried with
@@ -42,7 +43,7 @@ CAPTCHA_FAIL_MARKERS = (
 CAPTCHA_RETRY_LIMIT = 2
 
 
-def is_captcha_failure(res):
+def _body_matches(res, markers):
     if res is None:
         return False
     try:
@@ -50,7 +51,21 @@ def is_captcha_failure(res):
     except Exception:  # noqa: BLE001
         return False
     low = body.lower()
-    return any(marker.lower() in low for marker in CAPTCHA_FAIL_MARKERS)
+    return any(marker.lower() in low for marker in markers)
+
+
+def is_captcha_failure(res):
+    return _body_matches(res, CAPTCHA_FAIL_MARKERS)
+
+
+def is_slider_failure(res):
+    return _body_matches(res, SLIDER_FAIL_MARKERS)
+
+
+def is_verification_failure(res):
+    # Login-side captcha/slider rejection means the pair was never evaluated;
+    # retrying with a fresh challenge is the only honest outcome.
+    return is_captcha_failure(res) or is_slider_failure(res)
 
 
 def _silence_fd1():
@@ -139,6 +154,10 @@ def main():
     ap.add_argument("--proxy", default="", help="http/https/socks5 proxy URL")
     ap.add_argument("--pairs-stdin", default="",
                     help="'-' = read JSON [{user,password}] from stdin and test only those pairs")
+    ap.add_argument("--slider", choices=("auto", "off"), default="auto",
+                    help="auto = detect and solve AJ-Captcha/profiled sliders")
+    ap.add_argument("--slider-profile", default="", help="JSON profile for a custom slider protocol")
+    ap.add_argument("--slider-helper", default="", help="path to the jingwei binary with captcha-solve")
     args = ap.parse_args()
 
     out = {"tool": "webcrack", "results": [], "missing": False, "error": ""}
@@ -185,10 +204,16 @@ def main():
         # Captcha rejections must never pass the length heuristic: a recheck on
         # such a page can otherwise report a credential that was never tested.
         fail_words = list(cfg["brute_force"].get("fail_words") or [])
-        for marker in CAPTCHA_FAIL_MARKERS:
+        for marker in CAPTCHA_FAIL_MARKERS + SLIDER_FAIL_MARKERS:
             if marker not in fail_words:
                 fail_words.append(marker)
         cfg["brute_force"]["fail_words"] = fail_words
+        cfg["slider"] = dict(cfg.get("slider") or {})
+        cfg["slider"]["enabled"] = args.slider != "off"
+        if args.slider_profile:
+            cfg["slider"]["profile"] = args.slider_profile
+        if args.slider_helper:
+            cfg["slider"]["helper"] = args.slider_helper
         cfg["brute_force"]["delay"] = max(0.0, args.delay)
         cfg["brute_force"]["task_timeout"] = max(10, args.per_url_timeout)
         cfg["brute_force"]["requests_proxies"] = {"http": proxy, "https": proxy} if proxy else {}
@@ -203,7 +228,8 @@ def main():
             attempts = pairs if pairs else [None]
             task = None
             captured = []
-            captcha_state = {"detected": False, "retries": 0, "failures": 0}
+            captcha_state = {"detected": False, "retries": 0, "failures": 0,
+                             "slider_retries": 0, "slider_failures": 0}
 
             def wrapped(session, username, password, _task=None):
                 # _task is unused; the closure keeps one captured list per URL so
@@ -211,14 +237,19 @@ def main():
                 _orig = _wrapped_orig[0]
                 res = _orig(session, username, password)
                 retries = 0
-                # A rejected captcha leaves the credential untested; solve a new
-                # image and try the same pair again before judging the response.
-                while retries < CAPTCHA_RETRY_LIMIT and is_captcha_failure(res):
+                # A rejected captcha/slider leaves the credential untested; solve
+                # a fresh challenge and try the same pair again.
+                while retries < CAPTCHA_RETRY_LIMIT and is_verification_failure(res):
                     retries += 1
-                    captcha_state["retries"] += 1
+                    if is_captcha_failure(res):
+                        captcha_state["retries"] += 1
+                    else:
+                        captcha_state["slider_retries"] += 1
                     res = _orig(session, username, password)
                 if is_captcha_failure(res):
                     captcha_state["failures"] += 1
+                elif is_slider_failure(res):
+                    captcha_state["slider_failures"] += 1
                 captured.append((username, password, cookie_header(session), res))
                 return res
 
@@ -256,6 +287,14 @@ def main():
                     "request": "",
                     "response": "",
                     "error": "",
+                    "slider": False,
+                    "slider_kind": "",
+                    "slider_solves": 0,
+                    "slider_retries": 0,
+                    "slider_failures": 0,
+                    "slider_login_retries": 0,
+                    "slider_login_failures": 0,
+                    "slider_error": "",
                 }
                 if pair is not None:
                     entry["pair_user"] = pair[0]
@@ -265,6 +304,8 @@ def main():
                     captured.clear()
                     captcha_state["retries"] = 0
                     captcha_state["failures"] = 0
+                    captcha_state["slider_retries"] = 0
+                    captcha_state["slider_failures"] = 0
                 started = time.time()
 
                 buf = io.StringIO()
@@ -289,6 +330,7 @@ def main():
                     captcha_state["detected"] = bool(
                         getattr(parser, "captcha_input_name", "")
                         or getattr(parser, "captcha_img_url", ""))
+                slider_stats = task.slider_stats() if task is not None and hasattr(task, "slider_stats") else {}
                 found_res = None
                 for u, p, cookie, res in reversed(captured):
                     if u == user and p == pwd and getattr(res, "request", None) is not None:
@@ -297,11 +339,16 @@ def main():
                 if user and pwd:
                     # The engine's recheck only compares response lengths, so a
                     # captcha rejection can masquerade as a success. Reject the
-                    # pair when the decisive response is still a captcha failure.
-                    if found_res is not None and is_captcha_failure(found_res[1]):
-                        entry["error"] = (
-                            "验证码识别失败：最终响应仍为验证码错误，未确认凭据（换码重试 {} 次）"
-                            .format(captcha_state["retries"]))
+                    # pair when the decisive response is still a rejection.
+                    if found_res is not None and is_verification_failure(found_res[1]):
+                        if is_captcha_failure(found_res[1]):
+                            entry["error"] = (
+                                "验证码识别失败：最终响应仍为验证码错误，未确认凭据（换码重试 {} 次）"
+                                .format(captcha_state["retries"]))
+                        else:
+                            entry["error"] = (
+                                "滑块校验未通过：最终响应仍提示滑块/验证码错误，未确认凭据（换图重试 {} 次）"
+                                .format(captcha_state["slider_retries"]))
                     else:
                         entry.update(found=True, username=user, password=pwd,
                                      kind=getattr(task, "found_kind", "weak"))
@@ -312,12 +359,29 @@ def main():
                 entry["captcha"] = captcha_state["detected"]
                 entry["captcha_retries"] = captcha_state["retries"]
                 entry["captcha_ocr_failures"] = captcha_state["failures"]
+                entry["slider"] = bool(slider_stats.get("detected"))
+                entry["slider_kind"] = slider_stats.get("kind", "") or ""
+                entry["slider_solves"] = int(slider_stats.get("solves") or 0)
+                entry["slider_retries"] = int(slider_stats.get("retries") or 0)
+                entry["slider_failures"] = int(slider_stats.get("failures") or 0)
+                entry["slider_login_retries"] = captcha_state["slider_retries"]
+                entry["slider_login_failures"] = captcha_state["slider_failures"]
+                entry["slider_error"] = slider_stats.get("error", "") or ""
                 entry["attempts"] = len(captured)
                 if not entry["found"] and entry["attempts"] > 0 and \
                         captcha_state["failures"] >= entry["attempts"]:
                     entry["error"] = (
                         "验证码 OCR 识别失败：{} 次请求均被验证码拒绝（换码重试 {} 次），未能评估任何凭据"
                         .format(captcha_state["failures"], captcha_state["retries"]))
+                if not entry["found"] and entry["slider"]:
+                    if entry["slider_error"]:
+                        entry["error"] = "滑块验证码自动处理失败: {}".format(entry["slider_error"])
+                    elif captcha_state["slider_failures"] > 0:
+                        entry["error"] = (
+                            "滑块校验被登录端拒绝：{} 次尝试仍提示滑块/验证码错误（换图重试 {} 次），未能评估凭据"
+                            .format(captcha_state["slider_failures"], captcha_state["slider_retries"]))
+                    elif entry["attempts"] == 0:
+                        entry["error"] = "检测到滑块验证码，但未完成任何登录尝试"
                 entry["elapsed_ms"] = int((time.time() - started) * 1000)
                 log_lines = [re.sub(r"\s+", " ", ln).strip() for ln in buf.getvalue().splitlines()]
                 log_lines = [ln for ln in log_lines if ln][-6:]

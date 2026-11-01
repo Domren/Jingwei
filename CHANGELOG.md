@@ -2,7 +2,7 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [1.3.0] - 2026-10-31
+## [1.3.0] - 2026-11-01
 
 本版把利用闭环从「单点验证」扩展到「横向、维持、撤离」：SQL 注入确认后做权限影响评估，
 弱口令确认后可自动接力 Webshell 上传；内网新增侦察、凭据台账、SOCKS5 / 端口转发隧道与
@@ -28,6 +28,11 @@
   `LinkScanTaskResult` 绑定回父扫描，扫描汇总同步深挖确认数与发现数。
 - **WebCrack**：支持按 `user:password` 精确复用已确认凭据（经 stdin 传递，不出现在进程
   标题）；支持代理；识别验证码被拒并换图重试，分别统计重试与 OCR 失败次数。
+- **WebCrack 滑块自动化**：弱口令引擎内嵌纯 HTTP 滑块处理，自动识别 AJ-Captcha
+  blockPuzzle，逐次获取新挑战图并经 stdin 调用 `jingwei captcha-solve` 求解；用
+  AES-128-ECB 生成 `pointJson` 与 `captchaVerification` 注入登录表单，校验失败自动换图
+  重试。接口与图片限制在登录页同源；另支持 JSON profile 描述自定义滑块协议，极验/易盾
+  等商业协议明确报不支持，求解器缺失或版本过旧时给出可操作的诊断。
 - **通用滑块验证码**：新增 `captcha` 包与受 JWT 保护的 `POST /api/captcha/slider`，传入
   背景图与滑块图即可得到缺口坐标、拖动距离与置信度，可生成拟人拖动轨迹；纯 Go 图像匹配，
   不依赖浏览器或外部识别服务。LLM 通过 `solve_slider_captcha` 工具使用，弱口令、深度利用
@@ -52,6 +57,9 @@
   部署、验证、载荷执行与撤销全部通过，`crontab` 与文件确认清理。
 - 无 LLM 扫描 #11：nuclei 55 条模板分三组正常执行，基线枚举 `?id=1` 并排队 sqlmap，
   确认 boolean/error/time/UNION 注入与 DBA 权限，critical 发现回写扫描（结果 1 / 发现 1）。
+- WebCrack 滑块（本机 mock AJ-Captcha）：admin/123456 自动换图求解命中，证据请求含
+  `captchaVerification`，会话 Cookie 保留；错误口令未被误报为成功；求解器缺失与旧版
+  二进制分别给出明确错误。Python 17 项单测与 `go test -p 1 ./...` 全绿。
 
 ### 升级
 

@@ -84,6 +84,14 @@ def load_config():
             "captcha_input_name": "captcha",
             "captcha_img_name": "captcha_img"
         },
+
+        "slider": {
+            "enabled": True,
+            "helper": "",
+            "profile": "",
+            "max_tries": 3,
+            "x_scale": 1.0,
+        },
         
         "dictionary": {
             "base": {

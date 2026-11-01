@@ -23,6 +23,7 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 from ..utils.logger import Info, Error
+from .slider_captcha import build_slider_adapter, SliderError, UnsupportedSlider
 
 
 class PageParser:
@@ -54,6 +55,9 @@ class PageParser:
         self.captcha_input_name = ''  # 验证码输入框名称
         self.captcha_img_url = ''     # 验证码图片URL
         self.captcha_value = ''       # 验证码值(如果已识别)
+
+        # 滑块验证码（纯 HTTP 自动处理）
+        self.slider = None
     
     def run(self):
         """
@@ -66,7 +70,14 @@ class PageParser:
             self._get_response_content()
             self._parse_cms()
             self._parse_form()
-            
+
+            # 滑块与图片验证码相互独立：没有 ddddocr 时也要能处理滑块。
+            try:
+                self.slider = build_slider_adapter(self.url, self.response_content, self.config)
+            except SliderError as e:
+                Error(f"[-] 滑块适配器初始化失败: {e}")
+                self.slider = UnsupportedSlider(self.url, self.config, str(e))
+
             # 如果启用验证码且ddddocr可用，则处理验证码
             if self.config["captcha"]["enabled"]:
                 if DDDDOCR_AVAILABLE:

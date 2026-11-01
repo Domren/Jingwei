@@ -43,7 +43,7 @@ func jsonStr(s string) string {
 }
 
 func TestRunWebCrackStub(t *testing.T) {
-	result := `{"tool":"webcrack","results":[{"url":"http://127.0.0.1/login","found":true,"username":"admin","password":"123456","kind":"weak","cookie":"PHPSESSID=stub","attempts":58,"elapsed_ms":1600,"request":"POST /login HTTP/1.1\r\n\r\nusername=admin&password=123456&captcha=k76y","response":"HTTP/1.1 200 OK\r\n\r\nok","error":"","captcha":true,"captcha_retries":2,"captcha_ocr_failures":0}],"missing":false,"error":""}`
+	result := `{"tool":"webcrack","results":[{"url":"http://127.0.0.1/login","found":true,"username":"admin","password":"123456","kind":"weak","cookie":"PHPSESSID=stub","attempts":58,"elapsed_ms":1600,"request":"POST /login HTTP/1.1\r\n\r\nusername=admin&password=123456&captcha=k76y","response":"HTTP/1.1 200 OK\r\n\r\nok","error":"","captcha":true,"captcha_retries":2,"captcha_ocr_failures":0,"slider":true,"slider_kind":"aj-captcha","slider_solves":5,"slider_retries":1,"slider_failures":0,"slider_login_retries":1,"slider_login_failures":0,"slider_error":""}],"missing":false,"error":""}`
 	t.Setenv("JINGWEI_WEBCRACK_BRIDGE", writeStubBridge(t, result))
 
 	run := RunWebCrack(context.Background(), WebCrackOptions{
@@ -76,6 +76,11 @@ func TestRunWebCrackStub(t *testing.T) {
 	}
 	if !r.Captcha || r.CaptchaRetries != 2 || r.CaptchaOCRFails != 0 {
 		t.Fatalf("captcha metadata = %+v", r)
+	}
+	if !r.Slider || r.SliderKind != "aj-captcha" || r.SliderSolves != 5 ||
+		r.SliderRetries != 1 || r.SliderFailures != 0 ||
+		r.SliderLoginRetries != 1 || r.SliderLoginFailures != 0 || r.SliderError != "" {
+		t.Fatalf("slider metadata = %+v", r)
 	}
 }
 

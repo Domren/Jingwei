@@ -29,6 +29,7 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 from .page_parser import PageParser
+from .slider_captcha import SliderError
 from ..utils.dict_generator import generate_dictionary, generate_sql_injection_dict
 from ..utils.logger import Info, Error, Success, GREEN, RESET
 
@@ -136,7 +137,15 @@ class BruteForceTask:
                     future.cancel()
                     self._cleanup()
                     return (None, None)
+                except SliderError as e:
+                    Error(f"[-] 滑块验证码自动处理失败: {e}")
+                    self._cleanup()
+                    return (None, None)
 
+        except SliderError as e:
+            Error(f"[-] 滑块验证码自动处理失败: {e}")
+            self._cleanup()
+            return (None, None)
         except Exception as e:
             Error(f"{str(e)}")
             self._cleanup()
@@ -177,6 +186,16 @@ class BruteForceTask:
         if self.session:
             self.session.close()
             self.session = None
+
+    def slider_stats(self):
+        """返回滑块处理统计，桥接脚本据此区分「凭据错误」和「验证码未处理」。"""
+        slider = getattr(self.parser, "slider", None) if self.parser else None
+        if not slider:
+            return {
+                "detected": False, "kind": "", "solves": 0,
+                "retries": 0, "failures": 0, "error": "",
+            }
+        return slider.get_stats()
     
     def _brute_force_request(self, session, username, password):
         """
@@ -210,7 +229,11 @@ class BruteForceTask:
                     data[self.parser.captcha_input_name] = captcha_value
             except Exception as e:
                 Error(f"获取验证码失败: {str(e)}")
-        
+
+        # 滑块每次尝试都要重新取图/校验，验证结果通常一次性有效。
+        if self.parser.slider:
+            self.parser.slider.prepare(session, data)
+
         # 每200次请求更换一次User-Agent
         self.request_count += 1
         if self.request_count % self.ua_change_interval == 1:  # 第1, 201, 401...次请求时更换UA
@@ -349,6 +372,8 @@ class BruteForceTask:
             if error_length1 != error_length2:
                 raise Exception(f"[-] {self.url} 错误长度不为固定值")
             return error_length1
+        except SliderError:
+            raise
         except Exception as e:
             raise Exception(f"获取错误长度失败: {str(e)}")
     
@@ -434,6 +459,8 @@ class BruteForceTask:
                 
                 try:
                     res = self._brute_force_request(session, username, password)
+                except SliderError:
+                    raise
                 except Exception as e:
                     Error(f"发送请求失败: {str(e)}")
                     continue
@@ -529,6 +556,8 @@ class BruteForceTask:
             
             try:
                 res = self._brute_force_request(session, username, password)
+            except SliderError:
+                raise
             except Exception as e:
                 Error(f"发送请求失败: {str(e)}")
                 return None, None, False
@@ -587,6 +616,11 @@ class BruteForceTask:
                             if not f.done():
                                 f.cancel()
                         break
+                except SliderError:
+                    for f in future_to_credential:
+                        if not f.done():
+                            f.cancel()
+                    raise
                 except Exception as e:
                     Error(f"测试 {username}/{password} 时出错: {e}")
         

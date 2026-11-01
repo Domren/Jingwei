@@ -47,6 +47,12 @@ func main() {
 }
 
 func run() int {
+	// Local helper endpoint used by the vendored WebCrack bridge. It must be
+	// dispatched before flag parsing/banner output so its stdout stays JSON-only.
+	if len(os.Args) > 1 && os.Args[1] == "captcha-solve" {
+		return runCaptchaSolveCommand(os.Args[2:], os.Stdin, os.Stdout)
+	}
+
 	var (
 		addr    = flag.String("addr", ":8787", "HTTP listen address")
 		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
