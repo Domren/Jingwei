@@ -8,9 +8,8 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Docker](https://img.shields.io/badge/ghcr.io-domren%2Fjingwei-2496ED?logo=docker&logoColor=white)](https://github.com/Domren/Jingwei/pkgs/container/jingwei)
 
-> 本项目基于 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX) **v0.3.23** 二次开发，
-> 保留原始提交历史、版权声明与 AGPL-3.0 许可证；上游项目源自
-> [Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX)。
+> 本项目基于 **Autumn-27/ARTEX** 二次开发，保留原始提交历史、版权声明与 AGPL-3.0 许可证；
+> 上游现由 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX) 持续维护，完整署名见 [NOTICE](NOTICE)。
 
 </div>
 
@@ -344,8 +343,8 @@ docker build --network=host --build-arg TARGETARCH=amd64 \
   工具与 MCP/Skills 可在系统页扩展。
 - **流量**：内置 MITM 代理录制请求/响应，供发现证据与报告引用。
 
-更细的引擎生命周期、意图状态机与多轮规划说明见上游
-[ARTEX 文档](https://github.com/RuoJi6/ARTEX)。
+更细的引擎生命周期、意图状态机与多轮规划说明见上游 ARTEX 仓库
+（[RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)，即 Autumn-27/ARTEX 的持续维护版）。
 
 ## 发布流程
 
@@ -377,8 +376,8 @@ AGPL-3.0 开源；若修改后通过网络向用户提供服务，必须向这�
 
 本项目基于 ARTEX 二次开发：
 
-- 上游：[RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)（AGPL-3.0）
-- 上游源头：[Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX)
+- 上游作者与源头：**Autumn-27/ARTEX**（AGPL-3.0）
+- 现由 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX) 持续维护
 - Jingwei 新增与修改：Copyright (C) 2026 Jingwei contributors
 
 ### 允许使用范围

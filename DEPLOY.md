@@ -413,6 +413,7 @@ OpenAI 兼容服务通常需要同时设置 `JINGWEI_LLM_PROVIDER=openai`（或 
 
 ## 12. 许可
 
-Jingwei 基于 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX) 二次开发，
+Jingwei 基于 **Autumn-27/ARTEX** 二次开发（上游现由
+[RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX) 持续维护），
 采用 **AGPL-3.0** 许可证。完整条款见 [LICENSE](LICENSE)，上游版权与修改说明见
 [NOTICE](NOTICE)。通过网络向第三方提供本软件时，必须按 AGPL-3.0 公开对应源码。
