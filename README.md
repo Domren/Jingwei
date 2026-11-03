@@ -86,7 +86,9 @@
 - **密钥与静态数据**：签名根密钥改存数据库单行表，容器重建不再重新铸钥匙（升级既不用重新登录，
   也不用重投 webshell）；内网口令与模型 API 密钥按用途派生密钥密封入库，接口不再回显明文。
 - **修复**：等不到回包不再报成「shell 坏了」（九处传输错误不再被压平成字符串）；系统族探测没答时不再
-  被猜测永久钉死；同一内网会话改为轮次互斥；系统信息不再被一次根目录遍历拖死整面板。
+  被猜测永久钉死；同一内网会话改为轮次互斥；系统信息不再被一次根目录遍历拖死整面板；不带 `type` 的
+  资产查询不再被兜底成 `root_domain`（内网拓扑图此前对没有根域名的目标永远空白）。
+- **文档**：README 截图换成 Jingwei 自己的界面（演示数据 + 1.4.0 实机实例两组，共 20 张）。
 - **维持与撤离**：落地物台账增加指纹、TTL 与幂等判定；撤离支持 dry-run 预览、残留扫描、可选自动删壳，
   失败项保持可重试。
 - **工程**：测试并行隔离（每包独立 schema + 套件锁）、浏览器端到端脚本随仓库提供于 `tools/e2e/`、
@@ -170,25 +172,56 @@
 
 ## 截图
 
-| 仪表盘 | 任务列表 |
+> 标注「演示数据」的页面取自内置演示数据集（`NEXT_PUBLIC_MOCK=1`：域名 `acme.com`、地址为 RFC 5737
+> 文档保留段）；其余取自 1.4.0 实机实例，目标是本地 Docker 隔离靶机，地址均为内网段。
+
+### 平台与 LLM 协同（演示数据）
+
+| 仪表盘：Token 消耗、活动流、发现概览 | 任务列表：目标进度与漏洞分级 |
 | :---: | :---: |
 | ![仪表盘](screenshots/dashboard.png) | ![任务](screenshots/tasks.png) |
 
-| 任务执行过程 | 探索链路 |
+| 人在环路对话：注入 hint、旁路提问 | LLM 录制：逐轮请求与工具调用回放 |
 | :---: | :---: |
-| ![执行过程](screenshots/sessions.png) | ![探索链路](screenshots/graph.png) |
+| ![对话](screenshots/chat.png) | ![LLM 录制](screenshots/llm.png) |
 
-| 发现 | 资产 |
-| :---: | :---: |
-| ![发现](screenshots/findings.png) | ![资产](screenshots/assets.png) |
+### 无 LLM 扫描与可复现证据（实机）
 
-| 流量录制 | 人在环路对话 |
+| 自动化漏扫：端口探测 + 指纹 + POC 命中 | 发现：按任务与系统分组，可批量整理 |
 | :---: | :---: |
-| ![流量](screenshots/traffic.png) | ![对话](screenshots/chat.png) |
+| ![自动化漏扫](screenshots/scans.png) | ![发现](screenshots/findings.png) |
 
-| 拦截审批 | LLM 配置 |
+| POC 库：内置 1.3 万条 nuclei 模板 | 资产：企业 / IP / 子域 / 服务 / 应用 / 接口分层 |
 | :---: | :---: |
-| ![拦截](screenshots/intercept.png) | ![LLM](screenshots/llm.png) |
+| ![POC 库](screenshots/pocs.png) | ![资产](screenshots/assets.png) |
+
+### 流量、拦截与拓扑
+
+| 流量（演示数据）：全局录制代理 | 命令拦截（演示数据）：规则 + 模型兜底 |
+| :---: | :---: |
+| ![流量](screenshots/traffic.png) | ![拦截规则](screenshots/intercept.png) |
+
+| 内网拓扑（演示数据）：按资产类型分层 | 请求重发（实机）：原始报文重放，时钟块可左右拖拽 |
+| :---: | :---: |
+| ![内网拓扑](screenshots/topology.png) | ![请求重发](screenshots/repeater.png) |
+
+### 深度利用（实机）
+
+| WebShell 管理：存活检测与加密 v2 协议 | 工作台 · 虚拟终端：当前目录、退出码、耗时 |
+| :---: | :---: |
+| ![WebShell 管理](screenshots/webshells.png) | ![工作台终端](screenshots/workbench-terminal.png) |
+
+| 工作台 · 文件管理（大马） | 工作台 · 系统信息：一次往返采集 12 个分区 |
+| :---: | :---: |
+| ![文件管理](screenshots/workbench-files.png) | ![系统信息](screenshots/workbench-info.png) |
+
+| 内网渗透：会话 / 隧道 / 凭据 / 落地物 | 会话终端：与工作台共用同一组件 |
+| :---: | :---: |
+| ![内网渗透](screenshots/intranet-sessions.png) | ![内网会话终端](screenshots/intranet-terminal.png) |
+
+| 凭据台账：口令只写不读 | 受管资源与端口审计：到期自动回收 |
+| :---: | :---: |
+| ![凭据台账](screenshots/intranet-credentials.png) | ![受管资源](screenshots/resources.png) |
 
 ---
 
@@ -203,7 +236,7 @@
 ### 方式一：使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.2.2 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.4.0 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 # 编辑 .env：至少修改 POSTGRES_PASSWORD
@@ -215,8 +248,8 @@ docker compose up -d
 
 ```bash
 mkdir jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.2.2/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.2.2/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.4.0/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.4.0/deploy/.env.example
 # 编辑 .env 后启动
 docker compose pull
 docker compose up -d
@@ -230,7 +263,7 @@ docker compose up -d
 镜像发布在 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.2.2
+docker pull ghcr.io/domren/jingwei:1.4.0
 ```
 
 仓库维护者将 Package 设为公开后可直接拉取。若镜像仍为私有，请使用具备
@@ -248,7 +281,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u Domren --password-stdin
 | --- | :---: | --- |
 | `POSTGRES_PASSWORD` | 是 | 数据库密码，建议使用字母数字强随机值 |
 | `POSTGRES_USER` / `POSTGRES_DB` | 否 | 默认均为 `jingwei` |
-| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.2.2` |
+| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.4.0` |
 | `JINGWEI_WEB_PORT` | 否 | Web/API 宿主端口，默认 `9790` |
 | `JINGWEI_PROXY_PORT` | 否 | 流量代理宿主端口，默认 `9791`，仅绑定 `127.0.0.1` |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | 否 | 也可启动后在 UI 配置 |
@@ -323,11 +356,11 @@ cd web && npm ci && npm run build:static && cd ..
 # 2. 嵌入前端并编译 Linux 二进制
 rm -rf server/webui/dist && cp -r web/out server/webui/dist
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.2.2" -o dist/amd64/jingwei ./cmd/jingwei
+  -ldflags "-s -w -X main.version=1.4.0" -o dist/amd64/jingwei ./cmd/jingwei
 
 # 3. 构建运行镜像
 docker build --network=host --build-arg TARGETARCH=amd64 \
-  -t jingwei:1.2.2 .
+  -t jingwei:1.4.0 .
 ```
 
 本地开发运行后端与前端的方法见 [DEPLOY.md](DEPLOY.md#从源码开发)。

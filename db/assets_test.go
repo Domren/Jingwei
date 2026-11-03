@@ -574,6 +574,48 @@ func TestQueryByType(t *testing.T) {
 	}
 }
 
+// TestQueryByTypeEmptyReturnsAllTypes 钉住「不带 type 就是全量」这个契约：
+// 内网拓扑一次取一批资产再按类型分层，若空 type 被收窄成某一种类型，
+// 没有根域名的任务就永远画不出图，而调用方看不出差别。
+func TestQueryByTypeEmptyReturnsAllTypes(t *testing.T) {
+	d, av2, _ := testSetup(t)
+	t.Cleanup(func() { _ = d.Close() })
+
+	rid, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "alldomain.example.net"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deleteAsset(d, rid)
+	iid, err := av2.UpsertIP(UpsertIPReq{IP: "198.51.100.241"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deleteAsset(d, iid)
+
+	assets, err := av2.QueryByType("", 200, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[int64]string{}
+	for _, a := range assets {
+		seen[a.ID] = a.Type
+	}
+	if seen[rid] != "root_domain" {
+		t.Errorf("空 type 的全量查询漏掉了 root_domain %d（拿到 %q）", rid, seen[rid])
+	}
+	if seen[iid] != "ip" {
+		t.Errorf("空 type 的全量查询漏掉了 ip %d（拿到 %q）", iid, seen[iid])
+	}
+
+	total, err := av2.CountByType("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total < 2 {
+		t.Errorf("CountByType(\"\") = %d，应至少数到两条不同类型资产", total)
+	}
+}
+
 // TestDeleteByTaskID: 独有资产被删,与其他任务共享的资产仅解除关联(保留),host 反查正确。
 func TestDeleteByTaskID(t *testing.T) {
 	d, av2, _ := testSetup(t)

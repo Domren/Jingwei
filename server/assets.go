@@ -428,9 +428,8 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 				assets, err = as.QueryByTask(taskID, typ, limit, offset)
 			}
 		default:
-			if typ == "" {
-				typ = "root_domain"
-			}
+			// 不带 type 的全量视图（内网拓扑一次取 500 条分层渲染）不能被悄悄
+			// 收窄成 root_domain：那样只有恰好登记了根域名的任务才画得出图。
 			total, err = as.CountByType(typ)
 			if err == nil && offset < total {
 				assets, err = as.QueryByType(typ, limit, offset)

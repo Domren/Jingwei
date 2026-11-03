@@ -1076,7 +1076,9 @@ RETURNING id`,
 // Query helpers
 // =====================================================================
 
-// QueryByType returns assets rows of a given type, newest first.
+// QueryByType returns assets rows of a given type, newest first. An empty typ
+// means every type: callers that want the whole asset view (内网拓扑 needs 公司 →
+// 域名 → IP → 服务 → 端点 in one pass) must not be forced to invent a type filter.
 func (s *AssetStore) QueryByType(typ string, limit, offset int) ([]*Asset, error) {
 	if limit <= 0 {
 		limit = 50
@@ -1084,7 +1086,7 @@ func (s *AssetStore) QueryByType(typ string, limit, offset int) ([]*Asset, error
 	if offset < 0 {
 		offset = 0
 	}
-	rows, err := s.db.Query(`
+	q := `
 SELECT id, type, company_id, array_to_json(task_ids)::text,
        COALESCE(domain,''), COALESCE(root_domain,''), COALESCE(ip,''),
        COALESCE(c_segment::text,''), port,
@@ -1095,10 +1097,14 @@ SELECT id, type, company_id, array_to_json(task_ids)::text,
        COALESCE(favicon_mmh3,''), status_code, content_length,
        COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
        COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
-FROM assets
-WHERE type = $1
-ORDER BY last_seen DESC, id DESC
-LIMIT $2 OFFSET $3`, typ, limit, offset)
+FROM assets`
+	args := []any{}
+	if typ != "" {
+		args = append(args, typ)
+		q += fmt.Sprintf(` WHERE type = $%d`, len(args))
+	}
+	q += pageClause(&args, limit, offset)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1107,9 +1113,17 @@ LIMIT $2 OFFSET $3`, typ, limit, offset)
 }
 
 // CountByType returns the total number of assets of a type (for server-side pagination).
+// CountByType counts assets of a given type; an empty typ counts every type so
+// it stays consistent with QueryByType.
 func (s *AssetStore) CountByType(typ string) (int, error) {
+	q := `SELECT count(*) FROM assets`
+	args := []any{}
+	if typ != "" {
+		args = append(args, typ)
+		q += fmt.Sprintf(` WHERE type = $%d`, len(args))
+	}
 	var n int
-	err := s.db.QueryRow(`SELECT count(*) FROM assets WHERE type = $1`, typ).Scan(&n)
+	err := s.db.QueryRow(q, args...).Scan(&n)
 	return n, err
 }
 

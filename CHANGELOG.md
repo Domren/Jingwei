@@ -260,9 +260,25 @@
   （`normalizeListenHost` 把 `0.0.0.0`/`::`/`*`/空视为同一只通配 socket，`localhost`/`127.0.0.1`/`::1` 视为 loopback），
   不一致时调 `java_chains_services_restart` 换绑再重新发布，并在任务日志里写明换过绑；重启失败不谎报成功，
   改为按当前监听投递并提示「回连结果需人工核对」。新增 `scanner.JavaChainsClient.JNDIService`/`RestartJNDI` 承载这两个动作。
+- **不带 type 的资产查询被悄悄收窄成 root_domain，内网拓扑页因此画不出图**：`GET /api/assets` 在既没有 `company_id`
+  也没有 `task_id`、且 `type` 为空时把 `type` 兜底成 `root_domain`，存储层再按 `type = $1` 过滤。拓扑页正是用
+  `api.assets("", 500)` 一次取全量、再在前端按「公司 → 域名 → IP → 服务 → 端点」分层，于是只有登记过根域名的任务
+  才可能出图；纯 IP / 服务资产（内网段扫描、单 IP 靶站）永远显示「暂无资产」，而接口回的是 200 加空数组，
+  调用方看不出是被过滤还是真没有。现在空 `type` 在 `CountByType`/`QueryByType` 里就是不加类型条件，兜底删除。
+  新增 `TestQueryByTypeEmptyReturnsAllTypes` 钉住「同一次查询里 root_domain 与 ip 两种类型都要能拿到」。
 
 ### 验证
 
+- **内网拓扑修复的实机核对**：换上带修复的二进制后，同一实例的 `GET /api/assets?type=&limit=500` 从 `total 0`
+  变成 `total 13`（12 条 service + 1 条 ip），`type=service` 与 `type=root_domain` 的过滤结果不变；拓扑页从
+  「0 个节点 · 0 条关系」变成「3 个节点 · 12 条关系」。
+- **README 截图换成 Jingwei 自己的界面**：20 张图分两组采集——仪表盘/任务/对话/LLM 录制/流量/拦截/拓扑取自内置
+  演示数据（`NEXT_PUBLIC_MOCK=1`，域名 `acme.com`、地址为 RFC 5737 文档保留段），漏扫/发现/POC 库/资产/请求重发/
+  WebShell 工作台/内网渗透/受管资源取自 1.4.0 实机实例（本地隔离靶机，内网地址）。上游 ARTEX 的
+  `agents.png`/`logs.png`/`assets_test.png`/`sessions.png`/`graph.png` 一并删除。截图过程中发现两处不能用的画面，
+  都是「看文字断言发现不了、只有看图才看得见」：演示数据下发现页直接抛 `Cannot read properties of undefined`，
+  以及系统信息面板把宿主机名带到画面里——后者改用更矮的视口把该区块留在画面外，终端类截图也换成不含
+  `uname -n` 的命令。
 - **请求重发时钟块（本轮）**：`tools/e2e/verify-repeater-clock.js` 打真实实例 16 项全绿——到秒格式、每秒走字、
   位于「请求报文」上方、报文区整体下移、边框确实渲染出来、默认居中、页面上不再有左/中/右按钮与左右箭头、
   鼠标右拖 180px 落点准确、拖完偏移写进 localStorage、往两头的过头拖拽都夹在正文区内、刷新后位置不变且还能继续拖、
