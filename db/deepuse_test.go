@@ -363,6 +363,58 @@ func TestLinkScanTaskResultBindsDeepFinding(t *testing.T) {
 	}
 }
 
+func TestWebshellV2SecretLifecycle(t *testing.T) {
+	d := deepTestSetup(t)
+	t.Cleanup(func() { _ = d.Close() })
+
+	shell, err := d.CreateWebshell(WebshellInput{
+		Name:          "v2 shell",
+		URL:           "http://127.0.0.1:4/v2.php",
+		ShellType:     "php",
+		Protocol:      "v2",
+		Secret:        "v1:sealed-secret",
+		Carrier:       "X-Ab12Cd34Ef",
+		PayloadSHA256: "abc123",
+		KeyVersion:    1,
+		Target:        "http://127.0.0.1:4/",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM webshells WHERE id = $1`, shell.ID)
+
+	if shell.Protocol != "v2" || !shell.HasSecret || shell.HasPassword {
+		t.Fatalf("unexpected v2 shell flags: %+v", shell)
+	}
+	if shell.Carrier != "X-Ab12Cd34Ef" || shell.PayloadSHA256 != "abc123" || shell.KeyVersion != 1 {
+		t.Fatalf("v2 fields not persisted: %+v", shell)
+	}
+
+	// Empty password on update must not wipe a stored secret or protocol.
+	if err := d.UpdateWebshell(shell.ID, WebshellInput{Name: "改名", URL: shell.URL, ShellType: "php"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.GetWebshell(shell.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Protocol != "v2" || got.Secret != "v1:sealed-secret" || got.Carrier != shell.Carrier {
+		t.Fatalf("update touched server-managed fields: %+v", got)
+	}
+
+	if err := d.UpdateWebshellSecret(shell.ID, "v1:rotated", "jw_NewCarrier1", "def456", 2); err != nil {
+		t.Fatal(err)
+	}
+	got, err = d.GetWebshell(shell.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Secret != "v1:rotated" || got.Carrier != "jw_NewCarrier1" ||
+		got.PayloadSHA256 != "def456" || got.KeyVersion != 2 {
+		t.Fatalf("rotation not persisted: %+v", got)
+	}
+}
+
 func TestWebshellCRUD(t *testing.T) {
 	d := deepTestSetup(t)
 	t.Cleanup(func() { _ = d.Close() })

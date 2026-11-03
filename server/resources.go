@@ -56,6 +56,18 @@ func (m *resourceManager) loop(ctx context.Context) {
 	}
 }
 
+// forget drops the in-process cleanup closure of a resource whose ledger row was
+// already retired elsewhere. Without it, a later release() would run teardown for
+// a tunnel the platform already gave up on.
+func (m *resourceManager) forget(id int64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	delete(m.cleanup, id)
+	m.mu.Unlock()
+}
+
 // register persists a resource and remembers its in-process cleanup.
 func (m *resourceManager) register(in db.ManagedResourceInput, cleanup func(context.Context)) (*db.ManagedResource, error) {
 	if m == nil || m.s.m.pg == nil {
@@ -73,7 +85,7 @@ func (m *resourceManager) register(in db.ManagedResourceInput, cleanup func(cont
 	return res, nil
 }
 
-// release runs the cleanup and marks the resource released. DB release happens
+// release marks the resource released and runs its cleanup. DB release happens
 // even when cleanup fails, because the ledger must not keep lying about state.
 func (m *resourceManager) release(ctx context.Context, id int64, note string) (bool, error) {
 	if m == nil || m.s.m.pg == nil {
@@ -83,17 +95,51 @@ func (m *resourceManager) release(ctx context.Context, id int64, note string) (b
 	fn := m.cleanup[id]
 	delete(m.cleanup, id)
 	m.mu.Unlock()
-	if fn != nil {
-		fn(ctx)
-	}
 	res, found, err := m.s.m.pg.ReleaseManagedResource(id, note)
 	if err != nil || !found {
 		return found, err
 	}
+	m.runCleanup(ctx, res, fn)
 	if res.Kind == db.ManagedKindCallback {
 		m.maybeStopJNDI(ctx)
 	}
 	return true, nil
+}
+
+// runCleanup tears down what a resource row represents. The closure only lives
+// in this process, so after a restart every persisted resource looks releasable
+// while the thing it guards is still running; tunnels are the kind whose
+// teardown can be rebuilt from the row (metadata tunnel_id → session command),
+// and a leaked listener on the target is exactly what evacuation must not leave.
+func (m *resourceManager) runCleanup(ctx context.Context, res *db.ManagedResource, fn func(context.Context)) {
+	if fn != nil {
+		fn(ctx)
+		return
+	}
+	if res == nil || res.Kind != db.ManagedKindTunnel {
+		return
+	}
+	tid := metadataInt64(res.Metadata, "tunnel_id")
+	if tid <= 0 {
+		return
+	}
+	log.Printf("[resources] 资源 #%d 的内存清理回调已随重启丢失，按台账补做隧道 #%d 拆除", res.ID, tid)
+	m.s.intranetStopTunnel(ctx, tid, "受管资源释放：回调丢失，已按台账补做隧道拆除")
+}
+
+func metadataInt64(md map[string]any, key string) int64 {
+	switch v := md[key].(type) {
+	case float64:
+		return int64(v)
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case string:
+		n, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		return n
+	}
+	return 0
 }
 
 // releaseTask releases every resource owned by a task (used when a task ends or
@@ -131,9 +177,7 @@ func (m *resourceManager) reap(ctx context.Context) {
 		fn := m.cleanup[r.ID]
 		delete(m.cleanup, r.ID)
 		m.mu.Unlock()
-		if fn != nil {
-			fn(ctx)
-		}
+		m.runCleanup(ctx, r, fn)
 		log.Printf("[resources] 资源 #%d（%s %s）已过期回收", r.ID, r.Kind, r.Endpoint)
 	}
 	if len(rows) > 0 {
@@ -228,6 +272,63 @@ func (s *Server) releaseWebshellResource(id int64, note string) {
 	}
 	if err := s.m.pg.ReleaseManagedResourceByWebshell(id, note); err != nil {
 		log.Printf("[resources] 释放 webshell #%d 台账: %v", id, err)
+	}
+}
+
+// ---------------------------------------------------------------- 内存马台账
+
+func memshellTTL() time.Duration {
+	hours := 72
+	if raw := strings.TrimSpace(os.Getenv("JINGWEI_MEMSHELL_TTL_HOURS")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			hours = n
+		}
+	}
+	return time.Duration(hours) * time.Hour
+}
+
+func (s *Server) registerMemshellResource(ms *db.JavaMemshell) {
+	if s == nil || s.resourceMgr == nil || ms == nil {
+		return
+	}
+	endpoint := strings.TrimSpace(ms.URL)
+	if endpoint == "" {
+		return
+	}
+	meta := map[string]any{
+		"memshell_id": ms.ID,
+		"type":        ms.Type,
+		"name":        ms.Name,
+		"path":        ms.Path,
+		"port":        ms.Port,
+	}
+	if ms.WebshellID != nil {
+		meta["webshell_id"] = *ms.WebshellID
+	}
+	if ms.TaskID != nil {
+		meta["task_id"] = *ms.TaskID
+	}
+	if _, err := s.resourceMgr.register(db.ManagedResourceInput{
+		Kind:      db.ManagedKindMemshell,
+		Name:      displayOr(ms.Name, ms.Type+" 内存马"),
+		Endpoint:  endpoint,
+		Target:    ms.Target,
+		Owner:     "memshell:" + displayOr(ms.Type, "unknown"),
+		TaskID:    ms.TaskID,
+		ExpiresAt: ptrTime(time.Now().Add(memshellTTL())),
+		Metadata:  meta,
+		Note:      "内存马生命周期跟踪",
+	}, nil); err != nil {
+		log.Printf("[resources] 登记内存马 #%d: %v", ms.ID, err)
+	}
+}
+
+func (s *Server) releaseMemshellResource(id int64, note string) {
+	if s == nil || s.m == nil || s.m.pg == nil {
+		return
+	}
+	if err := s.m.pg.ReleaseManagedResourceByMemshell(id, note); err != nil {
+		log.Printf("[resources] 释放内存马 #%d 台账: %v", id, err)
 	}
 }
 

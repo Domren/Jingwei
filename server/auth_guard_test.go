@@ -13,7 +13,7 @@ import (
 )
 
 func TestGeneratedSliderPuzzleIsSolvable(t *testing.T) {
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 40; i++ {
 		puzzle, err := newSliderPuzzle("192.0.2.10")
 		if err != nil {
 			t.Fatal(err)
@@ -37,6 +37,29 @@ func TestGeneratedSliderPuzzleIsSolvable(t *testing.T) {
 		if delta > sliderTolerance {
 			t.Fatalf("puzzle %d: solver offset=%d want %d (confidence=%.2f)", i, res.Offset, puzzle.challenge.answerX, res.Confidence)
 		}
+	}
+}
+
+// TestRawSliderRenderAmbiguityRate measures how often a single drawing pass is
+// ambiguous before newSliderPuzzle redraws it. The retry loop is what keeps
+// TestGeneratedSliderPuzzleIsSolvable deterministic, so the raw rate is tracked
+// here instead: if drawing ever degrades toward mostly-unreadable, issuance
+// would burn all four solver runs per captcha and this test says so.
+func TestRawSliderRenderAmbiguityRate(t *testing.T) {
+	const rounds = 200
+	var missed int
+	for i := 0; i < rounds; i++ {
+		render, err := renderSliderPuzzle()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !sliderPuzzleSolvable(render) {
+			missed++
+		}
+	}
+	t.Logf("单次绘制歧义率 %d/%d", missed, rounds)
+	if float64(missed) > float64(rounds)*0.25 {
+		t.Fatalf("歧义率过高: %d/%d，签发一次验证码要重绘满 %d 次", missed, rounds, sliderPuzzleAttempts)
 	}
 }
 

@@ -64,3 +64,7 @@ Thumbs.db
 # 本地靶场验收证据（含目标地址/会话细节，仅保留在开发机）
 /evidence/local-linux-p3p4/
 /evidence/zkaq-d54f/
+
+# tools/e2e 的截图与本地依赖
+tools/e2e/shots/
+tools/e2e/node_modules/

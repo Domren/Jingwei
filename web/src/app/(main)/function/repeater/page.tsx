@@ -17,7 +17,17 @@ import { api } from "@/lib/api";
 // 请求重发：把改过的原始报文按字节发给目标，拿回原始响应。
 //
 // 版面刻意只留「报文 + 响应」两栏：重发是高频动作，多一个下拉就多一次犹豫。
+// 唯一的例外是报文上方那行时钟——判时间盲注、看限速窗口都要手边有个走秒的表；
+// 它是个带边框的整块，默认居中，按住可以左右拖到不挡字的地方，位置记在浏览器里。
 // 目标地址默认从请求行的 Host 头推出来，允许手改——同一个包换站重发是常态。
+
+const CLOCK_PREF_KEY = "jingwei.repeater.clock";
+
+/** 公历带秒的时刻，例：2026年11月03日 13:45:09。 */
+function formatCivilClock(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}年${pad(d.getMonth() + 1)}月${pad(d.getDate())}日 ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
 
 const SAMPLE = `GET / HTTP/1.1
 Host: example.com
@@ -88,6 +98,59 @@ export default function RepeaterPage() {
   const [viaProxy, setViaProxy] = React.useState(false);
   const [sending, setSending] = React.useState(false);
   const [result, setResult] = React.useState<SendResult | null>(null);
+
+  // 时钟走的是浏览器本地时间：先空着，挂载后才填，静态导出的首屏与服务端渲染不比对错。
+  const [clock, setClock] = React.useState<Date | null>(null);
+  // 位置只有一个数：相对正文区中心的水平偏移，0 就是居中，左右各拖到行边缘为止。
+  const [clockOffset, setClockOffset] = React.useState(0);
+  const clockDrag = React.useRef<{ startX: number; startOffset: number; room: number } | null>(null);
+
+  React.useEffect(() => {
+    const tick = () => setClock(new Date());
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  // 位置是偏好，存在浏览器里；读的时候容错，坏了或形状不对就当没存过。
+  React.useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(CLOCK_PREF_KEY) || "") as { offset?: number };
+      if (Number.isFinite(saved.offset)) {
+        setClockOffset(Math.max(-2000, Math.min(2000, Math.round(saved.offset as number))));
+      }
+    } catch {
+      // 没有存档或存档不是 JSON：用默认位置
+    }
+  }, []);
+
+  React.useEffect(() => {
+    localStorage.setItem(CLOCK_PREF_KEY, JSON.stringify({ offset: clockOffset }));
+  }, [clockOffset]);
+
+  const clampClockOffset = (px: number, room: number) => Math.max(-room, Math.min(room, px));
+
+  function onClockPointerDown(e: React.PointerEvent<HTMLSpanElement>) {
+    const row = e.currentTarget.parentElement;
+    if (!row) return;
+    const room = Math.max(0, row.getBoundingClientRect().width / 2 - e.currentTarget.getBoundingClientRect().width / 2);
+    clockDrag.current = { startX: e.clientX, startOffset: clockOffset, room };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }
+
+  function onClockPointerMove(e: React.PointerEvent<HTMLSpanElement>) {
+    const drag = clockDrag.current;
+    if (!drag) return;
+    setClockOffset(clampClockOffset(drag.startOffset + (e.clientX - drag.startX), drag.room));
+  }
+
+  function onClockPointerEnd(e: React.PointerEvent<HTMLSpanElement>) {
+    if (!clockDrag.current) return;
+    clockDrag.current = null;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+  }
 
   // 报文里的 Host 变了就同步目标地址——除非用户手动改过。
   const targetTouched = React.useRef(false);
@@ -191,7 +254,23 @@ export default function RepeaterPage() {
         </div>
       </div>
 
-      <div className="grid flex-1 gap-4 lg:grid-cols-2">
+      <div className="relative flex h-10 items-center">
+        {clock ? (
+          <span
+            className="absolute left-1/2 cursor-grab touch-none select-none rounded-md border bg-card/70 px-2.5 py-1 font-mono text-sm tabular-nums text-muted-foreground active:cursor-grabbing"
+            style={{ transform: `translate(calc(-50% + ${clockOffset}px), 0)` }}
+            title="按住左右拖动可挪位置"
+            onPointerDown={onClockPointerDown}
+            onPointerMove={onClockPointerMove}
+            onPointerUp={onClockPointerEnd}
+            onPointerCancel={onClockPointerEnd}
+          >
+            {formatCivilClock(clock)}
+          </span>
+        ) : null}
+      </div>
+
+      <div className="mt-3 grid flex-1 gap-4 lg:grid-cols-2">
         <Card className="flex min-h-[420px] flex-col">
           <CardHeader className="flex-row items-center justify-between gap-2">
             <CardTitle className="text-sm">请求报文</CardTitle>

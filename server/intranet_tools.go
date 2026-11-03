@@ -27,11 +27,13 @@ func (s *Server) intranetTools() []actool.CoreTool {
 		s.toolIntranetTunnel(),
 		s.toolIntranetRecon(),
 		s.toolIntranetCredentials(),
+		s.toolIntranetCredRegister(),
 		s.toolIntranetCredReuse(),
 		s.toolIntranetPersist(),
 		s.toolIntranetArtifacts(),
 		s.toolIntranetArtifactRegister(),
 		s.toolIntranetArtifactRevoke(),
+		s.toolPHPSemiPersist(),
 		s.toolIntranetEvacuate(),
 		s.toolIntranetRequestScope(),
 		s.toolIntranetHandoff(),
@@ -58,29 +60,25 @@ func intranetIntParam(desc string) map[string]any {
 
 func (s *Server) toolIntranetOpenSession() actool.CoreTool {
 	return wrTool("intranet_open_session",
-		"把一个已登记的 webshell 提升为可复用的内网会话（逻辑会话，不驻留进程；cwd 由平台维护）。打开时会探测目标 OS/用户/可用工具并记录到会话事件。后续用 intranet_exec/upload/download/batch_exec 在会话里操作。",
+		"打开一个可复用的内网会话（逻辑会话，不驻留进程；cwd 由平台维护）。默认 transport=webshell，把一个已登记的 webshell 提升为会话；内网主机只有 22 端口、没有 web 服务时用 transport=ssh，用凭据台账里的账号直接登录，凭据只在打开时读取、不复制进会话。两种 transport 打开时都会探测目标 OS/用户/可用工具并记录到会话事件，后续 intranet_exec/upload/download/batch_exec、权限维持与撤离台账都同样可用。SSH 目标必须先通过任务范围检查；只能经隧道接入时填 dial_host/dial_port（隧道监听地址），host 仍填它在内网段里的真实地址。",
 		objSchema(map[string]any{
-			"webshell_id": intranetIntParam("已登记的 webshell ID（必填）"),
-			"name":        strParam("会话名称（可选）"),
-			"host":        strParam("目标主机（可选，默认从 webshell 地址推断）"),
-			"cwd":         strParam("初始工作目录，默认 /"),
-			"task_id":     intranetIntParam("归属任务 ID（可选；任务运行中会自动带入当前任务）"),
-			"note":        strParam("备注（可选）"),
-		}, "webshell_id"),
+			"webshell_id":   intranetIntParam("已登记的 webshell ID（transport=webshell 时必填）"),
+			"transport":     strParam("webshell（默认）或 ssh"),
+			"credential_id": intranetIntParam("凭据台账 ID（transport=ssh 时必填；先用 intranet_cred_register 登记 ssh 账号口令）"),
+			"port":          intranetIntParam("SSH 端口，默认 22"),
+			"user":          strParam("SSH 登录账号（可选，默认取凭据里的 username）"),
+			"dial_host":     strParam("实际连接地址（可选，默认用 host；经端口转发隧道接入时填隧道监听地址）"),
+			"dial_port":     intranetIntParam("实际连接端口（可选，经隧道接入时填隧道监听端口）"),
+			"name":          strParam("会话名称（可选）"),
+			"host":          strParam("目标主机（webshell 会话可省略，默认从其地址推断；SSH 会话必填，写内网真实地址）"),
+			"cwd":           strParam("初始工作目录，默认 /"),
+			"task_id":       intranetIntParam("归属任务 ID（可选；任务运行中会自动带入当前任务）"),
+			"note":          strParam("备注（可选）"),
+		}),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
-			var a struct {
-				WebshellID int64  `json:"webshell_id"`
-				Name       string `json:"name"`
-				Host       string `json:"host"`
-				Cwd        string `json:"cwd"`
-				TaskID     int64  `json:"task_id"`
-				Note       string `json:"note"`
-			}
+			var a intranetSessionDTO
 			if err := json.Unmarshal(in, &a); err != nil {
 				return actool.Errorf("参数格式错误"), nil
-			}
-			if a.WebshellID <= 0 {
-				return actool.Errorf("webshell_id 必填"), nil
 			}
 			pg, err := s.intranetToolPG()
 			if err != nil {
@@ -88,6 +86,26 @@ func (s *Server) toolIntranetOpenSession() actool.CoreTool {
 			}
 			if a.TaskID <= 0 {
 				a.TaskID = intranetCtxTaskID(ctx)
+			}
+			if db.NormalizeIntranetTransport(a.Transport) == db.IntranetTransportSSH {
+				sess, info, serr := s.intranetOpenSSHSession(ctx, pg, intranetSSHSessionRequest{
+					Name: a.Name, TaskID: a.TaskID, Host: a.Host, Port: a.Port,
+					User: a.User, CredentialID: a.CredentialID,
+					DialHost: a.DialHost, DialPort: a.DialPort,
+					Cwd: a.Cwd, Note: a.Note,
+				})
+				out := map[string]any{"probe": info}
+				if sess != nil {
+					out["session"] = sess
+				}
+				if serr != nil {
+					out["error"] = serr.Error()
+					return jsonResult(out)
+				}
+				return jsonResult(out)
+			}
+			if a.WebshellID <= 0 {
+				return actool.Errorf("webshell_id 必填（SSH 会话请传 transport=ssh 与 credential_id）"), nil
 			}
 			sess, info, err := s.intranetOpenSession(ctx, pg, a.WebshellID, a.TaskID, a.Name, a.Host, a.Cwd, a.Note)
 			if err != nil {
@@ -131,7 +149,11 @@ func (s *Server) toolIntranetExec() actool.CoreTool {
 				timeout = intranetExecTimeout
 			}
 			out := s.intranetExec(ctx, pg, sess, a.Command, timeout)
-			return jsonResult(map[string]any{"session_id": sess.ID, "cwd": out.Cwd, "output": out.Output, "exit_code": out.ExitCode, "is_error": out.IsError, "note": out.Note})
+			// timed_out / marker_ok are what let a worker tell "this command never
+			// returns" apart from "this shell is dead" — without them a stopped
+			// wait reads as a transport failure and the next tool call gives up on
+			// a session that is still working.
+			return jsonResult(map[string]any{"session_id": sess.ID, "cwd": out.Cwd, "output": out.Output, "exit_code": out.ExitCode, "is_error": out.IsError, "timed_out": out.TimedOut, "marker_ok": out.MarkerOK, "note": out.Note})
 		})
 }
 
@@ -263,7 +285,7 @@ func (s *Server) toolIntranetBatchExec() actool.CoreTool {
 
 func (s *Server) toolIntranetTunnel() actool.CoreTool {
 	return wrTool("intranet_tunnel",
-		"内网隧道生命周期（两阶段）：action=create 先登记计划（socks5/port_forward/reverse_forward），probe 探测目标环境，plan 生成部署命令（端口转发需要目标有 socat，否则要手写 deploy_command；chisel/ssh 需要平台已配置 JINGWEI_PIVOT_SERVER），deploy 后台启动并登记受管资源（TTL 到期自动拆除），verify 校验监听，teardown 拆除并释放资源，status/list 查询。部署成功后会返回 access 提示（socks5 隧道给出可用的 socks5:// 代理地址）。部署到未登记范围的内网主机前，先用 intranet_request_scope 申请并由人审批。",
+		"内网隧道生命周期（两阶段）：action=create 先登记计划（socks5/port_forward/reverse_forward），probe 探测目标环境，plan 生成部署命令（端口转发需要目标有 socat，否则要手写 deploy_command；chisel/ssh 需要平台已配置 JINGWEI_PIVOT_SERVER），deploy 后台启动并登记受管资源（TTL 到期自动拆除），verify 校验监听，teardown 拆除并释放资源，status/list 查询。部署成功后会返回 access 提示（socks5 隧道给出可用的 socks5:// 代理地址）。隧道台账用 listen_side 记录监听端口开在哪一侧：target（socat、ssh -D/-L、chisel R:）或 pivot（chisel client 不带 R:，监听在控制端）；verify 与拆除复核都按这一侧做，在错误的一侧复核会把好隧道判成失败。部署到未登记范围的内网主机前，先用 intranet_request_scope 申请并由人审批。",
 		objSchema(map[string]any{
 			"action":           strParam("create/probe/plan/deploy/verify/teardown/status/list（必填）"),
 			"tunnel_id":        intranetIntParam("隧道 ID（除 create/list 外必填）"),
@@ -271,11 +293,12 @@ func (s *Server) toolIntranetTunnel() actool.CoreTool {
 			"task_id":          intranetIntParam("归属任务 ID（可选，默认当前任务）"),
 			"name":             strParam("隧道名称（可选）"),
 			"kind":             strParam("socks5 / port_forward / reverse_forward，默认 port_forward"),
-			"listen_host":      strParam("目标监听地址，默认 127.0.0.1"),
-			"listen_port":      intranetIntParam("目标监听端口（1-65535）"),
+			"listen_host":      strParam("监听地址，默认 127.0.0.1"),
+			"listen_port":      intranetIntParam("监听端口（1-65535）"),
+			"listen_side":      strParam("监听端口所在侧：target（默认，socat/ssh -D/-L/chisel R:）或 pivot（chisel client 不带 R:，监听开在控制端）；plan 自动选型会改写它，手写 deploy_command 时用这里纠正"),
 			"remote_host":      strParam("转发目标主机"),
 			"remote_port":      intranetIntParam("转发目标端口"),
-			"deploy_command":   strParam("自定义部署命令（可选；支持 echo JW_PID:$! 便于回收）"),
+			"deploy_command":   strParam("自定义部署命令（可选；支持 echo JW_PID:$! 便于回收）；plan 时传 auto 可按目标当前工具重新自动选型"),
 			"verify_command":   strParam("自定义验证命令（可选）"),
 			"teardown_command": strParam("自定义拆除命令（可选）"),
 			"ttl_seconds":      intranetIntParam("部署后自动回收秒数，默认 3600，最大 86400"),
@@ -291,6 +314,7 @@ func (s *Server) toolIntranetTunnel() actool.CoreTool {
 				Kind            string `json:"kind"`
 				ListenHost      string `json:"listen_host"`
 				ListenPort      int    `json:"listen_port"`
+				ListenSide      string `json:"listen_side"`
 				RemoteHost      string `json:"remote_host"`
 				RemotePort      int    `json:"remote_port"`
 				DeployCommand   string `json:"deploy_command"`
@@ -301,6 +325,10 @@ func (s *Server) toolIntranetTunnel() actool.CoreTool {
 			}
 			if err := json.Unmarshal(in, &a); err != nil {
 				return actool.Errorf("参数格式错误"), nil
+			}
+			side, sideErr := intranetListenSideArg(a.ListenSide)
+			if sideErr != nil {
+				return actool.Errorf(sideErr.Error()), nil
 			}
 			pg, err := s.intranetToolPG()
 			if err != nil {
@@ -326,7 +354,7 @@ func (s *Server) toolIntranetTunnel() actool.CoreTool {
 				}
 				in := db.IntranetTunnelInput{
 					Name: a.Name, SessionID: a.SessionID, TaskID: a.TaskID, Kind: kind,
-					ListenHost: a.ListenHost, ListenPort: a.ListenPort,
+					ListenHost: a.ListenHost, ListenPort: a.ListenPort, ListenSide: side,
 					RemoteHost: intranetHost(a.RemoteHost), RemotePort: a.RemotePort,
 					DeployCommand: a.DeployCommand, VerifyCommand: a.VerifyCommand,
 					TeardownCommand: a.TeardownCommand, Note: a.Note,
@@ -369,11 +397,21 @@ func (s *Server) toolIntranetTunnel() actool.CoreTool {
 				info, out := s.intranetProbe(ctx, pg, sess)
 				return jsonResult(map[string]any{"probe": info, "result": out})
 			case "plan":
+				// 手写 deploy_command 时自动选型不参与，监听侧只能由操作员用 listen_side
+				// 纠正——记错侧，verify 与拆除复核就站错边。
+				if side != "" {
+					if _, err := pg.UpdateIntranetTunnelPlan(t.ID, "", "", "", "", side); err != nil {
+						return actool.Errorf(err.Error()), nil
+					}
+					if fresh, gerr := pg.GetIntranetTunnel(t.ID); gerr == nil {
+						t = fresh
+					}
+				}
 				updated, info, err := s.intranetPlanTunnel(ctx, pg, t, a.DeployCommand, a.VerifyCommand, a.TeardownCommand)
 				if err != nil {
 					return actool.Errorf(err.Error()), nil
 				}
-				return jsonResult(map[string]any{"tunnel": updated, "probe": info})
+				return jsonResult(map[string]any{"tunnel": updated, "probe": info, "listen_side": updated.ListenSide})
 			case "deploy":
 				updated, out, err := s.intranetDeployTunnel(ctx, pg, t, time.Duration(a.TTLSeconds)*time.Second)
 				if err != nil {

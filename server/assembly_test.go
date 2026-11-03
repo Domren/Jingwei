@@ -30,7 +30,7 @@ func TestAssembleVisibleSkill(t *testing.T) {
 	if err != nil {
 		t.Skipf("no database config (%v) — skipping", err)
 	}
-	pg, err := db.Open(dsn)
+	pg, err := db.OpenTestSchema(dsn, "jingwei_test_server")
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}

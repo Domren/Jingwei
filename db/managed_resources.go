@@ -16,6 +16,7 @@ var errManagedResourceIdentity = errors.New("受管资源缺少 kind 或 endpoin
 const (
 	ManagedKindCallback = "callback" // JNDI/OAST/回调端口
 	ManagedKindWebshell = "webshell" // 已投放的 webshell
+	ManagedKindMemshell = "memshell" // JVM 内存马（filter/servlet/listener/valve/agent）
 	ManagedKindTunnel   = "tunnel"   // 内网隧道
 	ManagedKindListener = "listener" // 其它平台主动监听的端口
 )
@@ -197,6 +198,19 @@ func (d *DB) ReleaseManagedResourceByWebshell(webshellID int64, note string) err
 SET status='released', released_at=now(), note=CASE WHEN $2='' THEN note ELSE $2 END
 WHERE kind='webshell' AND status='active' AND metadata->>'webshell_id' = $1`,
 		strconv.FormatInt(webshellID, 10), strings.TrimSpace(note))
+	return err
+}
+
+// ReleaseManagedResourceByMemshell releases the ledger entry tied to a memory
+// shell id (stored in metadata), used after removal or forced cleanup.
+func (d *DB) ReleaseManagedResourceByMemshell(memshellID int64, note string) error {
+	if memshellID <= 0 {
+		return nil
+	}
+	_, err := d.Exec(`UPDATE managed_resources
+SET status='released', released_at=now(), note=CASE WHEN $2='' THEN note ELSE $2 END
+WHERE kind='memshell' AND status='active' AND metadata->>'memshell_id' = $1`,
+		strconv.FormatInt(memshellID, 10), strings.TrimSpace(note))
 	return err
 }
 

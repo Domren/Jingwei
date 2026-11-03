@@ -325,7 +325,10 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 
 	if nrun.TimedOut {
 		r.logf("scan", "nuclei 执行超时（%ds），保留已产出的结果", r.task.TimeoutSeconds)
-		return "failed", "failed", fmt.Sprintf("扫描超时（%ds），已保留 %d 条结果", r.task.TimeoutSeconds, stored), summary
+		// 只报 nuclei 条数会让人以为这一轮什么都没留下：超时前已经入库的资产探测、
+		// 弱口令与服务暴露发现同样是这次扫描的产出。
+		return "failed", "failed", fmt.Sprintf("扫描超时（%ds），已保留 %d 条 POC 结果、%d 条发现（含应用层探测、弱口令与服务暴露）",
+			r.task.TimeoutSeconds, stored, findings+exposureFindings), summary
 	}
 	if r.ctx.Err() != nil {
 		return r.aborted("扫描已中断", summary)
@@ -352,9 +355,25 @@ func (r *scanRun) aborted(errMsg string, summary map[string]any) (string, string
 		return "canceled", "canceled", "已手动停止", summary
 	}
 	if errors.Is(r.ctx.Err(), context.DeadlineExceeded) {
-		return "failed", "failed", fmt.Sprintf("扫描超时（%ds）", r.task.TimeoutSeconds), summary
+		// 中断可能发生在探测阶段之后：这一轮已经入库的结果与发现要照 summary 报出来，
+		// 否则超时文案只说「扫描超时」，看不出还有东西可查。
+		return "failed", "failed", fmt.Sprintf("扫描超时（%ds），已保留 %d 条结果、%d 条发现",
+			r.task.TimeoutSeconds, summaryInt(summary, "results"), summaryInt(summary, "findings")), summary
 	}
 	return "failed", "failed", errMsg, summary
+}
+
+// summaryInt reads a counter out of the run summary; absent means zero.
+func summaryInt(summary map[string]any, key string) int {
+	switch v := summary[key].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	}
+	return 0
 }
 
 func nucleiErrorMessage(run scanner.NucleiRun) string {
@@ -582,8 +601,132 @@ func normalizeScanURL(raw string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(raw)), "/")
 }
 
+// intranetTunnelIdentity maps an endpoint the platform reached on its own machine
+// back to the internal host a live tunnel puts behind it. Port-forward tunnels
+// listen on a local address, so a through-the-tunnel scan discovers 127.0.0.1 and
+// used to register it as an intranet asset: the ledger fills with the platform's
+// own address, reports show phantom hosts, and the next scan of that asset
+// attacks Jingwei itself. ok=false means no tunnel explains the local port, so the
+// endpoint is not this scan's business at all and must not be persisted.
+func intranetTunnelIdentity(pg *db.DB, host string, port int) (string, int, bool) {
+	if !intranetHostIsLocal(host) {
+		return host, port, true
+	}
+	if port <= 0 {
+		return "", 0, false
+	}
+	t, err := pg.LiveIntranetTunnelByListen(host, port)
+	if err != nil || t == nil {
+		return "", 0, false
+	}
+	remote := strings.TrimSpace(t.RemoteHost)
+	if remote == "" {
+		return "", 0, false
+	}
+	if t.RemotePort > 0 {
+		return remote, t.RemotePort, true
+	}
+	return remote, port, true
+}
+
+// rewriteScanURL points a discovered URL at the internal identity behind a tunnel
+// listener, keeping the scheme, path and query intact.
+func rewriteScanURL(raw, host string, port int) string {
+	u, err := url.Parse(raw)
+	if err != nil || host == "" || u.Scheme == "" || u.Host == "" {
+		return raw
+	}
+	newHost := net.JoinHostPort(host, strconv.Itoa(port))
+	if (u.Scheme == "http" && port == 80) || (u.Scheme == "https" && port == 443) {
+		newHost = host
+	}
+	u.Host = newHost
+	return u.String()
+}
+
+// remapTunnelledDiscovery rewrites the endpoints a proxied scan saw on its own
+// machine into the internal identities behind the tunnels, and drops the local
+// addresses no tunnel explains. It also returns alias keys (listener → internal)
+// so findings recorded against the address actually requested still resolve to
+// the asset stored under the internal identity.
+func (r *scanRun) remapTunnelledDiscovery(res *scanner.DiscoverResult) (*scanner.DiscoverResult, map[string]string) {
+	if res == nil || res.Resolved == nil || strings.TrimSpace(r.task.Proxy) == "" {
+		return res, nil
+	}
+	aliases := map[string]string{}
+	out := &scanner.DiscoverResult{PortList: res.PortList}
+	ips := []string{}
+	seenIP := map[string]bool{}
+	pushIP := func(ip string) {
+		if ip != "" && !seenIP[ip] {
+			seenIP[ip] = true
+			ips = append(ips, ip)
+		}
+	}
+	mapped, dropped := 0, 0
+	for _, ip := range res.Resolved.IPs {
+		if intranetHostIsLocal(ip) {
+			// 本机 IP 只在带端口时才可归属；端口循环会把真实内网身份补进来。
+			dropped++
+			continue
+		}
+		pushIP(ip)
+	}
+	for _, pf := range res.Ports {
+		host, port, ok := intranetTunnelIdentity(r.pg, pf.IP, pf.Port)
+		if !ok {
+			dropped++
+			r.logf("discover", "跳过本机端口 %s:%d（%s）：没有登记在册的隧道承载它，不写资产以免把平台自身记成内网目标",
+				pf.IP, pf.Port, pf.Service)
+			continue
+		}
+		if host != pf.IP {
+			mapped++
+			aliases[hostPortKey(pf.IP, pf.Port)] = hostPortKey(host, port)
+		}
+		rewritten := pf
+		rewritten.IP, rewritten.Port = host, port
+		pushIP(host)
+		out.Ports = append(out.Ports, rewritten)
+	}
+	for _, svc := range res.Services {
+		host, port, ok := intranetTunnelIdentity(r.pg, svc.IP, svc.Port)
+		if !ok {
+			dropped++
+			r.logf("discover", "跳过本机 Web 服务 %s：没有登记在册的隧道承载它", svc.URL)
+			continue
+		}
+		rewritten := svc
+		if host != svc.IP {
+			mapped++
+			newURL := rewriteScanURL(svc.URL, host, port)
+			aliases[normalizeScanURL(svc.URL)] = normalizeScanURL(newURL)
+			rewritten.URL = newURL
+			rewritten.Host = net.JoinHostPort(host, strconv.Itoa(port))
+			rewritten.IP, rewritten.Port = host, port
+		}
+		pushIP(rewritten.IP)
+		out.Services = append(out.Services, rewritten)
+	}
+	out.Resolved = &scanner.Resolved{IPs: ips, Domains: res.Resolved.Domains}
+	for ip, domains := range res.Resolved.DomainsByIP {
+		if intranetHostIsLocal(ip) {
+			continue
+		}
+		if out.Resolved.DomainsByIP == nil {
+			out.Resolved.DomainsByIP = map[string][]string{}
+		}
+		out.Resolved.DomainsByIP[ip] = domains
+	}
+	if mapped > 0 || dropped > 0 {
+		r.logf("discover", "隧道扫描地址归位：%d 个本机端点已按内网身份登记，%d 个无法归属的本机端点未写入资产", mapped, dropped)
+	}
+	return out, aliases
+}
+
 func (r *scanRun) persistDiscovery(res *scanner.DiscoverResult) (*scanAssetIndex, int, int) {
 	idx := newScanAssetIndex()
+	res, discoveryAliases := r.remapTunnelledDiscovery(res)
 	exposureFindings := 0
 	portsByIP := map[string][]db.PortService{}
 	for _, pf := range res.Ports {
@@ -712,6 +855,18 @@ func (r *scanRun) persistDiscovery(res *scanner.DiscoverResult) (*scanAssetIndex
 			exposureFindings++
 		}
 	}
+	for listener, internal := range discoveryAliases {
+		if id, ok := idx.byURL[internal]; ok {
+			if _, exists := idx.byURL[listener]; !exists {
+				idx.byURL[listener] = id
+			}
+		}
+		if id, ok := idx.byHostPort[internal]; ok {
+			if _, exists := idx.byHostPort[listener]; !exists {
+				idx.byHostPort[listener] = id
+			}
+		}
+	}
 	r.logf("discover", "资产入库完成：关联 %d 个资产，服务暴露发现 %d 条", linked, exposureFindings)
 	return idx, linked, exposureFindings
 }
@@ -750,28 +905,44 @@ func (r *scanRun) runAppDiscovery(res *scanner.DiscoverResult, assets *scanAsset
 	for _, app := range systems {
 		status := app.StatusCode
 		length := app.ContentLength
+		assetURL, assetIP := app.URL, app.IP
+		if strings.TrimSpace(r.task.Proxy) != "" {
+			host, port, ok := intranetTunnelIdentity(r.pg, app.IP, app.Port)
+			if !ok {
+				r.logf("app", "跳过本机应用层系统 %s：没有登记在册的隧道承载它", app.URL)
+				continue
+			}
+			if host != app.IP {
+				assetURL, assetIP = rewriteScanURL(app.URL, host, port), host
+			}
+		}
 		id, err := r.pg.Assets().UpsertHTTPService(db.UpsertHTTPServiceReq{
-			URL:           app.URL,
+			URL:           assetURL,
 			Technologies:  app.Technologies,
 			StatusCode:    &status,
 			ContentLength: &length,
 			PageTitle:     app.Title,
-			IP:            app.IP,
+			IP:            assetIP,
 		})
 		if err != nil {
-			r.logf("app", "写入应用层系统资产失败 %s: %v", app.URL, err)
+			r.logf("app", "写入应用层系统资产失败 %s: %v", assetURL, err)
 			continue
 		}
-		assets.addService(app.URL, id)
+		assets.addService(assetURL, id)
+		if assetURL != app.URL {
+			// 系统是在隧道监听地址上发现的：别名让后续发现仍能关联到这条按内网
+			// 身份登记的资产。
+			assets.addService(app.URL, id)
+		}
 		note := "应用层系统 · 来源 " + appSourceLabel(app.Source)
 		if app.Server != "" {
 			note += " · " + app.Server
 		}
 		if err := r.pg.AddScanTaskAsset(r.task.ID, db.ScanTaskAsset{
-			AssetID: id, AssetType: "app", Host: app.Host, URL: app.URL, Note: note,
+			AssetID: id, AssetType: "app", Host: app.Host, URL: assetURL, Note: note,
 			StatusCode: &status, PageTitle: app.Title, Technologies: app.Technologies,
 		}); err != nil {
-			r.logf("app", "关联应用层系统资产失败 %s: %v", app.URL, err)
+			r.logf("app", "关联应用层系统资产失败 %s: %v", assetURL, err)
 			continue
 		}
 		linked++
@@ -1570,9 +1741,23 @@ func normalizeScanWebshell(req *db.ScanTaskInput) error {
 	default:
 		return errors.New("Webshell 类型必须是 php、jsp 或 aspx")
 	}
+	protocol := strings.ToLower(strings.TrimSpace(stringParam(req.WebshellParams, "protocol")))
+	switch protocol {
+	case "":
+		protocol = "v2"
+	case "v2", "legacy":
+	default:
+		return errors.New("Webshell 协议必须是 v2 或 legacy")
+	}
 	password := strings.TrimSpace(stringParam(req.WebshellParams, "password"))
-	if password == "" {
-		password = randomShellPassword()
+	if protocol == "legacy" {
+		if password == "" {
+			password = randomShellPassword()
+		}
+	} else {
+		// v2 shells carry a per-shell random key inside the payload; a request
+		// password has no meaning and must not be persisted in task params.
+		password = ""
 	}
 	fieldName := strings.TrimSpace(stringParam(req.WebshellParams, "field_name"))
 	if fieldName == "" {
@@ -1581,6 +1766,7 @@ func normalizeScanWebshell(req *db.ScanTaskInput) error {
 	req.WebshellParams["upload_path"] = uploadPath
 	req.WebshellParams["land_path"] = landPath
 	req.WebshellParams["shell_type"] = shellType
+	req.WebshellParams["protocol"] = protocol
 	req.WebshellParams["password"] = password
 	req.WebshellParams["field_name"] = fieldName
 	return nil

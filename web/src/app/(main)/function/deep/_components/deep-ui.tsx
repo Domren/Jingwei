@@ -51,6 +51,39 @@ export function severityClass(sev: string) {
   }
 }
 
+// shellStatusMeta also carries a hint: 未确认 is the state a shell lands in when an
+// operator's wait expired, and nothing re-checks on a timer on purpose — polling a
+// client's host on a schedule is the operator's decision, not a background default.
+// Without the hint the badge reads as a stale bug rather than as "click 检测".
+export function shellStatusMeta(status: string): { label: string; className: string; hint: string } {
+  switch (status) {
+    case "alive":
+      return {
+        label: "存活",
+        className: "border-emerald-500/30 bg-emerald-500/10 text-emerald-600",
+        hint: "最近一次检测或命令通道确认过它还在应答",
+      };
+    case "dead":
+      return {
+        label: "失效",
+        className: "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400",
+        hint: "最近一次检测没能通过：载荷被删、密钥换了或目标不再应答",
+      };
+    case "unknown":
+      return {
+        label: "未确认",
+        className: "border-amber-500/30 bg-amber-500/10 text-amber-600",
+        hint: "上一次等待超时或检测没通过，既没证明活着也没证明死的；平台不会定时重连目标，点「检测」确认",
+      };
+    default:
+      return {
+        label: "未检测",
+        className: "border-slate-500/30 bg-slate-500/10 text-slate-600 dark:text-slate-400",
+        hint: "登记后还没做过检测",
+      };
+  }
+}
+
 export function statusMeta(task: DeepTask): { label: string; className: string } {
   switch (task.status) {
     case "queued":
@@ -102,9 +135,15 @@ export function verdictMeta(verdict: string): { label: string; className: string
     case "not_reproduced":
       return { label: "未复现", className: "border-slate-500/30 bg-slate-500/10 text-slate-600 dark:text-slate-400" };
     case "tool_uncovered":
-      return { label: "超出工具检测范围", className: "border-slate-500/30 bg-slate-500/10 text-slate-600 dark:text-slate-400" };
+      return {
+        label: "超出工具检测范围",
+        className: "border-slate-500/30 bg-slate-500/10 text-slate-600 dark:text-slate-400",
+      };
     case "session_needed":
-      return { label: "需要登录会话", className: "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400" };
+      return {
+        label: "需要登录会话",
+        className: "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400",
+      };
     case "tool_unavailable":
       return { label: "工具未安装", className: "border-amber-500/30 bg-amber-500/10 text-amber-600" };
     case "error":

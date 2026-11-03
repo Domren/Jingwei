@@ -168,3 +168,25 @@ func TestScanAssetIndexLongestPathPrefix(t *testing.T) {
 		}
 	}
 }
+
+func TestScanSummaryIntReportsStoredWork(t *testing.T) {
+	// A live 300s nuclei timeout wrote summary {results:2, findings:2} while the
+	// error text still read 「已保留 0 条结果」. The abort message reads these
+	// counters through summaryInt, so the JSON-decoded shapes are what matter.
+	summary := map[string]any{"results": 2, "findings": int64(3), "open_ports": float64(9)}
+	if got := summaryInt(summary, "results"); got != 2 {
+		t.Errorf("results=%d want 2", got)
+	}
+	if got := summaryInt(summary, "findings"); got != 3 {
+		t.Errorf("findings=%d want 3", got)
+	}
+	if got := summaryInt(summary, "open_ports"); got != 9 {
+		t.Errorf("open_ports=%d want 9", got)
+	}
+	if got := summaryInt(summary, "absent"); got != 0 {
+		t.Errorf("absent key=%d want 0", got)
+	}
+	if got := summaryInt(nil, "results"); got != 0 {
+		t.Errorf("nil summary=%d want 0", got)
+	}
+}

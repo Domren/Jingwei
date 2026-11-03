@@ -1,9 +1,61 @@
 package db
 
 import (
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestIntranetArtifactFingerprintTTLAndDuplicate(t *testing.T) {
+	d, _, _ := testSetup(t)
+	t.Cleanup(func() { _ = d.Close() })
+	host := "10.77.9.9"
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM intranet_artifacts WHERE host=$1`, host)
+	})
+
+	expired := time.Now().Add(-time.Minute)
+	first, err := d.AddIntranetArtifact(IntranetArtifactInput{
+		Host: host, Kind: IntranetArtifactCron, Name: "ttl", Path: "crontab:fp",
+		RevokeCommand: "true", Fingerprint: "fp-ttl-test", ExpiresAt: &expired,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Fingerprint != "fp-ttl-test" || first.ExpiresAt == nil || !first.ExpiresAt.Before(time.Now()) {
+		t.Fatalf("artifact = %+v", first)
+	}
+	found, err := d.FindActiveIntranetArtifactByFingerprint("fp-ttl-test")
+	if err != nil || found.ID != first.ID {
+		t.Fatalf("find by fingerprint = %+v err=%v", found, err)
+	}
+	if _, err := d.AddIntranetArtifact(IntranetArtifactInput{
+		Host: host, Kind: IntranetArtifactCron, Name: "ttl-dup", Path: "crontab:fp2",
+		RevokeCommand: "true", Fingerprint: "fp-ttl-test",
+	}); !errors.Is(err, ErrIntranetArtifactDuplicate) {
+		t.Fatalf("duplicate active fingerprint err = %v", err)
+	}
+
+	expiredRows, err := d.ListExpiredIntranetArtifacts(time.Now(), 10)
+	if err != nil || len(expiredRows) != 1 || expiredRows[0].ID != first.ID {
+		t.Fatalf("expired rows = %+v err=%v", expiredRows, err)
+	}
+
+	if _, err := d.MarkIntranetArtifactRevoked(first.ID, "ttl cleanup"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.FindActiveIntranetArtifactByFingerprint("fp-ttl-test"); !errors.Is(err, ErrIntranetArtifactNotFound) {
+		t.Fatalf("revoked fingerprint still active: %v", err)
+	}
+	second, err := d.AddIntranetArtifact(IntranetArtifactInput{
+		Host: host, Kind: IntranetArtifactCron, Name: "ttl-reinstall", Path: "crontab:fp3",
+		RevokeCommand: "true", Fingerprint: "fp-ttl-test",
+	})
+	if err != nil || second.ID == first.ID {
+		t.Fatalf("reinstall after revoke = %+v err=%v", second, err)
+	}
+}
 
 func TestIntranetArtifactStore(t *testing.T) {
 	d, _, _ := testSetup(t)

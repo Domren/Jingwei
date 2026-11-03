@@ -21,7 +21,7 @@ func TestWorkerReviewContextAcrossToolCalls(t *testing.T) {
 	if err != nil {
 		t.Skip("no test database configured")
 	}
-	d, err := db.Open(dsn)
+	d, err := db.OpenTestSchema(dsn, "jingwei_test_agent")
 	if err != nil {
 		t.Fatal(err)
 	}

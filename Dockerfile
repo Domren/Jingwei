@@ -1,4 +1,8 @@
-# syntax=docker/dockerfile:1
+#
+# 这里刻意不写 `# syntax=docker/dockerfile:1`：那一行会让 buildkit 去 Docker Hub 拉外部
+# 前端，而本机的 dockerd 通过 systemd drop-in 配了 HTTP(S)_PROXY=127.0.0.1:7890 却没有
+# 进程在监听，于是解析直接失败、镜像构建不起来（Docker 28.5 的内置前端就支持下面用到的
+# RUN --mount=type=cache）。等 daemon 的代理配置修好后可以再把这行加回来。
 #
 # 运行镜像（不在镜像里编译）：只装常用工具，放入**预编译好的 Linux 单二进制**。
 # 二进制由 CI 的 binaries job 交叉编译（纯 Go、无 QEMU），按目标架构放在
@@ -58,20 +62,30 @@ RUN --mount=type=cache,target=/root/.cache/pip pip3 install -i "${PIP_INDEX_URL}
 # 长度基线+失败关键字判定→二次复验。纯 Python，装依赖即可用；桥接脚本只输出
 # 一个 JSON 文档，Go 侧按原始报文登记发现。
 #
-# 依赖分两档：requirements-core.txt 是引擎本体（requests/bs4/lxml/pyfiglet，约 10MB）；
+# 依赖分两档：requirements-core.txt 是引擎本体（requests/requests[socks]/bs4/lxml/pyfiglet，约 10MB）；
 # ddddocr+onnxruntime+opencv 约 200MB 且国内源常常缺包，只用于**带验证码**的登录页。
 # 上游代码对 ddddocr 是 try/except 导入，缺件时带验证码的站点会被跳过并记录原因，
 # 不带验证码的站点（绝大多数靶场与 CMS 后台）不受影响。需要 OCR 时：
 #   docker compose build --build-arg WEBCRACK_OCR=true
 COPY tools/webcrack/ /app/tools/webcrack/
 ARG WEBCRACK_OCR=false
-RUN --mount=type=cache,target=/root/.cache/pip pip3 install -i "${PIP_INDEX_URL}" --retries 5 --timeout 60 \
-        -r /app/tools/webcrack/requirements-core.txt \
+# 核心依赖与它的导入自检必须用 {} 成组：shell 里 && 与 || 同优先级左结合，
+# 写成 "装依赖 && 自检 || echo" 时，任何一个前置步骤失败都会被 echo 吃掉、层退出码 0，
+# Docker 于是缓存住一个装坏了的 webcrack（SOCKS5 隧道下的登录尝试会在运行时才报错）。
+# ddddocr 仍然是可选的，只允许它自己失败。
+RUN --mount=type=cache,target=/root/.cache/pip \
+    { \
+      pip3 install -i "${PIP_INDEX_URL}" --retries 5 --timeout 60 \
+          -r /app/tools/webcrack/requirements-core.txt \
+      && python3 -c "import requests, bs4, lxml, pyfiglet, socks; print('[webcrack] core 依赖可用')"; \
+    } \
     && if [ "${WEBCRACK_OCR}" = "true" ]; then \
-         pip3 install -i "${PIP_INDEX_URL}" --retries 5 --timeout 60 ddddocr || echo "[webcrack] ddddocr 安装失败，带验证码的登录页将被跳过"; \
+         pip3 install -i "${PIP_INDEX_URL}" --retries 5 --timeout 60 ddddocr \
+           && python3 -c "import ddddocr; print('[webcrack] OCR 可用')" \
+           || echo "[webcrack] ddddocr 安装失败，带验证码的登录页将被跳过"; \
+       else \
+         echo "[webcrack] OCR 未安装（WEBCRACK_OCR=false）"; \
        fi \
-    && python3 -c "import requests, bs4, lxml, pyfiglet" \
-    && python3 -c "import ddddocr; print('[webcrack] OCR 可用')" || echo "[webcrack] OCR 未安装（WEBCRACK_OCR=false）" \
     && python3 /app/tools/webcrack/jingweibridge.py --help >/dev/null
 ARG DALFOX_VERSION=3.2.4
 RUN set -eux; \

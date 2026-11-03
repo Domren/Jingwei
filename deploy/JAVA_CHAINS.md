@@ -46,6 +46,46 @@ docker compose --profile java-chains stop java-chains
 
 回调端口没有认证，不能长期暴露公网。
 
+### 宿主机发布地址 ≠ 容器内监听地址
+
+`JAVA_CHAINS_CALLBACK_BIND` 只决定 docker **在宿主机哪块网卡上发布**这些端口；sidecar 进程自己的监听地址由
+`JAVA_CHAINS_LISTEN_BIND` 决定（默认 `0.0.0.0`），因为容器有独立网络命名空间，docker-proxy 是把连接转发到
+**容器的 eth0 IP**，不是容器自己的 loopback。把监听也设成 `127.0.0.1`，宿主机端口看着是开的、`curl` 也通，
+后面却没有任何进程在容器内的 eth0 上监听，于是无论目标是本机、其他容器还是远端主机，永远回连不上——
+LDAP 表现为 `anonymous bind failed` / `LDAP connection has been closed`，日志里连一条 lookup 都没有。
+
+`JAVA_CHAINS_LISTEN_BIND` 不改变暴露面：外部能否连到回调端口仍由 `JAVA_CHAINS_CALLBACK_BIND` 决定。
+`java_bind_host` 走的是这个监听地址，`java_callback_host` 才是写进 payload 的回连地址，两者可以不同
+（本机靶场：bind `0.0.0.0` + callback `127.0.0.1`；远端靶机：bind `0.0.0.0` + callback 宿主机可达 IP）。
+
+## 正路径实测
+
+反序列化 payload 的构造—投递—回连—确认全链路已在真机上跑通，两侧都是真实组件（不是 mock）：
+java-chains sidecar `javachains/javachains:2.0.0-beta7` + Tomcat9/JSP on JDK17 上的 fastjson 型
+JNDI sink（读 body 里的 `dataSourceName` 后 `new InitialContext().lookup(...)`）。
+
+集成测试 `server/java_chains_deep_live_test.go` 默认 `t.Skip`，同时设置以下变量才会执行：
+
+```bash
+JAVA_CHAINS_MCP_TOKEN=... JAVA_CHAINS_URL=http://127.0.0.1:9792 \
+JAVA_CHAINS_LIVE_TARGET=http://<靶机>:8081 \
+JINGWEI_PG_DSN=postgres://... go test -p 1 -count=1 -run TestJavaChainsLive ./server/
+```
+
+它按自动链路的原样入口 `runJavaChains` 跑一条本地构造的 nuclei 模板（`ldap://{{interactsh-url}}/jwlab`），
+断言的不只是「没报错」：
+
+- 预设 `java.fastjson.jndi` 被选中并成功发布，投递的是**改写后**的原始报文（含 `ldap://<callback>:50389/<token>`，
+  不再有 `{{interactsh-url}}` 占位符）；
+- sidecar `runtime_logs` 出现该 token 的 `outcome=lookup|serve`，模板因此被判为**已确认复现**
+  （`verdict=confirmed`，证据保留请求/响应），而不是「已投递」；
+- 回调端口登记成受管资源，任务结束后发布数归零、JNDI 服务停止、台账行 released；
+- 另一条用例先把 JNDI 服务起在 `127.0.0.1` 再要求 `0.0.0.0`，验证平台会察觉 `bound.host` 与要求不一致、
+  重启服务并重新发布，而不是把 payload 投到一个没人监听的地址上。
+
+JDK17 上 lookup 到达侧车后，对象反序列化会被 JDK 自己拒掉（`Object deserialization is not allowed`），
+这不影响「目标确实回连了」的判定——回连确认的是注入点可达，不是链子打通。
+
 ## Skill / MCP 集成
 
 `skills/java-chains/SKILL.md` 随镜像构建进入 `/app/skills`，默认对 `auto`、`pentest`、`worker` 可见。它声明 `mcps: JavaChains`：
@@ -77,7 +117,7 @@ Web UI（`http://127.0.0.1:9792`）仅用于排障和手动操作，不进入 Ji
 | --- | --- | --- |
 | `java_chains` | `auto` | 设为 `off` 关闭本任务自动调用 |
 | `java_cmd` | `id` | 通过预设执行的低风险命令 |
-| `java_bind_host` | `JAVA_CHAINS_CALLBACK_BIND` | JNDI 服务绑定地址 |
+| `java_bind_host` | `JAVA_CHAINS_LISTEN_BIND`（默认 `0.0.0.0`） | JNDI 服务在**容器内**的监听地址，不要填 `127.0.0.1` |
 | `java_callback_host` | `JAVA_CHAINS_CALLBACK_HOST` | 写入 payload、供目标回连的地址 |
 | `java_chains_wait` | `12` | 回连等待秒数（3–30） |
 
@@ -107,7 +147,13 @@ volumes:
 - **java_chains_* 工具没出现**：看 `docker logs jingwei-jingwei-1 | grep -i java-chains` 是否有注册/发现日志；确认 `JAVA_CHAINS_MCP_TOKEN` 非空、重建过 Jingwei，且 Agent 已绑定 java-chains Skill。token 失效时重跑 setup 脚本。
 - **MCP 注册了但工具发现失败**：在宿主机 `curl -H "X-Api-Token: $JAVA_CHAINS_MCP_TOKEN" http://127.0.0.1:9792/api/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"check","version":"1"}}}'` 自检；403 表示 token 无 `mcp:invoke` 或已轮换。
 - **登录失败**：`JAVA_CHAINS_PASS` 必须与 sidecar 启动时一致；修改后重建 sidecar。
-- **没有回连**：检查目标到回调 IP/端口的连通性、JDK 版本、gadget 依赖和编码；目标侧有 WAF/黑名单时换链或换编码。
+- **没有回连**：先问「侧车到底监听在哪」——`java_chains_services_get {"service":"jndi"}` 看 `bound.host`，
+  是 `127.0.0.1` 就是监听落在容器 loopback 上、目标永远到不了（见上文「宿主机发布地址 ≠ 容器内监听地址」，
+  改 `JAVA_CHAINS_LISTEN_BIND` 后需重启 JNDI 服务，`quick_jndi` 对已运行的服务不会换绑）。已确认 Jingwei 会自动
+  察觉并重启重发，日志里会写「JNDI 服务实际监听 …，与要求的 … 不一致，重启服务后重新发布」。
+  其余检查：目标到回调 IP/端口的连通性、JDK 版本（JDK 的 JNDI LDAP provider 默认
+  `trustSerialData=false`，新 JDK 上 lookup 可达但对象不会被反序列化）、gadget 依赖和编码；
+  目标侧有 WAF/黑名单时换链或换编码。
 
 ## 安全
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -258,7 +259,7 @@ func TestIntranetPivotServer(t *testing.T) {
 func TestAutoSelectTunnelUsesPivotServer(t *testing.T) {
 	t.Setenv("JINGWEI_PIVOT_SERVER", "10.9.9.9:8788")
 	tr := &db.IntranetTunnel{ID: 7, Kind: db.IntranetTunnelKindSocks5, ListenHost: "0.0.0.0", ListenPort: 1080}
-	deploy, reason := autoSelectTunnelCommand(tr.Kind, intranetProbeInfo{Bins: []string{"chisel"}}, tr)
+	deploy, reason, side := autoSelectTunnelCommand(tr.Kind, intranetProbeInfo{Bins: []string{"chisel"}}, tr)
 	if deploy == "" {
 		t.Fatalf("chisel socks5 deploy empty: %s", reason)
 	}
@@ -268,18 +269,103 @@ func TestAutoSelectTunnelUsesPivotServer(t *testing.T) {
 	if strings.Contains(deploy, "YOUR_C2") {
 		t.Fatalf("placeholder leaked: %s", deploy)
 	}
+	// chisel client 不带 R: 时监听开在控制端：记成 target 会让 verify 在目标上查一个
+	// 从来不存在端口，把好隧道判死。
+	if side != db.IntranetListenSidePivot {
+		t.Fatalf("chisel socks5 listen side = %q, want %q", side, db.IntranetListenSidePivot)
+	}
+	if !strings.Contains(deploy, "echo $p >/tmp/jw_tunnel_7.pid") || !strings.Contains(deploy, "JW_PID:$p") {
+		t.Fatalf("chisel deploy must record the pid on the target too: %s", deploy)
+	}
+
+	// ssh -D 在目标上开监听，选型不能把监听侧写成 pivot。
+	sshSide, _, side := autoSelectTunnelCommand(tr.Kind, intranetProbeInfo{Bins: []string{"ssh"}}, tr)
+	if side != db.IntranetListenSideTarget {
+		t.Fatalf("ssh -D listen side = %q, want target", side)
+	}
+	if !strings.Contains(sshSide, "ssh -N -D 0.0.0.0:1080") || !strings.Contains(sshSide, "BatchMode=yes") {
+		t.Fatalf("ssh -D deploy = %s", sshSide)
+	}
 
 	t.Setenv("JINGWEI_PIVOT_SERVER", "")
-	deploy, reason = autoSelectTunnelCommand(db.IntranetTunnelKindSocks5, intranetProbeInfo{Bins: []string{"chisel"}}, tr)
+	deploy, reason, side = autoSelectTunnelCommand(db.IntranetTunnelKindSocks5, intranetProbeInfo{Bins: []string{"chisel"}}, tr)
 	if deploy != "" || !strings.Contains(reason, "JINGWEI_PIVOT_SERVER") {
 		t.Fatalf("expected clear pivot error, deploy=%q reason=%q", deploy, reason)
 	}
 
 	// socat needs no pivot endpoint.
 	fwd := &db.IntranetTunnel{ID: 8, Kind: db.IntranetTunnelKindPort, ListenHost: "0.0.0.0", ListenPort: 8080, RemoteHost: "10.0.0.8", RemotePort: 80}
-	deploy, reason = autoSelectTunnelCommand(fwd.Kind, intranetProbeInfo{Bins: []string{"socat"}}, fwd)
+	deploy, reason, side = autoSelectTunnelCommand(fwd.Kind, intranetProbeInfo{Bins: []string{"socat"}}, fwd)
 	if deploy == "" || !strings.Contains(deploy, "socat") || reason == "" {
 		t.Fatalf("socat deploy = %q reason=%q", deploy, reason)
+	}
+	if side != db.IntranetListenSideTarget {
+		t.Fatalf("socat listen side = %q, want target", side)
+	}
+	// chisel R:（反向转发）把监听开在目标，与控制端一侧的 chisel server 端口无关。
+	rev := &db.IntranetTunnel{ID: 9, Kind: db.IntranetTunnelKindRemote, ListenHost: "0.0.0.0", ListenPort: 8888, RemoteHost: "127.0.0.1", RemotePort: 3000}
+	t.Setenv("JINGWEI_PIVOT_SERVER", "10.9.9.9:8788")
+	deploy, _, side = autoSelectTunnelCommand(rev.Kind, intranetProbeInfo{Bins: []string{"chisel"}}, rev)
+	if side != db.IntranetListenSideTarget || !strings.Contains(deploy, "R:8888:127.0.0.1:3000") {
+		t.Fatalf("chisel R: tunnel = %q side=%q", deploy, side)
+	}
+}
+
+func TestIntranetTunnelTeardownCoversLostPID(t *testing.T) {
+	if got := intranetTunnelTeardown(0, 0); got != "" {
+		t.Fatalf("no pid and no tunnel id must yield no teardown: %q", got)
+	}
+	withPID := intranetTunnelTeardown(4321, 7)
+	if !strings.Contains(withPID, "kill 4321") || !strings.Contains(withPID, "kill -9 4321") {
+		t.Fatalf("teardown must kill the captured pid: %q", withPID)
+	}
+	// 部署输出被壳吃掉时只剩 pid 文件：拆除仍要能收回那个 chisel/ssh 客户端。
+	if !strings.Contains(withPID, `p=$(cat /tmp/jw_tunnel_7.pid 2>/dev/null)`) {
+		t.Fatalf("teardown must fall back to the on-target pid file: %q", withPID)
+	}
+	onlyFile := intranetTunnelTeardown(0, 7)
+	if !strings.Contains(onlyFile, "/tmp/jw_tunnel_7.pid") || strings.Contains(onlyFile, "kill 0") {
+		t.Fatalf("pid-less teardown = %q", onlyFile)
+	}
+	if !strings.Contains(onlyFile, "rm -f /tmp/jw_tunnel_7.pid /tmp/jw_tunnel_7.log") {
+		t.Fatalf("teardown must remove its own residue: %q", onlyFile)
+	}
+}
+
+func TestIntranetPivotListenerChecks(t *testing.T) {
+	if !intranetHostIsLocal("127.0.0.1") || !intranetHostIsLocal("localhost") {
+		t.Fatal("loopback must count as this host")
+	}
+	if intranetHostIsLocal("") || intranetHostIsLocal("203.0.113.9") {
+		t.Fatal("empty/external addresses must not count as this host")
+	}
+	if got := intranetPivotMarkerPort("pivot:tcp:18080"); got != 18080 {
+		t.Fatalf("marker port = %d", got)
+	}
+	if got := intranetPivotMarkerPort("ss -lnt"); got != 0 {
+		t.Fatalf("non-marker must yield 0, got %d", got)
+	}
+	// 占住一个端口再检查：控制端即本机时读监听表，不能把在听的端口说成没在听。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot listen locally: %v", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	if ok, detail := intranetPivotListenerState("127.0.0.1", port); !ok {
+		t.Fatalf("listener on this host reported down: %s", detail)
+	}
+	free, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot reserve a free port: %v", err)
+	}
+	freePort := free.Addr().(*net.TCPAddr).Port
+	free.Close()
+	if ok, detail := intranetPivotListenerState("127.0.0.1", freePort); ok || !strings.Contains(detail, "没有") {
+		t.Fatalf("absent port must report down with a reason: ok=%v detail=%q", ok, detail)
+	}
+	if ok, detail := intranetPivotListenerState("", port); ok || !strings.Contains(detail, "JINGWEI_PIVOT_SERVER") {
+		t.Fatalf("missing pivot host must be an honest failure: ok=%v detail=%q", ok, detail)
 	}
 }
 
@@ -292,6 +378,9 @@ func TestIntranetTunnelAccessHints(t *testing.T) {
 	access := s.intranetTunnelAccess(nil, socks)
 	if access["proxy"] != "socks5://10.0.0.5:1080" {
 		t.Fatalf("socks access = %+v", access)
+	}
+	if access["listen_side"] != db.IntranetListenSideTarget {
+		t.Fatalf("target-side hint = %+v", access)
 	}
 	loop := &db.IntranetTunnel{
 		Kind: db.IntranetTunnelKindSocks5, Status: db.IntranetTunnelDeployed,
@@ -306,6 +395,29 @@ func TestIntranetTunnelAccessHints(t *testing.T) {
 	}
 	if access := s.intranetTunnelAccess(nil, planned); access != nil {
 		t.Fatalf("planned tunnel should have no access hint: %+v", access)
+	}
+	// 监听侧是 pivot 时，即便 listen_host 记着目标的 127.0.0.1，也必须给出控制端地址：
+	// 按目标回环处理会让操作员以为隧道只能从目标内部用，而它其实已经能直连。
+	t.Setenv("JINGWEI_PIVOT_SERVER", "10.9.9.9:8788")
+	pivoted := &db.IntranetTunnel{
+		Kind: db.IntranetTunnelKindSocks5, Status: db.IntranetTunnelVerified,
+		ListenHost: "127.0.0.1", ListenPort: 1080, ListenSide: db.IntranetListenSidePivot,
+	}
+	access = s.intranetTunnelAccess(nil, pivoted)
+	if access["listen_side"] != db.IntranetListenSidePivot || access["proxy"] != "socks5://10.9.9.9:1080" {
+		t.Fatalf("pivot-side access = %+v", access)
+	}
+	if access["loopback_only"] == true {
+		t.Fatalf("pivot-side tunnel must not be reported as target-loopback only: %+v", access)
+	}
+	// 反向转发（R:）的监听在目标上，控制端一侧只有 chisel server 端口。
+	rev := &db.IntranetTunnel{
+		Kind: db.IntranetTunnelKindRemote, Status: db.IntranetTunnelVerified,
+		ListenHost: "10.0.0.5", ListenPort: 8888, RemoteHost: "127.0.0.1", RemotePort: 3000,
+	}
+	access = s.intranetTunnelAccess(nil, rev)
+	if access["endpoint"] != "10.0.0.5:8888" {
+		t.Fatalf("reverse forward endpoint must stay on the target: %+v", access)
 	}
 }
 

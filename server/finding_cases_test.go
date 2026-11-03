@@ -22,7 +22,7 @@ func testCaseServer(t *testing.T) (*Server, int64, []int64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pg, err := db.Open(dsn)
+	pg, err := db.OpenTestSchema(dsn, "jingwei_test_server")
 	if err != nil {
 		t.Fatal(err)
 	}

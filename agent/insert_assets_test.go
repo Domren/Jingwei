@@ -16,7 +16,7 @@ func testDB(t *testing.T) *db.DB {
 	if err != nil {
 		t.Skipf("no database config (%v)", err)
 	}
-	d, err := db.Open(dsn)
+	d, err := db.OpenTestSchema(dsn, "jingwei_test_agent")
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
 	}

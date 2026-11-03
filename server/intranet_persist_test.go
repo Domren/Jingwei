@@ -8,8 +8,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf16"
 
 	"github.com/Autumn-27/jingwei/db"
 )
@@ -130,6 +133,13 @@ func TestBuildSSHKeyPersistPlan(t *testing.T) {
 	if !strings.Contains(named.Deploy, "getent passwd 'deploy'") {
 		t.Errorf("named user home not resolved: %q", named.Deploy)
 	}
+	// www-data 之类的账号即便装上公钥也登不进来，部署成功不等于拿到了立足点。
+	if !strings.Contains(named.Deploy, intranetWarnNoLoginShell) {
+		t.Errorf("login-shell warning missing: %q", named.Deploy)
+	}
+	if strings.Contains(named.Verify, intranetWarnNoLoginShell) {
+		t.Errorf("verify must stay marker-only: %q", named.Verify)
+	}
 }
 
 func TestBuildSchtasksPersistPlan(t *testing.T) {
@@ -211,6 +221,283 @@ func TestBuildRegistryPersistPlan(t *testing.T) {
 	}
 }
 
+func TestBuildAdvancedPOSIXPersistPlans(t *testing.T) {
+	userSvc, err := buildUserSystemdPersistPlan(intranetPersistInput{Command: "sleep 600", Name: "user-keeper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if userSvc.Kind != db.IntranetArtifactUserSystemd || !strings.HasPrefix(userSvc.Path, "user-systemd:current:jingwei-") {
+		t.Fatalf("user systemd plan = %+v", userSvc)
+	}
+	svcScript, _ := userSvc.Metadata["script_path"].(string)
+	svcScriptRel := strings.TrimPrefix(svcScript, "~/")
+	if !strings.Contains(userSvc.Deploy, "systemctl --user enable --now") ||
+		!strings.Contains(userSvc.Deploy, "$home/"+svcScriptRel) ||
+		!strings.Contains(userSvc.Revoke, "systemctl --user disable --now") {
+		t.Errorf("user systemd deploy/revoke = %q / %q", userSvc.Deploy, userSvc.Revoke)
+	}
+
+	atPlan, err := buildAtPersistPlan(intranetPersistInput{
+		Command: "echo jw-at", Schedule: "now + 10 minutes", Name: "at-keeper",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue, _ := atPlan.Metadata["queue"].(string)
+	if atPlan.Kind != db.IntranetArtifactAt || len(queue) != 1 ||
+		!strings.Contains(atPlan.Deploy, "at -q "+queue) || !strings.Contains(atPlan.Deploy, "atq -q "+queue) ||
+		!strings.Contains(atPlan.Revoke, "atrm") {
+		t.Fatalf("at plan = %+v", atPlan)
+	}
+	for _, bad := range []string{"", "-f /tmp/x", "now; reboot", "tomorrow\nreboot"} {
+		if _, err := buildAtPersistPlan(intranetPersistInput{Command: "id", Schedule: bad}); err == nil {
+			t.Errorf("at schedule %q must be rejected", bad)
+		}
+	}
+
+	profile, err := buildProfilePersistPlan(intranetPersistInput{Command: "echo jw-profile", Name: "prof"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker, _ := profile.Metadata["marker"].(string)
+	if profile.Kind != db.IntranetArtifactProfile || !strings.HasPrefix(profile.Path, "profile:current:.profile:") {
+		t.Fatalf("profile plan = %+v", profile)
+	}
+	for name, cmd := range map[string]string{"deploy": profile.Deploy, "revoke": profile.Revoke, "verify": profile.Verify} {
+		if !strings.Contains(cmd, marker) {
+			t.Errorf("profile %s lacks marker: %q", name, cmd)
+		}
+	}
+	if custom, err := buildProfilePersistPlan(intranetPersistInput{Command: "id", Schedule: ".bashrc"}); err != nil ||
+		!strings.Contains(custom.Path, ":.bashrc:") {
+		t.Fatalf("custom profile = %+v err=%v", custom, err)
+	}
+	for _, bad := range []string{"../x", ".config/foo", "profile", ".."} {
+		if _, err := buildProfilePersistPlan(intranetPersistInput{Command: "id", Schedule: bad}); err == nil {
+			t.Errorf("profile file %q must be rejected", bad)
+		}
+	}
+
+	for _, c := range []intranetPersistInput{
+		{Kind: db.IntranetArtifactUserSystemd, Command: "id"},
+		{Kind: db.IntranetArtifactAt, Command: "id", Schedule: "now + 1 minute"},
+		{Kind: db.IntranetArtifactProfile, Command: "id"},
+	} {
+		plan, err := buildIntranetPersistPlan(c)
+		if err != nil {
+			t.Errorf("dispatch %s: %v", c.Kind, err)
+			continue
+		}
+		if plan.Kind != c.Kind {
+			t.Errorf("dispatch %s -> %s", c.Kind, plan.Kind)
+		}
+	}
+}
+
+func decodeWindowsPSScript(t *testing.T, command string) string {
+	t.Helper()
+	const marker = "-EncodedCommand "
+	i := strings.Index(command, marker)
+	if i < 0 {
+		t.Fatalf("command is not an encoded PowerShell script: %q", command)
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(command[i+len(marker):]))
+	if err != nil || len(raw)%2 != 0 {
+		t.Fatalf("invalid encoded script: %v", err)
+	}
+	units := make([]uint16, len(raw)/2)
+	for j := range units {
+		units[j] = uint16(raw[2*j]) | uint16(raw[2*j+1])<<8
+	}
+	return string(utf16.Decode(units))
+}
+
+func TestBuildAdvancedWindowsPersistPlans(t *testing.T) {
+	svc, err := buildServicePersistPlan(intranetPersistInput{Command: "echo jw-svc", Name: "keeper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceName, _ := svc.Metadata["service_name"].(string)
+	if svc.Kind != db.IntranetArtifactService || !strings.HasPrefix(svc.Path, "service:keeper-") {
+		t.Fatalf("service plan = %+v", svc)
+	}
+	for label, cmd := range map[string]string{"deploy": svc.Deploy, "revoke": svc.Revoke, "verify": svc.Verify} {
+		if serviceName == "" || !strings.Contains(cmd, winQuote(serviceName)) {
+			t.Errorf("service %s lacks name %q: %q", label, serviceName, cmd)
+		}
+	}
+	if !strings.Contains(svc.Deploy, "sc create") || !strings.Contains(svc.Deploy, "binPath= ") ||
+		!strings.Contains(svc.Deploy, "start= auto") || !strings.Contains(svc.Revoke, "sc delete") {
+		t.Errorf("service deploy/revoke = %q / %q", svc.Deploy, svc.Revoke)
+	}
+
+	wmi, err := buildWMIPersistPlan(intranetPersistInput{Command: "echo jw-wmi", Name: "wmi-keeper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wmiName, _ := wmi.Metadata["consumer_name"].(string)
+	wmiDeploy := decodeWindowsPSScript(t, wmi.Deploy)
+	wmiRevoke := decodeWindowsPSScript(t, wmi.Revoke)
+	wmiVerify := decodeWindowsPSScript(t, wmi.Verify)
+	for part, script := range map[string]string{
+		"__EventFilter": wmiDeploy, "CommandLineEventConsumer": wmiDeploy,
+		"__FilterToConsumerBinding": wmiDeploy, "cmd.exe /c echo jw-wmi": wmiDeploy,
+		intranetArtifactOK: wmiDeploy, "Remove-WmiObject": wmiRevoke,
+		intranetArtifactPresent: wmiVerify, intranetArtifactGone: wmiVerify,
+	} {
+		if !strings.Contains(script, part) {
+			t.Errorf("wmi script lacks %q:\n%s", part, script)
+		}
+	}
+	if wmiName == "" || !strings.Contains(wmiDeploy, wmiName) {
+		t.Errorf("wmi name %q missing", wmiName)
+	}
+
+	startup, err := buildStartupPersistPlan(intranetPersistInput{Command: "echo jw-startup", Name: "boot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startupDeploy := decodeWindowsPSScript(t, startup.Deploy)
+	startupRevoke := decodeWindowsPSScript(t, startup.Revoke)
+	startupVerify := decodeWindowsPSScript(t, startup.Verify)
+	if startup.Kind != db.IntranetArtifactStartup || !strings.HasPrefix(startup.Path, "startup:boot-") {
+		t.Fatalf("startup plan = %+v", startup)
+	}
+	for part, script := range map[string]string{
+		"Startup": startupDeploy, "Set-Content": startupDeploy, "echo jw-startup": startupDeploy,
+		"Remove-Item": startupRevoke, "Test-Path": startupVerify,
+	} {
+		if !strings.Contains(script, part) {
+			t.Errorf("startup script lacks %q:\n%s", part, script)
+		}
+	}
+
+	if _, err := buildServicePersistPlan(intranetPersistInput{Command: `echo "bad"`}); err == nil {
+		t.Fatal("quoted windows command must be rejected")
+	}
+	if _, err := buildStartupPersistPlan(intranetPersistInput{Command: "echo %PATH%"}); err == nil {
+		t.Fatal("windows command with % must be rejected")
+	}
+}
+
+func TestIntranetArtifactFingerprintAndTTL(t *testing.T) {
+	base := intranetArtifactFingerprint("cron", "10.0.0.5", "beacon", "@daily", "echo hi", "", "")
+	if again := intranetArtifactFingerprint("CRON", "10.0.0.5", " beacon ", "@daily", "echo hi", "", ""); again != base {
+		t.Fatalf("fingerprint is not canonical: %q vs %q", base, again)
+	}
+	if other := intranetArtifactFingerprint("cron", "10.0.0.5", "beacon", "@daily", "echo bye", "", ""); other == base {
+		t.Fatal("different command must change fingerprint")
+	}
+	if other := intranetArtifactFingerprint("cron", "10.0.0.6", "beacon", "@daily", "echo hi", "", ""); other == base {
+		t.Fatal("different host must change fingerprint")
+	}
+	if expires, err := intranetArtifactExpiry(0); err != nil || expires != nil {
+		t.Fatalf("zero ttl = %v/%v", expires, err)
+	}
+	expires, err := intranetArtifactExpiry(3600)
+	if err != nil || expires == nil || time.Until(*expires) < 50*time.Minute {
+		t.Fatalf("ttl expiry = %v/%v", expires, err)
+	}
+	for _, bad := range []int64{30, int64((31 * 24 * time.Hour).Seconds())} {
+		if _, err := intranetArtifactExpiry(bad); err == nil {
+			t.Errorf("ttl %d must be rejected", bad)
+		}
+	}
+}
+
+func TestIntranetPersistProfileIdempotentAndTTL(t *testing.T) {
+	pg := prescanTestDB(t)
+	s, sess, home := newIntranetPersistFixture(t, pg)
+	in := intranetPersistInput{
+		SessionID: sess.ID, Kind: db.IntranetArtifactProfile, Command: "echo jw-profile",
+		Name: "profile-idem", TTLSeconds: 3600,
+	}
+	art, _, verify, reused, err := s.intranetPersist(context.Background(), pg, in)
+	if err != nil {
+		t.Fatalf("profile persist: %v verify=%+v", err, verify)
+	}
+	if reused || art == nil || art.ExpiresAt == nil || art.Fingerprint == "" {
+		t.Fatalf("profile artifact = %+v reused=%v", art, reused)
+	}
+	profilePath := filepath.Join(home, ".profile")
+	data, err := os.ReadFile(profilePath)
+	if err != nil || !strings.Contains(string(data), "echo jw-profile # jw:") {
+		t.Fatalf("profile = %q err=%v", data, err)
+	}
+
+	again, _, _, reusedAgain, err := s.intranetPersist(context.Background(), pg, in)
+	if err != nil || !reusedAgain || again.ID != art.ID {
+		t.Fatalf("idempotent redeploy = %+v reused=%v err=%v", again, reusedAgain, err)
+	}
+	data, _ = os.ReadFile(profilePath)
+	if strings.Count(string(data), "echo jw-profile") != 1 {
+		t.Fatalf("profile command duplicated: %q", data)
+	}
+
+	if _, _, vout, ok, err := s.intranetRevokeArtifact(context.Background(), pg, art.ID, 0); err != nil || !ok {
+		t.Fatalf("profile revoke ok=%v err=%v verify=%+v", ok, err, vout)
+	}
+	data, _ = os.ReadFile(profilePath)
+	if strings.Contains(string(data), "jw-profile") {
+		t.Fatalf("profile command survived revoke: %q", data)
+	}
+}
+
+// Apache 不给 www-data 设置 HOME：只认 "$HOME" 的维持脚本会把 .profile 拼成
+// /.profile，落地物落到根目录然后报「部署未通过验证」。这里只跑家目录解析片段。
+func TestSSHHomeScriptResolvesWhenEnvHomeEmpty(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("posix shell fragment")
+	}
+	frag, err := intranetSSHHomeScript("")
+	if err != nil {
+		t.Fatalf("home script: %v", err)
+	}
+	env := make([]string, 0, len(os.Environ()))
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "HOME=") {
+			env = append(env, kv)
+		}
+	}
+	cmd := exec.Command("/bin/sh", "-c", frag+"\nprintf '%s' \"$home\"")
+	cmd.Env = append(env, "HOME=")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("home resolution failed with empty HOME: %v (%q)", err, out)
+	}
+	home := strings.TrimSpace(string(out))
+	if home == "" || home == "/" {
+		t.Fatalf("resolved home = %q, want the account home directory", home)
+	}
+	if fi, serr := os.Stat(home); serr != nil || !fi.IsDir() {
+		t.Fatalf("resolved home %q is not a directory: %v", home, serr)
+	}
+}
+
+func TestBuildProfilePersistPlanWarnsUnusableShell(t *testing.T) {
+	plan, err := buildProfilePersistPlan(intranetPersistInput{Command: "echo jw", User: "www-data"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan.Deploy, intranetWarnNoLoginShell) || !strings.Contains(plan.Deploy, "getent passwd 'www-data'") {
+		t.Errorf("profile deploy = %q", plan.Deploy)
+	}
+}
+
+func TestIntranetPersistFailureReasonQuotesTarget(t *testing.T) {
+	run := intranetExecOutcome{Output: "mkdir: cannot create directory '/var/www/.ssh': Permission denied", ExitCode: 1, IsError: true}
+	got := intranetPersistFailureReason(run, intranetExecOutcome{ExitCode: -1})
+	if !strings.Contains(got, "Permission denied") {
+		t.Fatalf("reason = %q, must carry the target-side error", got)
+	}
+	if got2 := intranetPersistFailureReason(intranetExecOutcome{ExitCode: 3, IsError: true}, intranetExecOutcome{ExitCode: -1}); !strings.Contains(got2, "退出码 3") {
+		t.Fatalf("silent failure reason = %q", got2)
+	}
+	if got3 := intranetPersistFailureReason(intranetExecOutcome{}, intranetExecOutcome{Output: "JW_ARTIFACT_GONE"}); !strings.Contains(got3, "JW_ARTIFACT_GONE") {
+		t.Fatalf("verify output must win over an empty deploy: %q", got3)
+	}
+}
+
 func TestBuildIntranetPersistPlanKindValidation(t *testing.T) {
 	if _, err := buildIntranetPersistPlan(intranetPersistInput{Kind: "file"}); err == nil {
 		t.Fatal("file is not a standard persistence module")
@@ -224,7 +511,10 @@ func TestBuildIntranetPersistPlanKindValidation(t *testing.T) {
 }
 
 func TestIntranetPersistKindForOS(t *testing.T) {
-	for _, kind := range []string{db.IntranetArtifactCron, db.IntranetArtifactSystemd, db.IntranetArtifactSSHKey} {
+	for _, kind := range []string{
+		db.IntranetArtifactCron, db.IntranetArtifactSystemd, db.IntranetArtifactUserSystemd,
+		db.IntranetArtifactAt, db.IntranetArtifactProfile, db.IntranetArtifactSSHKey,
+	} {
 		if err := intranetPersistKindForOS(kind, intranetOSPosix); err != nil {
 			t.Errorf("posix kind %s rejected: %v", kind, err)
 		}
@@ -232,7 +522,10 @@ func TestIntranetPersistKindForOS(t *testing.T) {
 			t.Errorf("posix kind %s must be rejected on Windows", kind)
 		}
 	}
-	for _, kind := range []string{db.IntranetArtifactSchtasks, db.IntranetArtifactRegistry} {
+	for _, kind := range []string{
+		db.IntranetArtifactSchtasks, db.IntranetArtifactRegistry,
+		db.IntranetArtifactService, db.IntranetArtifactWMI, db.IntranetArtifactStartup,
+	} {
 		if err := intranetPersistKindForOS(kind, intranetOSWindows); err != nil {
 			t.Errorf("windows kind %s rejected: %v", kind, err)
 		}
@@ -310,7 +603,7 @@ func TestIntranetPersistCronDeployAndRevoke(t *testing.T) {
 	pg := prescanTestDB(t)
 	s, sess, home := newIntranetPersistFixture(t, pg)
 
-	art, out, verify, err := s.intranetPersist(context.Background(), pg, intranetPersistInput{
+	art, out, verify, _, err := s.intranetPersist(context.Background(), pg, intranetPersistInput{
 		SessionID: sess.ID, Kind: db.IntranetArtifactCron,
 		Schedule: "*/5 * * * *", Command: "echo jw-beacon", Name: "t-cron",
 	})
@@ -354,7 +647,7 @@ func TestIntranetPersistSSHKeyDeployAndRevoke(t *testing.T) {
 	s, sess, home := newIntranetPersistFixture(t, pg)
 	const key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl tester@example"
 
-	art, out, verify, err := s.intranetPersist(context.Background(), pg, intranetPersistInput{
+	art, out, verify, _, err := s.intranetPersist(context.Background(), pg, intranetPersistInput{
 		SessionID: sess.ID, Kind: db.IntranetArtifactSSHKey, PublicKey: key,
 	})
 	if err != nil {

@@ -31,8 +31,8 @@ func TestIntranetWrapCommandPHP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("payload is not base64: %v", err)
 	}
-	if !strings.Contains(string(decoded), "id\n__jw_ec=$?") {
-		t.Fatalf("decoded script does not run the command: %q", decoded)
+	if !strings.Contains(string(decoded), "(\n") || !strings.Contains(string(decoded), "id") {
+		t.Fatalf("decoded script does not run the command in a subshell: %q", decoded)
 	}
 }
 
@@ -191,5 +191,34 @@ func TestIntranetInternalScriptsReachTrailer(t *testing.T) {
 			t.Fatalf("%s wrapper trailer missing (ok=%v code=%d); an `exit` in the script kills it:\n%s",
 				name, ok, code, raw)
 		}
+	}
+}
+
+// A deploy script that dies half-way must still report what happened: the
+// persistence ledger is the only record the operator gets of a failed deploy.
+func TestIntranetScriptReportsFailedCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("posix wrapper test")
+	}
+	out, err := exec.Command("/bin/sh", "-c",
+		intranetScript("/tmp", "set -e\nprintf out-part\\n\nls /definitely-missing")).CombinedOutput()
+	if err != nil && !strings.Contains(err.Error(), "exit status") {
+		t.Fatalf("run failed: %v\n%s", err, out)
+	}
+	output, cwd, code, ok := parseIntranetOutput(string(out))
+	if !ok {
+		t.Fatalf("set -e destroyed the trailer, no exit code recovered:\n%s", out)
+	}
+	if code == 0 {
+		t.Fatalf("failing command reported exit 0:\n%s", out)
+	}
+	if !strings.Contains(output, "out-part") {
+		t.Fatalf("output before the failure was lost:\n%s", output)
+	}
+	if !strings.Contains(output, "No such file") && !strings.Contains(output, "cannot access") {
+		t.Fatalf("target-side stderr is not in the output:\n%s", output)
+	}
+	if cwd != "/tmp" {
+		t.Fatalf("cwd = %q, want /tmp", cwd)
 	}
 }

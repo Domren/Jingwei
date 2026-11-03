@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/scanner"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -23,6 +24,7 @@ func (s *Server) deepTools() []actool.CoreTool {
 		s.toolVerifyXSS(),
 		s.toolWAFBypass(),
 		s.toolInjectWebshell(),
+		s.toolWebshellRegister(),
 		s.toolGetDeepTask(),
 		s.toolSolveSliderCaptcha(),
 	}, append(s.intranetTools(), s.resourceTools()...)...)
@@ -214,7 +216,7 @@ func (s *Server) toolWAFBypass() actool.CoreTool {
 
 func (s *Server) toolInjectWebshell() actool.CoreTool {
 	return wrTool("inject_webshell",
-		"向已授权目标的上传接口尝试投放 webshell，并在提供落地地址时验证存活；成功后会登记到 Webshell 管理。仅在明确授权且可控的测试环境使用。",
+		"向已授权目标的上传接口尝试投放 webshell，并在提供落地地址时验证存活；成功后会登记到 Webshell 管理。仅在明确授权且可控的测试环境使用。落地地址若已登记为受管壳，这次上传覆盖的就是那个文件：平台改写原有那条记录（id 不变、密钥与载荷指纹换成新的、旧的受管资源台账按「被覆盖」释放），不会再新增第二行，也不会让绑在旧壳上的会话悬着。",
 		objSchema(map[string]any{
 			"upload_url": strParam("上传接口完整 URL"),
 			"land_url":   strParam("webshell 落地 URL（可选，用于存活验证）"),
@@ -233,6 +235,186 @@ func (s *Server) toolInjectWebshell() actool.CoreTool {
 		}, "upload_url"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			return s.runDeepTool(ctx, in, db.DeepTaskWebshellInject)
+		})
+}
+
+// webshellRegisterInput is the payload of the webshell_register tool.
+type webshellRegisterInput struct {
+	URL        string `json:"url"`
+	ShellType  string `json:"shell_type"`
+	Protocol   string `json:"protocol"`
+	Password   string `json:"password"`
+	Name       string `json:"name"`
+	Target     string `json:"target"`
+	UploadURL  string `json:"upload_url"`
+	TaskID     int64  `json:"task_id"`
+	Proxy      string `json:"proxy"`
+	Verify     *bool  `json:"verify"`
+	SessionID  int64  `json:"session_id"`
+	DeployPath string `json:"deploy_path"`
+	Note       string `json:"note"`
+}
+
+// toolWebshellRegister covers shells that reached the target without going
+// through inject_webshell: a file the worker wrote itself, another exploit
+// chain, or a shell already sitting on the box. Registration is what binds the
+// shell to the task and the ledger, so without it those files stay invisible to
+// evacuation.
+func (s *Server) toolWebshellRegister() actool.CoreTool {
+	return wrTool("webshell_register",
+		"把目标上已存在的 webshell 登记为受管壳：封存密钥、写资源台账并绑定任务，之后才能 intranet_open_session 开会话，撤离时也才会被枚举清理。用于 inject_webshell 之外的投放途径（自己写的文件、其他漏洞链、发现既有壳）。默认加密 v2 协议并立即做一次存活验证。若该地址已登记过，本工具不会新增第二条记录：不带 deploy_path 时直接把已有那条返回给你（already_registered），带 session_id + deploy_path 时把正确载荷写上去并改写那条记录（id 不变、旧的受管资源台账按覆盖释放）。若目标上的文件不是精卫生成的载荷，v2 验证必然失败：此时给出 session_id + deploy_path，本工具会经该会话把正确的载荷写到该路径再登记（载荷与密钥不经过对话上下文）。legacy 明文口令壳无法自我删除，撤离只会列为残留并要求人工 rm 复核。",
+		objSchema(map[string]any{
+			"url":         strParam("webshell 访问地址（必填），例如 http://10.99.0.2/shell.php"),
+			"shell_type":  strParam("php / jsp / aspx，默认 php"),
+			"protocol":    strParam("v2（默认，密钥不出流量）或 legacy（旧版明文口令）"),
+			"password":    strParam("legacy 协议必填的连接口令；v2 忽略"),
+			"name":        strParam("显示名称（可选，默认 shell.<类型>）"),
+			"target":      strParam("归属目标（可选，默认取 url）"),
+			"upload_url":  strParam("投放该文件的接口或来源地址（可选，写入台账便于回溯）"),
+			"task_id":     intranetIntParam("归属任务 ID（可选，任务上下文中自动带入；必须能取到，撤离按任务枚举 webshell）"),
+			"session_id":  intranetIntParam("已有内网会话 ID（可选；与 deploy_path 一起使用时先写载荷再登记）"),
+			"deploy_path": strParam("载荷应写入的目标路径（可选，须与 url 对应，例如 /var/www/html/shell.php；需 session_id）"),
+			"proxy":       strParam("存活验证用的代理（可选，例如经隧道的 socks5://127.0.0.1:1080）"),
+			"verify":      map[string]any{"type": "boolean", "description": "登记后立刻验证存活，默认 true"},
+			"note":        strParam("备注（可选）"),
+		}, "url"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a webshellRegisterInput
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf("参数格式错误"), nil
+			}
+			shellURL := strings.TrimSpace(a.URL)
+			if shellURL == "" {
+				return actool.Errorf("url 必填"), nil
+			}
+			taskID := a.TaskID
+			if taskID <= 0 {
+				taskID = intranetCtxTaskID(ctx)
+			}
+			if taskID <= 0 {
+				return actool.Errorf("task_id 必填：撤离按任务枚举 webshell，不绑定任务的登记永远不会被清理"), nil
+			}
+			pg, err := s.intranetToolPG()
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if reason, allowed := shellAllowed(pg, shellURL); !allowed {
+				return actool.Errorf("webshell 地址命中资产拦截规则，已拒绝：" + reason), nil
+			}
+			shellType := strings.ToLower(strings.TrimSpace(a.ShellType))
+			switch shellType {
+			case "jsp", "aspx":
+			default:
+				shellType = "php"
+			}
+			req := db.WebshellInput{
+				Name:      displayOr(strings.TrimSpace(a.Name), "shell."+shellType),
+				URL:       shellURL,
+				ShellType: shellType,
+				Protocol:  strings.TrimSpace(a.Protocol),
+				Password:  a.Password,
+				Target:    displayOr(strings.TrimSpace(a.Target), shellURL),
+				Source:    "manual",
+				TaskID:    &taskID,
+				Note:      strings.TrimSpace(a.Note),
+			}
+			payload, badRequest, err := s.buildWebshellMaterial(&req)
+			if err != nil {
+				if badRequest {
+					return actool.Errorf(err.Error()), nil
+				}
+				return actool.Errorf("生成 webshell 载荷失败: " + err.Error()), nil
+			}
+			res := map[string]any{"protocol": payload.Protocol, "self_delete": payload.Protocol == scanner.ShellProtocolV2}
+			deployPath := strings.TrimSpace(a.DeployPath)
+			if deployPath != "" {
+				sess, serr := s.intranetSession(pg, a.SessionID)
+				if serr != nil {
+					return actool.Errorf("deploy_path 需要可用的 session_id：" + serr.Error()), nil
+				}
+				out, uerr := s.intranetUpload(ctx, pg, sess, deployPath, []byte(payload.Content))
+				if uerr != nil || out.IsError {
+					msg := strings.TrimSpace(out.Output + out.Note)
+					if uerr != nil {
+						if msg == "" {
+							msg = uerr.Error()
+						} else {
+							msg += "：" + uerr.Error()
+						}
+					}
+					return actool.Errorf(fmt.Sprintf("写入载荷到 %s 失败: %s", deployPath, msg)), nil
+				}
+				res["deployed_to"] = deployPath
+				res["deploy_session_id"] = sess.ID
+				res["deploy_output"] = truncateText(strings.TrimSpace(out.Output), 1000)
+			} else if a.SessionID > 0 {
+				return actool.Errorf("session_id 需要与 deploy_path 一起使用"), nil
+			}
+			shell, err := s.storeManagedWebshell(pg, req, strings.TrimSpace(a.UploadURL), shellURL)
+			if err != nil {
+				var taken *webshellURLTaken
+				if !errors.As(err, &taken) || taken.Existing == nil {
+					return actool.Errorf("写入 webshell 记录失败: " + err.Error()), nil
+				}
+				if deployPath == "" {
+					// Nothing was written to the target, so the record there still
+					// describes the live payload. A second row would put a key on this
+					// URL that no file answers to, and evacuation would then delete the
+					// wrong one.
+					out := map[string]any{
+						"already_registered": true,
+						"webshell_id":        taken.Existing.ID,
+						"protocol":           taken.Existing.Protocol,
+						"shell_type":         taken.Existing.ShellType,
+						"status":             taken.Existing.Status,
+						"payload_sha256":     taken.Existing.PayloadSHA256,
+						"next_step": fmt.Sprintf("该地址已登记为壳 #%d，直接用它的 id 开内网会话；"+
+							"要把目标上的文件换成精卫载荷，带上 session_id + deploy_path 重新调用本工具",
+							taken.Existing.ID),
+					}
+					if taken.Existing.TaskID != nil {
+						out["task_id"] = *taken.Existing.TaskID
+					}
+					return jsonResult(out)
+				}
+				// The payload was just written over that path, so the old record now
+				// describes a file that is gone: re-point it instead of adding a row.
+				shell, err = s.reclaimRegisteredWebshell(pg, taken.Existing, req, strings.TrimSpace(a.UploadURL))
+				if err != nil {
+					return actool.Errorf("改写既有登记失败: " + err.Error()), nil
+				}
+				res["superseded_webshell_id"] = taken.Existing.ID
+				res["superseded_payload_sha256"] = taken.Existing.PayloadSHA256
+			}
+			res["webshell_id"] = shell.ID
+			res["task_id"] = taskID
+			res["payload_sha256"] = shell.PayloadSHA256
+			res["ledger"] = true
+			if a.Verify != nil && !*a.Verify {
+				res["verified"] = false
+				res["next_step"] = "未做存活验证；开会话或撤离前先确认该地址可用"
+				return jsonResult(res)
+			}
+			client := scanner.NewDeepClientWithProxy(15*time.Second, strings.TrimSpace(a.Proxy))
+			alive, note := scanner.CheckShellAlive(ctx, client, shellURL, payload)
+			status := "unknown"
+			if alive {
+				status = "alive"
+			}
+			if err := pg.UpdateWebshellState(shell.ID, status, "", truncateText(note, 2000)); err != nil {
+				res["state_error"] = err.Error()
+			}
+			res["verified"] = true
+			res["alive"] = alive
+			res["note"] = note
+			if alive {
+				res["next_step"] = "已受管，可用 intranet_open_session(webshell_id) 开内网会话"
+			} else if deployPath != "" {
+				res["next_step"] = "载荷已写入但地址无应答：核对 url 与 deploy_path 是否指向同一文件、Web 根目录与文件权限"
+			} else {
+				res["next_step"] = fmt.Sprintf("目标上的文件没有按 %s 协议应答：带上 session_id + deploy_path 重新调用本工具，由平台把正确载荷写入目标；不要对同一地址反复登记", payload.Protocol)
+			}
+			return jsonResult(res)
 		})
 }
 

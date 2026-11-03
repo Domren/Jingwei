@@ -166,10 +166,15 @@ type triggeredRun struct {
 }
 
 func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string) *Server {
-	key, err := loadOrCreateJWTKey(keyDir, dataDir)
+	key, err := loadOrCreateJWTKey(m.pg, keyDir, dataDir)
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
+	// The same root seals the credential ledger and the model API keys at rest.
+	// Installing it on the database handle is what lets every reader see plaintext
+	// without each call site remembering to unseal — a missed one would dial SSH
+	// with ciphertext or send a garbage Authorization header to a provider.
+	m.pg.UseSealKey(key)
 	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
@@ -304,6 +309,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		s.deepMgr = newDeepManager(s)
 		s.deepMgr.start(ctx)
 		s.resourceMgr.start(ctx)
+		go s.runIntranetHeartbeat(ctx)
+		go s.runIntranetArtifactExpiry(ctx)
 	}
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
 	return s
@@ -945,9 +952,26 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/deep/webshells/{id}", s.updateWebshell)
 	mux.HandleFunc("DELETE /api/deep/webshells/{id}", s.deleteWebshell)
 	mux.HandleFunc("POST /api/deep/webshells/{id}/check", s.checkWebshell)
+	mux.HandleFunc("GET /api/deep/webshells/{id}/payload", s.webshellPayload)
+	mux.HandleFunc("POST /api/deep/webshells/{id}/rotate", s.rotateWebshellKey)
+	// 大马：加密 v2 通道内的文件管理（列目录/读写/删除/重命名/权限）
+	mux.HandleFunc("GET /api/deep/webshells/{id}/files", s.listWebshellFiles)
+	mux.HandleFunc("GET /api/deep/webshells/{id}/file", s.readWebshellFile)
+	mux.HandleFunc("POST /api/deep/webshells/{id}/file", s.writeWebshellFile)
+	mux.HandleFunc("POST /api/deep/webshells/{id}/files/action", s.actionWebshellFiles)
+	mux.HandleFunc("POST /api/deep/webshells/{id}/php-persist", s.phpSemiPersistWebshell)
 	// 凭据库：全局凭据视图（跨任务）
 	mux.HandleFunc("GET /api/deep/credentials", s.listGlobalCredentials)
 	mux.HandleFunc("POST /api/deep/webshells/{id}/exec", s.execWebshellCommand)
+	mux.HandleFunc("GET /api/deep/webshells/{id}/info", s.webshellInfo)
+	// Java 内存马：由 v2 JSP webshell 注入 filter/servlet/listener/valve/agent
+	mux.HandleFunc("GET /api/deep/memshells", s.listJavaMemshells)
+	mux.HandleFunc("GET /api/deep/memshells/{id}", s.getJavaMemshell)
+	mux.HandleFunc("DELETE /api/deep/memshells/{id}", s.deleteJavaMemshell)
+	mux.HandleFunc("POST /api/deep/memshells/{id}/check", s.checkJavaMemshell)
+	mux.HandleFunc("POST /api/deep/memshells/{id}/exec", s.execJavaMemshell)
+	mux.HandleFunc("GET /api/deep/webshells/{id}/memshells", s.listWebshellMemshells)
+	mux.HandleFunc("POST /api/deep/webshells/{id}/memshells", s.deployJavaMemshell)
 	mux.HandleFunc("GET /api/deep/java-chains/status", s.javaChainsStatus)
 	// 内网两阶段 MVP：会话 / 隧道 / 范围审批 / 任务交接（与 agent 工具共用数据）
 	s.registerIntranet(mux)

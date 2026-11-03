@@ -20,7 +20,7 @@ func TestJudgeConfigIncompleteScriptDefaultAndOverride(t *testing.T) {
 	if dsn == "" {
 		t.Skip("requires isolated JINGWEI_PG_DSN")
 	}
-	pg, err := db.Open(dsn)
+	pg, err := db.OpenTestSchema(dsn, "jingwei_test_server")
 	if err != nil {
 		t.Fatal(err)
 	}

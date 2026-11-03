@@ -41,6 +41,10 @@ type RawExchange struct {
 	Response string
 	Role     string
 	Note     string
+	// CapturedAt is when the exchange happened, in Unix seconds. It is part of the
+	// snapshot identity, so saving the same bytes twice only dedupes when the
+	// caller states the same instant; zero means "now".
+	CapturedAt int64
 }
 
 func splitRawPacket(raw string) (head, body string) {
@@ -112,8 +116,12 @@ func (s *Store) SaveRawExchanges(ctx context.Context, findingID int64, exchanges
 		if role == "" {
 			role = "supporting"
 		}
+		captured := ex.CapturedAt
+		if captured == 0 {
+			captured = time.Now().Unix()
+		}
 		snap := db.TrafficEvidenceSnapshot{
-			CapturedAt:  time.Now().Unix(),
+			CapturedAt:  captured,
 			URL:         u,
 			Method:      method,
 			Status:      status,

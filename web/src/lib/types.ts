@@ -1736,7 +1736,12 @@ export interface Webshell {
   name: string;
   url: string;
   shell_type: string;
-  password: string;
+  protocol: string;
+  has_password: boolean;
+  has_secret: boolean;
+  carrier: string;
+  payload_sha256: string;
+  key_version: number;
   target: string;
   source: string;
   task_id?: number;
@@ -1744,6 +1749,7 @@ export interface Webshell {
   note: string;
   last_checked?: string;
   last_output: string;
+  os_kind: string;
   created_at: string;
   updated_at: string;
 }
@@ -1752,10 +1758,183 @@ export interface WebshellInput {
   name?: string;
   url: string;
   shell_type?: string;
+  protocol?: string;
   password?: string;
   target?: string;
   source?: string;
   note?: string;
+}
+
+// ---- 大马（v2 文件管理）----
+export interface ShellFileEntry {
+  name: string;
+  type: "dir" | "file" | "link" | "other";
+  size: number;
+  modified: number;
+  mode: string;
+}
+
+export interface ShellFileList {
+  path: string;
+  parent: string;
+  entries: ShellFileEntry[];
+  truncated: boolean;
+  chunk_size: number;
+  max_read: number;
+}
+
+export interface ShellFileChunk {
+  path: string;
+  offset: number;
+  size: number;
+  eof: boolean;
+  bytes: number;
+  data: string; // base64
+}
+
+export interface ShellFileWriteResult {
+  path: string;
+  offset: number;
+  written: number;
+  size: number;
+}
+
+export type ShellFileAction = "delete" | "rename" | "mkdir" | "chmod";
+
+export interface ShellExecInput {
+  command: string;
+  cwd?: string;
+  timeout_seconds?: number;
+  /** Only the memory-horse endpoint needs this: it has no cached shell row. */
+  os_kind?: string;
+}
+
+// One virtual-terminal turn. exit_code is -1 when the target never reported the
+// trailer; marker_ok distinguishes "no exit code" from "exit code 0".
+export interface ShellExecResult {
+  output: string;
+  cwd?: string;
+  exit_code: number;
+  os_kind?: string;
+  duration_ms: number;
+  timed_out: boolean;
+  marker_ok: boolean;
+  is_error: boolean;
+  note?: string;
+}
+
+export interface ShellInfoSection {
+  label: string;
+  output: string;
+}
+
+// The PHP runtime self-report (v2 "I" op); absent on JSP/ASPX and legacy shells.
+export interface ShellRuntimeInfo {
+  os: string;
+  sapi: string;
+  php: string;
+  file: string;
+  dir: string;
+  document_root: string;
+  script: string;
+  user_ini_filename: string;
+  user_ini_cache_ttl: number;
+  auto_prepend_file: string;
+  open_basedir: string;
+  disable_functions: string;
+  server: string;
+  user: string;
+  cwd: string;
+  tmp: string;
+}
+
+export interface ShellInfoResult {
+  shell_id: number;
+  os_kind: string;
+  cwd: string;
+  sections: ShellInfoSection[];
+  runtime?: ShellRuntimeInfo | null;
+  runtime_note: string;
+  duration_ms: number;
+  marker_ok: boolean;
+  note?: string;
+}
+
+export interface JavaMemshell {
+  id: number;
+  webshell_id?: number;
+  task_id?: number;
+  type: string;
+  name: string;
+  path: string;
+  url: string;
+  port: number;
+  has_secret: boolean;
+  carrier: string;
+  target: string;
+  container: string;
+  servlet_api: string;
+  status: string;
+  note: string;
+  last_checked?: string;
+  last_output: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface JavaMemshellInput {
+  type: string;
+  name?: string;
+  path?: string;
+  port?: number;
+}
+
+export interface PHPPersistInput {
+  mode?: "auto" | "user_ini" | "htaccess" | string;
+  directory?: string;
+  filename?: string;
+  config_name?: string;
+  trigger_url?: string;
+  wait_seconds?: number;
+  force?: boolean;
+  name?: string;
+  description?: string;
+  ttl_seconds?: number;
+}
+
+export interface PHPPersistInfo {
+  os?: string;
+  sapi?: string;
+  php?: string;
+  file?: string;
+  dir?: string;
+  document_root?: string;
+  script?: string;
+  user_ini_filename?: string;
+  user_ini_cache_ttl?: number;
+  auto_prepend_file?: string;
+  open_basedir?: string;
+  disable_functions?: string;
+  server?: string;
+  user?: string;
+  cwd?: string;
+  tmp?: string;
+}
+
+export interface PHPPersistResult {
+  webshell?: Webshell;
+  artifact?: IntranetArtifact;
+  mode: string;
+  directory: string;
+  payload_path: string;
+  config_path: string;
+  trigger_url: string;
+  info: PHPPersistInfo;
+  verified: boolean;
+  pending: boolean;
+  user_ini_cache_ttl?: number;
+  warnings?: string[];
+  note: string;
 }
 
 export interface JavaChainsStatus {
@@ -1776,6 +1955,7 @@ export interface IntranetSession {
   host: string;
   cwd: string;
   status: "active" | "closed" | string;
+  transport?: "webshell" | "ssh" | string;
   last_seen?: string;
   metadata: Record<string, unknown>;
   note: string;
@@ -1784,15 +1964,26 @@ export interface IntranetSession {
   webshell_name?: string;
   webshell_url?: string;
   shell_type?: string;
+  ssh_port?: number;
+  ssh_user?: string;
+  ssh_credential_id?: number;
+  ssh_dial_host?: string;
+  ssh_dial_port?: number;
 }
 
 export interface IntranetSessionInput {
   name?: string;
-  webshell_id: number;
+  webshell_id?: number;
   task_id?: number;
   host?: string;
   cwd?: string;
   note?: string;
+  transport?: "webshell" | "ssh";
+  port?: number;
+  user?: string;
+  credential_id?: number;
+  dial_host?: string;
+  dial_port?: number;
 }
 
 export interface IntranetSessionEvent {
@@ -1805,13 +1996,59 @@ export interface IntranetSessionEvent {
   created_at: string;
 }
 
-export interface IntranetExecResult {
-  output: string;
-  cwd?: string;
-  exit_code: number;
-  is_error: boolean;
-  note?: string;
+// 凭据台账：口令只写不读，接口只回 has_password（与 webshell 密钥同一套规则）。
+export interface IntranetCredential {
+  id: number;
+  host: string;
+  port: number;
+  protocol: string;
+  url: string;
+  username: string;
+  has_password: boolean;
+  source: string;
+  task_id?: number;
+  scan_task_id?: number;
+  finding_id?: number;
+  status: "untested" | "valid" | "invalid" | string;
+  evidence: string;
+  last_used_at?: string;
+  created_at: string;
+  updated_at: string;
 }
+
+export interface IntranetCredentialInput {
+  host?: string;
+  port?: number;
+  protocol?: string;
+  url?: string;
+  username: string;
+  password: string;
+  source?: string;
+  task_id?: number;
+  evidence?: string;
+}
+
+export interface IntranetReuseTarget {
+  url: string;
+  host?: string;
+  status: "valid" | "invalid" | "skipped" | "error" | string;
+  username?: string;
+  kind?: string;
+  request?: string;
+  response?: string;
+  cookie?: string;
+  attempts?: number;
+  elapsed_ms?: number;
+  error?: string;
+}
+
+/**
+ * One terminal turn on an intranet session. Same shape as a webshell / memory-horse
+ * turn on purpose (the server aliases its own outcome type to that struct), so the
+ * shared terminal component can drive an SSH session and a landed shell alike and a
+ * stopped wait can't be misread as a dead channel.
+ */
+export type IntranetExecResult = ShellExecResult;
 
 export interface IntranetProbeInfo {
   host?: string;
@@ -1836,6 +2073,7 @@ export interface IntranetTunnel {
   kind: "socks5" | "port_forward" | "reverse_forward" | string;
   listen_host: string;
   listen_port: number;
+  listen_side: "target" | "pivot" | string;
   remote_host: string;
   remote_port: number;
   status: "planned" | "deployed" | "verified" | "failed" | "stopped" | string;
@@ -1856,6 +2094,7 @@ export interface IntranetTunnelInput {
   kind?: string;
   listen_host?: string;
   listen_port: number;
+  listen_side?: string;
   remote_host?: string;
   remote_port?: number;
   deploy_command?: string;
@@ -1900,7 +2139,21 @@ export interface IntranetArtifact {
   task_id?: number;
   session_id?: number;
   host: string;
-  kind: "file" | "cron" | "systemd" | "ssh_key" | "other" | string;
+  kind:
+    | "file"
+    | "cron"
+    | "systemd"
+    | "user_systemd"
+    | "at"
+    | "profile"
+    | "ssh_key"
+    | "schtasks"
+    | "registry"
+    | "service"
+    | "wmi"
+    | "startup"
+    | "other"
+    | string;
   name: string;
   path: string;
   description: string;
@@ -1908,8 +2161,10 @@ export interface IntranetArtifact {
   revoke_command: string;
   verify_command: string;
   status: "active" | "revoked" | string;
+  fingerprint: string;
   evidence: string;
   metadata: Record<string, unknown>;
+  expires_at?: string;
   revoked_at?: string;
   created_at: string;
   updated_at: string;
@@ -1925,22 +2180,36 @@ export interface IntranetArtifactInput {
   description?: string;
   revoke_command: string;
   verify_command?: string;
+  ttl_seconds?: number;
   metadata?: Record<string, unknown>;
 }
 
 export interface IntranetPersistInput {
-  kind: "cron" | "systemd" | "ssh_key" | string;
+  kind:
+    | "cron"
+    | "systemd"
+    | "user_systemd"
+    | "at"
+    | "profile"
+    | "ssh_key"
+    | "schtasks"
+    | "registry"
+    | "service"
+    | "wmi"
+    | "startup"
+    | string;
   name?: string;
   schedule?: string;
   command?: string;
   public_key?: string;
   user?: string;
   description?: string;
+  ttl_seconds?: number;
   task_id?: number;
 }
 
 export interface IntranetEvacuationItem {
-  type: "artifact" | "tunnel" | "resource" | "session" | string;
+  type: "artifact" | "tunnel" | "resource" | "session" | "webshell" | string;
   id: number;
   kind: string;
   name: string;
@@ -1955,6 +2224,13 @@ export interface IntranetEvacuationTotals {
   failed: number;
 }
 
+export interface IntranetEvacuationScan {
+  checked: number;
+  present: number;
+  gone: number;
+  unknown: number;
+}
+
 export interface IntranetEvacuationReport {
   task_id: number;
   dry_run: boolean;
@@ -1964,6 +2240,9 @@ export interface IntranetEvacuationReport {
   tunnels: IntranetEvacuationTotals;
   resources: IntranetEvacuationTotals;
   sessions: IntranetEvacuationTotals;
+  memshells: IntranetEvacuationTotals;
+  webshells: IntranetEvacuationTotals;
+  scan: IntranetEvacuationScan;
   items: IntranetEvacuationItem[];
   residual: string[];
   summary: string;
@@ -1973,6 +2252,8 @@ export interface IntranetEvacuationInput {
   task_id: number;
   dry_run?: boolean;
   close_sessions?: boolean;
+  delete_webshells?: boolean;
+  scan?: boolean;
   note?: string;
 }
 

@@ -359,6 +359,20 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- platform_secret holds the platform signing root in exactly one row. Losing it
+-- invalidates every login session and bricks every planted webshell, because
+-- their stored keys are sealed with a derivation of it — so it belongs in the
+-- database, the one artifact operators already dump before an upgrade, and not
+-- in the container's writable layer where `compose up --force-recreate` used to
+-- rotate it silently. It is deliberately NOT a settings row: settings are read
+-- by name all over the app and echoed to the browser, while this value is
+-- loaded exactly once, at startup.
+CREATE TABLE IF NOT EXISTS platform_secret (
+    id         SMALLINT PRIMARY KEY CHECK (id = 1),
+    jwt_key    TEXT NOT NULL CHECK (char_length(jwt_key) >= 32),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS llm_profiles (
     id               BIGSERIAL PRIMARY KEY,
     name             TEXT NOT NULL UNIQUE,
@@ -1802,8 +1816,53 @@ CREATE TABLE IF NOT EXISTS webshells (
 );
 CREATE INDEX IF NOT EXISTS idx_webshells_created ON webshells(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_webshells_target ON webshells(target);
+-- 加密 webshell v2：密钥只存在于载荷源码里，平台侧加密落盘在 secret 中；
+-- carrier 是随机请求载体名（随机 HTTP 头或表单字段），payload_sha256 是
+-- 最近一次生成/投放载荷的指纹，key_version 随轮换递增。
+ALTER TABLE webshells ADD COLUMN IF NOT EXISTS protocol TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE webshells ADD COLUMN IF NOT EXISTS secret TEXT NOT NULL DEFAULT '';
+ALTER TABLE webshells ADD COLUMN IF NOT EXISTS carrier TEXT NOT NULL DEFAULT '';
+ALTER TABLE webshells ADD COLUMN IF NOT EXISTS payload_sha256 TEXT NOT NULL DEFAULT '';
+ALTER TABLE webshells ADD COLUMN IF NOT EXISTS key_version INTEGER NOT NULL DEFAULT 1;
+-- os_kind 缓存一次探测的结果：换 POSIX/Windows wrapper 靠的是它，每条命令先探测
+-- 一次会把一次交互变成两次往返。故意不存 cwd——目录属于「哪一个交互上下文」而不
+-- 属于这个落地文件：一个 webshell 可以绑任意多个内网会话，每个会话已经各自记着
+-- cwd（intranet_sessions.cwd），这里再存一份就是同一个目标上的第二个真相。
+ALTER TABLE webshells ADD COLUMN IF NOT EXISTS os_kind TEXT NOT NULL DEFAULT '';
 DROP TRIGGER IF EXISTS trg_webshells_upd ON webshells;
 CREATE TRIGGER trg_webshells_upd BEFORE UPDATE ON webshells
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Java 内存马：由加密 v2 webshell 注入目标 JVM 的常驻组件（filter/servlet/
+-- listener/valve/agent）。密钥同样封装后落库，只存在于投放载荷与运行时内存；
+-- webshell_id 记录父级落地点，即使内存马地址失效也能通过父 shell 反向清理。
+CREATE TABLE IF NOT EXISTS java_memshells (
+    id            BIGSERIAL PRIMARY KEY,
+    webshell_id   BIGINT REFERENCES webshells(id) ON DELETE SET NULL,
+    task_id       BIGINT REFERENCES deep_tasks(id) ON DELETE SET NULL,
+    type          TEXT NOT NULL DEFAULT '',
+    name          TEXT NOT NULL DEFAULT '',
+    path          TEXT NOT NULL DEFAULT '',
+    url           TEXT NOT NULL DEFAULT '',
+    port          INTEGER NOT NULL DEFAULT 0,
+    secret        TEXT NOT NULL DEFAULT '',
+    carrier       TEXT NOT NULL DEFAULT '',
+    target        TEXT NOT NULL DEFAULT '',
+    container     TEXT NOT NULL DEFAULT '',
+    servlet_api   TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'unknown',
+    note          TEXT NOT NULL DEFAULT '',
+    last_checked  TIMESTAMPTZ,
+    last_output   TEXT NOT NULL DEFAULT '',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_memshells_webshell ON java_memshells(webshell_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_memshells_created ON java_memshells(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memshells_target ON java_memshells(target);
+CREATE INDEX IF NOT EXISTS idx_memshells_task ON java_memshells(task_id);
+DROP TRIGGER IF EXISTS trg_memshells_upd ON java_memshells;
+CREATE TRIGGER trg_memshells_upd BEFORE UPDATE ON java_memshells
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- 受管资源台账：JNDI/回调端口、Webshell、隧道等由平台主动创建的资源，
@@ -1848,6 +1907,12 @@ CREATE TABLE IF NOT EXISTS intranet_sessions (
     last_seen   TIMESTAMPTZ,
     metadata    JSONB NOT NULL DEFAULT '{}',
     note        TEXT NOT NULL DEFAULT '',
+    transport   TEXT NOT NULL DEFAULT 'webshell',
+    ssh_port    INTEGER NOT NULL DEFAULT 0,
+    ssh_user    TEXT NOT NULL DEFAULT '',
+    ssh_credential_id BIGINT NOT NULL DEFAULT 0,
+    ssh_dial_host TEXT NOT NULL DEFAULT '',
+    ssh_dial_port INTEGER NOT NULL DEFAULT 0,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -1856,6 +1921,12 @@ CREATE INDEX IF NOT EXISTS idx_intranet_sessions_task ON intranet_sessions(task_
 DROP TRIGGER IF EXISTS trg_intranet_sessions_upd ON intranet_sessions;
 CREATE TRIGGER trg_intranet_sessions_upd BEFORE UPDATE ON intranet_sessions
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+ALTER TABLE intranet_sessions ADD COLUMN IF NOT EXISTS transport TEXT NOT NULL DEFAULT 'webshell';
+ALTER TABLE intranet_sessions ADD COLUMN IF NOT EXISTS ssh_port INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE intranet_sessions ADD COLUMN IF NOT EXISTS ssh_user TEXT NOT NULL DEFAULT '';
+ALTER TABLE intranet_sessions ADD COLUMN IF NOT EXISTS ssh_credential_id BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE intranet_sessions ADD COLUMN IF NOT EXISTS ssh_dial_host TEXT NOT NULL DEFAULT '';
+ALTER TABLE intranet_sessions ADD COLUMN IF NOT EXISTS ssh_dial_port INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS intranet_session_events (
     id         BIGSERIAL PRIMARY KEY,
@@ -1876,6 +1947,7 @@ CREATE TABLE IF NOT EXISTS intranet_tunnels (
     kind             TEXT NOT NULL DEFAULT 'socks5',
     listen_host      TEXT NOT NULL DEFAULT '127.0.0.1',
     listen_port      INTEGER NOT NULL DEFAULT 0,
+    listen_side      TEXT NOT NULL DEFAULT 'target',
     remote_host      TEXT NOT NULL DEFAULT '',
     remote_port      INTEGER NOT NULL DEFAULT 0,
     status           TEXT NOT NULL DEFAULT 'planned',
@@ -1893,6 +1965,10 @@ CREATE INDEX IF NOT EXISTS idx_intranet_tunnels_task ON intranet_tunnels(task_id
 DROP TRIGGER IF EXISTS trg_intranet_tunnels_upd ON intranet_tunnels;
 CREATE TRIGGER trg_intranet_tunnels_upd BEFORE UPDATE ON intranet_tunnels
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+-- 监听端在哪一侧：chisel client 的 SOCKS/正向监听开在控制端，socat 与 ssh -D/-L
+-- 开在目标。没有这个字段时，验证与拆除复核一律在目标上查端口，控制端侧的隧道
+-- 永远"验证失败"，台账里的进程信息也按错误的一侧回收。
+ALTER TABLE intranet_tunnels ADD COLUMN IF NOT EXISTS listen_side TEXT NOT NULL DEFAULT 'target';
 
 -- 内网新目标的授权申请：人工在 UI 批准后才写入 task_scope；agent 只可提交申请。
 CREATE TABLE IF NOT EXISTS intranet_scope_requests (
@@ -1962,9 +2038,15 @@ CREATE TABLE IF NOT EXISTS intranet_artifacts (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE intranet_artifacts ADD COLUMN IF NOT EXISTS fingerprint TEXT NOT NULL DEFAULT '';
+ALTER TABLE intranet_artifacts ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_intranet_artifacts_task ON intranet_artifacts(task_id, status, id DESC);
 CREATE INDEX IF NOT EXISTS idx_intranet_artifacts_session ON intranet_artifacts(session_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_intranet_artifacts_host ON intranet_artifacts(host, kind, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_intranet_artifacts_fingerprint_active
+    ON intranet_artifacts(fingerprint) WHERE status='active' AND fingerprint <> '';
+CREATE INDEX IF NOT EXISTS idx_intranet_artifacts_expires
+    ON intranet_artifacts(expires_at) WHERE status='active' AND expires_at IS NOT NULL;
 DROP TRIGGER IF EXISTS trg_intranet_artifacts_upd ON intranet_artifacts;
 CREATE TRIGGER trg_intranet_artifacts_upd BEFORE UPDATE ON intranet_artifacts
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();

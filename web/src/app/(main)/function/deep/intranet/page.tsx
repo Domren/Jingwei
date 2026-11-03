@@ -3,6 +3,7 @@
 import * as React from "react";
 
 import {
+  ActivityIcon,
   ArrowRightLeftIcon,
   CheckIcon,
   DownloadIcon,
@@ -36,7 +37,15 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
@@ -44,16 +53,48 @@ import { api } from "@/lib/api";
 import type {
   IntranetArtifact,
   IntranetBatchItem,
+  IntranetCredential,
   IntranetEvacuationReport,
   IntranetExecResult,
   IntranetScopeRequest,
   IntranetSession,
+  IntranetSessionEvent,
   IntranetTunnel,
   Task,
   Webshell,
 } from "@/lib/types";
 
 import { FieldRow, fmtTime } from "../_components/deep-ui";
+import { ShellTerminal, fmtDuration, shellExitBadge } from "../_components/shell-terminal";
+
+// ExecOutcome 是「一次操作一个结果」的展示：终端页签已经习惯的退出码、耗时与
+// 「超时」，在上传/下载页签里也不该退化成把 note 拼进输出的一坨文本——那正是
+// 「命令不返回」被读成「这个 shell 坏了」的地方。
+function ExecOutcome({ result, extra }: { result: IntranetExecResult; extra?: string }) {
+  const badge = shellExitBadge(result);
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex flex-wrap items-center gap-2 text-muted-foreground text-xs">
+        <Badge variant="outline" className={`h-4 px-1.5 text-[10px] ${badge.className}`}>
+          exit {badge.label}
+        </Badge>
+        <span>{fmtDuration(result.duration_ms)}</span>
+        {result.cwd ? <span className="font-mono">{result.cwd}</span> : null}
+        {extra ? <span>{extra}</span> : null}
+      </div>
+      <pre
+        className={`whitespace-pre-wrap break-all rounded-md border p-3 font-mono text-xs ${
+          result.is_error ? "text-red-600 dark:text-red-400" : ""
+        }`}
+      >
+        {result.output || "（无输出）"}
+      </pre>
+      {result.note && result.note !== result.output ? (
+        <div className="text-amber-600 dark:text-amber-400 text-xs">{result.note}</div>
+      ) : null}
+    </div>
+  );
+}
 
 const TUNNEL_KIND_LABEL: Record<string, string> = {
   socks5: "SOCKS5 代理",
@@ -69,6 +110,35 @@ function sessionStatusMeta(status: string) {
       return { label: "已关闭", className: "border-slate-500/30 bg-slate-500/10 text-slate-600 dark:text-slate-400" };
     default:
       return { label: status || "—", className: "border-slate-500/30 bg-slate-500/10 text-slate-600" };
+  }
+}
+
+function sessionHealthMeta(metadata: Record<string, unknown> | undefined) {
+  const health = typeof metadata?.health === "string" ? metadata.health : "";
+  const failures = Number(metadata?.health_failures ?? 0);
+  const latency = Number(metadata?.health_latency_ms ?? 0);
+  const err = typeof metadata?.health_error === "string" ? metadata.health_error : "";
+  switch (health) {
+    case "ok":
+      return {
+        label: latency > 0 ? `存活 ${latency}ms` : "存活",
+        className: "border-emerald-500/30 bg-emerald-500/10 text-emerald-600",
+        title: err,
+      };
+    case "degraded":
+      return {
+        label: `心跳异常 ${failures}/3`,
+        className: "border-amber-500/30 bg-amber-500/10 text-amber-600",
+        title: err,
+      };
+    case "lost":
+      return {
+        label: "失联",
+        className: "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400",
+        title: err,
+      };
+    default:
+      return null;
   }
 }
 
@@ -106,8 +176,82 @@ const ARTIFACT_KIND_LABEL: Record<string, string> = {
   file: "文件",
   cron: "计划任务",
   systemd: "systemd 服务",
+  user_systemd: "用户 systemd",
+  at: "at 任务",
+  profile: "profile 启动项",
   ssh_key: "SSH 公钥",
+  schtasks: "Windows 计划任务",
+  registry: "注册表 Run",
+  service: "Windows 服务",
+  wmi: "WMI 订阅",
+  startup: "启动文件夹",
+  php_user_ini: "PHP .user.ini",
+  php_htaccess: "PHP .htaccess",
   other: "其它",
+};
+
+const CRED_SOURCE_LABEL: Record<string, string> = {
+  weakpass: "弱口令命中",
+  reuse: "横向复用",
+  manual: "人工登记",
+  intel: "情报",
+  config: "配置文件",
+  browser: "浏览器",
+};
+
+interface PersistKindMeta {
+  label: string;
+  os: "linux" | "windows";
+  schedule?: { label: string; hint: string; placeholder: string; fallback: string };
+  user?: boolean;
+  publicKey?: boolean;
+  command?: boolean;
+}
+
+const PERSIST_KIND_META: Record<string, PersistKindMeta> = {
+  cron: {
+    label: "cron 计划任务",
+    os: "linux",
+    schedule: { label: "cron 表达式", hint: "5 段或 @reboot/@daily 等", placeholder: "*/10 * * * *", fallback: "*/10 * * * *" },
+    command: true,
+  },
+  systemd: { label: "systemd 系统服务", os: "linux", command: true },
+  user_systemd: { label: "用户级 systemd", os: "linux", user: true, command: true },
+  at: {
+    label: "at 一次性任务",
+    os: "linux",
+    schedule: {
+      label: "触发时间",
+      hint: "at 时间语法；重启后需重新登记",
+      placeholder: "now + 10 minutes",
+      fallback: "now + 10 minutes",
+    },
+    user: true,
+    command: true,
+  },
+  profile: {
+    label: "profile 登录启动",
+    os: "linux",
+    schedule: { label: "目标文件", hint: "用户家目录下的点文件", placeholder: ".profile", fallback: ".profile" },
+    user: true,
+    command: true,
+  },
+  ssh_key: { label: "SSH 公钥", os: "linux", user: true, publicKey: true },
+  schtasks: {
+    label: "计划任务 (schtasks)",
+    os: "windows",
+    schedule: {
+      label: "触发规则",
+      hint: "onlogon / onstart / minute:N / hourly:N / daily:HH:MM",
+      placeholder: "onlogon",
+      fallback: "onlogon",
+    },
+    command: true,
+  },
+  registry: { label: "注册表 Run 键", os: "windows", command: true },
+  service: { label: "Windows 服务", os: "windows", command: true },
+  wmi: { label: "WMI 事件订阅", os: "windows", command: true },
+  startup: { label: "启动文件夹", os: "windows", command: true },
 };
 
 function artifactStatusMeta(status: string) {
@@ -121,8 +265,30 @@ function artifactStatusMeta(status: string) {
   }
 }
 
+function credentialStatusMeta(status: string) {
+  switch (status) {
+    case "valid":
+      return { label: "已验证可用", className: "border-emerald-500/30 bg-emerald-500/10 text-emerald-600" };
+    case "invalid":
+      return { label: "已失效", className: "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400" };
+    default:
+      return { label: "待验证", className: "border-slate-500/30 bg-slate-500/10 text-slate-600 dark:text-slate-400" };
+  }
+}
+
+function credentialLabel(c: IntranetCredential) {
+  const port = c.port ? `:${c.port}` : "";
+  return `#${c.id} ${c.username}@${c.host}${port} · ${(c.protocol || "http").toUpperCase()} · ${
+    CRED_SOURCE_LABEL[c.source] ?? c.source
+  }`;
+}
+
 function tunnelEndpoint(t: IntranetTunnel) {
-  const listen = `${t.listen_host || "0.0.0.0"}:${t.listen_port}`;
+  // 监听端在控制端（chisel client 不带 R:）时，listen_host 是 chisel server 的绑定地址，
+  // 要连的是控制端；写成目标地址会把人引向一个从未开过的端口。
+  const listen = t.listen_side === "pivot"
+    ? `控制端:${t.listen_port}`
+    : `${t.listen_host || "0.0.0.0"}:${t.listen_port}`;
   if (t.kind === "socks5") return listen;
   return `${listen} → ${t.remote_host || "?"}:${t.remote_port || "?"}`;
 }
@@ -137,6 +303,23 @@ function taskLabel(task: Task) {
 function webshellLabel(shell: Webshell) {
   const name = shell.name || shell.url;
   return `${name} · ${(shell.shell_type || "php").toUpperCase()}`;
+}
+
+// SSH 会话没有 webshell：承载它的是凭据台账里的一条账号，目标是只有 22 端口 open
+// 的内网主机。列表里必须一眼分清两种承载方式，否则「无 webshell」看起来像坏了。
+function sessionTransportLabel(session: IntranetSession) {
+  return session.transport === "ssh" ? "SSH" : (session.shell_type || "php").toUpperCase();
+}
+
+function sessionEndpoint(session: IntranetSession) {
+  if (session.transport !== "ssh") {
+    return `${session.host || "—"} · ${session.webshell_url || "无 webshell"}`;
+  }
+  const identity = `${session.host || "—"}:${session.ssh_port || 22}`;
+  const via = session.ssh_dial_host
+    ? ` 经 ${session.ssh_dial_host}:${session.ssh_dial_port || session.ssh_port || 22}`
+    : "";
+  return `${identity}${via} · ${session.ssh_user || "?"}`;
 }
 
 function fmtBytes(n: number) {
@@ -157,19 +340,12 @@ function readFileBase64(file: File): Promise<string> {
   });
 }
 
-interface TerminalLine {
-  id: string;
-  command: string;
-  output: string;
-  isError: boolean;
-  at: string;
-}
-
 export default function DeepIntranetPage() {
   const [sessions, setSessions] = React.useState<IntranetSession[]>([]);
   const [tunnels, setTunnels] = React.useState<IntranetTunnel[]>([]);
   const [requests, setRequests] = React.useState<IntranetScopeRequest[]>([]);
   const [artifacts, setArtifacts] = React.useState<IntranetArtifact[]>([]);
+  const [credentials, setCredentials] = React.useState<IntranetCredential[]>([]);
   const [webshells, setWebshells] = React.useState<Webshell[]>([]);
   const [tasks, setTasks] = React.useState<Task[]>([]);
   const [loading, setLoading] = React.useState(false);
@@ -183,17 +359,19 @@ export default function DeepIntranetPage() {
     let alive = true;
     async function load() {
       try {
-        const [s, t, r, a] = await Promise.all([
+        const [s, t, r, a, c] = await Promise.all([
           api.intranetSessions({ limit: 200 }),
           api.intranetTunnels({ limit: 200 }),
           api.intranetScopeRequests({ limit: 200 }),
           api.intranetArtifacts({ limit: 200 }),
+          api.intranetCredentials({ limit: 200 }),
         ]);
         if (!alive) return;
         setSessions(s.sessions ?? []);
         setTunnels(t.tunnels ?? []);
         setRequests(r.requests ?? []);
         setArtifacts(a.artifacts ?? []);
+        setCredentials(c.credentials ?? []);
       } catch (e) {
         if (alive) toast.error((e as Error).message);
       } finally {
@@ -234,34 +412,90 @@ export default function DeepIntranetPage() {
   const [sessionOpen, setSessionOpen] = React.useState(false);
   const [sessionSaving, setSessionSaving] = React.useState(false);
   const [sessionForm, setSessionForm] = React.useState({
+    transport: "webshell",
     webshell_id: "",
     name: "",
     task_id: "none",
     host: "",
     cwd: "",
     note: "",
+    port: "22",
+    user: "",
+    credential_id: "",
+    dial_host: "",
+    dial_port: "",
   });
 
   function openCreateSession() {
-    setSessionForm({ webshell_id: "", name: "", task_id: "none", host: "", cwd: "", note: "" });
+    setSessionForm({
+      transport: "webshell",
+      webshell_id: "",
+      name: "",
+      task_id: "none",
+      host: "",
+      cwd: "",
+      note: "",
+      port: "22",
+      user: "",
+      credential_id: "",
+      dial_host: "",
+      dial_port: "",
+    });
     setSessionOpen(true);
   }
 
+  function pickSessionCredential(id: string) {
+    const c = credentials.find((x) => String(x.id) === id);
+    setSessionForm((f) => ({
+      ...f,
+      credential_id: id,
+      host: f.host.trim() || c?.host || "",
+      user: f.user.trim() || c?.username || "",
+      // 只有登记成 SSH 的凭据才带着 22 这类端口；HTTP 凭据的 80 不能当成 SSH 端口。
+      port: c?.protocol === "ssh" && c.port > 0 ? String(c.port) : f.port,
+    }));
+  }
+
   async function saveSession() {
-    if (!sessionForm.webshell_id) {
+    const isSSH = sessionForm.transport === "ssh";
+    if (!isSSH && !sessionForm.webshell_id) {
       toast.error("请选择要复用的 webshell");
+      return;
+    }
+    if (isSSH && !sessionForm.host.trim()) {
+      toast.error("SSH 会话需要目标在内网段里的地址，例如 10.99.0.20");
+      return;
+    }
+    if (isSSH && !sessionForm.credential_id.trim()) {
+      toast.error("SSH 会话必须绑定凭据台账里的一条凭据");
       return;
     }
     setSessionSaving(true);
     try {
-      const r = await api.createIntranetSession({
-        webshell_id: Number(sessionForm.webshell_id),
-        name: sessionForm.name.trim(),
-        task_id: sessionForm.task_id !== "none" ? Number(sessionForm.task_id) : undefined,
-        host: sessionForm.host.trim(),
-        cwd: sessionForm.cwd.trim(),
-        note: sessionForm.note,
-      });
+      const r = await api.createIntranetSession(
+        isSSH
+          ? {
+              transport: "ssh",
+              name: sessionForm.name.trim(),
+              task_id: sessionForm.task_id !== "none" ? Number(sessionForm.task_id) : undefined,
+              host: sessionForm.host.trim(),
+              port: Number(sessionForm.port) || 22,
+              user: sessionForm.user.trim(),
+              credential_id: Number(sessionForm.credential_id),
+              dial_host: sessionForm.dial_host.trim() || undefined,
+              dial_port: sessionForm.dial_port.trim() ? Number(sessionForm.dial_port) : undefined,
+              cwd: sessionForm.cwd.trim(),
+              note: sessionForm.note,
+            }
+          : {
+              webshell_id: Number(sessionForm.webshell_id),
+              name: sessionForm.name.trim(),
+              task_id: sessionForm.task_id !== "none" ? Number(sessionForm.task_id) : undefined,
+              host: sessionForm.host.trim(),
+              cwd: sessionForm.cwd.trim(),
+              note: sessionForm.note,
+            },
+      );
       setSessionOpen(false);
       refresh();
       const probe = r.probe;
@@ -270,7 +504,9 @@ export default function DeepIntranetPage() {
       } else {
         toast.success(`会话已建立${probe?.host ? ` · ${probe.host}` : ""}${probe?.user ? ` · ${probe.user}` : ""}`);
       }
-      void openTerminal(r.session);
+      // 探测失败的 SSH 会话会被平台关掉：打开一个只会每条命令都报同一个错的终端，
+      // 只会让人以为是执行坏了，而不是登录坏了。
+      if (r.session.status !== "closed") void openTerminal(r.session);
     } catch (e) {
       toast.error((e as Error).message);
     } finally {
@@ -279,74 +515,45 @@ export default function DeepIntranetPage() {
   }
 
   // ---- 终端 ----
+  // 命令页签交给共用的 ShellTerminal；「执行记录」是会话台账的事件流（含 worker 与
+  // 其它标签页跑过的命令）。两者分开而不是混成一份输出：事件里没有退出码和结束标记，
+  // 硬塞进终端只会显示假的 exit 0。
   const [termSession, setTermSession] = React.useState<IntranetSession | null>(null);
-  const [termLines, setTermLines] = React.useState<TerminalLine[]>([]);
-  const [termCommand, setTermCommand] = React.useState("id");
-  const [termRunning, setTermRunning] = React.useState(false);
+  const [termEvents, setTermEvents] = React.useState<IntranetSessionEvent[]>([]);
   const [termMode, setTermMode] = React.useState("exec");
   const [uploadFile, setUploadFile] = React.useState<File | null>(null);
   const [uploadPath, setUploadPath] = React.useState("");
   const [uploadResult, setUploadResult] = React.useState<IntranetExecResult | null>(null);
+  const [uploadBusy, setUploadBusy] = React.useState(false);
   const [downloadPath, setDownloadPath] = React.useState("");
   const [downloadBusy, setDownloadBusy] = React.useState(false);
+  const [downloadResult, setDownloadResult] = React.useState<{ result: IntranetExecResult; extra?: string } | null>(
+    null,
+  );
 
-  const openTerminal = React.useCallback(async (session: IntranetSession) => {
-    setTermSession(session);
-    setTermLines([]);
-    setTermMode("exec");
-    setUploadFile(null);
-    setUploadPath("");
-    setUploadResult(null);
-    setDownloadPath("");
+  const loadTermEvents = React.useCallback(async (id: number) => {
     try {
-      const r = await api.intranetSessionEvents(session.id, 50);
-      setTermLines(
-        (r.events ?? []).map((ev) => ({
-          id: `ev-${ev.id}`,
-          command: ev.command,
-          output: ev.output,
-          isError: ev.is_error,
-          at: ev.created_at,
-        })),
-      );
+      const r = await api.intranetSessionEvents(id, 50);
+      setTermEvents(r.events ?? []);
     } catch {
-      // 历史事件读取失败时仍可执行新命令
+      // 读不到历史不影响执行
     }
   }, []);
 
-  function appendTermLine(command: string, result: IntranetExecResult) {
-    const output = result.note ? `${result.output}\n[${result.note}]` : result.output;
-    setTermLines((prev) => [
-      ...prev,
-      {
-        id: `live-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        command,
-        output,
-        isError: result.is_error,
-        at: new Date().toISOString(),
-      },
-    ]);
-  }
-
-  async function runTermCommand() {
-    if (!termSession) return;
-    const cmd = termCommand.trim();
-    if (!cmd) {
-      toast.error("请输入命令");
-      return;
-    }
-    setTermRunning(true);
-    try {
-      const r = await api.intranetExec(termSession.id, cmd);
-      setTermSession(r.session);
-      appendTermLine(cmd, r.result);
-      refresh();
-    } catch (e) {
-      toast.error((e as Error).message);
-    } finally {
-      setTermRunning(false);
-    }
-  }
+  const openTerminal = React.useCallback(
+    (session: IntranetSession) => {
+      setTermSession(session);
+      setTermMode("exec");
+      setUploadFile(null);
+      setUploadPath("");
+      setUploadResult(null);
+      setDownloadPath("");
+      setDownloadResult(null);
+      setTermEvents([]);
+      void loadTermEvents(session.id);
+    },
+    [loadTermEvents],
+  );
 
   async function doUpload() {
     if (!termSession) return;
@@ -362,14 +569,14 @@ export default function DeepIntranetPage() {
       toast.error("文件超过 4MB 上限");
       return;
     }
-    setTermRunning(true);
+    setUploadBusy(true);
     setUploadResult(null);
     try {
       const b64 = await readFileBase64(uploadFile);
       const r = await api.intranetUpload(termSession.id, uploadPath.trim(), b64);
       setTermSession(r.session);
       setUploadResult(r.result);
-      appendTermLine(`upload ${uploadFile.name} -> ${uploadPath.trim()}`, r.result);
+      void loadTermEvents(termSession.id);
       if (r.result.is_error) {
         toast.error(r.result.note || "上传失败");
       } else {
@@ -379,7 +586,7 @@ export default function DeepIntranetPage() {
     } catch (e) {
       toast.error((e as Error).message);
     } finally {
-      setTermRunning(false);
+      setUploadBusy(false);
     }
   }
 
@@ -393,6 +600,7 @@ export default function DeepIntranetPage() {
     setDownloadBusy(true);
     try {
       const r = await api.intranetDownload(termSession.id, path);
+      setDownloadResult({ result: r.result });
       if (r.result.is_error) {
         toast.error(r.result.note || "下载失败");
         return;
@@ -407,7 +615,9 @@ export default function DeepIntranetPage() {
       a.download = path.split("/").pop() || "download.bin";
       a.click();
       URL.revokeObjectURL(url);
-      toast.success(`已下载 ${fmtBytes(r.size)}${r.truncated ? `（文件共 ${fmtBytes(r.total)}，已截断）` : ""}`);
+      const extra = `已下载 ${fmtBytes(r.size)}${r.truncated ? `（文件共 ${fmtBytes(r.total)}，已截断）` : ""}`;
+      setDownloadResult({ result: r.result, extra });
+      toast.success(extra);
       refresh();
     } catch (e) {
       toast.error((e as Error).message);
@@ -422,6 +632,37 @@ export default function DeepIntranetPage() {
     try {
       await api.updateIntranetSession(session.id, { status: next });
       toast.success(next === "active" ? "会话已重新打开" : "会话已关闭");
+      refresh();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function pingSession(session: IntranetSession) {
+    setBusyId(`session-${session.id}`);
+    try {
+      const r = await api.intranetSessionHeartbeat(session.id);
+      if (r.alive) {
+        toast.success("会话存活");
+      } else {
+        toast.error(`心跳失败：${r.result.note || r.result.output || "目标未返回标记"}`);
+      }
+      refresh();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function failoverSession(session: IntranetSession) {
+    if (!window.confirm(`为会话「${session.name || session.host}」自动切换同主机的备用 webshell？`)) return;
+    setBusyId(`session-${session.id}`);
+    try {
+      const r = await api.intranetSessionFailover(session.id);
+      toast.success(`已切换到 webshell #${r.webshell.id}（${r.latency_ms} ms）`);
       refresh();
     } catch (e) {
       toast.error((e as Error).message);
@@ -492,6 +733,7 @@ export default function DeepIntranetPage() {
     kind: "port_forward",
     listen_host: "127.0.0.1",
     listen_port: "",
+    listen_side: "target",
     remote_host: "127.0.0.1",
     remote_port: "",
     deploy_command: "",
@@ -508,6 +750,7 @@ export default function DeepIntranetPage() {
       kind: "port_forward",
       listen_host: "127.0.0.1",
       listen_port: "",
+      listen_side: "target",
       remote_host: "127.0.0.1",
       remote_port: "",
       deploy_command: "",
@@ -542,6 +785,7 @@ export default function DeepIntranetPage() {
         kind: tunnelForm.kind,
         listen_host: tunnelForm.listen_host.trim(),
         listen_port: listenPort,
+        listen_side: tunnelForm.listen_side,
         remote_host: tunnelForm.remote_host.trim(),
         remote_port: remotePort || undefined,
         deploy_command: tunnelForm.deploy_command,
@@ -737,6 +981,7 @@ export default function DeepIntranetPage() {
     command: "",
     public_key: "",
     user: "",
+    ttl_seconds: "",
     path: "",
     revoke_command: "",
     verify_command: "",
@@ -744,6 +989,7 @@ export default function DeepIntranetPage() {
 
   const activeArtifacts = artifacts.filter((a) => a.status === "active").length;
   const shownArtifacts = artifactFilter === "all" ? artifacts : artifacts.filter((a) => a.status === artifactFilter);
+  const persistMeta = PERSIST_KIND_META[artifactForm.persist_kind] ?? PERSIST_KIND_META.cron;
 
   function openCreateArtifact() {
     const active = sessions.find((s) => s.status === "active");
@@ -758,6 +1004,7 @@ export default function DeepIntranetPage() {
       command: "",
       public_key: "",
       user: "",
+      ttl_seconds: "",
       path: "",
       revoke_command: "",
       verify_command: "",
@@ -774,19 +1021,31 @@ export default function DeepIntranetPage() {
     setArtifactSaving(true);
     try {
       const taskId = artifactForm.task_id === "none" ? undefined : Number(artifactForm.task_id);
+      const ttl = artifactForm.ttl_seconds.trim();
+      const ttlSeconds = ttl ? Number(ttl) : undefined;
+      if (ttlSeconds !== undefined && (!Number.isFinite(ttlSeconds) || ttlSeconds < 60 || ttlSeconds > 2592000)) {
+        toast.error("TTL 需在 60 到 2592000 秒（30 天）之间");
+        return;
+      }
       if (artifactMode === "persist") {
+        const kind = artifactForm.persist_kind;
+        const needsSchedule = ["cron", "at", "profile", "schtasks"].includes(kind);
+        const needsUser = ["ssh_key", "user_systemd", "at", "profile"].includes(kind);
         const r = await api.persistIntranetSession(sessionId, {
-          kind: artifactForm.persist_kind,
+          kind,
           name: artifactForm.name.trim(),
           description: artifactForm.description.trim(),
-          schedule: artifactForm.persist_kind === "cron" ? artifactForm.schedule.trim() : undefined,
-          command: artifactForm.persist_kind === "ssh_key" ? undefined : artifactForm.command.trim(),
-          public_key: artifactForm.persist_kind === "ssh_key" ? artifactForm.public_key.trim() : undefined,
-          user: artifactForm.persist_kind === "ssh_key" ? artifactForm.user.trim() : undefined,
+          schedule: needsSchedule ? artifactForm.schedule.trim() : undefined,
+          command: kind === "ssh_key" ? undefined : artifactForm.command.trim(),
+          public_key: kind === "ssh_key" ? artifactForm.public_key.trim() : undefined,
+          user: needsUser ? artifactForm.user.trim() : undefined,
+          ttl_seconds: ttlSeconds,
           task_id: taskId,
         });
         if (!r.deployed) {
           toast.error(r.error || "部署未通过验证，已登记台账供撤离清理");
+        } else if (r.reused) {
+          toast.success(`落地物 #${r.artifact.id} 已在位，已幂等复用`);
         } else {
           toast.success(`已部署并登记落地物 #${r.artifact.id}`);
         }
@@ -805,6 +1064,7 @@ export default function DeepIntranetPage() {
           description: artifactForm.description.trim(),
           revoke_command: revoke,
           verify_command: artifactForm.verify_command.trim(),
+          ttl_seconds: ttlSeconds,
         });
         toast.success("已登记落地物");
       }
@@ -832,9 +1092,107 @@ export default function DeepIntranetPage() {
     }
   }
 
+  // ---- 凭据台账：口令只写不读，界面里永远看不见明文 ----
+  const [credFilter, setCredFilter] = React.useState<"all" | "untested" | "valid" | "invalid">("all");
+  const [credOpen, setCredOpen] = React.useState(false);
+  const [credSaving, setCredSaving] = React.useState(false);
+  const [credForm, setCredForm] = React.useState({
+    host: "",
+    port: "",
+    protocol: "http",
+    url: "",
+    username: "",
+    password: "",
+    source: "manual",
+    task_id: "none",
+    evidence: "",
+  });
+
+  const shownCredentials = React.useMemo(
+    () => (credFilter === "all" ? credentials : credentials.filter((c) => c.status === credFilter)),
+    [credFilter, credentials],
+  );
+
+  function setCredentialForm(field: keyof typeof credForm, value: string) {
+    setCredForm((f) => ({ ...f, [field]: value }));
+  }
+
+  function openCreateCredential() {
+    setCredForm({
+      host: "",
+      port: "",
+      protocol: "http",
+      url: "",
+      username: "",
+      password: "",
+      source: "manual",
+      task_id: "none",
+      evidence: "",
+    });
+    setCredOpen(true);
+  }
+
+  async function saveCredential() {
+    if (!credForm.username.trim() || !credForm.password) {
+      toast.error("账号与口令都不能为空");
+      return;
+    }
+    if (!credForm.host.trim() && !credForm.url.trim()) {
+      toast.error("需要内网主机地址，或可解析的登录 URL");
+      return;
+    }
+    setCredSaving(true);
+    try {
+      const saved = await api.registerIntranetCredential({
+        host: credForm.host.trim(),
+        port: Number(credForm.port) > 0 ? Number(credForm.port) : undefined,
+        protocol: credForm.protocol.trim(),
+        url: credForm.url.trim(),
+        username: credForm.username.trim(),
+        password: credForm.password,
+        source: credForm.source,
+        task_id: credForm.task_id === "none" ? undefined : Number(credForm.task_id),
+        evidence: credForm.evidence.trim(),
+      });
+      toast.success(`已登记凭据 #${saved.id}，口令只留在台账里`);
+      setCredOpen(false);
+      refresh();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setCredSaving(false);
+    }
+  }
+
+  async function reuseCredential(cred: IntranetCredential) {
+    setBusyId(`cred-${cred.id}`);
+    try {
+      const r = await api.intranetCredentialReuse(cred.id);
+      const targets = r.targets ?? [];
+      const valid = targets.filter((t) => t.status === "valid");
+      const skipped = targets.filter((t) => t.status === "skipped");
+      if (valid.length > 0) {
+        toast.success(`凭据 #${cred.id} 在 ${valid.length} 个登录页复用成功`);
+      } else if (skipped.length > 0 && skipped.length === targets.length) {
+        toast.error(skipped[0]?.error || "目标不在任务范围内，未发起验证");
+      } else if (r.note) {
+        toast.warning(r.note);
+      } else {
+        toast.warning(`凭据 #${cred.id} 未能登录任何目标`);
+      }
+      refresh();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   const [evacuateOpen, setEvacuateOpen] = React.useState(false);
   const [evacuateTask, setEvacuateTask] = React.useState("none");
   const [evacuateCloseSessions, setEvacuateCloseSessions] = React.useState(true);
+  const [evacuateDeleteShells, setEvacuateDeleteShells] = React.useState(false);
+  const [evacuateScan, setEvacuateScan] = React.useState(true);
   const [evacuateBusy, setEvacuateBusy] = React.useState<"preview" | "run" | null>(null);
   const [evacuateReport, setEvacuateReport] = React.useState<IntranetEvacuationReport | null>(null);
 
@@ -856,7 +1214,7 @@ export default function DeepIntranetPage() {
     if (
       !dryRun &&
       !window.confirm(
-        `对任务 #${evacuateTask} 执行撤离清理？将按台账逆序撤销落地物、拆除隧道并${evacuateCloseSessions ? "关闭会话" : "保留会话"}。`,
+        `对任务 #${evacuateTask} 执行撤离清理？将按台账逆序撤销落地物、拆除隧道、移除本任务关联的 Java 内存马并${evacuateCloseSessions ? "关闭会话" : "保留会话"}${evacuateDeleteShells ? "，并自删除本任务会话绑定的 v2 webshell" : ""}。`,
       )
     ) {
       return;
@@ -867,6 +1225,8 @@ export default function DeepIntranetPage() {
         task_id: Number(evacuateTask),
         dry_run: dryRun,
         close_sessions: evacuateCloseSessions,
+        delete_webshells: evacuateDeleteShells,
+        scan: evacuateScan,
       });
       setEvacuateReport(r.report);
       if (dryRun) {
@@ -935,6 +1295,7 @@ export default function DeepIntranetPage() {
         <TabsList className="w-fit">
           <TabsTrigger value="sessions">会话 ({sessions.length})</TabsTrigger>
           <TabsTrigger value="tunnels">隧道 ({tunnels.length})</TabsTrigger>
+          <TabsTrigger value="credentials">凭据台账 ({credentials.length})</TabsTrigger>
           <TabsTrigger value="artifacts">落地物 ({activeArtifacts})</TabsTrigger>
           <TabsTrigger value="scopes">范围审批 ({requests.length})</TabsTrigger>
         </TabsList>
@@ -942,7 +1303,7 @@ export default function DeepIntranetPage() {
         <TabsContent value="sessions" className="flex min-h-0 flex-1 flex-col gap-3">
           {sessions.length === 0 ? (
             <div className="rounded-md border border-dashed py-12 text-center text-muted-foreground text-sm">
-              还没有内网会话。先添加 webshell，再点击右上角「新建会话」。
+              还没有内网会话。有 Web 服务的目标先添加 webshell；只有 22 端口的内网主机登记好凭据后，点右上角「新建会话」选 SSH。
             </div>
           ) : (
             <Table>
@@ -959,6 +1320,7 @@ export default function DeepIntranetPage() {
               <TableBody>
                 {sessions.map((s) => {
                   const meta = sessionStatusMeta(s.status);
+                  const health = sessionHealthMeta(s.metadata);
                   return (
                     <TableRow key={s.id}>
                       <TableCell>
@@ -973,23 +1335,34 @@ export default function DeepIntranetPage() {
                             {s.name || s.webshell_name || s.host || `会话 #${s.id}`}
                           </div>
                           <Badge variant="outline" className="text-[10px] uppercase">
-                            {(s.shell_type || "php").toUpperCase()}
+                            {sessionTransportLabel(s)}
                           </Badge>
                         </div>
                         <div
                           className="max-w-72 truncate font-mono text-xs text-muted-foreground"
-                          title={s.webshell_url}
+                          title={sessionEndpoint(s)}
                         >
-                          {s.host || "—"} · {s.webshell_url || "无 webshell"}
+                          {sessionEndpoint(s)}
                         </div>
                       </TableCell>
                       <TableCell className="max-w-56 truncate font-mono text-xs" title={s.cwd}>
                         {s.cwd || "—"}
                       </TableCell>
                       <TableCell>
-                        <Badge variant="outline" className={meta.className}>
-                          {meta.label}
-                        </Badge>
+                        <div className="flex flex-col items-start gap-1">
+                          <Badge variant="outline" className={meta.className}>
+                            {meta.label}
+                          </Badge>
+                          {health ? (
+                            <Badge
+                              variant="outline"
+                              className={`text-[10px] ${health.className}`}
+                              title={health.title || undefined}
+                            >
+                              {health.label}
+                            </Badge>
+                          ) : null}
+                        </div>
                       </TableCell>
                       <TableCell className="text-muted-foreground text-xs">
                         {fmtTime(s.last_seen ?? s.updated_at)}
@@ -1004,6 +1377,24 @@ export default function DeepIntranetPage() {
                           >
                             <SquareTerminalIcon className="size-3.5" />
                             终端
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            title="心跳检测"
+                            disabled={s.status !== "active" || busyId === `session-${s.id}`}
+                            onClick={() => void pingSession(s)}
+                          >
+                            <ActivityIcon className="size-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            title="切换到同主机备用 webshell"
+                            disabled={s.status !== "active" || busyId === `session-${s.id}`}
+                            onClick={() => void failoverSession(s)}
+                          >
+                            <ArrowRightLeftIcon className="size-3.5" />
                           </Button>
                           <Button
                             variant="ghost"
@@ -1151,11 +1542,113 @@ export default function DeepIntranetPage() {
           )}
         </TabsContent>
 
+        <TabsContent value="credentials" className="flex min-h-0 flex-1 flex-col gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-muted-foreground text-sm">
+              弱口令命中与横向验证过的账号都汇总在这里，按 host+账号+口令 去重；从泄露页面、配置文件里读出的口令可用「登记凭据」手工入账。
+              台账只回写「有没有口令」，明文不下发到浏览器：复用验证与 SSH 会话都由平台按凭据 ID 取用。
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Select
+                value={credFilter}
+                onValueChange={(v) => setCredFilter(v as "all" | "untested" | "valid" | "invalid")}
+              >
+                <SelectTrigger className="w-28">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">全部</SelectItem>
+                  <SelectItem value="untested">待验证</SelectItem>
+                  <SelectItem value="valid">已验证</SelectItem>
+                  <SelectItem value="invalid">已失效</SelectItem>
+                </SelectContent>
+              </Select>
+              <Button size="sm" onClick={openCreateCredential}>
+                <KeyRoundIcon className="size-4" />
+                登记凭据
+              </Button>
+            </div>
+          </div>
+          {shownCredentials.length === 0 ? (
+            <div className="rounded-md border border-dashed py-12 text-center text-muted-foreground text-sm">
+              暂无凭据。渗透基线的弱口令命中会自动登记；只有 22 端口的内网主机需要先用「登记凭据」把账号口令入账，
+              之后才能开 SSH 会话或对登录页做复用验证。
+            </div>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-16">ID</TableHead>
+                  <TableHead className="w-52">主机</TableHead>
+                  <TableHead className="w-40">账号</TableHead>
+                  <TableHead className="w-24">来源</TableHead>
+                  <TableHead className="w-24">状态</TableHead>
+                  <TableHead>依据</TableHead>
+                  <TableHead className="w-32">最近使用</TableHead>
+                  <TableHead className="w-28 text-right">操作</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {shownCredentials.map((c) => {
+                  const meta = credentialStatusMeta(c.status);
+                  return (
+                    <TableRow key={c.id}>
+                      <TableCell className="font-mono text-xs">#{c.id}</TableCell>
+                      <TableCell>
+                        <div className="font-mono text-xs">
+                          {c.host}
+                          {c.port ? `:${c.port}` : ""}
+                        </div>
+                        <div className="text-muted-foreground text-xs">
+                          {(c.protocol || "http").toUpperCase()} · {fmtTime(c.created_at)}
+                        </div>
+                      </TableCell>
+                      <TableCell className="font-mono text-xs">{c.username || "—"}</TableCell>
+                      <TableCell>
+                        <Badge variant="outline">{CRED_SOURCE_LABEL[c.source] ?? c.source ?? "—"}</Badge>
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant="outline" className={meta.className}>
+                          {meta.label}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>
+                        <div className="max-w-md truncate text-xs" title={c.evidence || c.url || ""}>
+                          {c.evidence || c.url || "—"}
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-muted-foreground text-xs">
+                        {c.last_used_at ? fmtTime(c.last_used_at) : "—"}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={busyId === `cred-${c.id}`}
+                          title="用这一组账号口令精确验证登记过的登录页（不走字典）"
+                          onClick={() => void reuseCredential(c)}
+                        >
+                          {busyId === `cred-${c.id}` ? (
+                            <Loader2Icon className="size-3.5 animate-spin" />
+                          ) : (
+                            <ShieldCheckIcon className="size-3.5" />
+                          )}
+                          复用验证
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          )}
+        </TabsContent>
+
         <TabsContent value="artifacts" className="flex min-h-0 flex-1 flex-col gap-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <p className="text-muted-foreground text-sm">
-              目标侧落地物（上传文件 / 计划任务 / systemd 服务 / SSH 公钥）统一登记在这里，每条都带撤销与验证命令；
-              撤离清理按台账逆序执行撤销并输出报告。
+              目标侧落地物（文件 / Linux 持久化 / Windows 持久化）统一登记在这里，每条都带撤销与验证命令；
+              同指纹重复部署会幂等复用，TTL 到期自动撤销；撤离清理按台账逆序执行撤销并输出报告。
             </p>
             <div className="flex flex-wrap items-center gap-2">
               <Select
@@ -1183,8 +1676,8 @@ export default function DeepIntranetPage() {
           </div>
           {shownArtifacts.length === 0 ? (
             <div className="rounded-md border border-dashed py-12 text-center text-muted-foreground text-sm">
-              暂无落地物记录。通过会话上传的新文件会自动登记；计划任务、systemd 服务与 SSH 公钥可用右上角「部署 /
-              登记」创建。
+              暂无落地物记录。通过会话上传的新文件会自动登记；cron / systemd / at / profile / SSH
+              公钥以及 Windows 的 schtasks / 注册表 / 服务 / WMI / 启动文件夹可用右上角「部署 / 登记」创建。
             </div>
           ) : (
             <Table>
@@ -1219,6 +1712,9 @@ export default function DeepIntranetPage() {
                         <Badge variant="outline" className={meta.className}>
                           {meta.label}
                         </Badge>
+                        {a.status === "active" && a.expires_at ? (
+                          <div className="mt-1 text-muted-foreground text-xs">到期 {fmtTime(a.expires_at)}</div>
+                        ) : null}
                       </TableCell>
                       <TableCell className="text-muted-foreground text-xs">{fmtTime(a.created_at)}</TableCell>
                       <TableCell className="text-right">
@@ -1342,12 +1838,141 @@ export default function DeepIntranetPage() {
         </TabsContent>
       </Tabs>
 
+      {/* 登记凭据 */}
+      <Dialog open={credOpen} onOpenChange={setCredOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>登记内网凭据</DialogTitle>
+            <DialogDescription>
+              把字典之外的账号口令入账：信息泄露页面读出的口令、会话里 cat 配置文件得到的凭据、人工提供的情报。
+              口令保存后不再回显，复用时由平台按记录取用。
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            className="flex flex-col gap-4"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void saveCredential();
+            }}
+          >
+            <FieldRow label="内网主机" hint="它在内网段里的地址；填了登录 URL 可留空自动推导">
+              <Input
+                value={credForm.host}
+                onChange={(e) => setCredentialForm("host", e.target.value)}
+                placeholder="10.99.0.20"
+              />
+            </FieldRow>
+            <div className="flex gap-4">
+              <FieldRow label="端口" hint="留空按协议默认">
+                <Input
+                  className="w-28"
+                  value={credForm.port}
+                  onChange={(e) => setCredentialForm("port", e.target.value)}
+                  placeholder="22"
+                />
+              </FieldRow>
+              <FieldRow label="协议">
+                <Select value={credForm.protocol} onValueChange={(v) => setCredentialForm("protocol", v)}>
+                  <SelectTrigger className="w-36">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="ssh">SSH</SelectItem>
+                    <SelectItem value="http">HTTP</SelectItem>
+                    <SelectItem value="https">HTTPS</SelectItem>
+                    <SelectItem value="mysql">MySQL</SelectItem>
+                    <SelectItem value="rdp">RDP</SelectItem>
+                    <SelectItem value="smb">SMB</SelectItem>
+                    <SelectItem value="ftp">FTP</SelectItem>
+                  </SelectContent>
+                </Select>
+              </FieldRow>
+            </div>
+            <FieldRow label="登录地址" hint="复用验证要打的目标；SSH 凭据可留空">
+              <Input
+                value={credForm.url}
+                onChange={(e) => setCredentialForm("url", e.target.value)}
+                placeholder="http://10.99.0.20/manager/login"
+              />
+            </FieldRow>
+            <div className="flex gap-4">
+              <FieldRow label="账号">
+                <Input
+                  value={credForm.username}
+                  onChange={(e) => setCredentialForm("username", e.target.value)}
+                  placeholder="root"
+                />
+              </FieldRow>
+              <FieldRow label="口令">
+                <Input
+                  type="password"
+                  autoComplete="new-password"
+                  value={credForm.password}
+                  onChange={(e) => setCredentialForm("password", e.target.value)}
+                  placeholder="按原样保存，不做改动"
+                />
+              </FieldRow>
+            </div>
+            <div className="flex gap-4">
+              <FieldRow label="来源">
+                <Select value={credForm.source} onValueChange={(v) => setCredentialForm("source", v)}>
+                  <SelectTrigger className="w-40">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="manual">人工登记</SelectItem>
+                    <SelectItem value="intel">情报</SelectItem>
+                    <SelectItem value="config">配置文件</SelectItem>
+                    <SelectItem value="browser">浏览器</SelectItem>
+                    <SelectItem value="weakpass">弱口令命中</SelectItem>
+                    <SelectItem value="reuse">横向复用</SelectItem>
+                  </SelectContent>
+                </Select>
+              </FieldRow>
+              <FieldRow label="所属任务">
+                <Select value={credForm.task_id} onValueChange={(v) => setCredentialForm("task_id", v)}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">不关联任务</SelectItem>
+                    {tasks.map((t) => (
+                      <SelectItem key={t.id} value={t.id}>
+                        #{t.id} {taskLabel(t)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FieldRow>
+            </div>
+            <FieldRow label="依据" hint="凭据从哪里来，例如「10.99.0.20 监控面板泄露」">
+              <Textarea
+                rows={2}
+                value={credForm.evidence}
+                onChange={(e) => setCredentialForm("evidence", e.target.value)}
+              />
+            </FieldRow>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setCredOpen(false)}>
+                取消
+              </Button>
+              <Button type="submit" disabled={credSaving}>
+                {credSaving ? <Loader2Icon className="size-4 animate-spin" /> : <PlusIcon className="size-4" />}
+                登记
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
       {/* 新建会话 */}
       <Dialog open={sessionOpen} onOpenChange={setSessionOpen}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>新建内网会话</DialogTitle>
-            <DialogDescription>会话不驻留进程，每次执行都复用所选 webshell；工作目录由平台维护。</DialogDescription>
+            <DialogDescription>
+              会话不驻留进程：Webshell 承载的会话每次执行都复用所选 webshell，SSH 承载的会话复用凭据台账里的账号。工作目录由平台维护。
+            </DialogDescription>
           </DialogHeader>
           <form
             className="flex flex-col gap-4"
@@ -1356,23 +1981,102 @@ export default function DeepIntranetPage() {
               void saveSession();
             }}
           >
-            <FieldRow label="Webshell">
+            <FieldRow label="承载方式" hint="只有 22 端口 open、没有 Web 服务的内网主机选 SSH">
               <Select
-                value={sessionForm.webshell_id}
-                onValueChange={(v) => setSessionForm({ ...sessionForm, webshell_id: v })}
+                value={sessionForm.transport}
+                onValueChange={(v) => setSessionForm({ ...sessionForm, transport: v })}
               >
                 <SelectTrigger>
-                  <SelectValue placeholder="选择已登记的 webshell" />
+                  <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {webshells.map((w) => (
-                    <SelectItem key={w.id} value={String(w.id)}>
-                      {webshellLabel(w)}
-                    </SelectItem>
-                  ))}
+                  <SelectItem value="webshell">Webshell（HTTP 壳）</SelectItem>
+                  <SelectItem value="ssh">SSH（凭据台账账号）</SelectItem>
                 </SelectContent>
               </Select>
             </FieldRow>
+            {sessionForm.transport === "ssh" ? (
+              <>
+                <FieldRow label="内网主机" hint="它在内网段里的地址，用于范围校验与资产回流">
+                  <Input
+                    value={sessionForm.host}
+                    onChange={(e) => setSessionForm({ ...sessionForm, host: e.target.value })}
+                    placeholder="10.99.0.20"
+                  />
+                </FieldRow>
+                <FieldRow
+                  label="凭据"
+                  hint={
+                    credentials.length === 0
+                      ? "台账里还没有凭据：先到「凭据台账」登记账号口令，再回来开 SSH 会话"
+                      : "口令不落在校本会话上，建立连接时由平台按记录取用"
+                  }
+                >
+                  <Select value={sessionForm.credential_id} onValueChange={pickSessionCredential}>
+                    <SelectTrigger>
+                      <SelectValue placeholder="选择凭据台账里的账号" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {credentials.map((c) => (
+                        <SelectItem key={c.id} value={String(c.id)}>
+                          {credentialLabel(c)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </FieldRow>
+                <FieldRow label="SSH 端口">
+                  <Input
+                    value={sessionForm.port}
+                    onChange={(e) => setSessionForm({ ...sessionForm, port: e.target.value })}
+                    placeholder="22"
+                  />
+                </FieldRow>
+                <FieldRow label="登录账号" hint="留空用凭据里的账号">
+                  <Input
+                    value={sessionForm.user}
+                    onChange={(e) => setSessionForm({ ...sessionForm, user: e.target.value })}
+                    placeholder="root"
+                  />
+                </FieldRow>
+                <FieldRow
+                  label="接入地址"
+                  hint="只能经端口转发隧道到达时填隧道监听地址（例如 127.0.0.1:40123），主机仍按内网身份记账"
+                >
+                  <div className="flex gap-2">
+                    <Input
+                      value={sessionForm.dial_host}
+                      onChange={(e) => setSessionForm({ ...sessionForm, dial_host: e.target.value })}
+                      placeholder="dial 主机（可留空）"
+                    />
+                    <Input
+                      className="w-32"
+                      value={sessionForm.dial_port}
+                      onChange={(e) => setSessionForm({ ...sessionForm, dial_port: e.target.value })}
+                      placeholder="端口"
+                    />
+                  </div>
+                </FieldRow>
+              </>
+            ) : (
+              <FieldRow label="Webshell">
+                <Select
+                  value={sessionForm.webshell_id}
+                  onValueChange={(v) => setSessionForm({ ...sessionForm, webshell_id: v })}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="选择已登记的 webshell" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {webshells.map((w) => (
+                      <SelectItem key={w.id} value={String(w.id)}>
+                        {webshellLabel(w)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FieldRow>
+            )}
             <FieldRow label="名称">
               <Input
                 value={sessionForm.name}
@@ -1395,13 +2099,15 @@ export default function DeepIntranetPage() {
                 </SelectContent>
               </Select>
             </FieldRow>
-            <FieldRow label="主机" hint="用于范围校验，留空从 webshell 地址推断">
-              <Input
-                value={sessionForm.host}
-                onChange={(e) => setSessionForm({ ...sessionForm, host: e.target.value })}
-                placeholder="10.0.0.5"
-              />
-            </FieldRow>
+            {sessionForm.transport === "ssh" ? null : (
+              <FieldRow label="主机" hint="用于范围校验，留空从 webshell 地址推断">
+                <Input
+                  value={sessionForm.host}
+                  onChange={(e) => setSessionForm({ ...sessionForm, host: e.target.value })}
+                  placeholder="10.0.0.5"
+                />
+              </FieldRow>
+            )}
             <FieldRow label="初始目录">
               <Input
                 value={sessionForm.cwd}
@@ -1444,52 +2150,79 @@ export default function DeepIntranetPage() {
               <span className="rounded bg-muted px-1.5 py-0.5">cwd: {termSession?.cwd || "—"}</span>
             </DialogDescription>
           </DialogHeader>
-          <Tabs value={termMode} onValueChange={setTermMode}>
+          <Tabs
+            value={termMode}
+            onValueChange={(v) => {
+              setTermMode(v);
+              // 执行记录是台账，不是这个标签页的滚动缓冲：终端里刚跑完的命令、worker
+              // 在别处跑的命令都得切过去时重新读一次，否则看到的是打开对话框那一刻的快照。
+              if (v === "events" && termSession) void loadTermEvents(termSession.id);
+            }}
+          >
             <TabsList className="w-fit">
               <TabsTrigger value="exec">命令</TabsTrigger>
               <TabsTrigger value="upload">上传</TabsTrigger>
               <TabsTrigger value="download">下载</TabsTrigger>
+              <TabsTrigger value="events">执行记录</TabsTrigger>
             </TabsList>
-            <TabsContent value="exec" className="flex flex-col gap-3">
-              <ScrollArea className="h-80 rounded-md border">
+            <TabsContent value="exec">
+              {termSession ? (
+                <ShellTerminal
+                  // 会话切换必须重挂：终端把目录与滚动缓冲放在自己的 state 里，
+                  // 复用同一个实例会把上一个会话的输出留在屏幕上。
+                  key={`intranet-${termSession.id}`}
+                  historyKey={`intranet-${termSession.id}`}
+                  osKind={String(termSession.metadata?.os ?? "")}
+                  initialCwd={termSession.cwd || ""}
+                  heightClass="h-[46vh]"
+                  run={async ({ command, osKind: family, timeoutSeconds }) => {
+                    const r = await api.intranetExec(termSession.id, command, timeoutSeconds, family);
+                    setTermSession(r.session);
+                    refresh();
+                    return r.result;
+                  }}
+                />
+              ) : null}
+            </TabsContent>
+            <TabsContent value="events" className="flex flex-col gap-2">
+              <div className="flex items-center justify-between gap-2 text-muted-foreground text-xs">
+                <span>会话台账记录的命令，含 worker 与其它标签页跑的；事件里不带退出码与结束标记。</span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6"
+                  onClick={() => termSession && void loadTermEvents(termSession.id)}
+                >
+                  <RefreshCwIcon className="size-3.5" />
+                  刷新
+                </Button>
+              </div>
+              <ScrollArea className="h-[46vh] rounded-md border">
                 <div className="flex flex-col gap-3 p-3 font-mono text-xs">
-                  {termLines.length === 0 ? (
-                    <span className="text-muted-foreground">（无历史输出）</span>
+                  {termEvents.length === 0 ? (
+                    <span className="text-muted-foreground">（暂无执行记录）</span>
                   ) : (
-                    termLines.map((line) => (
-                      <div key={line.id} className="flex flex-col gap-1">
+                    termEvents.map((ev) => (
+                      <div key={ev.id} className="flex flex-col gap-1">
                         <div className="text-muted-foreground">
                           <span className="text-emerald-600 dark:text-emerald-400">$ </span>
-                          {line.command}
-                          <span className="ml-2 text-[10px]">{fmtTime(line.at)}</span>
+                          {ev.command}
+                          <span className="ml-2 text-[10px]">
+                            {ev.kind} · {fmtTime(ev.created_at)}
+                          </span>
                         </div>
                         <pre
                           className={`whitespace-pre-wrap break-all rounded bg-muted/50 p-2 ${
-                            line.isError ? "text-red-600 dark:text-red-400" : ""
+                            ev.is_error ? "text-red-600 dark:text-red-400" : ""
                           }`}
                         >
-                          {line.output || "（无输出）"}
+                          {ev.output || "（无输出）"}
                         </pre>
                       </div>
                     ))
                   )}
                 </div>
               </ScrollArea>
-              <div className="flex gap-2">
-                <Input
-                  value={termCommand}
-                  onChange={(e) => setTermCommand(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void runTermCommand();
-                  }}
-                  placeholder="例如 id / uname -a"
-                  className="font-mono"
-                />
-                <Button onClick={() => void runTermCommand()} disabled={termRunning}>
-                  {termRunning ? <Loader2Icon className="size-4 animate-spin" /> : <PlayIcon className="size-4" />}
-                  执行
-                </Button>
-              </div>
             </TabsContent>
             <TabsContent value="upload" className="flex flex-col gap-3">
               <FieldRow label="本地文件" hint="上限 4MB，分块 base64 写入">
@@ -1511,16 +2244,12 @@ export default function DeepIntranetPage() {
                 />
               </FieldRow>
               <div className="flex justify-end">
-                <Button onClick={() => void doUpload()} disabled={termRunning || !uploadFile}>
-                  {termRunning ? <Loader2Icon className="size-4 animate-spin" /> : <UploadIcon className="size-4" />}
+                <Button onClick={() => void doUpload()} disabled={uploadBusy || !uploadFile}>
+                  {uploadBusy ? <Loader2Icon className="size-4 animate-spin" /> : <UploadIcon className="size-4" />}
                   上传
                 </Button>
               </div>
-              {uploadResult ? (
-                <pre className="whitespace-pre-wrap break-all rounded-md border p-3 font-mono text-xs">
-                  {uploadResult.output || uploadResult.note || "（无输出）"}
-                </pre>
-              ) : null}
+              {uploadResult ? <ExecOutcome result={uploadResult} /> : null}
             </TabsContent>
             <TabsContent value="download" className="flex flex-col gap-3">
               <FieldRow label="远程路径" hint="单次最多 512KB，超出会截断">
@@ -1537,6 +2266,12 @@ export default function DeepIntranetPage() {
                   下载
                 </Button>
               </div>
+              {downloadResult ? (
+                <ExecOutcome
+                  result={{ ...downloadResult.result, output: downloadResult.result.output || "（内容已保存到本地）" }}
+                  extra={downloadResult.extra}
+                />
+              ) : null}
             </TabsContent>
           </Tabs>
         </DialogContent>
@@ -1639,6 +2374,20 @@ export default function DeepIntranetPage() {
                         #{s.id} {s.name || s.host}
                       </SelectItem>
                     ))}
+                </SelectContent>
+              </Select>
+            </FieldRow>
+            <FieldRow label="监听侧" hint="规划自动选型会改写；手写部署命令时用它纠正，验证与拆除复核都按这里记的一侧进行">
+              <Select
+                value={tunnelForm.listen_side}
+                onValueChange={(v) => setTunnelForm({ ...tunnelForm, listen_side: v })}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="target">目标（socat / ssh -D -L / chisel R:）</SelectItem>
+                  <SelectItem value="pivot">控制端（chisel client 不带 R:）</SelectItem>
                 </SelectContent>
               </Select>
             </FieldRow>
@@ -1763,6 +2512,10 @@ export default function DeepIntranetPage() {
                 <div>
                   <span className="text-muted-foreground">PID：</span>
                   {detailTunnel.pid ?? "—"}
+                </div>
+                <div>
+                  <span className="text-muted-foreground">监听侧：</span>
+                  {detailTunnel.listen_side === "pivot" ? "控制端（验证与复核查这一侧）" : "目标"}
                 </div>
                 <div>
                   <span className="text-muted-foreground">更新时间：</span>
@@ -2014,7 +2767,7 @@ export default function DeepIntranetPage() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="persist">标准模块（cron / systemd / ssh_key）</SelectItem>
+                  <SelectItem value="persist">标准模块（Linux / Windows 持久化）</SelectItem>
                   <SelectItem value="manual">手工登记（任意落地物）</SelectItem>
                 </SelectContent>
               </Select>
@@ -2058,49 +2811,70 @@ export default function DeepIntranetPage() {
             </FieldRow>
             {artifactMode === "persist" ? (
               <>
-                <FieldRow label="模块">
+                <FieldRow label="模块" hint={`当前模块适用于 ${persistMeta.os === "windows" ? "Windows" : "Linux/Unix"} 目标`}>
                   <Select
                     value={artifactForm.persist_kind}
-                    onValueChange={(v) => setArtifactForm({ ...artifactForm, persist_kind: v })}
+                    onValueChange={(v) => {
+                      const meta = PERSIST_KIND_META[v];
+                      setArtifactForm((f) => ({ ...f, persist_kind: v, schedule: meta?.schedule?.fallback ?? "" }));
+                    }}
                   >
                     <SelectTrigger>
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="cron">cron 计划任务</SelectItem>
-                      <SelectItem value="systemd">systemd 服务</SelectItem>
-                      <SelectItem value="ssh_key">SSH 公钥</SelectItem>
+                      <SelectGroup>
+                        <SelectLabel>Linux / Unix</SelectLabel>
+                        {Object.entries(PERSIST_KIND_META)
+                          .filter(([, m]) => m.os === "linux")
+                          .map(([value, m]) => (
+                            <SelectItem key={value} value={value}>
+                              {m.label}
+                            </SelectItem>
+                          ))}
+                      </SelectGroup>
+                      <SelectGroup>
+                        <SelectLabel>Windows</SelectLabel>
+                        {Object.entries(PERSIST_KIND_META)
+                          .filter(([, m]) => m.os === "windows")
+                          .map(([value, m]) => (
+                            <SelectItem key={value} value={value}>
+                              {m.label}
+                            </SelectItem>
+                          ))}
+                      </SelectGroup>
                     </SelectContent>
                   </Select>
                 </FieldRow>
-                {artifactForm.persist_kind === "cron" ? (
-                  <FieldRow label="cron 表达式" hint="5 段或 @reboot/@daily 等">
+                {persistMeta.schedule ? (
+                  <FieldRow label={persistMeta.schedule.label} hint={persistMeta.schedule.hint}>
                     <Input
                       value={artifactForm.schedule}
                       onChange={(e) => setArtifactForm({ ...artifactForm, schedule: e.target.value })}
-                      placeholder="*/10 * * * *"
+                      placeholder={persistMeta.schedule.placeholder}
                     />
                   </FieldRow>
                 ) : null}
-                {artifactForm.persist_kind === "ssh_key" ? (
-                  <>
-                    <FieldRow label="公钥">
-                      <Textarea
-                        value={artifactForm.public_key}
-                        onChange={(e) => setArtifactForm({ ...artifactForm, public_key: e.target.value })}
-                        rows={2}
-                        placeholder="ssh-ed25519 AAAA..."
-                      />
-                    </FieldRow>
-                    <FieldRow label="目标账号" hint="留空使用当前用户">
-                      <Input
-                        value={artifactForm.user}
-                        onChange={(e) => setArtifactForm({ ...artifactForm, user: e.target.value })}
-                        placeholder="root"
-                      />
-                    </FieldRow>
-                  </>
-                ) : (
+                {persistMeta.publicKey ? (
+                  <FieldRow label="公钥">
+                    <Textarea
+                      value={artifactForm.public_key}
+                      onChange={(e) => setArtifactForm({ ...artifactForm, public_key: e.target.value })}
+                      rows={2}
+                      placeholder="ssh-ed25519 AAAA..."
+                    />
+                  </FieldRow>
+                ) : null}
+                {persistMeta.user ? (
+                  <FieldRow label="目标账号" hint="留空使用当前用户">
+                    <Input
+                      value={artifactForm.user}
+                      onChange={(e) => setArtifactForm({ ...artifactForm, user: e.target.value })}
+                      placeholder="root"
+                    />
+                  </FieldRow>
+                ) : null}
+                {persistMeta.command ? (
                   <FieldRow label="执行命令">
                     <Textarea
                       value={artifactForm.command}
@@ -2109,7 +2883,15 @@ export default function DeepIntranetPage() {
                       placeholder="要维持执行的命令"
                     />
                   </FieldRow>
-                )}
+                ) : null}
+                <FieldRow label="TTL（秒）" hint="可选；到期后后台自动撤销，60–2592000">
+                  <Input
+                    value={artifactForm.ttl_seconds}
+                    onChange={(e) => setArtifactForm({ ...artifactForm, ttl_seconds: e.target.value })}
+                    placeholder="留空表示不过期，例如 86400"
+                    inputMode="numeric"
+                  />
+                </FieldRow>
               </>
             ) : (
               <>
@@ -2134,6 +2916,14 @@ export default function DeepIntranetPage() {
                     onChange={(e) => setArtifactForm({ ...artifactForm, verify_command: e.target.value })}
                     rows={2}
                     placeholder="test -e /tmp/tool && echo JW_ARTIFACT_PRESENT || echo JW_ARTIFACT_GONE"
+                  />
+                </FieldRow>
+                <FieldRow label="TTL（秒）" hint="可选；到期后后台自动撤销，60–2592000">
+                  <Input
+                    value={artifactForm.ttl_seconds}
+                    onChange={(e) => setArtifactForm({ ...artifactForm, ttl_seconds: e.target.value })}
+                    placeholder="留空表示不过期，例如 86400"
+                    inputMode="numeric"
                   />
                 </FieldRow>
               </>
@@ -2168,8 +2958,10 @@ export default function DeepIntranetPage() {
           <DialogHeader>
             <DialogTitle>撤离清理</DialogTitle>
             <DialogDescription>
-              按落地物台账 id 倒序撤销并验证，随后拆除任务隧道、释放受管资源并关闭会话。webshell
-              不会自动删除，会列入残留提醒。
+              按落地物台账 id 倒序撤销并验证，随后复核残留、拆除任务隧道、释放受管资源并关闭会话。
+              内存马会在父 webshell 之前清理（父 shell 反注册优先，失败则端点自移除）；未确认移除时保留父
+              webshell 并列入残留。webshell 默认只探活并列入残留提醒；显式开启后才会对 v2 载荷执行自删除与
+              404/标记复核。
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-4">
@@ -2195,6 +2987,22 @@ export default function DeepIntranetPage() {
                 onCheckedChange={(v) => setEvacuateCloseSessions(Boolean(v))}
               />
               关闭该任务的活跃会话
+            </label>
+            <label htmlFor="evac-delete-shells" className="flex items-center gap-2 text-sm">
+              <Checkbox
+                id="evac-delete-shells"
+                checked={evacuateDeleteShells}
+                onCheckedChange={(v) => setEvacuateDeleteShells(Boolean(v))}
+              />
+              自删除本任务会话绑定的 v2 webshell（旧版协议仍需手工清理）
+            </label>
+            <label htmlFor="evac-rescan" className="flex items-center gap-2 text-sm">
+              <Checkbox
+                id="evac-rescan"
+                checked={evacuateScan}
+                onCheckedChange={(v) => setEvacuateScan(Boolean(v))}
+              />
+              撤离后重新执行验证命令做残留复核
             </label>
             <div className="flex flex-wrap items-center gap-2">
               <Button
@@ -2242,6 +3050,18 @@ export default function DeepIntranetPage() {
                   <Badge variant="outline">
                     会话 {evacuateReport.sessions.done}/{evacuateReport.sessions.total}
                   </Badge>
+                  <Badge variant="outline">
+                    内存马 {evacuateReport.memshells.done}/{evacuateReport.memshells.total}
+                  </Badge>
+                  <Badge variant="outline">
+                    webshell {evacuateReport.webshells.done}/{evacuateReport.webshells.total}
+                  </Badge>
+                  {evacuateReport.scan.checked > 0 ? (
+                    <Badge variant="outline">
+                      复核 {evacuateReport.scan.checked} 项（存在 {evacuateReport.scan.present}、未知{" "}
+                      {evacuateReport.scan.unknown}）
+                    </Badge>
+                  ) : null}
                 </div>
                 {evacuateReport.residual.length > 0 ? (
                   <div className="rounded-md border border-red-500/30 bg-red-500/5 p-2">

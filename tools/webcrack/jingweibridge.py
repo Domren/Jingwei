@@ -356,6 +356,14 @@ def main():
                             entry["request"] = build_request_text(found_res[1])
                             entry["response"] = build_response_text(found_res[1])
                             entry["cookie"] = found_res[0]
+                if not entry["found"] and not entry["request"]:
+                    # 被拒绝的尝试也要留下原始报文：否则「凭据无效」只是一个结论，
+                    # 复核的人看不到目标到底收到了什么、答了什么。
+                    for u, p, cookie, res in reversed(captured):
+                        if getattr(res, "request", None) is not None:
+                            entry["request"] = build_request_text(res)
+                            entry["response"] = build_response_text(res)
+                            break
                 entry["captcha"] = captcha_state["detected"]
                 entry["captcha_retries"] = captcha_state["retries"]
                 entry["captcha_ocr_failures"] = captcha_state["failures"]

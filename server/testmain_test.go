@@ -24,19 +24,25 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		os.Exit(m.Run())
 	}
-	pg, err := db.Open(dsn)
+	pg, err := db.OpenTestSchema(dsn, "jingwei_test_server")
 	if err != nil {
-		os.Exit(m.Run())
+		// A DSN is configured, so these tests write real rows. Running without the
+		// isolated schema and without the lock means sharing tables with db/agent —
+		// the deadlock this lock exists to keep apart.
+		fmt.Fprintf(os.Stderr, "server suite: 打不开隔离 schema，拒绝在共享表上跑：%v\n", err)
+		os.Exit(1)
 	}
 	conn, err := pg.Conn(context.Background())
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "server suite: 取固定连接失败，拒绝在无锁状态下跑：%v\n", err)
 		_ = pg.Close()
-		os.Exit(m.Run())
+		os.Exit(1)
 	}
 	if _, err := conn.ExecContext(context.Background(), `SELECT pg_advisory_lock(7337741002)`); err != nil {
+		fmt.Fprintf(os.Stderr, "server suite: 拿不到套件锁，拒绝与别的包并发写共享表：%v\n", err)
 		_ = conn.Close()
 		_ = pg.Close()
-		os.Exit(m.Run())
+		os.Exit(1)
 	}
 	watermark := toolUsageWatermark(pg)
 	code := m.Run()

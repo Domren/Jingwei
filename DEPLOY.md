@@ -1,6 +1,6 @@
 # Jingwei（精卫）Docker 部署指南
 
-适用版本：**v1.3.1**。Jingwei 自 1.0.0 起只通过容器镜像分发，
+适用版本：**v1.4.0**。Jingwei 自 1.0.0 起只通过容器镜像分发，
 部署、升级和回滚都使用 Docker Compose。
 
 - 镜像：`ghcr.io/domren/jingwei`
@@ -26,7 +26,7 @@ LLM 不是启动必需项，但对话、任务执行和 Agent 自动规划需要
 ### 2.1 使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.3.1 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.4.0 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 ```
@@ -35,8 +35,8 @@ cp .env.example .env
 
 ```bash
 mkdir -p jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.3.1/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.3.1/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.4.0/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.4.0/deploy/.env.example
 ```
 
 两种方式得到的目录结构相同：
@@ -52,7 +52,7 @@ curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.3.1/deploy/
 镜像默认发布到 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.3.1
+docker pull ghcr.io/domren/jingwei:1.4.0
 ```
 
 维护者把 Package 可见性设为 **Public** 后，以上命令无需登录。
@@ -70,9 +70,9 @@ unset GHCR_TOKEN
 
 | 标签 | 说明 |
 | --- | --- |
-| `1.3.1` / `v1.3.1` | 固定版本，生产环境推荐 |
+| `1.4.0` / `v1.4.0` | 固定版本，生产环境推荐 |
 | `latest` | 最新正式版 |
-| `v1.3.1-amd64` / `v1.3.1-arm64` | 单架构中间镜像，一般不用 |
+| `v1.4.0-amd64` / `v1.4.0-arm64` | 单架构中间镜像，一般不用 |
 
 ## 4. 配置 `.env`
 
@@ -82,7 +82,7 @@ unset GHCR_TOKEN
 POSTGRES_USER=jingwei
 POSTGRES_PASSWORD=请替换为强随机密码
 POSTGRES_DB=jingwei
-JINGWEI_IMAGE=ghcr.io/domren/jingwei:1.3.1
+JINGWEI_IMAGE=ghcr.io/domren/jingwei:1.4.0
 JINGWEI_WEB_PORT=9790
 JINGWEI_PROXY_PORT=9791
 ```
@@ -117,7 +117,7 @@ curl -fsS http://127.0.0.1:9790/api/health
 期望健康检查返回：
 
 ```json
-{"ok":true,"service":"jingwei","version":"1.3.1"}
+{"ok":true,"service":"jingwei","version":"1.4.0"}
 ```
 
 从 v1.1.0 升级时注意：环境变量前缀已由 `ARTEX_` 改为 `JINGWEI_`，旧变量不再读取。
@@ -143,10 +143,16 @@ Compose 使用两个命名卷：
 
 | 卷 | 挂载点 | 内容 |
 | --- | --- | --- |
-| `jingwei_pgdata` | PostgreSQL 数据目录 | 任务、配置、POC 模板、审批、资产等 |
-| `jingwei_jingwei_data` | `/app/data` | JWT 签名密钥、流量录制等运行数据 |
+| `jingwei_pgdata` | PostgreSQL 数据目录 | 任务、配置、POC 模板、审批、资产，以及**平台签名密钥**（`platform_secret` 单行表） |
+| `jingwei_jingwei_data` | `/app/data` | 流量录制、导出物等可浏览工作区数据（**不含**签名密钥） |
 
 PostgreSQL 默认只在 Compose 内部网络暴露，不映射到宿主机端口。
+
+> **签名密钥跟着库走。** 这把钥匙派生出三样东西：会话 JWT 的签名、webshell / 内存马 / 半持久化密钥的密封、
+> HTTP Basic 认证门的 cookie。因此 6.1 的 `pg_dump` 就是密钥备份，不需要另外保存文件。只恢复 `data` 卷而丢了库
+> （或反过来）会重新铸一把，后果是所有登录会话失效 **加上** 所有已投放 webshell 报「密钥解封失败，请重新投放载荷」
+> ——目标上的文件还在，但平台打不开了。1.4.0 之前密钥写在 `/app/jwt.key`（容器可写层，不在任何卷内），
+> `docker compose up --force-recreate` 一次就轮换一次；首次升级到本版时旧文件会被原样搬进库并删除，不改变钥匙本身。
 
 ### 6.1 备份
 
@@ -225,8 +231,43 @@ docker compose up -d
 
 ### 7.3 关于页面更新提示
 
-Docker 模式下，系统配置页仍会检查 GitHub 最新 Release，但不会替换容器内二进制
-（容器重建后会丢失）。升级请始终使用 `docker compose pull && docker compose up -d`。
+「系统设置 → 版本与更新」检查的是 GitHub 上最新的正式版本，以**服务端**结果为准：下载是后端做的，
+只有后端能访问 GitHub 才谈得上更新（浏览器能连而服务器连不上的情况很常见，那时页面会在「检查」这一步
+就报错，而不是点了「立即更新」才失败）。
+
+Docker 模式下点「立即更新」**确实会换装**，但要知道它的边界：
+
+- 换的是**容器可写层里的二进制**，镜像里的 playwright / nmap / webcrack 等工具链不会跟着变。
+  新版本若依赖新工具，页面更新是不够的，必须换镜像。
+- 换装写的是可写层，所以 `docker compose up -d --force-recreate`（或改了 `JINGWEI_IMAGE` 之后重建）
+  会退回**镜像自带的那个版本**。页面更新是临时的，不是升级。
+- 换装带标记与备份：新版起不来、连续崩溃会自动回滚到上一版；也可以在页面上手动回滚。
+
+所以两条路分工明确：**临时热修**用页面更新；**正式升级**改 `.env` 里的 `JINGWEI_IMAGE` 为新版本号，
+再 `docker compose pull && docker compose up -d`，这样程序与工具链一起换。
+
+### 7.4 签名根密钥换过之后怎么办
+
+平台签名根密钥存在数据库 `platform_secret` 单行表里。它派生出会话 JWT 签名、webshell / 内存马
+密钥密封、内网凭据密封与模型 API 密钥密封。**这把值一变，之前登记的一切密封记录都解不开**：
+所有人掉登录；每条 webshell 命令回「密钥解封失败（JWT 密钥可能已更换，请重新投放载荷）」；
+凭据复用与 SSH 会话直接拒绝并提示重新登记。启动时会自检并打印条数：
+
+```bash
+docker compose logs jingwei | grep '\[seal\]'
+```
+
+不存在「换一把密钥再把旧密文解一遍」的路径——密封用的就是这把密钥，旧密文对新密钥不可逆；
+逐壳的 `POST /api/deep/webshells/{id}/rotate` 也需要旧密钥才能发起。所以只有两条恢复方式：
+
+1. **找回旧密钥**：从换密钥之前的数据库备份里读出 `platform_secret` 那一行，写回当前库，重启即全部恢复。
+   这就是 §6.1 的 `pg_dump` 必须按密钥备份来管的原因。
+2. **重新投放**：备份也丢了，就按台账逐条重做——重新投放 webshell 载荷、重新注入内存马、重新登记凭据、
+   在系统设置里重新填写模型 API 密钥。旧记录里的目标路径仍然可用，照着覆盖投放即可，但目标上那份用旧密钥
+   的载荷必须被换掉，否则它会拒绝新密钥的握手。
+
+正常情况下升级与容器重建都不会换这把密钥（1.4.0 之前会，因为密钥写在容器可写层里，每次
+`--force-recreate` 重新生成一把）。
 
 ## 8. 反向代理与 HTTPS
 
@@ -299,9 +340,9 @@ rm -rf server/webui/dist
 cp -r web/out server/webui/dist
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.3.1" -o dist/amd64/jingwei ./cmd/jingwei
+  -ldflags "-s -w -X main.version=1.4.0" -o dist/amd64/jingwei ./cmd/jingwei
 
-docker build --network=host --build-arg TARGETARCH=amd64 -t jingwei:1.3.1 .
+docker build --network=host --build-arg TARGETARCH=amd64 -t jingwei:1.4.0 .
 ```
 
 ARM64 构建时把 `GOARCH` 与 `TARGETARCH` 改为 `arm64`，并在对应架构的机器上
@@ -334,7 +375,7 @@ docker compose logs --tail=100 postgres
 
 ### 10.2 无法拉取 GHCR 镜像
 
-- 确认镜像版本存在：`docker manifest inspect ghcr.io/domren/jingwei:1.3.1`
+- 确认镜像版本存在：`docker manifest inspect ghcr.io/domren/jingwei:1.4.0`
 - 若 Package 是私有的，先按第 3 节登录；Token 需要 `read:packages`。
 - 确认 Docker 所在网络可以访问 `ghcr.io`。
 

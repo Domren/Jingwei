@@ -74,6 +74,17 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	if !strings.Contains(recording, "目标真正会执行的通道") || !strings.Contains(recording, "撤销后必须证明") {
 		t.Fatalf("worker cleanup tail misses revert verification: %q", recording)
 	}
+	// A deep-dive round left a dozen raw-HTTP uploads outside every ledger and wrote
+	// "已清理" anyway; evacuation walks the ledger, so it must be told to register
+	// anything it keeps and to say 未登记 when it does neither. The rule now names
+	// webshell_register too, since "登记成 webshell" was not actionable before it
+	// existed and shells outside the task binding are never enumerated by cleanup.
+	if !strings.Contains(recording, "intranet_artifact_register") || !strings.Contains(recording, "未登记、未清理") {
+		t.Fatalf("worker cleanup tail misses ledger registration rule: %q", recording)
+	}
+	if !strings.Contains(recording, "webshell_register") || !strings.Contains(recording, "task_id") {
+		t.Fatalf("worker cleanup tail misses the webshell_register rule: %q", recording)
+	}
 	// Egress proxy set but capture OFF (no CA): the ProxyAddr template branch still
 	// renders, but the trafficTool block must NOT — those tools are not registered.
 	egressOnly := workerSystem("127.0.0.1:8080", "", "/data", "/data")

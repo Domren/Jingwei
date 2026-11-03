@@ -38,6 +38,9 @@ services:
       JAVA_CHAINS_PASS: ${JAVA_CHAINS_PASS:-}
       JAVA_CHAINS_MCP_TOKEN: ${JAVA_CHAINS_MCP_TOKEN:-}
       JAVA_CHAINS_CALLBACK_BIND: ${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}
+      # 侧车容器内部的监听地址：容器有自己的网络命名空间，绑 127.0.0.1 时
+      # 宿主机发布的回调端口后面没有人监听，任何目标都回连不上。
+      JAVA_CHAINS_LISTEN_BIND: ${JAVA_CHAINS_LISTEN_BIND:-0.0.0.0}
       JAVA_CHAINS_CALLBACK_HOST: ${JAVA_CHAINS_CALLBACK_HOST:-127.0.0.1}
       # 抓包记录诊断：置 1 后每条完成流量都会打一行日志（定位"代理能转发但抓不到包"）
       JINGWEI_TRAFFIC_DEBUG: ${JINGWEI_TRAFFIC_DEBUG:-}
@@ -61,8 +64,9 @@ services:
       CHAINS_SHOW_PUBLIC_IP: "false"
     ports:
       - "127.0.0.1:${JAVA_CHAINS_WEB_PORT:-9792}:8011"
-      # 回调端口默认只绑定本机；远端目标需要把 JAVA_CHAINS_CALLBACK_BIND 改为 0.0.0.0
-      # 或指定网卡地址，并在测试结束后关闭/回收。
+      # 这里绑定的是**宿主机**哪个网卡公开回调端口，与侧车内部的监听地址
+      # （JAVA_CHAINS_LISTEN_BIND）是两件事。目标在远端时改为 0.0.0.0 或指定网卡，
+      # 并把 JAVA_CHAINS_CALLBACK_HOST 设成目标可达的宿主机地址。
       - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:58080:58080"
       - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:50389:50389"
       - "${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}:50388:50388"

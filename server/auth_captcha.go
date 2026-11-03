@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/Autumn-27/jingwei/captcha"
 )
 
 const (
@@ -240,22 +242,70 @@ type sliderPuzzle struct {
 	piece      string
 }
 
+// sliderRender is one drawing pass: the notch position plus the two images the
+// browser will see.
+type sliderRender struct {
+	answerX, pieceY   int
+	background, piece string
+}
+
+// sliderPuzzleAttempts bounds how often newSliderPuzzle redraws before it ships
+// an unverified puzzle.
+const sliderPuzzleAttempts = 4
+
 // newSliderPuzzle cuts an opaque square straight out of a textured background,
 // then draws a visible gap in the place it came from. The piece therefore both
 // fits the gap outline and carries the original texture, which keeps the
 // puzzle solvable by a human and by the platform's own slider solver.
+//
+// "Solvable" is now checked instead of assumed. On a cluttered draw the outline
+// and content signals can both prefer a different spot — measured roughly one
+// puzzle in sixty — and a notch the reference solver cannot locate is a notch a
+// legitimate user may not see either, which locks that client IP out until the
+// challenge expires. Redrawing is bounded because refusing to issue a captcha
+// would lock everyone out over one unlucky draw.
 func newSliderPuzzle(ip string) (*sliderPuzzle, error) {
 	id, err := randomHex(24)
 	if err != nil {
 		return nil, err
 	}
+	var out sliderRender
+	for attempt := 0; attempt < sliderPuzzleAttempts; attempt++ {
+		out, err = renderSliderPuzzle()
+		if err != nil {
+			return nil, err
+		}
+		if sliderPuzzleSolvable(out) {
+			break
+		}
+	}
+	return &sliderPuzzle{
+		challenge: &sliderChallenge{
+			id:        id,
+			answerX:   out.answerX,
+			pieceY:    out.pieceY,
+			expires:   time.Now().Add(sliderChallengeTTL),
+			clientIP:  ip,
+			width:     sliderWidth,
+			height:    sliderHeight,
+			pieceSize: sliderPieceSize,
+		},
+		background: out.background,
+		piece:      out.piece,
+	}, nil
+}
+
+// renderSliderPuzzle draws one candidate. It carries no memory of earlier
+// attempts, so newSliderPuzzle can redraw until the notch is unambiguous.
+func renderSliderPuzzle() (sliderRender, error) {
+	var out sliderRender
 	answerX, err := randomRange(sliderPieceSize+24, sliderWidth-sliderPieceSize-16)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	pieceY, err := randomRange(24, sliderHeight-sliderPieceSize-16)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	bg := image.NewRGBA(image.Rect(0, 0, sliderWidth, sliderHeight))
 	// Fill the full canvas first: SetRGBA on a zero-value RGBA image leaves
@@ -276,26 +326,38 @@ func newSliderPuzzle(ip string) (*sliderPuzzle, error) {
 
 	backgroundURL, err := encodePNGDataURL(bg)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	pieceURL, err := encodePNGDataURL(pieceImg)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
-	return &sliderPuzzle{
-		challenge: &sliderChallenge{
-			id:        id,
-			answerX:   answerX,
-			pieceY:    pieceY,
-			expires:   time.Now().Add(sliderChallengeTTL),
-			clientIP:  ip,
-			width:     sliderWidth,
-			height:    sliderHeight,
-			pieceSize: sliderPieceSize,
-		},
-		background: backgroundURL,
-		piece:      pieceURL,
-	}, nil
+	out.answerX, out.pieceY = answerX, pieceY
+	out.background, out.piece = backgroundURL, pieceURL
+	return out, nil
+}
+
+// sliderPuzzleSolvable asks the platform's own slider solver where the notch is
+// and accepts the drawing only when the answer lands inside the tolerance the
+// login form itself will grant.
+func sliderPuzzleSolvable(draw sliderRender) bool {
+	bgBytes, err := captcha.DecodeDataURL(draw.background)
+	if err != nil {
+		return false
+	}
+	pieceBytes, err := captcha.DecodeDataURL(draw.piece)
+	if err != nil {
+		return false
+	}
+	res, err := captcha.SolveSlider(bgBytes, pieceBytes, captcha.SolveOptions{})
+	if err != nil {
+		return false
+	}
+	delta := res.Offset - draw.answerX
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= sliderTolerance
 }
 
 func encodePNGDataURL(img image.Image) (string, error) {

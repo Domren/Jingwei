@@ -58,42 +58,104 @@ func validatePassword(pw string) string {
 	return ""
 }
 
-// loadOrCreateJWTKey reads the 32-byte signing key from keyDir/jwt.key. keyDir is
-// the project base dir (next to the executable), NOT the browsable workspace root
-// (dataDir) — the signing key must never be listable/downloadable via the file
-// manager. Legacy installs kept it at dataDir/jwt.key; if present there and not yet
-// at the new location, it is migrated (key preserved, so sessions stay valid) and
-// the old file removed so it disappears from the workspace. On first run a random
-// key is generated and persisted.
-func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
-	path := filepath.Join(keyDir, jwtKeyFilename)
-	// one-time migration out of the old in-workspace location.
-	if legacy := filepath.Join(dataDir, jwtKeyFilename); legacy != path {
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			if data, rerr := os.ReadFile(legacy); rerr == nil {
-				if werr := os.WriteFile(path, data, 0o600); werr == nil {
-					_ = os.Remove(legacy)
-					log.Printf("[auth] JWT key 已从 %s 迁移到 %s（移出可浏览工作区）", legacy, path)
-				}
-			}
+// platformSecretStore is the persistence the signing root needs. Narrow on
+// purpose: the key is loaded once at startup and nothing else in the server may
+// read it back out of the database.
+type platformSecretStore interface {
+	PlatformJWTKey() (string, bool, error)
+	EnsurePlatformJWTKey(candidate string) (string, error)
+}
+
+// loadOrCreateJWTKey resolves the platform signing root, preferring the database.
+//
+// The key used to live at keyDir/jwt.key — the project base dir, deliberately not
+// the browsable workspace root (dataDir), because a signing key that the file
+// manager can list is a signing key that leaks. That location is also the
+// container's writable layer, so every `compose up --force-recreate` minted a new
+// one: all sessions revoked and every stored webshell key undecryptable
+// ("密钥解封失败，请重新投放载荷"). The database is the artifact operators already
+// back up, so the row is now authoritative and any legacy file is migrated into
+// it and removed.
+func loadOrCreateJWTKey(store platformSecretStore, keyDir, dataDir string) ([]byte, error) {
+	stored, ok, err := store.PlatformJWTKey()
+	if err != nil {
+		return nil, fmt.Errorf("读取平台签名密钥: %w", err)
+	}
+	if ok {
+		dropLegacyJWTKeys(keyDir, dataDir)
+		return []byte(stored), nil
+	}
+
+	legacy, legacyPath := readLegacyJWTKey(keyDir, dataDir)
+	candidate := legacy
+	if candidate == "" {
+		if candidate, err = randomJWTKey(); err != nil {
+			return nil, err
 		}
 	}
-	if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) >= 32 {
-		return []byte(strings.TrimSpace(string(data))), nil
+	// The constraint decides, so a concurrent boot that lost the race adopts the
+	// winner's key instead of signing sessions with one nobody else can verify.
+	final, err := store.EnsurePlatformJWTKey(candidate)
+	if err != nil {
+		// Refuse to boot on an ephemeral key: it looks healthy until the next
+		// recreate, which is exactly the failure this ordering exists to remove.
+		return nil, fmt.Errorf("写入平台签名密钥: %w", err)
 	}
+	// Only retire the file once it is provably the key the database holds; a lost
+	// race would otherwise delete the sole copy of the key that sealed the shells.
+	if legacyPath != "" && final == legacy {
+		if err := os.Remove(legacyPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[auth] 签名密钥已入库，旧文件 %s 未能删除：%v", legacyPath, err)
+		}
+	} else if legacyPath != "" {
+		log.Printf("[auth] 数据库已持有另一个签名密钥，%s 保留原样、不再使用", legacyPath)
+	}
+	return []byte(final), nil
+}
+
+// randomJWTKey mints a 32-character key from keyChars.
+func randomJWTKey() (string, error) {
 	buf := make([]byte, 32)
 	for i := range buf {
 		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(keyChars))))
 		if err != nil {
-			return nil, fmt.Errorf("generate jwt key: %w", err)
+			return "", fmt.Errorf("generate jwt key: %w", err)
 		}
 		buf[i] = keyChars[n.Int64()]
 	}
-	if err := os.WriteFile(path, buf, 0600); err != nil {
-		return nil, fmt.Errorf("write jwt key: %w", err)
+	return string(buf), nil
+}
+
+// readLegacyJWTKey returns the first key found at the pre-database locations:
+// keyDir/jwt.key (1.3.1 onward) then dataDir/jwt.key (before that).
+func readLegacyJWTKey(keyDir, dataDir string) (value, path string) {
+	for _, dir := range []string{keyDir, dataDir} {
+		p := filepath.Join(dir, jwtKeyFilename)
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if v := strings.TrimSpace(string(data)); v != "" {
+			return v, p
+		}
 	}
-	log.Printf("[auth] 新 JWT key 已写入 %s", path)
-	return buf, nil
+	return "", ""
+}
+
+// dropLegacyJWTKeys removes stale key files once the database is authoritative,
+// so a leftover file cannot look like the source of truth after a restore.
+func dropLegacyJWTKeys(keyDir, dataDir string) {
+	for _, dir := range []string{keyDir, dataDir} {
+		p := filepath.Join(dir, jwtKeyFilename)
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			log.Printf("[auth] 以库内密钥为准，但旧文件 %s 未能删除：%v", p, err)
+			continue
+		}
+		log.Printf("[auth] 已删除旧的签名密钥文件 %s（库内为准）", p)
+	}
 }
 
 type authSessionClaims struct {

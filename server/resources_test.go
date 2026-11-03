@@ -1,8 +1,12 @@
 package server
 
 import (
+	"context"
+	"encoding/json"
 	"net"
 	"testing"
+
+	"github.com/Autumn-27/jingwei/db"
 )
 
 func TestParseProcAddr(t *testing.T) {
@@ -81,5 +85,44 @@ func TestAuditLocalPortsRuns(t *testing.T) {
 		if l.Managed || l.Platform || l.Scope == "loopback" {
 			t.Fatalf("unmanaged listener has wrong flags: %+v", l)
 		}
+	}
+}
+
+func TestMetadataInt64(t *testing.T) {
+	// JSON 数字回到 Go 里是 float64，写回再读出时可能是字符串，两种都要认。
+	var fromJSON map[string]any
+	if err := json.Unmarshal([]byte(`{"tunnel_id":3,"pid":"26427"}`), &fromJSON); err != nil {
+		t.Fatal(err)
+	}
+	if got := metadataInt64(fromJSON, "tunnel_id"); got != 3 {
+		t.Fatalf("float64 tunnel_id = %d", got)
+	}
+	if got := metadataInt64(fromJSON, "pid"); got != 26427 {
+		t.Fatalf("string pid = %d", got)
+	}
+	if got := metadataInt64(map[string]any{"x": int64(7)}, "x"); got != 7 {
+		t.Fatalf("int64 = %d", got)
+	}
+	for _, md := range []map[string]any{nil, {}, {"tunnel_id": "abc"}, {"tunnel_id": nil}} {
+		if got := metadataInt64(md, "tunnel_id"); got != 0 {
+			t.Fatalf("bad metadata %#v = %d, want 0", md, got)
+		}
+	}
+}
+
+func TestRunCleanupRebuildsTunnelTeardown(t *testing.T) {
+	m := &resourceManager{s: &Server{m: &Manager{}}}
+	var ran int
+	m.runCleanup(t.Context(), &db.ManagedResource{ID: 1, Kind: db.ManagedKindTunnel}, func(context.Context) { ran++ })
+	if ran != 1 {
+		t.Fatal("in-process cleanup closure must still win when it exists")
+	}
+	// 回调丢失（平台重启）时不能再静默跳过：隧道行的 metadata 里有 tunnel_id，
+	// 按台账补做拆除。pg 为空时 intranetStopTunnel 直接返回，这里只要求不 panic。
+	m.runCleanup(t.Context(), &db.ManagedResource{
+		ID: 2, Kind: db.ManagedKindTunnel, Metadata: map[string]any{"tunnel_id": float64(9)},
+	}, nil)
+	for _, kind := range []string{db.ManagedKindWebshell, db.ManagedKindCallback} {
+		m.runCleanup(t.Context(), &db.ManagedResource{ID: 3, Kind: kind}, nil)
 	}
 }

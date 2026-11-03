@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,9 @@ import (
 const (
 	IntranetSessionActive    = "active"
 	IntranetSessionClosed    = "closed"
+	IntranetHealthOK         = "ok"
+	IntranetHealthDegraded   = "degraded"
+	IntranetHealthLost       = "lost"
 	IntranetTunnelPlanned    = "planned"
 	IntranetTunnelDeployed   = "deployed"
 	IntranetTunnelVerified   = "verified"
@@ -28,7 +32,24 @@ const (
 	IntranetTunnelKindSocks5 = "socks5"
 	IntranetTunnelKindPort   = "port_forward"
 	IntranetTunnelKindRemote = "reverse_forward"
+	// 监听端所在的一侧：目标机上，还是控制端（JINGWEI_PIVOT_SERVER）上。
+	IntranetListenSideTarget = "target"
+	IntranetListenSidePivot  = "pivot"
+	// 会话承载方式：webshell 走 HTTP 壳，ssh 直接登录内网主机。内网里大量主机
+	// 只有 22 端口，没有 web 服务，也就永远落不下 webshell；不给出 SSH 会话这条
+	// 路，凭复用弱口令拿到的立足点就只是一条凭据记录，既不能执行、收集信息，也
+	// 进不了维持与撤离台账。
+	IntranetTransportWebshell = "webshell"
+	IntranetTransportSSH      = "ssh"
 )
+
+// NormalizeIntranetTransport maps a caller-supplied transport to a known value.
+func NormalizeIntranetTransport(v string) string {
+	if strings.EqualFold(strings.TrimSpace(v), IntranetTransportSSH) {
+		return IntranetTransportSSH
+	}
+	return IntranetTransportWebshell
+}
 
 type IntranetSession struct {
 	ID           int64          `json:"id"`
@@ -38,6 +59,7 @@ type IntranetSession struct {
 	Host         string         `json:"host"`
 	Cwd          string         `json:"cwd"`
 	Status       string         `json:"status"`
+	Transport    string         `json:"transport"`
 	LastSeen     *time.Time     `json:"last_seen,omitempty"`
 	Metadata     map[string]any `json:"metadata"`
 	Note         string         `json:"note"`
@@ -46,6 +68,14 @@ type IntranetSession struct {
 	WebshellName string         `json:"webshell_name,omitempty"`
 	WebshellURL  string         `json:"webshell_url,omitempty"`
 	ShellType    string         `json:"shell_type,omitempty"`
+
+	// SSH transport: the ledger keeps the real internal identity (Host/SSHPort)
+	// and the credential row, never a password copy.
+	SSHPort         int    `json:"ssh_port,omitempty"`
+	SSHUser         string `json:"ssh_user,omitempty"`
+	SSHCredentialID int64  `json:"ssh_credential_id,omitempty"`
+	SSHDialHost     string `json:"ssh_dial_host,omitempty"`
+	SSHDialPort     int    `json:"ssh_dial_port,omitempty"`
 }
 
 type IntranetSessionInput struct {
@@ -56,6 +86,13 @@ type IntranetSessionInput struct {
 	Cwd        string
 	Note       string
 	Metadata   map[string]any
+
+	Transport       string
+	SSHPort         int
+	SSHUser         string
+	SSHCredentialID int64
+	SSHDialHost     string
+	SSHDialPort     int
 }
 
 type IntranetSessionEvent struct {
@@ -76,6 +113,7 @@ type IntranetTunnel struct {
 	Kind            string    `json:"kind"`
 	ListenHost      string    `json:"listen_host"`
 	ListenPort      int       `json:"listen_port"`
+	ListenSide      string    `json:"listen_side"`
 	RemoteHost      string    `json:"remote_host"`
 	RemotePort      int       `json:"remote_port"`
 	Status          string    `json:"status"`
@@ -96,6 +134,7 @@ type IntranetTunnelInput struct {
 	Kind            string
 	ListenHost      string
 	ListenPort      int
+	ListenSide      string
 	RemoteHost      string
 	RemotePort      int
 	DeployCommand   string
@@ -127,21 +166,25 @@ type IntranetScopeRequestInput struct {
 
 const intranetSessionCols = `s.id, s.name, s.webshell_id, s.task_id, s.host, s.cwd, s.status,
 	s.last_seen, s.metadata, s.note, s.created_at, s.updated_at,
-	COALESCE(w.name,''), COALESCE(w.url,''), COALESCE(w.shell_type,'')`
+	COALESCE(w.name,''), COALESCE(w.url,''), COALESCE(w.shell_type,''),
+	s.transport, s.ssh_port, s.ssh_user, s.ssh_credential_id, s.ssh_dial_host, s.ssh_dial_port`
 
 // intranetSessionReturningCols is the same projection minus the webshells join,
 // for INSERT/UPDATE ... RETURNING where alias w is unavailable.
 const intranetSessionReturningCols = `id, name, webshell_id, task_id, host, cwd, status,
-	last_seen, metadata, note, created_at, updated_at, '', '', ''`
+	last_seen, metadata, note, created_at, updated_at, '', '', '',
+	transport, ssh_port, ssh_user, ssh_credential_id, ssh_dial_host, ssh_dial_port`
 
 func scanIntranetSession(row interface{ Scan(...any) error }) (*IntranetSession, error) {
 	var s IntranetSession
 	var raw []byte
 	if err := row.Scan(&s.ID, &s.Name, &s.WebshellID, &s.TaskID, &s.Host, &s.Cwd, &s.Status,
 		&s.LastSeen, &raw, &s.Note, &s.CreatedAt, &s.UpdatedAt,
-		&s.WebshellName, &s.WebshellURL, &s.ShellType); err != nil {
+		&s.WebshellName, &s.WebshellURL, &s.ShellType,
+		&s.Transport, &s.SSHPort, &s.SSHUser, &s.SSHCredentialID, &s.SSHDialHost, &s.SSHDialPort); err != nil {
 		return nil, err
 	}
+	s.Transport = NormalizeIntranetTransport(s.Transport)
 	s.Metadata = map[string]any{}
 	if len(raw) > 0 {
 		_ = json.Unmarshal(raw, &s.Metadata)
@@ -149,9 +192,44 @@ func scanIntranetSession(row interface{ Scan(...any) error }) (*IntranetSession,
 	return &s, nil
 }
 
+// SSHDialAddr is the TCP endpoint the platform actually connects to. It differs
+// from Host:SSHPort when the host is reached through a port-forward tunnel whose
+// listener sits on the control machine; the ledger keeps the real internal
+// identity either way, so scope checks and asset reflux never see a loopback.
+func (s *IntranetSession) SSHDialAddr() string {
+	if s == nil {
+		return ""
+	}
+	host := strings.TrimSpace(s.SSHDialHost)
+	port := s.SSHDialPort
+	if host == "" || port <= 0 {
+		host = strings.TrimSpace(s.Host)
+		port = s.SSHPort
+	}
+	if port <= 0 {
+		port = 22
+	}
+	if host == "" {
+		return ""
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
 func (d *DB) CreateIntranetSession(in IntranetSessionInput) (*IntranetSession, error) {
-	if in.WebshellID <= 0 {
+	transport := NormalizeIntranetTransport(in.Transport)
+	if transport == IntranetTransportWebshell && in.WebshellID <= 0 {
 		return nil, errors.New("需要 webshell_id")
+	}
+	if transport == IntranetTransportSSH {
+		if strings.TrimSpace(in.Host) == "" {
+			return nil, errors.New("SSH 会话需要目标主机")
+		}
+		if strings.TrimSpace(in.SSHUser) == "" {
+			return nil, errors.New("SSH 会话需要登录账号")
+		}
+		if in.SSHCredentialID <= 0 {
+			return nil, errors.New("SSH 会话需要绑定凭据台账中的凭据")
+		}
 	}
 	cwd := strings.TrimSpace(in.Cwd)
 	if cwd == "" {
@@ -165,12 +243,23 @@ func (d *DB) CreateIntranetSession(in IntranetSessionInput) (*IntranetSession, e
 	if in.TaskID > 0 {
 		taskID = in.TaskID
 	}
+	var webshell any
+	if in.WebshellID > 0 {
+		webshell = in.WebshellID
+	}
+	sshPort := in.SSHPort
+	if transport == IntranetTransportSSH && sshPort <= 0 {
+		sshPort = 22
+	}
 	return scanIntranetSession(d.QueryRow(`
-INSERT INTO intranet_sessions(name, webshell_id, task_id, host, cwd, note, metadata, last_seen)
-VALUES ($1,$2,$3,$4,$5,$6,$7,now())
+INSERT INTO intranet_sessions(name, webshell_id, task_id, host, cwd, note, metadata, last_seen,
+                              transport, ssh_port, ssh_user, ssh_credential_id, ssh_dial_host, ssh_dial_port)
+VALUES ($1,$2,$3,$4,$5,$6,$7,now(),$8,$9,$10,$11,$12,$13)
 RETURNING `+intranetSessionReturningCols+``,
-		strings.TrimSpace(in.Name), in.WebshellID, taskID, strings.TrimSpace(in.Host),
-		cwd, strings.TrimSpace(in.Note), string(meta)))
+		strings.TrimSpace(in.Name), webshell, taskID, strings.TrimSpace(in.Host),
+		cwd, strings.TrimSpace(in.Note), string(meta),
+		transport, sshPort, strings.TrimSpace(in.SSHUser), in.SSHCredentialID,
+		strings.TrimSpace(in.SSHDialHost), in.SSHDialPort))
 }
 
 // ListIntranetSessions returns sessions newest-first.
@@ -242,6 +331,106 @@ func (d *DB) TouchIntranetSession(id int64) error {
 	return err
 }
 
+// RecordIntranetSessionHealth stores a liveness snapshot in metadata. The
+// failure counter is derived inside the UPDATE so a worker probe and a manual
+// heartbeat cannot overwrite each other's count. Success advances last_seen,
+// failure leaves it untouched so stale-session scans keep selecting the row.
+func (d *DB) RecordIntranetSessionHealth(id int64, ok bool, latencyMS int, errMsg string, lostAfter int) (*IntranetSession, error) {
+	if id <= 0 {
+		return nil, errors.New("无效的会话 ID")
+	}
+	if lostAfter <= 0 {
+		lostAfter = 3
+	}
+	state := "fail"
+	if ok {
+		state = "ok"
+	}
+	return scanIntranetSession(d.QueryRow(`
+UPDATE intranet_sessions SET
+    metadata = metadata || jsonb_build_object(
+        'health', CASE WHEN $2='ok' THEN 'ok'
+                       WHEN COALESCE((metadata->>'health_failures')::int,0)+1 >= $5 THEN 'lost'
+                       ELSE 'degraded' END,
+        'health_failures', CASE WHEN $2='ok' THEN 0 ELSE COALESCE((metadata->>'health_failures')::int,0)+1 END,
+        'health_checked_at', to_jsonb(now()),
+        'health_latency_ms', $3::int,
+        'health_error', $4::text),
+    last_seen = CASE WHEN $2='ok' THEN now() ELSE last_seen END
+WHERE id=$1
+RETURNING `+intranetSessionReturningCols+``, id, state, latencyMS, strings.TrimSpace(errMsg), lostAfter))
+}
+
+// ListIntranetSessionsForHeartbeat returns active sessions whose last successful
+// contact is older than staleBefore. Failed probes bump updated_at, so the least
+// recently checked rows rotate to the back instead of starving the batch.
+func (d *DB) ListIntranetSessionsForHeartbeat(staleBefore time.Time, limit int) ([]*IntranetSession, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	rows, err := d.Query(`SELECT `+intranetSessionCols+`
+FROM intranet_sessions s LEFT JOIN webshells w ON w.id=s.webshell_id
+WHERE s.status=$1 AND (s.last_seen IS NULL OR s.last_seen < $2)
+ORDER BY s.updated_at ASC, s.id ASC LIMIT $3`, IntranetSessionActive, staleBefore, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*IntranetSession{}
+	for rows.Next() {
+		s, err := scanIntranetSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// ListWebshellsByIntranetTask returns distinct shells bound to sessions of a
+// task. webshells.task_id points at deep_tasks and intranet_sessions.task_id at
+// tasks, so the session binding is the only ownership link that can be compared
+// safely between the two namespaces.
+func (d *DB) ListWebshellsByIntranetTask(taskID int64) ([]*Webshell, error) {
+	if taskID <= 0 {
+		return nil, nil
+	}
+	rows, err := d.Query(`SELECT `+webshellCols+` FROM webshells
+WHERE task_id=$1 OR id IN (
+    SELECT DISTINCT webshell_id FROM intranet_sessions
+    WHERE task_id=$1 AND webshell_id IS NOT NULL
+)
+ORDER BY id DESC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*Webshell{}
+	for rows.Next() {
+		w, err := d.oneWebshell(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+// SetIntranetSessionWebshell rebinds a session to another shell and drops the
+// cached OS family, which may differ on the new host.
+func (d *DB) SetIntranetSessionWebshell(id, webshellID int64) (*IntranetSession, error) {
+	if id <= 0 || webshellID <= 0 {
+		return nil, errors.New("无效的会话或 webshell ID")
+	}
+	return scanIntranetSession(d.QueryRow(`
+UPDATE intranet_sessions SET webshell_id=$2, metadata = metadata - 'os'
+WHERE id=$1
+RETURNING `+intranetSessionReturningCols+``, id, webshellID))
+}
+
 func (d *DB) SetIntranetSessionTask(id, taskID int64) error {
 	if taskID <= 0 {
 		return nil
@@ -308,17 +497,27 @@ FROM intranet_session_events WHERE session_id=$1 ORDER BY id DESC LIMIT $2`, ses
 }
 
 const intranetTunnelCols = `id, name, session_id, task_id, kind, listen_host, listen_port,
-	remote_host, remote_port, status, deploy_command, verify_command, teardown_command,
+	listen_side, remote_host, remote_port, status, deploy_command, verify_command, teardown_command,
 	pid, evidence, note, created_at, updated_at`
 
 func scanIntranetTunnel(row interface{ Scan(...any) error }) (*IntranetTunnel, error) {
 	var t IntranetTunnel
 	if err := row.Scan(&t.ID, &t.Name, &t.SessionID, &t.TaskID, &t.Kind, &t.ListenHost, &t.ListenPort,
-		&t.RemoteHost, &t.RemotePort, &t.Status, &t.DeployCommand, &t.VerifyCommand, &t.TeardownCommand,
+		&t.ListenSide, &t.RemoteHost, &t.RemotePort, &t.Status, &t.DeployCommand, &t.VerifyCommand, &t.TeardownCommand,
 		&t.PID, &t.Evidence, &t.Note, &t.CreatedAt, &t.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &t, nil
+}
+
+// NormalizeIntranetListenSide maps free-form input to the two known sides,
+// defaulting to the target: an unknown side must not silently skip the
+// target-side port re-check that evacuation relies on.
+func NormalizeIntranetListenSide(side string) string {
+	if strings.EqualFold(strings.TrimSpace(side), IntranetListenSidePivot) {
+		return IntranetListenSidePivot
+	}
+	return IntranetListenSideTarget
 }
 
 func (d *DB) CreateIntranetTunnel(in IntranetTunnelInput) (*IntranetTunnel, error) {
@@ -345,10 +544,11 @@ func (d *DB) CreateIntranetTunnel(in IntranetTunnelInput) (*IntranetTunnel, erro
 	}
 	return scanIntranetTunnel(d.QueryRow(`
 INSERT INTO intranet_tunnels(name, session_id, task_id, kind, listen_host, listen_port,
-    remote_host, remote_port, deploy_command, verify_command, teardown_command, note)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    listen_side, remote_host, remote_port, deploy_command, verify_command, teardown_command, note)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
 RETURNING `+intranetTunnelCols,
 		name, sessionID, taskID, kind, listenHost, in.ListenPort,
+		NormalizeIntranetListenSide(in.ListenSide),
 		strings.TrimSpace(in.RemoteHost), in.RemotePort,
 		strings.TrimSpace(in.DeployCommand), strings.TrimSpace(in.VerifyCommand),
 		strings.TrimSpace(in.TeardownCommand), strings.TrimSpace(in.Note)))
@@ -408,16 +608,48 @@ func (d *DB) GetIntranetTunnel(id int64) (*IntranetTunnel, error) {
 	return scanIntranetTunnel(d.QueryRow(`SELECT `+intranetTunnelCols+` FROM intranet_tunnels WHERE id=$1`, id))
 }
 
-func (d *DB) UpdateIntranetTunnelPlan(id int64, deploy, verify, teardown, evidence string) (*IntranetTunnel, error) {
+// LiveIntranetTunnelByListen returns the tunnel that currently puts an internal
+// endpoint behind the given listening address. A local address only means
+// anything through a tunnel, so both the SSH dial and asset reflux have to trace
+// it back to the real endpoint: otherwise the platform records itself as an
+// intranet host, or worse, points a session at its own machine.
+func (d *DB) LiveIntranetTunnelByListen(listenHost string, port int) (*IntranetTunnel, error) {
+	if port <= 0 {
+		return nil, sql.ErrNoRows
+	}
+	host := strings.ToLower(strings.Trim(strings.TrimSpace(listenHost), "[]"))
+	// "localhost" and 127.0.0.1 are the same socket on this machine: a tunnel
+	// registered on one spelling must still explain an endpoint discovered under
+	// the other, or the listener looks unattributed and gets dropped.
+	if host == "localhost" {
+		host = "127.0.0.1"
+	}
+	return scanIntranetTunnel(d.QueryRow(`SELECT `+intranetTunnelCols+` FROM intranet_tunnels
+WHERE listen_port=$1
+  AND status IN ($2,$3)
+  AND (lower(listen_host)=$4 OR lower(listen_host) IN ('0.0.0.0','::','*',''))
+ORDER BY id DESC LIMIT 1`,
+		port, IntranetTunnelDeployed, IntranetTunnelVerified, host))
+}
+
+// UpdateIntranetTunnelPlan rewrites the plan columns. listenSide is applied only
+// when non-empty: the side is a fact about the selected command, so re-planning
+// with an empty value must not erase what a previous deploy proved.
+func (d *DB) UpdateIntranetTunnelPlan(id int64, deploy, verify, teardown, evidence, listenSide string) (*IntranetTunnel, error) {
+	side := ""
+	if strings.TrimSpace(listenSide) != "" {
+		side = NormalizeIntranetListenSide(listenSide)
+	}
 	return scanIntranetTunnel(d.QueryRow(`
 UPDATE intranet_tunnels SET
     deploy_command   = CASE WHEN $2='' THEN deploy_command ELSE $2 END,
     verify_command   = CASE WHEN $3='' THEN verify_command ELSE $3 END,
     teardown_command = CASE WHEN $4='' THEN teardown_command ELSE $4 END,
-    evidence         = CASE WHEN $5='' THEN evidence ELSE $5 END
+    evidence         = CASE WHEN $5='' THEN evidence ELSE $5 END,
+    listen_side      = COALESCE(NULLIF($6,''), listen_side)
 WHERE id=$1
 RETURNING `+intranetTunnelCols, id, strings.TrimSpace(deploy), strings.TrimSpace(verify),
-		strings.TrimSpace(teardown), evidence))
+		strings.TrimSpace(teardown), evidence, side))
 }
 
 func (d *DB) SetIntranetTunnelStatus(id int64, status string, pid int, evidence, note string) (*IntranetTunnel, error) {

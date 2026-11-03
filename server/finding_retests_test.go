@@ -40,7 +40,7 @@ func newRetestServer(t *testing.T) (*Server, int64) {
 	if err != nil {
 		t.Skip("test postgres not configured")
 	}
-	pg, err := db.Open(dsn)
+	pg, err := db.OpenTestSchema(dsn, "jingwei_test_server")
 	if err != nil {
 		t.Fatal(err)
 	}

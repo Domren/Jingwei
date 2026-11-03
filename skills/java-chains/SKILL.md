@@ -79,7 +79,16 @@ java_chains_quick_jndi {
 
 需要更细控制时：`java_chains_services_start`（`jndi`/`mysql`/`jrmp`/`tcp`/`http`）→ `java_chains_jobs_submit`（`protocol:"jndi"` 或 `"mysql"`，用 `presetId` 或 `request.chain`）→ `java_chains_jobs_watch` / `jobs_logs`。发布前用 `services_get` 确认端口、就绪状态和建议的对外地址。
 
-回调端口：LDAP 50389、RMI 50388、HTTP 58080、JRMP 13999、FakeMySQL 3308、HTTP Server 50000、TCP 11527。默认只绑定 `127.0.0.1`；目标在远端时，请操作员把 `JAVA_CHAINS_CALLBACK_BIND` 改为 `0.0.0.0` 或指定网卡，重建 sidecar 并放行防火墙。
+回调端口：LDAP 50389、RMI 50388、HTTP 58080、JRMP 13999、FakeMySQL 3308、HTTP Server 50000、TCP 11527。
+`bindHost` 是 **sidecar 容器内部**的监听地址，填 `0.0.0.0`：容器有自己的网络命名空间，docker 是把宿主机端口的
+连接转发到**容器的 eth0 IP**，绑 `127.0.0.1` 时宿主机端口看着通、容器内却没人监听，任何目标都回连不上。
+`advertisedHost` 才是写进 payload 的地址，必须是**目标**可达的宿主机 IP/域名。宿主机侧在哪个网卡上发布这些端口
+由操作员的 `JAVA_CHAINS_CALLBACK_BIND` 决定（默认 `127.0.0.1`；目标在远端时改为 `0.0.0.0` 或指定网卡、
+重建 sidecar 并放行防火墙）。发布前用 `services_get` 核对 `bound.host` 与 `activePublications`。
+
+`quick_jndi` 只会**启动**已停止的服务：服务已在运行时它沿用原来的监听，`bindHost` 变了也不换绑，只在返回的
+`service.bound.host` 里如实报出实际监听。要换绑用 `java_chains_services_restart`（`request.bindHost`/
+`advertisedHost`），否则 payload 会投到一个没人监听的地址上。
 
 ### 4. 注入与证据
 

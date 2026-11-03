@@ -386,6 +386,11 @@ class PageParser:
                     if keyword in parameter.lower():
                         password_field = parameter
                         break
+        if not (username_field and password_field):
+            username_field, password_field = self._guess_fields_by_type(content)
+            if username_field and password_field:
+                Info("关键字表未命中，按输入框类型推断登录参数: %s / %s" %
+                     (username_field, password_field))
 
         # 移除reset字段
         reset_fields = []
@@ -405,3 +410,29 @@ class PageParser:
                 self.form_data[self.captcha_input_name] = self.captcha_value
         else:
             raise Exception("无法找到登录参数")
+
+    def _guess_fields_by_type(self, content):
+        """关键字表落空时的兜底：type=password 的输入框即口令域，它之前最后一个
+        可见文本域是账号域。字段名被简写或混淆（u/p、name/key）的登录页用关键字
+        永远匹配不上，凭据复用与弱口令爆破会在整类目标上静默失效。"""
+        pwd = None
+        for element in content.find_all('input'):
+            itype = (element.get('type') or 'text').lower()
+            if itype == 'password' and element.get('name'):
+                pwd = element
+                break
+        if pwd is None:
+            return '', ''
+        skip = ('hidden', 'submit', 'button', 'reset', 'checkbox', 'radio', 'image', 'file')
+        user = ''
+        for element in content.find_all('input'):
+            if element is pwd:
+                break
+            itype = (element.get('type') or 'text').lower()
+            if itype in skip:
+                continue
+            if element.get('name'):
+                user = element.get('name')
+        if not user:
+            return '', ''
+        return user, pwd.get('name')

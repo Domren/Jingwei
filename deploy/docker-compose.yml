@@ -17,7 +17,7 @@ services:
     restart: unless-stopped
 
   jingwei:
-    image: ${JINGWEI_IMAGE:-ghcr.io/domren/jingwei:1.3.1}
+    image: ${JINGWEI_IMAGE:-ghcr.io/domren/jingwei:1.4.0}
     depends_on:
       postgres:
         condition: service_healthy
@@ -34,6 +34,9 @@ services:
       JAVA_CHAINS_PASS: ${JAVA_CHAINS_PASS:-}
       JAVA_CHAINS_MCP_TOKEN: ${JAVA_CHAINS_MCP_TOKEN:-}
       JAVA_CHAINS_CALLBACK_BIND: ${JAVA_CHAINS_CALLBACK_BIND:-127.0.0.1}
+      # 侧车容器内部的监听地址：容器有自己的网络命名空间，绑 127.0.0.1 时
+      # 宿主机发布的回调端口后面没有人监听，任何目标都回连不上。
+      JAVA_CHAINS_LISTEN_BIND: ${JAVA_CHAINS_LISTEN_BIND:-0.0.0.0}
       JAVA_CHAINS_CALLBACK_HOST: ${JAVA_CHAINS_CALLBACK_HOST:-127.0.0.1}
     ports:
       - "${JINGWEI_WEB_PORT:-9790}:8787"

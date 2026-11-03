@@ -142,13 +142,13 @@ func (r *deepRun) runJavaChains(templates []db.POCTemplate, target, mode string,
 				continue
 			}
 			if payload := javaChainJNDIPayload(preset); canDeliver && payload != "" {
-				jndi, qerr := client.QuickJNDI(callCtx, preset.ID, payload, inputs, bindHost, callbackHost)
+				jndi, qerr := r.publishJNDI(callCtx, client, preset, payload, inputs,
+					bindHost, callbackHost, mode, cd.tpl, &startedJobs)
 				if qerr != nil {
 					lastErr = qerr
 					r.logf(mode, "%s：预设 %s 发布失败：%v", cd.tpl.TemplateID, preset.ID, qerr)
 					continue
 				}
-				startedJobs = append(startedJobs, jndi.TaskID)
 				if id := r.trackJNDIResource(target, cd.tpl, preset, jndi); id > 0 {
 					resourceIDs = append(resourceIDs, id)
 				}
@@ -405,6 +405,57 @@ func javaChainInputs(preset scanner.JavaChainsPreset, cmd string) (map[string]an
 		}
 	}
 	return inputs, nil
+}
+
+// publishJNDI asks the sidecar for a JNDI publication and makes sure the
+// service actually listens on the address the task asked for. quick_jndi only
+// *starts* a stopped service: a service that is already running (left over from
+// an earlier task, or started by hand in the sidecar UI) keeps its old bind and
+// just reports it back. Publishing into that service advertises an address
+// nobody listens on, every attempt ends as "未回连", and the operator sees a
+// clean-looking miss instead of a misconfigured listener — so the mismatch is
+// repaired here by restarting the service and publishing again.
+func (r *deepRun) publishJNDI(ctx context.Context, client *scanner.JavaChainsClient,
+	preset scanner.JavaChainsPreset, payload string, inputs map[string]any,
+	bindHost, callbackHost, mode string, tpl db.POCTemplate, startedJobs *[]string) (*scanner.JavaChainsJNDI, error) {
+	jndi, err := client.QuickJNDI(ctx, preset.ID, payload, inputs, bindHost, callbackHost)
+	if err != nil {
+		return nil, err
+	}
+	if jndi.TaskID != "" {
+		*startedJobs = append(*startedJobs, jndi.TaskID)
+	}
+	bound := jndi.Service.Bound.Host
+	if bound == "" || strings.EqualFold(normalizeListenHost(bound), normalizeListenHost(bindHost)) {
+		return jndi, nil
+	}
+	r.logf(mode, "%s：JNDI 服务实际监听 %s，与要求的 %s 不一致，重启服务后重新发布", tpl.TemplateID, bound, bindHost)
+	if ferr := client.RestartJNDI(ctx, bindHost, callbackHost); ferr != nil {
+		r.logf(mode, "%s：重启 JNDI 服务失败（%v），按当前监听投递，回连结果需人工核对", tpl.TemplateID, ferr)
+		return jndi, nil
+	}
+	again, aerr := client.QuickJNDI(ctx, preset.ID, payload, inputs, bindHost, callbackHost)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if again.TaskID != "" {
+		*startedJobs = append(*startedJobs, again.TaskID)
+	}
+	return again, nil
+}
+
+// normalizeListenHost folds the spellings of one listen address so a service
+// bound to the IPv6 wildcard is not treated as a mismatch for 0.0.0.0.
+func normalizeListenHost(host string) string {
+	h := strings.TrimSpace(strings.ToLower(host))
+	h = strings.Trim(h, "[]")
+	switch h {
+	case "", "*", "all", "0.0.0.0", "::", "0000:0000:0000:0000:0000:0000:0000:0000":
+		return "unspecified"
+	case "localhost", "127.0.0.1", "::1":
+		return "loopback"
+	}
+	return h
 }
 
 // trackJNDIResource records the published JNDI endpoint in the managed-resource

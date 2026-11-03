@@ -53,8 +53,8 @@ import type {
   FindingReviewEvent,
   FindingScreenshot,
   FindingStats,
-  FindingSystemsPage,
   FindingStatus,
+  FindingSystemsPage,
   FindingsPage,
   FindingTraffic,
   FindingTrafficDetail,
@@ -68,12 +68,15 @@ import type {
   IntranetArtifact,
   IntranetArtifactInput,
   IntranetBatchItem,
+  IntranetCredential,
+  IntranetCredentialInput,
   IntranetEvacuationInput,
   IntranetEvacuationReport,
   IntranetExecResult,
   IntranetHandoffInput,
   IntranetPersistInput,
   IntranetProbeInfo,
+  IntranetReuseTarget,
   IntranetScopeRequest,
   IntranetScopeRequestInput,
   IntranetSession,
@@ -82,6 +85,8 @@ import type {
   IntranetTunnel,
   IntranetTunnelInput,
   JavaChainsStatus,
+  JavaMemshell,
+  JavaMemshellInput,
   JudgeConfig,
   JudgeUsage,
   LLMPoolStatus,
@@ -100,6 +105,8 @@ import type {
   NotificationDelivery,
   NotificationFilter,
   NotificationMeta,
+  PHPPersistInput,
+  PHPPersistResult,
   POCRunResponse,
   POCStats,
   POCTemplate,
@@ -114,6 +121,13 @@ import type {
   SessionTokenUsage,
   Settings,
   Severity,
+  ShellExecInput,
+  ShellExecResult,
+  ShellFileAction,
+  ShellFileChunk,
+  ShellFileList,
+  ShellFileWriteResult,
+  ShellInfoResult,
   SkillCall,
   SkillItem,
   Stats,
@@ -1555,7 +1569,62 @@ export const api = {
   deleteWebshell: (id: number) => del<{ ok: boolean }>(`/deep/webshells/${id}`),
   checkWebshell: (id: number) =>
     post<{ alive: boolean; status: string; note: string }>(`/deep/webshells/${id}/check`, {}),
-  execWebshell: (id: number, command: string) => post<{ output: string }>(`/deep/webshells/${id}/exec`, { command }),
+  execWebshell: (id: number, input: ShellExecInput) => post<ShellExecResult>(`/deep/webshells/${id}/exec`, input),
+  webshellInfo: (id: number, cwd?: string) =>
+    get<ShellInfoResult>(`/deep/webshells/${id}/info${cwd ? `?cwd=${encodeURIComponent(cwd)}` : ""}`),
+  webshellPayload: (id: number) =>
+    get<{ filename: string; content: string; sha256: string; carrier: string; protocol: string }>(
+      `/deep/webshells/${id}/payload`,
+    ),
+  rotateWebshell: (id: number) =>
+    post<{ ok: boolean; key_version: number; payload?: string; filename?: string; sha256?: string }>(
+      `/deep/webshells/${id}/rotate`,
+      {},
+    ),
+  webshellFiles: (id: number, path?: string) => {
+    const sp = new URLSearchParams();
+    if (path !== undefined && path !== "") sp.set("path", path);
+    return get<ShellFileList>(`/deep/webshells/${id}/files?${sp}`);
+  },
+  webshellFileRead: (id: number, path: string, offset = 0, length?: number) => {
+    const sp = new URLSearchParams({ path, offset: String(offset) });
+    if (length) sp.set("length", String(length));
+    return get<ShellFileChunk>(`/deep/webshells/${id}/file?${sp}`);
+  },
+  webshellFileWrite: (id: number, input: { path: string; offset: number; start: boolean; data: string }) =>
+    post<ShellFileWriteResult>(`/deep/webshells/${id}/file`, input),
+  webshellFileAction: (
+    id: number,
+    input: { action: ShellFileAction; path: string; target?: string; recursive?: boolean; mode?: string },
+  ) => post<{ ok: boolean }>(`/deep/webshells/${id}/files/action`, input),
+  phpSemiPersist: (id: number, input: PHPPersistInput) =>
+    post<{ result: PHPPersistResult }>(`/deep/webshells/${id}/php-persist`, input),
+  webshellMemshells: (id: number) =>
+    get<{ memshells: JavaMemshell[]; total: number }>(`/deep/webshells/${id}/memshells`),
+  memshells: (params?: {
+    webshell_id?: number;
+    task_id?: number;
+    status?: string;
+    target?: string;
+    limit?: number;
+  }) => {
+    const sp = new URLSearchParams();
+    if (params?.webshell_id) sp.set("webshell_id", String(params.webshell_id));
+    if (params?.task_id) sp.set("task_id", String(params.task_id));
+    if (params?.status) sp.set("status", params.status);
+    if (params?.target) sp.set("target", params.target);
+    sp.set("limit", String(params?.limit ?? 100));
+    return get<{ memshells: JavaMemshell[]; total: number }>(`/deep/memshells?${sp}`);
+  },
+  deployMemshell: (webshellId: number, input: JavaMemshellInput) =>
+    post<{ memshell: JavaMemshell }>(`/deep/webshells/${webshellId}/memshells`, input),
+  checkMemshell: (id: number) =>
+    post<{ alive: boolean; status: string; note: string }>(`/deep/memshells/${id}/check`, {}),
+  execMemshell: (id: number, input: ShellExecInput) => post<ShellExecResult>(`/deep/memshells/${id}/exec`, input),
+  deleteMemshell: (id: number, force?: boolean) =>
+    del<{ ok: boolean; removed: boolean; forced: boolean; note?: string; attempts?: string[] }>(
+      `/deep/memshells/${id}${force ? "?force=1" : ""}`,
+    ),
   // 凭据库：全局凭据视图（跨任务）
   globalCredentials: () => get<IntelligencePage>("/deep/credentials"),
 
@@ -1577,10 +1646,24 @@ export const api = {
   deleteIntranetSession: (id: number) => del<{ ok: boolean }>(`/intranet/sessions/${id}`),
   intranetSessionEvents: (id: number, limit = 100) =>
     get<{ events: IntranetSessionEvent[] }>(`/intranet/sessions/${id}/events?limit=${limit}`),
-  intranetExec: (id: number, command: string, timeoutSeconds?: number) =>
+  intranetSessionHeartbeat: (id: number) =>
+    post<{ alive: boolean; result: IntranetExecResult; session: IntranetSession }>(
+      `/intranet/sessions/${id}/heartbeat`,
+      {},
+    ),
+  intranetSessionFailover: (id: number, webshellId?: number) =>
+    post<{
+      switched: boolean;
+      latency_ms: number;
+      session: IntranetSession;
+      webshell: Webshell;
+      result: IntranetExecResult;
+    }>(`/intranet/sessions/${id}/failover`, { webshell_id: webshellId }),
+  intranetExec: (id: number, command: string, timeoutSeconds?: number, osKind?: string) =>
     post<{ result: IntranetExecResult; session: IntranetSession }>(`/intranet/sessions/${id}/exec`, {
       command,
       timeout_seconds: timeoutSeconds,
+      os_kind: osKind,
     }),
   intranetUpload: (id: number, path: string, contentBase64: string) =>
     post<{ result: IntranetExecResult; session: IntranetSession }>(`/intranet/sessions/${id}/upload`, {
@@ -1634,6 +1717,30 @@ export const api = {
     post<{ tunnel: IntranetTunnel; result: IntranetExecResult }>(`/intranet/tunnels/${id}/verify`, {}),
   intranetTunnelTeardown: (id: number) => post<{ tunnel: IntranetTunnel }>(`/intranet/tunnels/${id}/teardown`, {}),
 
+  // ---- 内网凭据台账：口令只写不读，响应里只有 has_password ----
+  intranetCredentials: (params?: {
+    host?: string;
+    status?: string;
+    task_id?: number;
+    scan_task_id?: number;
+    limit?: number;
+  }) => {
+    const sp = new URLSearchParams();
+    if (params?.host) sp.set("host", params.host);
+    if (params?.status) sp.set("status", params.status);
+    if (params?.task_id) sp.set("task_id", String(params.task_id));
+    if (params?.scan_task_id) sp.set("scan_task_id", String(params.scan_task_id));
+    sp.set("limit", String(params?.limit ?? 100));
+    return get<{ credentials: IntranetCredential[]; total: number }>(`/intranet/credentials?${sp}`);
+  },
+  registerIntranetCredential: (input: IntranetCredentialInput) =>
+    post<IntranetCredential>("/intranet/credentials", input),
+  intranetCredentialReuse: (credentialId: number, input?: { urls?: string[]; proxy?: string; task_id?: number }) =>
+    post<{ credential: IntranetCredential; targets: IntranetReuseTarget[]; task_id: number; note?: string }>(
+      "/intranet/credentials/reuse",
+      { credential_id: credentialId, ...input },
+    ),
+
   intranetScopeRequests: (params?: { status?: string; task_id?: number; limit?: number; offset?: number }) => {
     const sp = new URLSearchParams();
     if (params?.status) sp.set("status", params.status);
@@ -1678,7 +1785,10 @@ export const api = {
       session_id: sessionId,
     }),
   persistIntranetSession: (id: number, input: IntranetPersistInput) =>
-    post<{ artifact: IntranetArtifact; deployed: boolean; error?: string }>(`/intranet/sessions/${id}/persist`, input),
+    post<{ artifact: IntranetArtifact; deployed: boolean; reused: boolean; error?: string }>(
+      `/intranet/sessions/${id}/persist`,
+      input,
+    ),
   evacuateIntranetTask: (input: IntranetEvacuationInput) =>
     post<{ report: IntranetEvacuationReport }>("/intranet/evacuate", input),
 

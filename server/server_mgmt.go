@@ -2139,18 +2139,31 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	}
 	// Resolve API key: form input > profile stored key.
 	apiKey := strings.TrimSpace(req.APIKey)
-	if apiKey == "" && req.ProfileID != nil {
+	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
+	provider := strings.TrimSpace(req.Provider)
+	proxy := strings.TrimSpace(req.Proxy)
+	if req.ProfileID != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			apiKey = p.APIKey
+			if apiKey == "" {
+				apiKey = p.APIKey
+			}
+			// 只给 profile_id 时沿用该配置的行格式与地址；否则会去探默认
+			// anthropic 端点，拿回来的 403 与真实提供商毫无关系，误导排查。
+			if baseURL == "" {
+				baseURL = strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+			}
+			if provider == "" {
+				provider = p.Format
+			}
+			if proxy == "" {
+				proxy = p.Proxy
+			}
 		}
 	}
 	if apiKey == "" {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": "未提供 API Key"})
 		return
 	}
-
-	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
-	provider := strings.TrimSpace(req.Provider)
 
 	// Candidate endpoints to try in order. Some Anthropic-compatible providers
 	// (e.g. DeepSeek) implement /v1/messages under an /anthropic path but expose
@@ -2198,10 +2211,11 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build HTTP client with optional proxy.
-	transport := &http.Transport{}
-	if p := strings.TrimSpace(req.Proxy); p != "" {
-		if pu, err := url.Parse(p); err == nil {
+	// Build HTTP client with optional proxy; with none configured fall back to the
+	// environment (HTTP_PROXY/HTTPS_PROXY), matching how the agent's own client dials out.
+	transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
+	if proxy != "" {
+		if pu, err := url.Parse(proxy); err == nil {
 			transport.Proxy = http.ProxyURL(pu)
 		}
 	}

@@ -21,9 +21,16 @@ import (
 // JavaChainsConfig is the optional java-chains sidecar wiring. The token is
 // minted by deploy/java-chains-setup.sh; without it auto-invocation stays off.
 type JavaChainsConfig struct {
-	BaseURL      string
-	Token        string
-	BindHost     string
+	BaseURL string
+	Token   string
+	// BindHost is the interface the *sidecar* listens on. It is not the host
+	// publishing its docker ports: in the documented compose deployment the
+	// sidecar has its own network namespace, so binding 127.0.0.1 here leaves
+	// the listener reachable only from inside the container and no target,
+	// however local, can ever call back.
+	BindHost string
+	// CallbackHost is the address written into the payload — it must be
+	// reachable *from the target*.
 	CallbackHost string
 }
 
@@ -33,9 +40,13 @@ func JavaChainsConfigFromEnv() JavaChainsConfig {
 	if base == "" {
 		base = "http://java-chains:8011"
 	}
-	bind := strings.TrimSpace(os.Getenv("JAVA_CHAINS_CALLBACK_BIND"))
+	// Deliberately not derived from JAVA_CHAINS_CALLBACK_BIND: that variable
+	// selects which host interface docker publishes the callback ports on, and
+	// publishing on 127.0.0.1 is the safe default. Inside the sidecar the
+	// listener has to cover the docker bridge address for those ports to work.
+	bind := strings.TrimSpace(os.Getenv("JAVA_CHAINS_LISTEN_BIND"))
 	if bind == "" {
-		bind = "127.0.0.1"
+		bind = "0.0.0.0"
 	}
 	callback := strings.TrimSpace(os.Getenv("JAVA_CHAINS_CALLBACK_HOST"))
 	if callback == "" {
@@ -191,7 +202,10 @@ type JavaChainsJNDI struct {
 		Token    string `json:"token"`
 	} `json:"formats"`
 	Service struct {
-		State              string `json:"state"`
+		State string `json:"state"`
+		Bound struct {
+			Host string `json:"host"`
+		} `json:"bound"`
 		ActivePublications struct {
 			Count int `json:"count"`
 		} `json:"activePublications"`
@@ -329,21 +343,50 @@ func (c *JavaChainsClient) DeleteJob(ctx context.Context, taskID string) error {
 	return err
 }
 
+// JavaChainsService is the reported state of one sidecar protocol service.
+type JavaChainsService struct {
+	State string `json:"state"`
+	Bound struct {
+		Host string `json:"host"`
+	} `json:"bound"`
+	ActivePublications struct {
+		Count int `json:"count"`
+	} `json:"activePublications"`
+}
+
+// JNDIService reads the JNDI service state, including the interface it really
+// listens on and how many publications it holds.
+func (c *JavaChainsClient) JNDIService(ctx context.Context) (*JavaChainsService, error) {
+	raw, err := c.call(ctx, "java_chains_services_get", map[string]any{"service": "jndi"})
+	if err != nil {
+		return nil, err
+	}
+	var out JavaChainsService
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // ActiveJNDIPublications reports how many publications the JNDI service holds.
 func (c *JavaChainsClient) ActiveJNDIPublications(ctx context.Context) (int, error) {
-	raw, err := c.call(ctx, "java_chains_services_get", map[string]any{"service": "jndi"})
+	svc, err := c.JNDIService(ctx)
 	if err != nil {
 		return 0, err
 	}
-	var out struct {
-		ActivePublications struct {
-			Count int `json:"count"`
-		} `json:"activePublications"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return 0, err
-	}
-	return out.ActivePublications.Count, nil
+	return svc.ActivePublications.Count, nil
+}
+
+// RestartJNDI re-creates the JNDI service on the requested listen address.
+// quick_jndi only *starts* a stopped service: when one is already running it
+// keeps its previous bind, so a task that needs a different interface has to
+// restart it instead of publishing a reference nothing listens on.
+func (c *JavaChainsClient) RestartJNDI(ctx context.Context, bindHost, advertisedHost string) error {
+	_, err := c.call(ctx, "java_chains_services_restart", map[string]any{
+		"service": "jndi",
+		"request": map[string]any{"bindHost": bindHost, "advertisedHost": advertisedHost},
+	})
+	return err
 }
 
 // StopJNDI shuts the JNDI service down.

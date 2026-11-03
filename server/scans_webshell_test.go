@@ -34,6 +34,25 @@ func TestNormalizeScanWebshellDefaults(t *testing.T) {
 	if req.WebshellParams["field_name"] != "file" {
 		t.Fatalf("field_name = %v", req.WebshellParams["field_name"])
 	}
+	if req.WebshellParams["protocol"] != "v2" {
+		t.Fatalf("protocol = %v", req.WebshellParams["protocol"])
+	}
+	if pw, _ := req.WebshellParams["password"].(string); pw != "" {
+		t.Fatalf("v2 scan must not persist a password, got %q", pw)
+	}
+}
+
+func TestNormalizeScanWebshellLegacyPassword(t *testing.T) {
+	req := &db.ScanTaskInput{
+		WebshellInject: true,
+		WebshellParams: map[string]any{"upload_path": "/upload.php", "protocol": "legacy"},
+	}
+	if err := normalizeScanWebshell(req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.WebshellParams["protocol"] != "legacy" {
+		t.Fatalf("protocol = %v", req.WebshellParams["protocol"])
+	}
 	pw, _ := req.WebshellParams["password"].(string)
 	if !strings.HasPrefix(pw, "jw") || len(pw) != 10 {
 		t.Fatalf("password = %q", pw)
@@ -49,6 +68,7 @@ func TestNormalizeScanWebshellRejectsInvalidInput(t *testing.T) {
 		{"relative upload path", map[string]any{"upload_path": "upload.php"}},
 		{"relative land path", map[string]any{"upload_path": "/upload.php", "land_path": "shell.php"}},
 		{"unsupported shell type", map[string]any{"upload_path": "/upload.php", "shell_type": "war"}},
+		{"unsupported protocol", map[string]any{"upload_path": "/upload.php", "protocol": "v3"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

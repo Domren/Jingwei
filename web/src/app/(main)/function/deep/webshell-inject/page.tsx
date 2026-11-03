@@ -20,6 +20,11 @@ const SHELL_TYPES = [
   { value: "aspx", label: "ASPX" },
 ];
 
+const SHELL_PROTOCOLS = [
+  { value: "v2", label: "加密 v2（推荐）" },
+  { value: "legacy", label: "旧版明文" },
+];
+
 export default function DeepWebshellInjectPage() {
   const { tasks, total, loading, refresh } = useDeepTasks("webshell_inject");
   const [createOpen, setCreateOpen] = React.useState(false);
@@ -31,6 +36,7 @@ export default function DeepWebshellInjectPage() {
   const [uploadUrl, setUploadUrl] = React.useState("");
   const [landUrl, setLandUrl] = React.useState("");
   const [shellType, setShellType] = React.useState("php");
+  const [protocol, setProtocol] = React.useState("v2");
   const [password, setPassword] = React.useState("");
   const [fieldName, setFieldName] = React.useState("");
   const [fileName, setFileName] = React.useState("");
@@ -42,6 +48,7 @@ export default function DeepWebshellInjectPage() {
     setUploadUrl("");
     setLandUrl("");
     setShellType("php");
+    setProtocol("v2");
     setPassword("");
     setFieldName("");
     setFileName("");
@@ -67,7 +74,8 @@ export default function DeepWebshellInjectPage() {
           upload_url: uploadUrl.trim(),
           land_url: landUrl.trim(),
           shell_type: shellType,
-          password,
+          protocol,
+          password: protocol === "legacy" ? password : "",
           field_name: fieldName.trim(),
           file_name: fileName.trim(),
           extra,
@@ -162,9 +170,25 @@ export default function DeepWebshellInjectPage() {
                 </SelectContent>
               </Select>
             </FieldRow>
-            <FieldRow label="密码" hint="webshell 的访问口令，留空则不校验口令">
-              <Input value={password} onChange={(e) => setPassword(e.target.value)} placeholder="可留空" />
+            <FieldRow label="连接协议" hint="加密 v2 自动生成每目标随机密钥与随机请求载体">
+              <Select value={protocol} onValueChange={setProtocol}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {SHELL_PROTOCOLS.map((p) => (
+                    <SelectItem key={p.value} value={p.value}>
+                      {p.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </FieldRow>
+            {protocol === "legacy" ? (
+              <FieldRow label="密码" hint="旧版明文 shell 的访问口令，留空自动生成强口令">
+                <Input value={password} onChange={(e) => setPassword(e.target.value)} placeholder="可留空自动生成" />
+              </FieldRow>
+            ) : null}
             <FieldRow label="上传字段名" hint="multipart 表单的字段名，留空则以原始请求体发送">
               <Input value={fieldName} onChange={(e) => setFieldName(e.target.value)} placeholder="file" />
             </FieldRow>

@@ -103,6 +103,7 @@ func (r *scanRun) webshellTaskParams(target string, headers map[string]string, s
 		"upload_url": uploadURL,
 		"land_url":   landURL,
 		"shell_type": displayOr(stringParam(params, "shell_type"), "php"),
+		"protocol":   displayOr(stringParam(params, "protocol"), "v2"),
 		"password":   stringParam(params, "password"),
 		"field_name": displayOr(stringParam(params, "field_name"), "file"),
 		"source":     source,

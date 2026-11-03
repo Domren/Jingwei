@@ -200,6 +200,7 @@ export default function ScansPage() {
   const [shellUploadPath, setShellUploadPath] = React.useState("");
   const [shellLandPath, setShellLandPath] = React.useState("");
   const [shellType, setShellType] = React.useState("php");
+  const [shellProtocol, setShellProtocol] = React.useState("v2");
   const [shellPassword, setShellPassword] = React.useState("");
   const [shellField, setShellField] = React.useState("file");
 
@@ -413,7 +414,8 @@ export default function ScansPage() {
               upload_path: uploadPath,
               land_path: shellLandPath.trim(),
               shell_type: shellType,
-              password: shellPassword.trim(),
+              protocol: shellProtocol,
+              password: shellProtocol === "legacy" ? shellPassword.trim() : "",
               field_name: shellField.trim() || "file",
             }
           : undefined,
@@ -896,7 +898,7 @@ export default function ScansPage() {
                 <div>
                   <div className="text-sm">尝试 Webshell 注入</div>
                   <div className="text-[11px] text-muted-foreground">
-                    仅对 high 及以上命中自动尝试；需填写已知的上传接口，密码留空则自动生成
+                    仅对 high 及以上命中自动尝试；加密 v2 自动生成每目标随机密钥与随机载体，旧版必须设置强口令
                   </div>
                 </div>
                 <Switch checked={webshellInject} onCheckedChange={setWebshellInject} />
@@ -937,15 +939,29 @@ export default function ScansPage() {
                     </Select>
                   </div>
                   <div className="space-y-1.5">
-                    <Label htmlFor="shell-password">连接密码</Label>
-                    <Input
-                      id="shell-password"
-                      value={shellPassword}
-                      onChange={(e) => setShellPassword(e.target.value)}
-                      placeholder="留空自动生成"
-                      className="font-mono"
-                    />
+                    <Label>连接协议</Label>
+                    <Select value={shellProtocol} onValueChange={setShellProtocol}>
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="v2">加密 v2（推荐）</SelectItem>
+                        <SelectItem value="legacy">旧版明文</SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
+                  {shellProtocol === "legacy" ? (
+                    <div className="space-y-1.5">
+                      <Label htmlFor="shell-password">连接密码</Label>
+                      <Input
+                        id="shell-password"
+                        value={shellPassword}
+                        onChange={(e) => setShellPassword(e.target.value)}
+                        placeholder="留空自动生成强口令"
+                        className="font-mono"
+                      />
+                    </div>
+                  ) : null}
                   <div className="space-y-1.5">
                     <Label htmlFor="shell-field">上传字段名</Label>
                     <Input
@@ -1165,10 +1181,7 @@ export default function ScansPage() {
                       <Badge variant="secondary">
                         任务 {num(detailTask.summary.auto_done)}/{num(detailTask.summary.auto_tasks)}
                       </Badge>
-                      <Badge
-                        variant="outline"
-                        className={detailAutoConfirmed > 0 ? severityClass("high") : undefined}
-                      >
+                      <Badge variant="outline" className={detailAutoConfirmed > 0 ? severityClass("high") : undefined}>
                         深挖确认 {detailAutoConfirmed}
                       </Badge>
                       <Badge variant="secondary">基线注入点 {num(detailTask.summary.baseline_points)}</Badge>

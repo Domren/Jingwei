@@ -2,7 +2,70 @@ package db
 
 import (
 	"testing"
+	"time"
 )
+
+func TestListWebshellsByIntranetTask(t *testing.T) {
+	d, _, _ := testSetup(t)
+	t.Cleanup(func() { _ = d.Close() })
+
+	task, err := d.CreateTask("webshell ownership", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	other, err := d.CreateTask("other webshell ownership", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.DeleteTask(other.ID) })
+
+	mkShell := func(name string) *Webshell {
+		t.Helper()
+		ws, err := d.CreateWebshell(WebshellInput{
+			Name: name, URL: "http://127.0.0.1:9/" + name + ".php", ShellType: "php",
+			Password: "test", Target: "127.0.0.1", Source: "manual",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM webshells WHERE id=$1`, ws.ID) })
+		return ws
+	}
+	ws1, ws2, foreign := mkShell("owned-a"), mkShell("owned-b"), mkShell("foreign")
+
+	mkSession := func(taskID int64, shellID int64) *IntranetSession {
+		t.Helper()
+		sess, err := d.CreateIntranetSession(IntranetSessionInput{
+			Name: "ws-owner", WebshellID: shellID, TaskID: taskID, Host: "127.0.0.1", Cwd: "/",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intranet_sessions WHERE id=$1`, sess.ID) })
+		return sess
+	}
+	mkSession(task.ID, ws1.ID)
+	mkSession(task.ID, ws2.ID)
+	mkSession(task.ID, ws1.ID) // duplicate binding must not duplicate the result
+	mkSession(other.ID, foreign.ID)
+
+	shells, err := d.ListWebshellsByIntranetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(shells) != 2 || shells[0].ID != ws2.ID || shells[1].ID != ws1.ID {
+		t.Fatalf("shells = %+v", shells)
+	}
+	for _, ws := range shells {
+		if ws.ID == foreign.ID {
+			t.Fatalf("foreign shell leaked into task list: %+v", ws)
+		}
+	}
+	if shells, err := d.ListWebshellsByIntranetTask(0); err != nil || shells != nil {
+		t.Fatalf("invalid task id = %+v, %v", shells, err)
+	}
+}
 
 func TestIntranetSessionStore(t *testing.T) {
 	d, _, _ := testSetup(t)
@@ -77,6 +140,105 @@ func TestIntranetSessionStore(t *testing.T) {
 	}
 }
 
+func TestIntranetSessionHealthAndFailoverStore(t *testing.T) {
+	d, _, _ := testSetup(t)
+	t.Cleanup(func() { _ = d.Close() })
+
+	ws1, err := d.CreateWebshell(WebshellInput{
+		Name: "health-shell-1", URL: "http://127.0.0.1:9/health1.php",
+		ShellType: "php", Password: "test", Target: "127.0.0.1", Source: "manual",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM webshells WHERE id=$1`, ws1.ID)
+	ws2, err := d.CreateWebshell(WebshellInput{
+		Name: "health-shell-2", URL: "http://127.0.0.1:9/health2.php",
+		ShellType: "php", Password: "test", Target: "127.0.0.1", Source: "manual",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM webshells WHERE id=$1`, ws2.ID)
+
+	sess, err := d.CreateIntranetSession(IntranetSessionInput{
+		Name: "health-session", WebshellID: ws1.ID, Host: "127.0.0.1", Cwd: "/tmp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM intranet_sessions WHERE id=$1`, sess.ID)
+
+	degraded, err := d.RecordIntranetSessionHealth(sess.ID, false, 25, "dial timeout", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := degraded.Metadata["health"].(string); got != IntranetHealthDegraded {
+		t.Fatalf("first failure health = %q", got)
+	}
+	if got, _ := degraded.Metadata["health_failures"].(float64); int(got) != 1 {
+		t.Fatalf("first failure count = %v", degraded.Metadata["health_failures"])
+	}
+	if _, err := d.RecordIntranetSessionHealth(sess.ID, false, 30, "dial timeout", 3); err != nil {
+		t.Fatal(err)
+	}
+	lost, err := d.RecordIntranetSessionHealth(sess.ID, false, 35, "dial timeout", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := lost.Metadata["health"].(string); got != IntranetHealthLost {
+		t.Fatalf("third failure health = %q", got)
+	}
+	if got, _ := lost.Metadata["health_failures"].(float64); int(got) != 3 {
+		t.Fatalf("third failure count = %v", lost.Metadata["health_failures"])
+	}
+
+	ok, err := d.RecordIntranetSessionHealth(sess.ID, true, 8, "", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := ok.Metadata["health"].(string); got != IntranetHealthOK {
+		t.Fatalf("recovered health = %q", got)
+	}
+	if got, _ := ok.Metadata["health_failures"].(float64); int(got) != 0 {
+		t.Fatalf("recovered count = %v", ok.Metadata["health_failures"])
+	}
+	if got, _ := ok.Metadata["health_error"].(string); got != "" {
+		t.Fatalf("recovered error = %q", got)
+	}
+
+	list, err := d.ListIntranetSessionsForHeartbeat(time.Now().Add(time.Minute), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, s := range list {
+		if s.ID == sess.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("session #%d missing from stale heartbeat list", sess.ID)
+	}
+
+	if _, err := d.SetIntranetSessionMetadata(sess.ID, map[string]any{"os": "posix"}); err != nil {
+		t.Fatal(err)
+	}
+	rebound, err := d.SetIntranetSessionWebshell(sess.ID, ws2.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebound.WebshellID == nil || *rebound.WebshellID != ws2.ID {
+		t.Fatalf("rebound webshell = %+v", rebound.WebshellID)
+	}
+	if _, exists := rebound.Metadata["os"]; exists {
+		t.Fatalf("cached os not cleared on rebound: %+v", rebound.Metadata)
+	}
+	if _, err := d.SetIntranetSessionWebshell(0, ws2.ID); err == nil {
+		t.Fatal("invalid session id must be rejected")
+	}
+}
+
 func TestIntranetTunnelStoreAndLedger(t *testing.T) {
 	d, _, _ := testSetup(t)
 	t.Cleanup(func() { _ = d.Close() })
@@ -94,12 +256,30 @@ func TestIntranetTunnelStoreAndLedger(t *testing.T) {
 		t.Fatalf("new tunnel status = %q", tun.Status)
 	}
 
-	planned, err := d.UpdateIntranetTunnelPlan(tun.ID, "nohup socat x &", "ss -lnt | grep 18099", "kill 123", "probe evidence")
+	planned, err := d.UpdateIntranetTunnelPlan(tun.ID, "nohup socat x &", "ss -lnt | grep 18099", "kill 123", "probe evidence", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if planned.DeployCommand != "nohup socat x &" || planned.Evidence != "probe evidence" || planned.Status != IntranetTunnelPlanned {
 		t.Fatalf("planned tunnel = %+v", planned)
+	}
+	if planned.ListenSide != IntranetListenSideTarget {
+		t.Fatalf("listen side = %q, want the target default", planned.ListenSide)
+	}
+	// An empty side must keep the recorded value: re-planning a tunnel must not
+	// silently move its listener back to the target and misplace verification.
+	if _, err := d.UpdateIntranetTunnelPlan(tun.ID, "chisel client x 18099:socks", "", "", "", IntranetListenSidePivot); err != nil {
+		t.Fatal(err)
+	}
+	kept, err := d.UpdateIntranetTunnelPlan(tun.ID, "", "pivot:tcp:18099", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kept.ListenSide != IntranetListenSidePivot {
+		t.Fatalf("listen side after empty-side update = %q, want pivot", kept.ListenSide)
+	}
+	if kept.DeployCommand != "chisel client x 18099:socks" || kept.VerifyCommand != "pivot:tcp:18099" {
+		t.Fatalf("plan columns lost on side-preserving update: %+v", kept)
 	}
 
 	deployed, err := d.SetIntranetTunnelStatus(tun.ID, IntranetTunnelDeployed, 4321, "JW_PID:4321", "")

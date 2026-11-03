@@ -95,7 +95,14 @@ func DSN() (dsn, source string, err error) {
 
 // DB wraps the shared *sql.DB. PG handles its own connection pool + concurrency
 // (MVCC), so unlike the old SQLite store there is no process-wide write mutex.
-type DB struct{ *sql.DB }
+// DB embeds *sql.DB so callers keep the familiar Query/Exec surface. sealKey is
+// the at-rest sealing root, installed once by UseSealKey after the platform
+// signing key has been resolved; empty means "this handle stores plaintext",
+// which is what the isolated test harnesses run with.
+type DB struct {
+	*sql.DB
+	sealKey []byte
+}
 
 // ensureDatabase connects to the postgres system database and creates the target
 // database if it does not exist. dsn must be a postgres:// URL.
@@ -152,7 +159,7 @@ func Open(dsn string) (*DB, error) {
 		sqlDB.Close()
 		return nil, fmt.Errorf("ping postgres (%s): %w", config.Redact(dsn), err)
 	}
-	d := &DB{sqlDB}
+	d := &DB{DB: sqlDB}
 	// pgx runs multi-statement Exec via the simple protocol when there are no args.
 	// Keep the dedicated lock connection checked out until both DDL and seeding
 	// finish so concurrent application instances cannot initialize out of order.

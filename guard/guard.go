@@ -133,7 +133,13 @@ func egressCheckTool(name string) bool {
 	switch name {
 	case "web_fetch", "http_request", "http_post",
 		"verify_vulnerability", "exploit_vulnerability", "test_waf_bypass", "inject_webshell",
-		"intranet_exec", "intranet_batch_exec", "intranet_upload", "intranet_tunnel":
+		// webshell_register 会用会话把载荷写到目标、并对给定地址做存活探测，
+		// 两者都是把调用方内容送到远端。
+		"webshell_register",
+		"intranet_exec", "intranet_batch_exec", "intranet_upload", "intranet_tunnel",
+		// 登记凭据会把口令写进台账并留待复用时发往目标；不做外发检查就等于给
+		// 「把平台自身密钥洗成内网凭据」留了一条路。
+		"intranet_cred_register":
 		return true
 	}
 	return false

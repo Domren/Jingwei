@@ -68,6 +68,9 @@ func TestWebshellTaskParams(t *testing.T) {
 	if params["shell_type"] != "php" || params["field_name"] != "file" {
 		t.Errorf("defaults not applied: %v / %v", params["shell_type"], params["field_name"])
 	}
+	if params["protocol"] != "v2" {
+		t.Errorf("protocol default = %v", params["protocol"])
+	}
 	if params["source"] != "weakpass" || params["login_url"] != nil {
 		t.Errorf("source/login_url = %v / %v", params["source"], params["login_url"])
 	}

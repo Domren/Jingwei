@@ -42,6 +42,12 @@ func TestMain(m *testing.M) {
 		os.Exit(m.Run())
 	}
 	code := m.Run()
+	// The seal tests work inside their own schema so the one-time at-rest migration
+	// cannot reach rows another package is using; it is scratch state and goes with
+	// the rest of the suite.
+	if _, err := pg.Exec(`DROP SCHEMA IF EXISTS jingwei_seal_test CASCADE`); err != nil {
+		fmt.Fprintf(os.Stderr, "db suite: drop seal test schema: %v\n", err)
+	}
 	// os.Exit skips deferred calls, so the lock and pool are released explicitly:
 	// closing the pinned connection is what ends the session holding the lock.
 	if _, err := conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock(7337741002)`); err != nil {

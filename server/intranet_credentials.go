@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -45,6 +46,39 @@ type intranetReuseTarget struct {
 	Attempts  int    `json:"attempts,omitempty"`
 	ElapsedMS int64  `json:"elapsed_ms,omitempty"`
 	Error     string `json:"error,omitempty"`
+}
+
+// intranetAgentCredential is a ledger entry as the agent sees it: the API view
+// plus the plaintext password. The ledger REST handlers mask it
+// (db.IntranetCredential.Password is json:"-") because a browser, its extensions
+// and any proxy in front of the platform must not accumulate internal
+// credentials — but the agent needs the value: it authenticates with raw packets
+// (a Basic header, a POST body, an SSH interaction), and no credential_id-bearing
+// tool can carry those.
+type intranetAgentCredential struct {
+	*db.IntranetCredential
+	Password string `json:"password"`
+}
+
+func intranetAgentCredentials(rows []*db.IntranetCredential) []intranetAgentCredential {
+	out := make([]intranetAgentCredential, 0, len(rows))
+	for _, c := range rows {
+		if c == nil {
+			continue
+		}
+		out = append(out, intranetAgentCredential{IntranetCredential: c, Password: c.Password})
+	}
+	return out
+}
+
+// revealCredential replaces the masked ledger entry inside a reuse result with
+// the agent view. Only tool paths call it; REST handlers keep the masked row.
+func revealCredential(res map[string]any) {
+	c, ok := res["credential"].(*db.IntranetCredential)
+	if !ok || c == nil {
+		return
+	}
+	res["credential"] = intranetAgentCredential{IntranetCredential: c, Password: c.Password}
 }
 
 // intranetCredentialURL returns the credential's login URL, or one derived from
@@ -95,6 +129,12 @@ func (s *Server) intranetReuseCredential(ctx context.Context, pg *db.DB, in intr
 	cred, err := pg.GetIntranetCredential(in.CredentialID)
 	if err != nil {
 		return nil, errors.New("凭据不存在")
+	}
+	if cred.SealBroken {
+		// Reusing this row would send an empty password to the login page and the
+		// ledger would then record the credential as invalid — a false verdict about
+		// a credential that may still be perfectly good.
+		return nil, fmt.Errorf("凭据 #%d 的口令无法解封（平台签名密钥已更换），请重新登记该凭据", cred.ID)
 	}
 	if !scanner.WebCrackAvailable() {
 		return nil, errors.New("WebCrack 不可用（需要 python3 与 tools/webcrack），无法复用验证")
@@ -204,6 +244,13 @@ func (s *Server) intranetReuseCredential(ctx context.Context, pg *db.DB, in intr
 			targets[i].Status, targets[i].Error = "error", res.Error
 			continue
 		}
+		if !res.Found && res.Attempts == 0 && strings.TrimSpace(res.Request) == "" {
+			// 桥接器一次登录请求都没发出去（登录表单识别失败、页面不可达等）。
+			// 这不是「凭据被目标拒绝」：记成 invalid 会把仍然可用的凭据标成失效，
+			// 而且没有任何报文可供复核。
+			targets[i].Status, targets[i].Error = "error", "未发出登录请求: "+webCrackLastLog(res.Log, "目标登录表单无法识别")
+			continue
+		}
 		attempted++
 		if !res.Found {
 			targets[i].Status = "invalid"
@@ -230,9 +277,19 @@ func (s *Server) intranetReuseCredential(ctx context.Context, pg *db.DB, in intr
 	sameHostTried := 0
 	credHost := strings.ToLower(strings.TrimSpace(cred.Host))
 	for _, target := range targets {
-		if (target.Status == "valid" || target.Status == "invalid") && target.Host == credHost {
-			sameHostTried++
+		if target.Status != "valid" && target.Status != "invalid" {
+			continue
 		}
+		if target.Host != credHost {
+			continue
+		}
+		// 端口也要对上：隧道把内网服务都映射到 127.0.0.1 的不同端口，只比主机名会
+		// 让内网登录页的拒绝把外网仍然可用的凭据误标成失效。
+		_, port, _ := intranetTargetParts(target.URL)
+		if cred.Port > 0 && port > 0 && port != cred.Port {
+			continue
+		}
+		sameHostTried++
 	}
 	switch {
 	case found > 0:
@@ -284,6 +341,19 @@ func intranetTargetParts(raw string) (host string, port int, scheme string) {
 	return host, port, scheme
 }
 
+var webCrackANSIEscape = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+
+// webCrackLastLog returns the bridge's final progress line, the only clue a
+// target that was never probed carries (e.g. "无法找到登录参数").
+func webCrackLastLog(log []string, fallback string) string {
+	for i := len(log) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(webCrackANSIEscape.ReplaceAllString(log[i], "")); line != "" {
+			return truncateIntranetOutput(line, 300)
+		}
+	}
+	return fallback
+}
+
 func (s *Server) listIntranetCredentials(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
@@ -301,6 +371,70 @@ func (s *Server) listIntranetCredentials(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"credentials": rows, "total": len(rows)})
+}
+
+// registerIntranetCredential stores a credential the platform obtained outside a
+// dictionary run — read off an information-disclosure page, recovered from a
+// config file through a session, or handed over by the operator. Without it the
+// ledger can only ever hold wordlist hits, so the credentials that matter most on
+// an internal segment can neither be reused nor audited. The stored row is
+// written back without echoing the password: it is write-only in this API.
+func (s *Server) registerIntranetCredential(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		Host     string `json:"host"`
+		Port     int    `json:"port"`
+		Protocol string `json:"protocol"`
+		URL      string `json:"url"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Source   string `json:"source"`
+		TaskID   int64  `json:"task_id"`
+		Evidence string `json:"evidence"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "请求格式错误")
+		return
+	}
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	host := strings.ToLower(strings.TrimSpace(req.Host))
+	port := req.Port
+	urlRaw := strings.TrimSpace(req.URL)
+	if u, err := url.Parse(urlRaw); err == nil && u.Hostname() != "" {
+		if host == "" {
+			host = strings.ToLower(u.Hostname())
+		}
+		if port <= 0 {
+			if p, perr := strconv.Atoi(u.Port()); perr == nil {
+				port = p
+			}
+		}
+	}
+	if host == "" {
+		writeErr(w, 400, "需要 host 或可解析的 url")
+		return
+	}
+	source := strings.ToLower(strings.TrimSpace(req.Source))
+	if source == "" {
+		source = "manual"
+	}
+	if len(source) > 32 || strings.ContainsAny(source, " \t\r\n") {
+		writeErr(w, 400, "source 只能是不含空格的短标识，例如 manual / intel / config / browser")
+		return
+	}
+	row, err := pg.UpsertIntranetCredential(db.IntranetCredentialInput{
+		Host: host, Port: port, Protocol: strings.TrimSpace(req.Protocol), URL: urlRaw,
+		Username: req.Username, Password: req.Password, Source: source,
+		TaskID: req.TaskID, Evidence: strings.TrimSpace(req.Evidence),
+	})
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, row)
 }
 
 func (s *Server) reuseIntranetCredential(w http.ResponseWriter, r *http.Request) {
@@ -360,7 +494,7 @@ func (s *Server) toolIntranetCredentials() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			return jsonResult(map[string]any{"credentials": rows, "total": len(rows)})
+			return jsonResult(map[string]any{"credentials": intranetAgentCredentials(rows), "total": len(rows)})
 		})
 }
 
@@ -393,6 +527,65 @@ func (s *Server) toolIntranetCredReuse() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
+			revealCredential(res)
 			return jsonResult(res)
+		})
+}
+
+func (s *Server) toolIntranetCredRegister() actool.CoreTool {
+	return wrTool("intranet_cred_register",
+		"把字典爆破之外拿到的账号登记进内网凭据台账：信息泄露页面读出的口令、会话里 cat 配置文件得到的凭据、人工提供的情报。字典命中之外的凭据如果不登记，横向复用就永远用不到它们。登记后立刻可用 intranet_cred_reuse 对登录页做精确验证；同一 host+username+password 重复登记会合并更新。host 与 url 至少给一个，password 含空格也照原样传。",
+		objSchema(map[string]any{
+			"host":     strParam("凭据所属主机（IP 或主机名，可省略并从 url 推导）"),
+			"port":     intranetIntParam("端口（可选，省略时从 url 推导）"),
+			"protocol": strParam("http / https / ssh / mysql 等（可选，默认 http）"),
+			"url":      strParam("登录页或凭据来源地址（可选）"),
+			"username": strParam("账号（必填）"),
+			"password": strParam("口令（必填，按原样保存，不做 trim 之外的处理）"),
+			"source":   strParam("来源标识：manual / intel / config / browser / weakpass / reuse（默认 manual）"),
+			"task_id":  intranetIntParam("归属任务 ID（可选，默认当前任务）"),
+			"evidence": strParam("凭据从哪里来的说明，例如「10.99.0.20 监控面板泄露」"),
+		}, "username", "password"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				Host     string `json:"host"`
+				Port     int    `json:"port"`
+				Protocol string `json:"protocol"`
+				URL      string `json:"url"`
+				Username string `json:"username"`
+				Password string `json:"password"`
+				Source   string `json:"source"`
+				TaskID   int64  `json:"task_id"`
+				Evidence string `json:"evidence"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf("参数格式错误"), nil
+			}
+			host := strings.ToLower(strings.TrimSpace(a.Host))
+			if host == "" {
+				if u, err := url.Parse(strings.TrimSpace(a.URL)); err == nil {
+					host = strings.ToLower(u.Hostname())
+				}
+			}
+			if host == "" {
+				return actool.Errorf("需要 host 或可解析的 url"), nil
+			}
+			if a.TaskID <= 0 {
+				a.TaskID = intranetCtxTaskID(ctx)
+			}
+			pg, err := s.intranetToolPG()
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			row, err := pg.UpsertIntranetCredential(db.IntranetCredentialInput{
+				Host: host, Port: a.Port, Protocol: a.Protocol, URL: a.URL,
+				Username: a.Username, Password: a.Password,
+				Source: displayOr(strings.TrimSpace(a.Source), "manual"),
+				TaskID: a.TaskID, Evidence: strings.TrimSpace(a.Evidence),
+			})
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			return jsonResult(map[string]any{"credential": row})
 		})
 }

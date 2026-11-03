@@ -2,6 +2,412 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 新增
+
+- 暂无。
+
+## [1.4.0] - 2026-11-03（WebShell 与内网能力强化）
+
+### 新增
+
+- **加密 v2 WebShell 协议**：握手派生会话密钥（密钥不出现在流量中）、AEAD 加密、时间戳 + nonce
+  防重放、随机请求载体头、失败静默；支持 PHP / JSP / ASPX 与 Windows `cmd`/`powershell` 壳。
+- **载荷多态与自检**：同一密钥可生成不同外观载荷（填充、注释、函数名随机化）、载荷 SHA-256 指纹、
+  部署后自检；`GET /api/deep/webshells/{id}/payload` 导出与库中记录一致。
+- **平台签名密钥入库**：签名根密钥（`/app/jwt.key`）改存数据库单行表 `platform_secret`，启动时「库优先 → 旧文件迁移入库
+  后删除 → 都没有才生成并写库」。它同时是三样东西的根：会话 JWT 的 HS256 签名、webshell/内存马/半持久化密钥密封的派生
+  （`HMAC(jwt.key, 用途)`）、HTTP Basic 认证门 cookie 的派生。读取口刻意收窄成 `platformSecretStore` 两个方法，只在
+  `server.New` 调用一次；它不是一条 `settings`——`settings` 被到处按 key 读取并经 `GET /api/settings` 白名单回显给浏览器，
+  而这把钥匙绝不能出现在任何 API、报告或工具出口里。写入用 `INSERT … ON CONFLICT (id) DO NOTHING` 再读回，判定落在主键
+  约束上，两个实例同时首启因此会收敛到同一把而不是各自铸一把。
+- **内网凭据口令与模型 API 密钥同样密封入库**：密封内核从 webshell 一处抽成 `db/seal.go`，按用途派生
+  （`jingwei/webshell-secret/v1`、`jingwei/intranet-credential/v1`、`jingwei/llm-api-key/v1`，一处泄露解不开另一处），
+  并把它装进数据库层唯一的读写口：`UpsertIntranetCredential` 写入前密封、`scanIntranetCredential` 读出时解回，
+  `SaveProfile` 密封 `api_key`（`api_key_hint` 仍取明文末四位，界面照旧认得出是哪个 key），
+  `ActiveProfile`/`ProfileByID`/`PoolProfiles`/`ProfileAPIKeys` 解回明文。选择在库里收口而不是在每个调用点解封，
+  是因为漏掉一个点的表现是拿密文去拨 SSH 或去发 `Authorization` 头——看着像口令错了或 key 失效，排查方向完全错。
+  凭据口令用**确定性**密封（nonce 由明文派生）：`intranet_credentials` 上有 `UNIQUE (host, username, password)`，
+  随机 nonce 会让每次重登记都变成新的一行，台账重复报同一个凭据，绑在旧 `credential_id` 上的 SSH 会话也就指向
+  错误的行。解封失败不降级成「没有口令」：凭据行标记 `SealBroken`、列表照常返回（一行读不出不能让整张表空白），
+  而拨号与复用直接拒绝并写明「平台签名密钥已更换，请重新登记该凭据」；模型 key 解不开则清空该 profile 的 key，
+  让上层报「这个配置没有可用密钥」而不是带着一串密文去请求。存量明文由一次性启动迁移收敛（`secret_seal_v1` 标记，
+  只有整轮零失败才写标记，否则下次继续）。
+- **大马（文件管理）**：在 v2 通道上以单个操作字节实现目录列表、分块读/写、重命名、删除、
+  mkdir、chmod；分块 256 KiB、单次读取上限 512 KiB、列表上限 3000 条。载荷内部自我保护，
+  拒绝改写/删除自身与密钥缓存文件、拒绝删除 `/`。后端 `GET .../files`、`GET|POST .../file`、
+  `POST .../files/action`（仅 v2、必须有地址、受资产拦截规则约束、拒绝 NUL 路径、请求体上限 2 MiB），
+  前端「文件管理（大马）」面板支持浏览、上传、下载、在线编辑、重命名、权限与递归删除。
+- **Java 内存马**：经 JSP 父壳注入 Filter / Servlet / Listener / Valve / Agent 五类内存马，
+  支持类型探测、存活检查、命令执行与验证式移除；`java_memshells` 数据表与受管资源台账联动。
+- **PHP 半持久化**：`auto_prepend_file` 前置载荷（透传原页面、不改变站点行为），部署/撤销/验证
+  命令与台账记录，撤离时逆序清理。
+- **会话与传输**：WebShell 心跳与失效告警、分块上传下载、压缩传输。
+- **SSH 承载的内网会话**：内网里大量主机只有 22 端口、没有 web 服务，webshell 永远落不下去，凭据复用换来的
+  立足点就停在一条凭据记录上——不能执行、收集不到信息，也进不了维持与撤离台账。会话现在支持
+  `transport=ssh`（`intranet_open_session` 与内网页「承载方式」）：口令取自凭据台账的 `credential_id`，
+  每次执行都重新读取该行，凭据删掉会话立即拒绝再跑；命令仍走与 webshell 同一套 `__JW_CWD__`/`__JW_EC__`
+  标记协议，cwd 续用、OS 探测缓存、执行事件与探测记录全部一致。登录身份（`host` + `ssh_port`）与实际接入
+  地址（`dial_host`/`dial_port`）分开登记，经隧道映射的 SSH 因此不会把平台自己写成目标资产。登录通了却
+  跑不出标记协议的会话直接置为 closed 并写明「目标上的 shell 不是预期的那种」，不留 active 让后面每条命令
+  都撞同一句错；SSH 会话不参与 webshell 故障转移（400 拒收）。
+- **把目标上已有的文件登记成受管壳**：`webshell_register` 覆盖 `inject_webshell` 之外的投放途径——worker
+  自己写的文件、其他漏洞链的落地物、目标上本来就存在的壳。过去这些文件不进任何台账，撤离枚举不到。工具会
+  封存密钥、绑定任务、写资源台账，默认加密 v2 并立即做一次存活验证；若目标上的文件不是精卫生成的载荷
+  （v2 验证必然失败），可带 `session_id` + `deploy_path` 先经该会话把正确载荷写到对应路径再登记，载荷与
+  密钥不经过对话上下文。
+- **内网凭据台账可视化**：内网页新增「凭据台账」页签——弱口令命中、横向复用与手工登记的账号都列在同一张表里，
+  可按 待验证/已验证/已失效 过滤，逐条看来源、依据与最近使用时间，并可一键「复用验证」（只拿这一组账号口令打
+  登记过的登录页，不走字典）。过去这张表只有 `intranet_credentials` 工具看得到，人工想核对「这台只开 22 的主机
+  到底登记过哪些账号」只能进数据库查。新增「登记凭据」对话框把字典之外拿到的口令入账（泄露页面读出的、会话里
+  cat 配置文件得到的、情报给的）。新建 SSH 会话的「凭据 ID」手填框换成凭据选择器，选中即自动带上主机、账号与
+  SSH 端口——之前要人先查 ID 再手敲，填错只会得到「凭据不存在」。
+- **权限维持**：扩展标准维持模块，落地物台账增加指纹、TTL 与幂等判定。
+- **撤离清理**：dry-run 预览、残留扫描、可选自动删除 WebShell，失败项保持可重试。
+- **WebShell 工作台**：一条壳一个对话框，三个页签——虚拟终端、文件管理（大马）、系统信息。虚拟终端照内网会话
+  那套 `__JW_CWD__`/`__JW_EC__` 标记协议做逐条回传：当前目录、退出码、耗时、stderr 原样着色，`cd` 与「粘贴目录
+  跳转」都续用到下一轮，↑/↓ 翻历史，超时档位可选 15/30/60/120/300 秒，滚动区在切去别的页签时不清空
+  （只有终端页签常驻挂载）。系统信息一次往返采集 12 个分区（主机、身份、时间、网络、CPU、内存、磁盘、当前
+  目录、提权线索、可用工具、Web 服务与进程、端口），PHP v2 壳额外附带解释器自述。列表页与对话框的入口按钮
+  都带 title 说明它们走的是同一条命令通道。
+- **内网会话终端与 webshell 终端合成一个组件**：内网会话（SSH 承载、或绑定 webshell 的那两种）原来自己写了一套
+  终端——只有命令、输出、时间，没有目录、退出码、耗时，超时和「目标没回话」在界面上长得一样。现在它和工作台用
+  同一个 `ShellTerminal`：服务端把 `intranetExecOutcome` 改成 `shellExecResult` 的别名（`output/cwd/exit_code` 之外
+  多出 `os_kind/duration_ms/timed_out/marker_ok`，对老的读取方是纯增量），`intranetRun` 改为把会话传输包成
+  `shellSender` 后交给 `shellExec`，两种承载方式因此共用同一套 `__JW_CWD__`/`__JW_EC__` 语义与同一个超时判定。
+  目录仍然由服务端在会话行上记账，所以同一个目标的 webshell 终端与内网终端不会各拿一份状态互相打架；一条不返回
+  的命令也不再推进 `last_seen`，否则失效会话扫描会把挂住的目标当成健康的。对话框另开「执行记录」页签装台账
+  事件（含 worker 在别处跑的命令）——事件里没有退出码与结束标记，所以不并进终端滚动缓冲，切过去时重新读一次。
+  `intranet_exec` 工具出口也补上 `timed_out`/`marker_ok`，worker 不再把「这条命令不返回」误读成「这个 shell 坏了」。
+- **请求重发页的时钟块**：报文上方一个带边框的整块，显示当前公历时间到秒（`2026年11月03日 14:49:26`），每秒走字。
+  默认居中，按住可以左右拖到不挡字的地方，拖不出正文区边缘；位置只记一个「相对中心的偏移像素」，写进浏览器
+  localStorage，刷新与下次进来都保持。没有按钮、没有箭头、没有档位——挪这件事交给拖拽本身。时钟走的是浏览器
+  本地时间，且只在客户端渲染：静态导出的首屏没有服务端时刻，也就不会比对不上。
+
+### 变更
+
+- **隧道台账新增 `listen_side`**：监听端口开在哪一侧要写清楚——socat、`ssh -D`/`-L`、带 `R:` 的 chisel 开在
+  目标（`target`），`chisel client` 不带 `R:` 时监听开在控制端（`pivot`）。`verify` 与拆除复核都按这一侧做：
+  过去在控制端复核一条目标侧的 socat（或反过来）会把好隧道判成失败，也会让隧道明明拆掉了、台账却仍在
+  `deployed`。`plan` 自动选型时改写该字段，手写 `deploy_command` 时由操作员用 `listen_side` 纠正；部署成功后
+  返回的 `access` 也按侧给出真正能连的入口。未配置 `JINGWEI_PIVOT_SERVER` 时，plan 直接说明需要手动提供
+  `deploy_command`，不再生成一条拨不通的控制端命令。
+- WebShell 密钥在数据库中密封存储（`server/shell_secret.go`），接口不再回显明文密钥。
+- 删除测试代码中硬编码的数据库口令，测试统一使用隔离库与环境变量。
+
+### 修复
+
+- **探测失败会把目标永久钉在 POSIX**：系统族探测不到（chroot、受限 shell、目标当时没答）时 `shellOSKindOf` 回退
+  POSIX，这本身是对的——总得选一个 wrapper；错的是 `execWebshellCommand` 把这个回退值当事实写进 `webshells.os_kind`。
+  一旦写入，后续每一轮都读缓存、不再重探，一台只是当时没答的 Windows 壳就永久按 POSIX 语法执行，界面上也没有任何
+  地方可以纠正。现在 `shellExec` 只在探测真的答了时才报告系统族（未证实时 `os_kind` 留空，`UpdateWebshellTerminal`
+  的空值语义就是「不动这一列」），终端的系统族徽章换成可选择的下拉：自动探测 / POSIX sh / Windows cmd。人工指定是
+  决定而不是猜测，会照常写进台账；内网会话同样接受该字段并写进会话 metadata（唯一的系统族来源，避免上传、下载、
+  维持、撤离各步各用一套判断）。
+- **同一内网会话上的命令会互相踩目录**：会话的当前目录记在会话行上，两个标签页（或一个标签页与后台心跳）
+  同时执行时读到同一个旧值、并发跑完、后写的赢——终端下一轮从谁都没要过的目录继续，操作员在错误的位置读输出。
+  现在一个会话一轮：`intranetRun` 拿会话级互斥锁，`intranetHeartbeatCheck` 用 `TryLock`，拿不到就报
+  「上一条命令仍在执行，本次心跳未探测，也未记为失败」——一次五分钟的大文件传输不该把健康会话熬成「丢失」。
+- **「未确认」看起来像卡住的 bug**：一条超时的命令会把壳标成 `unknown`，而平台刻意不定时重连目标（按计划打客户
+  主机是操作员的决定，不是后台默认），于是徽章可以长期停在未确认却不说明原因。现在四种状态都带悬浮说明，未确认
+  那条写明「上一次等待超时或检测没通过……点『检测』确认」。
+- **测试包之间互相删数据**：`go test ./...` 并行时 `db`/`server`/`agent` 共用同一张表空间，一个包的清理会抹掉
+  另一个包正在断言的行（实测 `TestActivityPageSessions` 偶发失败，串行却永远通过）。这几个包的测试改用
+  `db.OpenTestSchema` 各占一个 schema——连接串钉 `search_path`，`schema.sql` 里不带限定的建表因此落进各自的
+  schema，每个包得到一份独立且完整播种的库。seal 测试的 schema 在套件结束时删除，不再留残渣。
+- **测试隔离只在一种 DSN 写法下成立**：`OpenTestSchema` 把 `options=-csearch_path=…` 直接拼在连接串末尾。
+  keyword/value 写法（配置文件生成的那种）这样是对的，但 URI 写法（`JINGWEI_PG_DSN=postgres://…?sslmode=disable`，
+  文档里给的就是这一种）的参数属于 query string，拼上去的裸空格被读成第二个 `sslmode` 值，于是走隔离 schema 的
+  测试整批死在「failed to configure TLS (sslmode is invalid)」。更要命的是各包 TestMain 把「打不开隔离句柄」当成
+  「没配数据库」照常跑下去，只是不再持有套件锁——`NewManager` 那批仍写共享表的测试于是和 db 包并发，实测报出
+  7 起 `deadlock detected (SQLSTATE 40P01)`。现在 `withSearchPath` 按 DSN 形态分别处理（URI 写进 query 参数并
+  合并调用方已有的 `options`，keyword 写法保持追加，已带 `options` 的 keyword 写法直接拒绝而不是写出两个同名参数），
+  TestMain 打不开隔离 schema 或拿不到锁时退出并说明原因，不再无声地降级到共享表；`db/test_schema_test.go` 钉住
+  两种形态。上一轮「并行全量通过」的结论是在 keyword 写法下得到的，换 URI 写法就暴露了这条，记录在此。
+- **重复保存同一份原始报文，去重看的是秒表**：快照 id 是内容指纹，而指纹把 `captured_at` 也算在内，
+  `SaveRawExchanges` 又用 `time.Now().Unix()` 去填它——同一个 finding 把同样两条报文存两遍，只要两次调用跨了秒边界
+  就落成 4 条快照而不是 2 条。`evidence` 里那条「want 2 deduplicated bindings」在负载下偶发失败就是这么来的（串行、
+  第一轮并行都过，第二轮并行才炸，所以它看起来像 flake 而不是 bug）。现在 `RawExchange` 带 `CapturedAt`，为 0 才取
+  「现在」：调用方知道报文是何时抓的就照实写，重试因此真的幂等；测试固定同一个瞬间。没有改指纹口径——快照 id 已经
+  写进库也写进导出包，动它要同时处理历史 id 与 `InstallSnapshots` 的完整性复核，代价和这条 flake 不成比例。
+- **夹具清理读数组的方式一直失败，只是被日志吞了**：`purgeEvidenceFixture` 用 `array_agg(…)::text[]` 读快照 id 再
+  `Scan` 进 `*[]string`，database/sql 不接受驱动的 string 落到 `*[]string`（实测报 `unsupported Scan`），而这个
+  helper 把错误记成 `t.Logf` 而非致命，于是清理静默半失效，全靠同一句 DELETE 里的 `created_at` 兜底才没留下可见残渣。
+  改成按行读 id，不再依赖数组编解码。
+- **仓库里的 Dockerfile 在开发机上构建不起来**：`# syntax=docker/dockerfile:1` 让 buildkit 去 Docker Hub 拉外部
+  前端，而 dockerd 的 systemd drop-in 把 `HTTP(S)_PROXY` 指到一个没监听的端口，解析直接失败——本轮之前每次部署
+  都靠一份删掉该行的 `/tmp/Dockerfile.1.4.0` 副本，等于部署不可复现。文件里只用到 `RUN --mount=type=cache`，
+  Docker 28.5 的内置前端就支持，所以删掉该行并在原位写明原因与恢复条件；本轮部署已直接用仓库根目录的 Dockerfile。
+- **端到端脚本只活在本机**：Playwright 验证脚本与签会话令牌的脚本散在仓库外，别人拿到仓库复现不了。移进
+  `tools/e2e/`（含 README，实例地址、令牌文件、截图目录、会话名都可用环境变量覆盖），本轮两条 e2e 就是从仓库里
+  跑通的。
+- **文件管理与系统信息把「等不到」说成「失败了」**：上一轮只修了命令通道，`scanner` 里还有六处在压平传输错误
+  （`shell_files.go`、`shell_info.go`、`shell_crypto.go` 两处、`memshell.go` 两处），`errors.New(resp.Error)` 把
+  `*url.Error` 变成裸字符串，`errors.Is(err, context.DeadlineExceeded)` 自然永远不成立。现在统一走
+  `resp.transportErr()` 保留原因，服务端新增 `shellChannelError`：期限到点回「等待超时：目标没有在期限内回答，
+  本次操作已停止（载荷上可能仍在执行）」，其它错误保持原话——一次慢目录列表不再和「shell 挂了」长得一样。
+- **内网对话框的上传/下载结果退化成文本**：命令页签升级后，这两个页签仍把 `note` 拼在输出里，看不到退出码、耗时与
+  「超时」。改为共用终端那套徽章（`shellExitBadge`/`fmtDuration` 导出后复用），一条规则两处渲染，不各写一份。
+- **旧协议壳的「文件管理」是灰的，但没说为什么**：禁用态只表达「不可用」，读者只会当成功能坏了。现在页签下方写明
+  大马走加密 v2 的文件操作字节，并说明要用最新载荷重新投放。
+- **签名密钥换过之后没有任何提示**：密封值对新密钥不可解，表现是每个 webshell 看着存活（存活检查过得去）而每条命令
+  都解不开，读起来像目标出了问题。现在启动时自检一次，按类别打印解不开的条数与各自的补救动作（重投载荷 / 重新注入 /
+  重新登记凭据 / 重填模型密钥），DEPLOY.md §7.4 写清两条恢复路径：从换密钥前的备份里把 `platform_secret` 那一行写回，
+  或按台账逐条重做。
+- **内网口令与模型 API 密钥明文躺在库里**：`intranet_credentials.password` 与 `llm_profiles.api_key` 都是明文列，
+  而它们恰恰是一次行动里最值钱的两样——内网账号口令、能花钱的 key。任何一次误查表、任何一份被贴进聊天或工单
+  的转储、任何一个把整行序列化出去的出口（日志导出、报告模板、将来新写的 handler）都会直接带走它们；
+  webshell 密钥早就密封了，这两处却没有，密封因此是不对称的：拿到库的人照样接管整个内网。现在两者按用途派生的
+  密钥密封入库（见「内网凭据口令与模型 API 密钥同样密封入库」）。要说清边界：签名根密钥也在同一个库里，所以这层
+  挡的是误查表、按 key 读设置的代码路径与共享转储时的顺手一览，不是「拿到数据库也读不出凭据」；它消除的是「库里
+  有明文」这件事本身。
+- **容器重建把所有已投放的 webshell 变成砖**：签名根密钥写在 `/app/jwt.key`——镜像层之外的容器可写层，`config.BaseDir()`
+  硬编码、不可配置。`docker compose up -d --force-recreate` 一次就重新铸一把，于是所有登录会话失效，更要命的是
+  `webshells.secret` / `java_memshells.secret` / 半持久化密钥都是用这把钥匙的派生密钥 AES 密封的，解封直接失败：
+  每条命令都回「webshell 密钥解封失败（JWT 密钥可能已更换，请重新投放载荷）」。目标上的文件还在、站点还在跑，但
+  平台再也打不开它们，只能删记录重投。密钥现在入库（见「平台签名密钥入库」），备份口径与数据库合一；首次启动会把
+  旧文件原样搬进库并删掉文件，因此升级那一次重建不轮换、壳不需要重投。写库失败时启动直接失败退出，不再抱着一个
+  「这次能用、下次重建就蒸发」的临时密钥正常运行。
+- **webshell 终端首条命令把目录钉在 `/`**：虚拟终端复用内网会话的脚本包装器，空 cwd 一律 `cd /`，于是登录后
+  第一条 `id`/`pwd` 报的是文件系统根目录，而 web 服务器实际把进程放在脚本所在目录——操作员据此判断「壳能读
+  网站目录吗」会得到错的答案，还得先手动 `cd`。现在 webshell 通道首轮用 `cd .`（保持目标自己的 `$PWD`，仍
+  在取不到时退回 `/`），内网 SSH 会话的语义不变，因为那边续用的是会话自己记下的目录。
+- **等不到回包被报成传输错误**：命令超过超时档位时，HTTP 发送端在自己的客户端超时上先断，交回的是
+  `Post …: context deadline exceeded`，而超时判定只看外层 context（超时 + 宽限），因此 `timed_out=false`、
+  备注是一句底层错误。操作员读到的是「这个壳坏了」，真实情况是「那条命令不返回」。现在客户端超时也判为
+  停止等待，写 `timed_out=true` 并说明目标上的命令可能仍在继续。
+- **错误原因在传输层被抹平，上面的判定在真实链路上根本不触发**：`DeepResponse.Error` 是字符串，
+  `RunShellCommand` 又用 `fmt.Errorf("%s", …)`/`errors.New(…)` 重建错误，`errors.Is`/`errors.As` 拿不到
+  `context.DeadlineExceeded` 与 `net.Error`。单元测试直接喂一个 `*url.Error` 所以照绿，真机复跑仍然误判。
+  `DeepResponse` 现在额外保留 `Err`，命令通道返回带原因的错误（文案不变，字符串匹配的调用方不受影响），
+  并在 `scanner` 侧加回归测试钉住「客户端超时的原因必须能被 `errors.Is` 读到」。
+- **系统信息整面板被一次根目录遍历拖死**：12 个分区共用一次请求与 60 秒预算，提权线索里的
+  `find / -perm -4000` 越过挂载点走进 `/mnt/c`，在实机上跑了几分钟——超时的不是那一个分区，而是整块信息
+  面板。改为 `-xdev` 并截断到 20 条，实测同机 12 分区 150–190ms 返回。
+- **协议徽章把密钥轮次写成协议版本**：列表页与工作台标题显示 `加密 v${key_version}`，v2 壳的密钥没轮换过时
+  就写着「加密 v1」——而「是不是 v2」恰好决定文件管理页签可不可用，读起来像平台在跟一个旧协议壳说话。
+  两处统一显示 `加密 v2`，密钥轮次留在悬浮说明里。
+- **非 PHP 壳的系统信息少一块却没有解释**：解释器自述（php.ini、open_basedir、disable_functions）只有 PHP
+  v2 壳能回答，JSP/ASPX 上过去只是安静地少一块，看起来像采集失败。现在这类壳明确标注该分区不可用及原因。
+- **同一落地地址重复投放留下两条壳记录**：往一个已经登记过的路径再注入一次，上传已经把目标上的文件换掉了，
+  旧记录描述的那个载荷不再存在——旧密钥打不开新文件，绑在旧 id 上的会话每条命令都撞 v2 MAC 校验失败，撤离时
+  自删除的是「记录里的旧载荷」而不是真实文件，目标上反而留下没人认领的后门。现在按调用意图分流：`inject_webshell`
+  与带 `session_id`+`deploy_path` 的 `webshell_register` 会覆盖投放，原地复用同一条记录（保留 id 让会话与台账仍然
+  对得上，换掉载荷/密钥/指纹，状态退回 `unknown`，旧的 `managed_resources` 行以「被覆盖」为原因置为 released，
+  同时只留一条 active，覆盖事实在 `summary`、壳备注与深度任务日志里各写一遍）；手工创建壳与不带投放参数的
+  `webshell_register` 遇到已登记地址则拒绝并指明是哪一条记录 owns 该地址（`already_registered` 提示直接复用该 id），
+  不再静默插第二行。
+- **凭据台账接口把内网账号口令明文发给浏览器**：`GET|POST /api/intranet/credentials` 直接序列化 `password`
+  字段，于是每条列表请求、每次登记的回显、前端状态缓存与反向代理访问日志里都留下一份内网口令副本——这些恰恰是
+  横向移动换来的最有价值的东西。现在 `db.IntranetCredential.Password` 是 `json:"-"`，只回 `has_password`
+  （与 webshell 密钥同一套「只写不读」规则）。界面本来也不需要明文：复用验证与 SSH 会话都由平台按
+  `credential_id` 自己取。agent 侧仍拿得到口令，因为拼原始报文（Basic 头、POST 体、SSH 交互）没有
+  `credential_id` 可携带，这一步在工具出口显式重新附加，只覆盖工具路径，REST 处理函数一律保持掩码。
+- **平台自己的隧道监听被回流成「内网资产」**：代理扫描的返回里，`127.0.0.1:41320` 这类地址是平台侧隧道的入口，
+  按原样落库就成了「精卫内网里有一台 127.0.0.1 的主机」——下一轮 scope 申请、开会话、批量执行都会去打自己的
+  隧道，还把这些假资产带进报告。现在回环地址先查隧道台账（`LiveIntranetTunnelByListen`：`localhost` 与
+  `127.0.0.1` 是同一只 socket，`0.0.0.0`/`::`/`*` 通配也算命中，只认 `deployed`/`verified`），命中就把这条发现
+  改写成隧道对端的真实内网身份——ip、端口、服务 URL 与 `Host` 头一起换（`rewriteScanURL` 拒绝无 scheme 的裸串，
+  不再拼出 `//10.253.77.14:80/not a url` 这种地址），查不到归属的本地监听直接丢弃；`intranet_request_scope`
+  审批时拒绝把平台自身登记为资产并在响应里写明原因，但 `task_scope` 照常授权，不逼着人为了「127.0.0.1」再批一次。
+  没有 `task.Proxy` 的普通扫描不参与改写，实验室里打到 loopback 的真实资产仍然按原样入库。
+- **实例重启后隧道拆不掉、台账却说已释放**：受管资源的拆除动作是内存里的回调表，进程重启或任务移交后回调就没了，
+  过期回收与释放只把台账改成 released，目标上的 socat / SOCKS 监听进程照旧听着。现在释放与过期回收都会按台账行
+  （`metadata.tunnel_id`）重建拆除流程；撤离时不等回调，无条件再走一遍会话侧的 `teardown_command`，并在杀掉进程后用
+  目标侧 `ss -lnt` 追加「【拆除复核】」证据。没有绑定会话、或没有拆除命令时，证据直接写明「拆除命令未执行，仅台账置为
+  stopped」，不再留下看不见的假干净。
+- **指向已删除任务的 `task_id` 把数据库报错直接吐给调用方**：创建内网会话、创建隧道、部署维持物时，Postgres 的
+  `intranet_sessions_task_id_fkey` 报错原样出现在 API 响应里。改为 `intranetTaskGuard` 前置校验，返回 400 与
+  「任务 #N 不存在或已删除，无法归入该任务的撤离台账」。
+- **维持物部署失败时台账只剩一句无从复核的话**：维持模块的部署脚本都以 `set -e` 开头，旧的内层脚本一旦中途失败就
+  打印不出结尾标记，退出码和已产生的输出一起丢失；且 web 壳通常只回传 stdout，目标侧的 `Permission denied` 全落在
+  web 服务器错误日志里，取证时看不见。命令改放进子 shell、由 `EXIT` trap 打印 `__JW_CWD__`/`__JW_EC__` 并整体 `2>&1`，
+  台账失败原因改为引用目标原话；对 `/usr/sbin/nologin` 一类无法落地维持物的账户新增 `JW_WARN_NOLOGIN_SHELL` 告警，
+  不再记成成功。
+- **JSP/ASPX 壳自删除后复核仍报可访问**：判定本身是对的（文件已删、servlet 仍在容器里驻留），撤离报告补充说明
+  需重载应用或重启容器才能断开，避免误读成删除失败。
+- **镜像里 webcrack 依赖装坏了也照样构建成功**：`Dockerfile` 的 webcrack 层以 `... || echo` 收尾，shell 里 `&&` 与 `||`
+  同优先级左结合，前面任何一步失败都被这句 echo 吃掉、层退出码为 0，Docker 于是缓存住一个缺件的层（SOCKS5 隧道下的
+  登录尝试要到运行时才报错）。核心依赖安装与其导入自检改用 `{ ...; }` 成组，失败即构建失败；`ddddocr` 仍保持可选。
+- **经 SOCKS5 隧道跑 webcrack 缺依赖**：`requirements-core.txt` 补上 `requests[socks]`，核心自检同时导入 `socks`。
+- **登录滑块偶尔发出自己解不开的题**：`TestGeneratedSliderPuzzleIsSolvable` 在全量测试里随机失败
+  （实测 8 连抽约每 64 题错 1 题，`solver offset=234 want 184，confidence=0.00`）。背景是随机圆斑与折线，
+  轮廓与内容两条打分通道都可能被别处的强边缘夺走。人眼看着含糊的题，合法用户也会拖错位置，而验证一次即作废、
+  只能重新登录，等于把一次随机绘图变成锁门。现在 `newSliderPuzzle` 发题前先用平台自己的 `captcha.SolveSlider`
+  核对缺口位置，落在登录容差外就重绘（上限 `sliderPuzzleAttempts=4`，四次都不合格就照旧发出，绝不因为
+  画不出题而拒绝登录页）。新增 `TestRawSliderRenderAmbiguityRate` 盯原始单次绘制的歧义率（实测 2-5/200），
+  绘图质量退化时先在这里报警，而不是让签发验证码慢下来。
+- **nuclei 超时把已拿到的结果连同报错一起丢掉**：超时分支只报「扫描超时」，调用方无从知道引擎已经落了多少 POC
+  命中与发现。改为在报错里带上保留条数，并说明其中含应用层探测、弱口令与服务暴露，不再把部分完成说成一无所获。
+- **LLM 用裸 HTTP 上传的可执行文件不进任何台账，撤离扫不到**：实网一轮深挖经上传点写了 12 个 PHP/JSP 马，
+  finding 里写「清理验证见 record_fact」，但既没登记、也没删除，`intranet_evacuate` 按落地物台账清理时报「未发现残留」，
+  最后只能人工进目标逐个 `rm` 再复核 404。worker 收尾规约新增第 6 条：保留的落地文件必须进台账
+  （webshell 由平台登记，其余用 `intranet_artifact_register` 带 `revoke_command`/`verify_command`），
+  既不登记也不删除时只能在 finding 里如实写「未登记、未清理，需人工确认」，不许写「已清理」。
+- **java-chains 的回调端口在容器里没有人在听**：`JAVA_CHAINS_CALLBACK_BIND` 一个变量被当成两件事用——它既是
+  docker 在**宿主机**哪块网卡上发布 50389/58080 等回调端口，又被直接拿去当 sidecar 的 `bindHost`。sidecar 容器有
+  自己的网络命名空间，docker-proxy 把连接转发到**容器的 eth0 IP**，所以按默认值 `127.0.0.1` 监听时，宿主机端口
+  看着是开的（本机 `curl` 都通）、容器内后面却没有进程在 eth0 上听，于是**任何**目标——本机、同宿主机其他容器、
+  远端主机——都永远回连不上：目标侧 JNDI lookup 直接失败，侧车日志停在 `anonymous bind failed` /
+  `LDAP connection has been closed`，一条 `outcome=lookup` 都不会有，平台只能报「已投递未回连」。现在拆成两个变量：
+  新增 `JAVA_CHAINS_LISTEN_BIND`（默认 `0.0.0.0`，只决定容器内的监听面，不改变暴露面）与
+  `JAVA_CHAINS_CALLBACK_BIND`（仍默认 `127.0.0.1`，决定宿主机发布），`java_bind_host` 走前者、
+  `java_callback_host` 走后者。
+- **JNDI 服务已在运行时换绑被静默忽略**：`quick_jndi` 的语义是「没起就起、起了就用」，服务已经启动时它照旧发布
+  成功并只在 `service.bound.host` 里报出**原来的**监听地址——要求 `0.0.0.0` 却拿到 `127.0.0.1` 也一样回 200，
+  payload 于是投到一个没人监听的地址。现在 `publishJNDI` 比对返回的 `bound.host` 与要求的监听地址
+  （`normalizeListenHost` 把 `0.0.0.0`/`::`/`*`/空视为同一只通配 socket，`localhost`/`127.0.0.1`/`::1` 视为 loopback），
+  不一致时调 `java_chains_services_restart` 换绑再重新发布，并在任务日志里写明换过绑；重启失败不谎报成功，
+  改为按当前监听投递并提示「回连结果需人工核对」。新增 `scanner.JavaChainsClient.JNDIService`/`RestartJNDI` 承载这两个动作。
+
+### 验证
+
+- **请求重发时钟块（本轮）**：`tools/e2e/verify-repeater-clock.js` 打真实实例 16 项全绿——到秒格式、每秒走字、
+  位于「请求报文」上方、报文区整体下移、边框确实渲染出来、默认居中、页面上不再有左/中/右按钮与左右箭头、
+  鼠标右拖 180px 落点准确、拖完偏移写进 localStorage、往两头的过头拖拽都夹在正文区内、刷新后位置不变且还能继续拖、
+  无页面脚本报错。中途走过一段弯路值得留着：第一版是「三档 + 箭头」，时钟做成绝对定位层而控制钮留在文档流里且没写
+  `ml-auto`，于是控制钮落在行首，与左对齐的时刻糊成一片——边缘位置全对、16 项全绿，是看截图才看出来的。改成整块
+  可拖之后，重叠这一类问题从根上没有了，断言也随之从「不重叠」换成「拖得动、夹得住、记得住」。
+  部署后 #9/#10 两套壳仍直接 `exec`（本轮只改前端与静态导出，密封未动）。
+- **B/D 类缺陷（本轮）**：`TestIntranetHeartbeatSkipsBusySession` 用真 SSH 夹具起一条挂住的命令，断言心跳报
+  「未探测」且失败计数不变；`db.OpenTestSchema` 之后连续两轮 `go test ./...`（并行、不加 `-p 1`）20 包全绿，
+  此前偶发失败的 `TestActivityPageSessions` 不再复现；部署改用仓库根目录的 `Dockerfile`（不再需要 `/tmp` 副本），
+  两条 e2e 从 `tools/e2e/` 运行：内网 SSH 终端 17 项、WebShell 工作台 24 项全绿。密钥扫描：本轮会话用到的
+  签名根密钥、靶机口令、测试库口令在工作树里 0 命中，`postgres://` 形态的匹配全是占位符，唯一的公网 IP 匹配来自
+  `web/node_modules/zod` 的测试夹具（已 gitignore）。
+- **A1-A5 缺陷修复（本轮）**：单测侧新增 `TestShellExecReportsOnlyProbedFamily`（探测没答就不报告系统族，报告了才
+  能被写入台账）、`TestShellOSKindOfFallsBackWithoutCachingFailure` 改为断言 `confirmed=false`（旧版只断言回退值是
+  POSIX，正是它让调用方敢把猜测当事实写进去）、`TestShellChannelErrorWordsDeadlines`（期限到点说「等待超时」，其它
+  错误保持原话）、`TestAuditSealedSecretsCountsUnreadable`（同一把密钥解得开的记录报 0，换一把后按类别报数，且那一行
+  标 `SealBroken` 而不是把密文当口令返回）。浏览器侧：WebShell 工作台 24 项全绿（新增旧协议壳的禁用说明与「明文」徽章
+  两项，夹具建完即删），内网 SSH 终端 17 项全绿（新增系统族下拉切到 Windows cmd 后快捷命令随之更换、切回自动仍可执行、
+  上传结果显示 `exit 0` 徽章三项）。部署后实测：启动日志无 `[seal]` 告警（现存密钥都能解开），#9/#10 两套壳的
+  `os_kind` 与探测结果一致，验证用的任务、凭据与会话已清理。
+- **内网 SSH 会话终端（本轮，真机）**：在 Ubuntu-1 起 sshd（`172.23.0.1:2201`，`lab` 账号），登记凭据 →
+  开 `transport=ssh` 会话 → 浏览器端到端 13 项全绿：对话框四页签（命令/上传/下载/执行记录）、`id; pwd` 回
+  `uid=1000(lab)` 且徽章 `exit 0`、`ls` 不存在的目录红色 stderr + `exit 2`、跳到 `/tmp` 后下一轮 `pwd` 仍在
+  `/tmp`、`sleep 30` 配 15 秒档位显示 `exit 超时` 而不是报错、切到「执行记录」时重新读台账并列出刚跑的命令、
+  全程无页面 JS 错误。截图写在本地 `shots/`（不入库，可用 `tools/e2e/` 的脚本重生成）。后端另有
+  `TestIntranetSSHExecReportsAbandonedWait` 钉住「超时不推进 `last_seen`」。
+- **凭据与模型密钥密封（本轮）**：`db/seal_test.go` 四条用例在独立 schema 里跑真库——写入后列值是 `v1:` 且不含明文、
+  `UNIQUE (host, username, password)` 在密封下仍然把重登记收敛成一行（这是最容易改坏的一条）、从库里读出的行再写回
+  不会被二次封装、明文行由启动迁移收敛且重跑无害、换一把根密钥时列表仍返回该行并标记 `SealBroken` 而不是把密文当
+  口令交出去、`api_key_hint` 仍是明文末四位、`ProfileAPIKeys`（出口指纹）拿到的是明文而不是密文、空 key 更新不丢
+  原 key。生产侧实测：迁移日志「凭据 0 条、模型密钥 3 个已改为密封」，`GET /api/llm` 的 `key_set=true`
+  （该值来自解回明文后的激活配置，解封失败会被清空），新登记的 SSH 凭据列值 `v1:` 且不含口令子串，而会话照常
+  拨号成功。之后第三次 `--force-recreate`：#9/#10 两套壳与 SSH 会话 #1 全部无需重投直接可用。
+- **签名密钥入库（本轮）**：先把运行中容器的 `/app/jwt.key` 备份出来，用同一把值建表并 seed `platform_secret`，
+  再连续 `--force-recreate` **两次**——这正是过去会砖掉一切的操作用法。结果：旧会话令牌仍然通过认证（签名密钥没换），
+  Ubuntu-1 上 #9 PHP / #10 JSP 两套壳**不重投**仍能 `exec`（密封密钥没换），新容器内已不存在 `/app/jwt.key`，
+  日志没有「新 JWT key 已写入」。工作台端到端 21 项在此构建上复跑仍全绿。新增 `server/auth_jwt_key_test.go`
+  覆盖库优先、旧文件迁移、工作区内旧位置迁移、重启复用、插入竞争失败方保留文件、写库失败拒绝启动六种情形；
+  `db/platform_secret_test.go` 覆盖读写、`ON CONFLICT` 收敛、<32 字节拒绝，并断言这把钥匙没有同时躺在 `settings` 里。
+  测试脚本 `mint-session.sh` 也随之改从库里取签名密钥——它读 `/app/jwt.key` 时立刻 `ENOENT`，正好是这次改动的旁证。
+- **WebShell 工作台（本轮，Ubuntu-1 真机）**：在边界靶机上按 API 落两套加密 v2 壳——Apache :8080 的 PHP 壳与
+  Tomcat9 :8081 的 JSP 壳，容器内经桥网关 `172.23.0.1` 访问目标。Playwright 无头端到端 21 项断言全绿：列表两行
+  都「检测→存活」且协议徽章写 `加密 v2`；PHP 终端 `id` 回 `uid=33(www-data)`、退出码 0、当前目录是脚本目录
+  `/var/www/html/assets`（不是 `/`）；`ls` 不存在的目录以红色 stderr + `exit 2` 呈现；目录跳到 `/etc` 后下一轮
+  仍在那儿；`sleep 30` 配 15 秒档位显示 `exit 超时` 与「目标上的命令可能仍在继续」而不是报错；大马列出网站目录
+  文件；系统信息 12 分区一次往返 188ms 并带 PHP 8.1 运行时自述（open_basedir / disable_functions 未限制）；
+  JSP 走同一组件回 `uid=999(tomcat)`，其系统信息对缺少 PHP 自述给出解释；全程无页面 JS 错误。截图存于
+  截图同样写在本地 `shots/`（不入库）。`go test -p 1 -count=1 ./...` 全绿（并行跑 `./...` 时 `db` 包会与
+  `agent`/`intercept` 抢同一张隔离库偶发失败，串行稳定）。
+- 全量 Go 测试 `go test -p 1 -count=1 ./...` 20 包 ok、0 FAIL（本轮实测于 2026-11-02，
+  接隔离库 `jingwei_gotest`，`gofmt -l` 与 `go vet` 无输出）；
+  java-chains 的两条真机用例另配 `JAVA_CHAINS_MCP_TOKEN`/`JAVA_CHAINS_LIVE_TARGET` 单独跑，同样全绿。
+  新增 `scanner/shell_files_*`、
+  `server/webshell_files_test.go`、`server/memshell_manual_test.go`、`scanner/shell_crypto_php_*` 等。
+- **SSH 承载会话与自资产回流（本轮）**：`server/intranet_ssh_test.go` 起一个进程内 `x/crypto/ssh` 服务加一个认得
+  包装脚本的假 POSIX shell，覆盖 SSH 会话的执行、cwd 续用、OS 探测缓存、凭据出证、登录通但无标记即关闭、拒绝把
+  平台自身作为 SSH 目标、经隧道映射的接入地址与身份分离、SSH 会话拒绝 webshell 故障转移；
+  `server/intranet_reflux_test.go` 覆盖 `LiveIntranetTunnelByListen`（`localhost` 拼写、`0.0.0.0` 通配、
+  未部署/端口 0/远端监听都不算命中）、`rewriteScanURL`、审批拒绝把平台自身登记成资产（`task_scope` 仍授权）、
+  隧道监听端口改写成真实内网身份，以及没有 `Proxy` 的普通扫描不参与改写。前端 `tsc --noEmit` 通过。
+- **落地地址覆盖与凭据掩罩（本轮）**：`server/webshell_reinject_test.go` 覆盖同一 `url` 第二次投放不再插行、
+  复用同一条记录（id 不变、载荷/密钥/指纹换掉、状态退回 `unknown`、备注写明覆盖了哪条旧载荷）、台账只留一条
+  active 且旧行以「被覆盖」为原因 released、手工创建重复地址得到 400 且不落库、`webshell_register` 回
+  `already_registered` 并指路 `deploy_path`；`server/intranet_credentials_mask_test.go` 覆盖列表与登记响应里
+  没有 `password` 键也没有明文、`has_password` 为真，以及 `intranet_credentials` 工具仍然把口令交给 agent。
+  新增页签「凭据台账」与 SSH 凭据选择器经 `tsc --noEmit` 通过，并已在生产实例（1.4.0）上补做浏览器视觉验证：
+  页签渲染出两条凭据、整页 DOM 与库中真实口令逐条比对不含明文，「登记凭据」对话框字段齐全，承载方式选 SSH 后
+  「凭据」是下拉选择器（选项为 `#id 账号@主机:端口 · 协议 · 来源`，同样不含口令）且带 SSH 端口 / 登录账号 /
+  接入地址三段——见 `docs/进度与下一步.md`「浏览器视觉验证」。
+- 真实 Tomcat 9 JSP 大马端到端通过；`php -S` 运行时文件管理与半持久化通过。
+- 前端 `tsc --noEmit` 与静态导出构建通过；`build.sh --target linux/amd64`（embedui）通过。
+- **三台 WSL Ubuntu 真机全能力回归**：边界机 Ubuntu-1 提供 PHP 漏洞站（:8080，file/search/upload/tools/backup）、
+  Tomcat9 `/lab/`（:8081，deser.jsp + upload.jsp）、MySQL（:3306/:3307）与 sshd（:2201），另有仅经隧道可达的
+  10.99.0.0/24 内网段；平台侧跑独立实例 `jingwei-lab`（`--network host -addr 127.0.0.1:9797 -proxy 127.0.0.1:9798`、
+  独立库 `jingwei_lab`），生产实例与生产库全程不参与。
+- **无 LLM 扫描 + 固定渗透基线**：3 个扫描任务 `done`——资产 6-10、开放端口 5-9、应用层系统 8、基线页面 12 与
+  参数点 18、弱口令命中 1、服务暴露发现 1-2；full 模式（347 模板、nuclei 333s）得 8 条发现，并自动派发 6 个深度
+  任务（4 条确认、19 条利用记录）。经 SOCKS5 隧道的内网扫描同样 `done`，内网资产按台账回流。
+- **WebShell v2 / 大马 / PHP 半持久化 / 内存马**：PHP 与 JSP v2 壳在真实 Apache 与 Tomcat9 上握手、执行、
+  轮换密钥与自删除全链路通过；大马文件管理（列表/分块读写/重命名/权限/递归删除）与半持久化 prepend 落到台账并可撤销；
+  Filter / Servlet / Listener / Valve / Agent 五类内存马注入后按验证式移除复核。
+- **P3 权限维持 + P4 撤离**：落地物台账累计 14 条（cron / systemd / user_systemd / profile / at / ssh_key /
+  php_htaccess），逐条部署验证后按 id 逆序撤销，终态全部 `revoked`，残留复核报「未发现残留」——这里的残留判定
+  由目标侧验证命令实态给出，不是台账改状态。
+- **有 LLM 深挖**：任务 4（钉住 profile 352、`seed_first_intent`、超时 1800s）终态 `done`，5 个目标全部 met、
+  6 条确认发现（4 critical / 2 high），每条都带可复现的原始请求/响应报文；对 `search.php?host=` 给出的是
+  「参数不进命令拼接」的反证并定位到真实 sink `tools/ping.php`，没有顺着任务描述硬凑成功；`llm_records` 抓到了
+  worker 的调用与用量；`GET /api/report?task=4` 输出 15333 字节 Markdown。
+- **超时收尾时序**（同一条任务实测）：`首次运行盖章 → 到点进入收尾 → drain 1m30s → 硬取消在跑 run → 终局一轮判定
+  5/5 → 收尾完成,终态=done`；被打断的意图如实写回 `exhausted`，未谎称完成。
+- **java-chains 只到降级路径**：本机拿不到 sidecar 镜像（Docker Hub 经代理不可达），MCP 探活报 `no such host`，
+  深挖按约定把「该能力不可用」连同原因写进结论，不虚构反序列化利用成功；构造 payload 的正路径仍未验证
+  （已于同日补验，见下条「java-chains 正路径端到端」）。
+- **java-chains 正路径端到端（2026-11-02 补验）**：这一轮 sidecar 镜像能正常拉到，于是用真
+  `javachains/javachains:2.0.0-beta7` + Ubuntu-1 Tomcat9/JDK17 上的 fastjson 型 JNDI sink
+  （读 body 的 `dataSourceName` 后 `new InitialContext().lookup(...)`，`/root/lab-ubuntu/u1-java-jndi.sh`）
+  跑通自动链路的真实入口 `runJavaChains`：预设 `java.fastjson.jndi` 被选中、
+  JNDI 引用发布成功（`service.bound.host=0.0.0.0`、token 形如 `ed3d96ee…`）、
+  把模板里的 `ldap://{{interactsh-url}}/jwlab` 改写成 `ldap://127.0.0.1:50389/<token>` 并投递原始报文，
+  侧车 `runtime_logs` 出现该 token 的 `outcome=lookup` 与 `outcome=serve`，记录因此是
+  `verdict=confirmed`（证据含请求/响应原文与 `outcome=`）而不是「已投递」；回调端口登记成受管资源，
+  任务结束后 JNDI 发布数归零、服务停止、台账行 released。上述两条断言固化为
+  `server/java_chains_deep_live_test.go`（缺 `JAVA_CHAINS_MCP_TOKEN`/`JAVA_CHAINS_LIVE_TARGET` 时 `t.Skip`，
+  不会把真机依赖带进 `go test ./...`），另一条 `TestJavaChainsLiveRepairsStaleListenBind` 先把服务起在
+  `127.0.0.1` 再要求 `0.0.0.0`，验证平台察觉 `bound.host` 不一致后重启并重新发布、仍然确认回连。
+  JDK17 上 lookup 到达侧车后对象反序列化被 JDK 自己的 `trustSerialData` 默认值拒掉
+  （`Object deserialization is not allowed`），这不影响「目标确实回连」的判定。也正是在这次实跑里暴露了
+  【修复】的「回调端口在容器里没有人在听」与「已运行时换绑被静默忽略」两项——之前两轮回归都只跑到降级路径，
+  没机会看见。
+- **本轮修掉的两处假干净**：LLM 裸 HTTP 上传的 12 个可执行文件不在任何台账里（撤离报「未发现残留」，最后人工
+  `rm` 后逐个复核 404，见【修复】「LLM 用裸 HTTP 上传的可执行文件不进任何台账」条）；nuclei 超时文案报
+  「已保留 0 条结果」而同一行 summary 里写着 `results:2 / findings:2`（见【修复】「nuclei 超时把已拿到的结果
+  连同报错一起丢掉」条）。
+- **靶机残留核验**：验证结束后 Ubuntu-1 上 `/var/www/html/upload/` 与 `/var/lib/tomcat9/webapps/lab/upload/` 均空、
+  无 `jingwei-*` systemd 单元、无 crontab / at 任务、无 `authorized_keys`、无 `.profile` 注入、无 chisel/socat 进程，
+  监听端口只剩靶场自身服务。
+- **靶机收摊（2026-11-02）**：按「停服务、保留软件包」处置——Ubuntu-1 `systemctl stop apache2 apache-htcacheclean
+  tomcat9 mysql ssh`、Ubuntu-2 `systemctl stop lab-release ssh`、Ubuntu-3 `systemctl stop lab-panel mysql ssh`。
+  四个 WSL 发行版共用 mirrored 网络，任一发行版内 `ss -lntp` 即可复核全部监听：2201/2202/2203/3306/3307/8080/8081/
+  8090/8091 全部消失，只剩生产实例的 9790 / 9791 / 55432 与只监听回环的测试库 55433（跑 go test 时按需起停）。
+  apt 包、`/var/www/html`、`webapps/lab`、`/opt/release`、
+  `/opt/panel` 与弱口令账号原样保留（unit 仍 `enabled`，下次验证 `systemctl start` 即复用）；部署脚本留在
+  `/root/lab-ubuntu`，其中本轮生成的口令已全部换成占位符，重建步骤见其 `README.md`。
+
+### 升级
+
+- **生产实例已切到 1.4.0（2026-11-02）**：`jingwei-jingwei-1` 从 `jingwei:1.3.1` 换成用当前工作树构建的
+  `jingwei:1.4.0`，只重建应用容器（`docker compose up -d --no-deps jingwei`），PostgreSQL 未动。升级前留好回滚点：
+  `pg_dump` 到 `/root/backups/jingwei-pre-1.4.0-*.dump`、`.env` 备份、旧镜像 tag `jingwei:1.3.1` 保留。
+  核对项全部通过：`GET /api/health` 返回 `version=1.4.0`；9790/9791 正常监听、登录页 200；各表行数与升级前一致
+  （scan_tasks 10、deep_tasks 17、webshells 3、managed_resources 6、findings 13、exploit_records 15、assets 52、
+  intranet_credentials 2、poc_templates 13141、intranet_tunnels 0）；`intranet_tunnels.listen_side` 由启动迁移自动
+  补上；容器环境里 `JAVA_CHAINS_LISTEN_BIND=0.0.0.0` 与 `JAVA_CHAINS_CALLBACK_BIND=127.0.0.1` 各司其职（远端目标要
+  回连仍须按 `deploy/JAVA_CHAINS.md` 改回调发布地址）；镜像内 `import socks` 可用（1.7.1）；服务出的前端 chunk 与
+  本地构建 md5 相同、含「凭据台账」与「登记凭据」，确认新 UI 真在跑而不是只有后端。
+- **升级后不必再重新登录、也不必重投 webshell**：1.3.1 把签名密钥移出可浏览工作区落到 `/app`（不在持久卷内），
+  此后每次容器重建都重新铸一把——所有人掉登录、所有已投放的壳解封失败要重投。本版把密钥移进数据库并在首次启动
+  时把旧文件原样搬进去，因此从 1.3.1/1.4.0 早期镜像升级时**只要旧容器里的 `/app/jwt.key` 还在**就能无损过渡；容器
+  已经被重建过、密钥已经换过的实例，则仍需重新投放一次载荷（此后不再轮换）。数据库本身仍是唯一需要备份的东西。
+- **构建环境的一处障碍**：docker daemon 的 systemd drop-in 里 `HTTP(S)_PROXY=127.0.0.1:7890` 指向一个没在监听的代理，
+  `# syntax=docker/dockerfile:1` 因此解析失败（也解释了此前几轮 sidecar 镜像拉不动）。本次不改系统配置，改用去掉
+  `# syntax=` 行的 Dockerfile 副本构建（本 Dockerfile 不用 heredoc / `--link` / secret 挂载，Docker 28.5.2 内置前端够用）。
+- 本版代码仍未提交（未获授权 commit/push），1.4.0 镜像由工作树直接构建。
+
 ## [1.3.1] - 2026-11-01
 
 本版修复 1.3.0 自测发现的两项平台认证问题：登录入口缺少验证码、速率限制与请求超时；
@@ -104,6 +510,19 @@ HttpOnly Cookie，修改密码会立即吊销全部旧会话。
 - 新增 `intranet_credentials`、`intranet_artifacts` 表，服务启动时自动建表，无需手工迁移。
 - 从 v1.2.2 升级只需替换镜像标签；原有配置与数据继续可用。
 
+## [1.2.2] - 2026-10-30
+
+文档补丁，功能与 1.2.1 相同。
+
+### 文档
+
+- README 增加微信公众号「网安智界」交流二维码，删除未引用的旧二维码图片。
+- 部署文档、Compose 默认镜像标签与前端包版本同步更新到 1.2.2。
+
+### 升级
+
+- 从 1.2.1 升级只需替换镜像标签，无需数据库迁移或配置变更。
+
 ## [1.2.1] - 2026-10-30
 
 发布包清理补丁，功能与 1.2.0 相同。
@@ -120,19 +539,6 @@ HttpOnly Cookie，修改密码会立即吊销全部旧会话。
 ### 升级
 
 - 从 1.2.0 升级只需替换镜像标签，无需数据库迁移或配置变更。
-
-## [1.2.2] - 2026-10-30
-
-文档补丁，功能与 1.2.1 相同。
-
-### 文档
-
-- README 增加微信公众号「网安智界」交流二维码，删除未引用的旧二维码图片。
-- 部署文档、Compose 默认镜像标签与前端包版本同步更新到 1.2.2。
-
-### 升级
-
-- 从 1.2.1 升级只需替换镜像标签，无需数据库迁移或配置变更。
 
 ## [1.2.0] - 2026-10-30
 

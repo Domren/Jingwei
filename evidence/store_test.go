@@ -58,10 +58,28 @@ func evidenceFixture(t *testing.T) (*Store, db.RecordFindingInput, string) {
 // time it was written.
 func purgeEvidenceFixture(t *testing.T, pg *db.DB, taskID int64, capturedSince time.Time) {
 	t.Helper()
-	var snapshotIDs []string
-	if err := pg.QueryRow(`SELECT COALESCE(array_agg(DISTINCT b.snapshot_id), '{}'::text[])::text[]
-FROM finding_traffic_bindings b JOIN findings f ON f.id=b.finding_id WHERE f.task_id=$1`, taskID).Scan(&snapshotIDs); err != nil {
+	// Read the ids as rows, not as a text[] aggregate: database/sql cannot assign
+	// a driver string into *[]string, and this helper swallows its errors as logs,
+	// so a failed read silently left the fixture's snapshots behind for the next
+	// run to trip over.
+	snapshotIDs := []string{}
+	rows, err := pg.Query(`SELECT DISTINCT b.snapshot_id
+FROM finding_traffic_bindings b JOIN findings f ON f.id=b.finding_id WHERE f.task_id=$1`, taskID)
+	if err != nil {
 		t.Logf("读取夹具快照失败(task=%d): %v", taskID, err)
+	} else {
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				t.Logf("读取夹具快照失败(task=%d): %v", taskID, err)
+				break
+			}
+			snapshotIDs = append(snapshotIDs, id)
+		}
+		if err := rows.Err(); err != nil {
+			t.Logf("读取夹具快照失败(task=%d): %v", taskID, err)
+		}
+		_ = rows.Close()
 	}
 	// The event payload keeps the task id even after the test deleted the finding
 	// itself, so the join alone would miss those events.
@@ -435,18 +453,25 @@ func TestSaveRawExchangesPersistsReproductionSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The capture instant is part of the snapshot identity, so leaving it unset
+	// would stamp both saves with "now" — and a save that straddles a second
+	// boundary would legitimately produce four snapshots, which is what this
+	// assertion kept reporting as a dedupe failure under parallel load.
+	capturedAt := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC).Unix()
 	exchanges := []RawExchange{
 		{
-			Request:  "POST /exploit HTTP/1.1\r\nHost: fixture.local\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nx=1",
-			Response: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nqueued",
-			Role:     "supporting",
-			Note:     "exploit request",
+			Request:    "POST /exploit HTTP/1.1\r\nHost: fixture.local\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nx=1",
+			Response:   "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nqueued",
+			Role:       "supporting",
+			Note:       "exploit request",
+			CapturedAt: capturedAt,
 		},
 		{
-			Request:  "GET /proof HTTP/1.1\r\nHost: fixture.local\r\n\r\n",
-			Response: "HTTP/1.1 200 OK\r\n\r\nsecret",
-			Role:     "proof",
-			Note:     "proof request",
+			Request:    "GET /proof HTTP/1.1\r\nHost: fixture.local\r\n\r\n",
+			Response:   "HTTP/1.1 200 OK\r\n\r\nsecret",
+			Role:       "proof",
+			Note:       "proof request",
+			CapturedAt: capturedAt,
 		},
 	}
 	if err = s.SaveRawExchanges(ctx, rec.FindingID, exchanges); err != nil {
