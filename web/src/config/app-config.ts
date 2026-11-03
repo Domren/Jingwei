@@ -8,6 +8,7 @@ export const APP_CONFIG = {
   copyright: `© ${currentYear}, Jingwei (精卫).`,
   meta: {
     title: "Jingwei（精卫）— 自主渗透测试控制台",
-    description: "LLM 驱动的全链自动化红队渗透平台",
+    description:
+      "不配 LLM 也能跑的自动化红队渗透平台：端口探测、Web 指纹、POC 命中与 sqlmap / dalfox 专项验证全程不依赖模型；配置 LLM 后自动规划、深挖与利用闭环。",
   },
 };

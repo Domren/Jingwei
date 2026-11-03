@@ -2,7 +2,7 @@
 
 # Jingwei（精卫）
 
-LLM 驱动的全链自动化红队渗透平台 · Docker 分发版
+自动化红队渗透平台 · 不配 LLM 也能扫描与验证，配上 LLM 则全链自动规划与深挖 · Docker 分发版
 
 [![Release](https://img.shields.io/github/v/release/Domren/Jingwei?label=release)](https://github.com/Domren/Jingwei/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
