@@ -345,7 +345,7 @@
 - **WebShell v2 / 大马 / PHP 半持久化 / 内存马**：PHP 与 JSP v2 壳在真实 Apache 与 Tomcat9 上握手、执行、
   轮换密钥与自删除全链路通过；大马文件管理（列表/分块读写/重命名/权限/递归删除）与半持久化 prepend 落到台账并可撤销；
   Filter / Servlet / Listener / Valve / Agent 五类内存马注入后按验证式移除复核。
-- **P3 权限维持 + P4 撤离**：落地物台账累计 14 条（cron / systemd / user_systemd / profile / at / ssh_key /
+- **权限维持与撤离**：落地物台账累计 14 条（cron / systemd / user_systemd / profile / at / ssh_key /
   php_htaccess），逐条部署验证后按 id 逆序撤销，终态全部 `revoked`，残留复核报「未发现残留」——这里的残留判定
   由目标侧验证命令实态给出，不是台账改状态。
 - **有 LLM 深挖**：任务 4（钉住 profile 352、`seed_first_intent`、超时 1800s）终态 `done`，5 个目标全部 met、
@@ -456,16 +456,16 @@ HttpOnly Cookie，修改密码会立即吊销全部旧会话。
 
 ### 新增
 
-- **P1 利用闭环**：sqlmap 确认注入后评估账户与 DBA 权限，按影响升级严重级；弱口令确认
+- **利用闭环**：sqlmap 确认注入后评估账户与 DBA 权限，按影响升级严重级；弱口令确认
   后自动排队 Webshell 注入任务，避免同一主机重复上传。
-- **P2 内网横向**：`intranet_recon` 收集网卡、路由、ARP、监听端口；凭据台账记录来源与
+- **内网横向**：`intranet_recon` 收集网卡、路由、ARP、监听端口；凭据台账记录来源与
   原始证据，跨主机精确复用前先验证；隧道支持 SOCKS5 与端口转发两阶段生命周期；目标扫描、
   弱口令、深度利用子任务均可经隧道代理出站；支持范围审批与任务交接；Windows 会话支持
   cmd 探测与执行。
-- **P3 权限维持**：`intranet_artifacts` 可撤销落地物台账，每条记录带部署、验证、撤销
+- **权限维持**：`intranet_artifacts` 可撤销落地物台账，每条记录带部署、验证、撤销
   命令与执行证据；Linux 标准模块 cron、systemd、ssh_key，Windows 标准模块计划任务
   （schtasks）与注册表启动项；上传文件自动登记为待清理落地物。
-- **P4 撤离清理**：按台账 id 倒序撤销并逐条验证，随后拆除隧道、释放受管回调与监听、
+- **撤离清理**：按台账 id 倒序撤销并逐条验证，随后拆除隧道、释放受管回调与监听、
   关闭会话；失败项保持 active 供重试，Webshell 作为残留明确列出；提供撤离预览、执行
   API、LLM 工具与撤离报告。
 - **深挖与验证**：上传表单字段自动解析并复用到 Webshell 链；注入基线任务的结果通过
@@ -496,7 +496,7 @@ HttpOnly Cookie，修改密码会立即吊销全部旧会话。
 
 ### 验证
 
-- Windows 目标 d54f：P1 取权、P2 横向、P3 计划任务与注册表维持、P4 逆序撤离均实测通过。
+- Windows 目标 d54f：取权、内网横向、计划任务与注册表维持、按台账逆序撤离均实测通过。
 - Linux 目标 jw-linux-p3（systemd 252 / Debian 12）：cron、systemd、ssh_key 三类模块的
   部署、验证、载荷执行与撤销全部通过，`crontab` 与文件确认清理。
 - 无 LLM 扫描 #11：nuclei 55 条模板分三组正常执行，基线枚举 `?id=1` 并排队 sqlmap，
