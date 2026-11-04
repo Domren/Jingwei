@@ -743,9 +743,29 @@ func checkShellAliveV2(ctx context.Context, c *DeepClient, shellURL string, p Sh
 		return false, fmt.Sprintf("HTTP %d（认证失败或 shell 已失效）", resp.StatusCode)
 	}
 	if _, err := decodeShellResponse(p, resp.Body); err != nil {
-		return false, err.Error()
+		return false, v2AliveNote(resp.Body, err)
 	}
 	return true, "加密通道验证通过"
+}
+
+// v2AliveNote separates「这个文件不是精卫生成的载荷」from「密钥或壳不对」. A plain PHP
+// file answers HTTP 200 with whatever it echoes, and that text never had a chance
+// of being a v2 envelope — reporting "令牌版本不匹配（可能密钥不匹配）" sends the
+// operator off to rotate a key on a file that is not a shell at all.
+func v2AliveNote(body string, err error) string {
+	t := strings.TrimSpace(body)
+	raw, derr := base64.RawURLEncoding.DecodeString(t)
+	if derr == nil && len(raw) >= shellV2GCMHeader+aes.BlockSize {
+		// 长度与编码都对得上，才真的是协议层的问题（密钥、版本、重放窗口）。
+		return err.Error()
+	}
+	preview := []rune(t)
+	if len(preview) > 48 {
+		preview = append(preview[:48], []rune("…")...)
+	}
+	return fmt.Sprintf("目标回显的不是加密 v2 协议报文（%d 字节：%q）——该文件很可能不是精卫生成的载荷；"+
+		"要接管它，用 webshell_register 带 session_id + deploy_path，由平台把正确载荷写到该路径后再登记",
+		len(t), string(preview))
 }
 
 // RotateShellKey asks the deployed shell to switch to newKey. The request is
