@@ -26,8 +26,13 @@ web/public/demo-version.json
 *.swp
 *.swo
 
-# docs
-/docs/
+# docs：四份工作手册随代码走（入库范围与脱敏记录见 docs/README.md）。
+# 不入库的是：对外宣传物料（含 2.3MB 封面二进制）、在线靶场的原始证据（含第三方平台
+# 会话与提交流水）、以及逐轮历史记录 进度与下一步.md（含在线平台账号与私有文档链接）。
+/docs/公众号-*.md
+/docs/公众号封面-*.png
+/docs/online-lab-*/
+/docs/进度与下一步.md
 
 # os
 .DS_Store
