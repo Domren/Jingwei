@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **镜像构建可以在无代理网络下完成**：Dockerfile 新增 `NPM_REGISTRY` 构建参数，
+  预装 `@playwright/*` 那一步原来只能直连 `registry.npmjs.org`，在国内网络下报
+  `npm error network … behind a proxy` 导致构建失败；留空时行为与之前完全一致（CI 不受影响），
+  本机构建传 `--build-arg NPM_REGISTRY=https://registry.npmmirror.com` 即可。与已有的
+  `PLAYWRIGHT_DOWNLOAD_HOST`、Node 二进制换源保持同一套思路。
+
 ### 新增
 
 - **弱口令检测地基**：`scanner/target.go` 的目标解析支持显式端口——`ip:port`、`[ipv6]:port`、

@@ -108,8 +108,12 @@ RUN set -eux; \
 # 这样容器内 MCP/CLI 首次启动即可用，不再联网下载浏览器。
 # 浏览器下载源可覆盖：官方 CDN 在部分网络下会中途断连，默认使用国内镜像。
 ARG PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
+# npm 源可覆盖：装 @playwright/* 时直连 registry.npmjs.org 在部分网络下会失败
+# （npm 报 "you are behind a proxy or have bad network settings"）。留空＝用 npm 默认源，
+# CI 行为不变；本机构建传 --build-arg NPM_REGISTRY=https://registry.npmmirror.com 即可。
+ARG NPM_REGISTRY=
 RUN export PLAYWRIGHT_DOWNLOAD_HOST="${PLAYWRIGHT_DOWNLOAD_HOST}" \
-    && npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest \
+    && npm install -g ${NPM_REGISTRY:+--registry=${NPM_REGISTRY}} @playwright/mcp@latest @playwright/cli@latest playwright@latest \
     && playwright-cli --help \
     && (playwright install --with-deps chromium || echo "WARN: playwright chromium install failed, browser features degraded") \
     && rm -rf /var/lib/apt/lists/*
