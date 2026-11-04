@@ -6,6 +6,14 @@
 
 ### 修复
 
+- **隧道自动选型里 ssh 与 chisel 共用一个端口**：`JINGWEI_PIVOT_SERVER` 的端口既被 chisel client 用来拨控制端，
+  又被生成的 `ssh -D` / `ssh -L` 当成 sshd 端口，而现实中 chisel 常在 8788、sshd 在 22 —— 只有一个值时
+  必然有一条路是错的（目标会去 ssh 登录 chisel 端口）。新增 `JINGWEI_PIVOT_SSH_PORT`（留空＝22）只作用于
+  ssh 变体，chisel 仍用 `JINGWEI_PIVOT_SERVER` 自带端口；该值非法时拒绝生成命令并点名变量，
+  不退回 22 假装成功。
+
+### 修复
+
 - **镜像构建可以在无代理网络下完成**：Dockerfile 新增 `NPM_REGISTRY` 构建参数，
   预装 `@playwright/*` 那一步原来只能直连 `registry.npmjs.org`，在国内网络下报
   `npm error network … behind a proxy` 导致构建失败；留空时行为与之前完全一致（CI 不受影响），

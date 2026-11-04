@@ -1296,6 +1296,22 @@ func intranetPivotEndpoint() (string, error) {
 	return intranetHostPort(host, port), nil
 }
 
+// intranetPivotSSHPort returns the port the SSH variants of a tunnel dial.
+// It cannot reuse JINGWEI_PIVOT_SERVER's port: that one is chisel's server port
+// (8788 by default), while sshd is nearly always 22 — one value cannot serve both,
+// and the generated `ssh -D`/`ssh -L` would otherwise try to log into chisel.
+func intranetPivotSSHPort() (int, error) {
+	raw := strings.TrimSpace(os.Getenv("JINGWEI_PIVOT_SSH_PORT"))
+	if raw == "" {
+		return 22, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 || n > 65535 {
+		return 0, fmt.Errorf("JINGWEI_PIVOT_SSH_PORT 无效（应为 1-65535）: %s", raw)
+	}
+	return n, nil
+}
+
 // autoSelectTunnelCommand picks the best deployment command based on what tools
 // are available on the target. 隧道自动选型：目标上有什么就用什么，优先选
 // 功能最强的工具（chisel > ssh > socat），而不是让操作员自己猜。
@@ -1309,7 +1325,8 @@ func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.Intranet
 	listenPort := t.ListenPort
 	remoteHost := t.RemoteHost
 	remotePort := t.RemotePort
-	pivotHost, pivotPort, pivotErr := intranetPivotServer()
+	// 端口不在这里取：chisel 用 JINGWEI_PIVOT_SERVER 的端口，ssh 变体用 intranetPivotSSHPort。
+	pivotHost, _, pivotErr := intranetPivotServer()
 	listenSide = db.IntranetListenSideTarget
 
 	switch kind {
@@ -1331,9 +1348,14 @@ func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.Intranet
 			if pivotErr != nil {
 				return "", pivotErr.Error(), listenSide
 			}
+			sshPort, sshErr := intranetPivotSSHPort()
+			if sshErr != nil {
+				return "", sshErr.Error(), listenSide
+			}
 			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("ssh -N -D 0.0.0.0:%d -p %d -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s",
-				listenPort, pivotPort, shQuote(pivotHost)))
+				listenPort, sshPort, shQuote(pivotHost)))
 			reason = "目标有 ssh，用 ssh -D 建 SOCKS5（目标监听 " + strconv.Itoa(listenPort) +
+				"，回连控制端 " + pivotHost + ":" + strconv.Itoa(sshPort) +
 				"；BatchMode 下要求目标到控制端已免密，否则会立刻失败而不是卡在口令提示。注意 -D 的出口在控制端，" +
 				"只能让目标借用控制端的网络，不能用于访问控制端不可达的内网段）"
 		} else {
@@ -1358,9 +1380,14 @@ func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.Intranet
 			if pivotErr != nil {
 				return "", pivotErr.Error(), listenSide
 			}
+			sshPort, sshErr := intranetPivotSSHPort()
+			if sshErr != nil {
+				return "", sshErr.Error(), listenSide
+			}
 			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("ssh -N -L %d:%s:%d -p %d -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s",
-				listenPort, remoteHost, remotePort, pivotPort, shQuote(pivotHost)))
-			reason = "目标没有 socat，用 ssh -L 做端口转发（注意：-L 的目的地由控制端发起，" +
+				listenPort, remoteHost, remotePort, sshPort, shQuote(pivotHost)))
+			reason = "目标没有 socat，用 ssh -L 做端口转发（回连控制端 " + pivotHost + ":" + strconv.Itoa(sshPort) +
+				"；注意：-L 的目的地由控制端发起，" +
 				"只有控制端也能访问 " + remoteHost + " 时才有意义；穿透到控制端不可达的内网段请改用 socat/chisel 或手工 deploy_command）"
 		} else if intranetHasBin(info, "chisel") {
 			if pivotErr != nil {

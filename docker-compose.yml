@@ -48,6 +48,8 @@ services:
       # 内网隧道的控制端地址：目标可访问的 host:port，裸主机名默认按 chisel 的 8788 处理。
       # 不配它，自动生成 chisel / ssh -D / ssh -L 部署命令这条路整个关着。
       JINGWEI_PIVOT_SERVER: ${JINGWEI_PIVOT_SERVER:-}
+      # ssh -D / ssh -L 回连控制端用的端口（sshd 常在 22，与 chisel 的 8788 不是一回事）。留空＝22。
+      JINGWEI_PIVOT_SSH_PORT: ${JINGWEI_PIVOT_SSH_PORT:-}
       # 单次模型调用的总墙钟（含 SDK 重试与流式读取），默认 15m；网关变慢时可调小。
       JINGWEI_LLM_CALL_TIMEOUT: ${JINGWEI_LLM_CALL_TIMEOUT:-}
       # false/0/off 关闭流式输出（默认流式）。
