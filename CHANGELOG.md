@@ -6,7 +6,38 @@
 
 ### 新增
 
-- 暂无。
+- **弱口令检测地基**：`scanner/target.go` 的目标解析支持显式端口——`ip:port`、`[ipv6]:port`、
+  `domain:port` 与带端口的 URL 都能解析，新增 `Target.Port`（只在输入写明端口时非零），
+  作为弱口令检测三级端口决策的第一级；端口写错（0 / 65536 / 非数字 / 结尾裸冒号）明确报
+  「端口无效」而不是退化成猜主机名，`host:port` 带路径、网段带端口都被拒绝，去重键纳入端口
+  （`10.0.0.1` 与 `10.0.0.1:2222` 不再互相吞掉）。IPv6 仍统一报「仅支持 IPv4」，与后续 IPv6 支持一并规划。
+
+## [1.4.2] - 2026-11-04（部署侧修复：环境变量注入面与端口覆盖）
+
+### 新增
+
+- **部署期可注入的运行时开关补齐**：`JINGWEI_PIVOT_SERVER`（内网隧道的控制端地址）、
+  `JINGWEI_GUARD_ENFORCEMENT`、`JINGWEI_WEBSHELL_TTL_HOURS` / `JINGWEI_MEMSHELL_TTL_HOURS`、
+  `JINGWEI_LLM_STREAM`、`JINGWEI_BTW_MAX_OUTPUT_TOKENS`、`JINGWEI_WEBCRACK_BRIDGE` /
+  `JINGWEI_WEBCRACK_PYTHON`、`JINGWEI_CONFIG` / `JINGWEI_SKILL_DIR` 现在都能从 `.env` 进容器。
+  此前 compose 是白名单式注入，这些变量代码在读、部署却配不上——其中
+  `JINGWEI_PIVOT_SERVER` 缺失会让 chisel / `ssh -D` / `ssh -L` 的隧道自动选型在真实实例上整体不可用
+  （`plan` 只会返回「未配置」），而它连 `.env.example` 都没进过。
+- **`tools/envaudit` 审计测试**：源码（非测试文件）里读的每一个环境变量，必须在两份 compose 与
+  `.env.example` 里都有落点，或在豁免表里写明理由；漏掉任何一个就测试失败。这道锁是为了让
+  「配置了也没用」这类缺陷不再复发。
+
+### 修复
+
+- 根目录 `docker-compose.yml` 的监听端口此前写死为 `9790/9791`，DEPLOY §10.3 让操作员改
+  `JINGWEI_WEB_PORT` / `JINGWEI_PROXY_PORT` 其实不起作用；现在与 `deploy/docker-compose.yml` 一致。
+- 根 compose 支持 `JINGWEI_PG_DSN` 覆盖（口令含需转义字符或数据库不在本 compose 里时的逃生口），
+  与 deploy compose 对齐。
+
+### 文档
+
+- DEPLOY §4 补充控制端地址与运行时开关的语义和默认值；§10.2 补充「拉取镜像失败往往是 dockerd 的
+  代理进程没在监听」的判读方法，并说明它只影响拉取、不影响本地构建与运行。
 
 ## [1.4.1] - 2026-11-04（安全加固：cookie 同站门、策略失败关闭、工作区固定根）
 

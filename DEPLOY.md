@@ -1,6 +1,6 @@
 # Jingwei（精卫）Docker 部署指南
 
-适用版本：**v1.4.1**。Jingwei 自 1.0.0 起只通过容器镜像分发，
+适用版本：**v1.4.2**。Jingwei 自 1.0.0 起只通过容器镜像分发，
 部署、升级和回滚都使用 Docker Compose。
 
 - 镜像：`ghcr.io/domren/jingwei`
@@ -26,7 +26,7 @@ LLM 不是启动必需项，但对话、任务执行和 Agent 自动规划需要
 ### 2.1 使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.4.1 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.4.2 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 ```
@@ -35,8 +35,8 @@ cp .env.example .env
 
 ```bash
 mkdir -p jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.4.1/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.4.1/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.4.2/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.4.2/deploy/.env.example
 ```
 
 两种方式得到的目录结构相同：
@@ -52,7 +52,7 @@ curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.4.1/deploy/
 镜像默认发布到 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.4.1
+docker pull ghcr.io/domren/jingwei:1.4.2
 ```
 
 维护者把 Package 可见性设为 **Public** 后，以上命令无需登录。
@@ -70,9 +70,9 @@ unset GHCR_TOKEN
 
 | 标签 | 说明 |
 | --- | --- |
-| `1.4.1` / `v1.4.1` | 固定版本，生产环境推荐 |
+| `1.4.2` / `v1.4.2` | 固定版本，生产环境推荐 |
 | `latest` | 最新正式版 |
-| `v1.4.1-amd64` / `v1.4.1-arm64` | 单架构中间镜像，一般不用 |
+| `v1.4.2-amd64` / `v1.4.2-arm64` | 单架构中间镜像，一般不用 |
 
 ## 4. 配置 `.env`
 
@@ -82,7 +82,7 @@ unset GHCR_TOKEN
 POSTGRES_USER=jingwei
 POSTGRES_PASSWORD=请替换为强随机密码
 POSTGRES_DB=jingwei
-JINGWEI_IMAGE=ghcr.io/domren/jingwei:1.4.1
+JINGWEI_IMAGE=ghcr.io/domren/jingwei:1.4.2
 JINGWEI_WEB_PORT=9790
 JINGWEI_PROXY_PORT=9791
 ```
@@ -104,6 +104,19 @@ JINGWEI_PROXY_PORT=9791
   此时调小为 `300s` 可让 worker 尽快放弃卡住的那一次并继续推进。
 - 如果需要限制访问来源，建议保持 `JINGWEI_PROXY_PORT` 只绑定 `127.0.0.1`，
   公网只开放反向代理端口。
+- **内网横向前必须先配 `JINGWEI_PIVOT_SERVER`**：隧道（chisel / `ssh -D` / `ssh -L`）的自动部署命令
+  需要一个**目标机能访问到**的控制端地址，格式 `host:port`（只写主机名时按 chisel 默认的 8788 处理）。
+  没配时深度利用的隧道「自动生成」会直接返回「未配置 JINGWEI_PIVOT_SERVER」，只能手写 `deploy_command`。
+  单机组网常见填法是宿主机在靶机可达网段的地址；这个地址会被写进下发到目标机的命令里，
+  所以别用公网监听口，用完把控制端端口关掉。
+- 其余运行时开关都在 `.env.example` 里带注释列出，留空即用内置默认值，改完需要
+  `docker compose up -d` 重建容器才生效（`restart` 不会重读 `.env`）。其中两条与安全行为有关：
+  `JINGWEI_GUARD_ENFORCEMENT` 默认 `strict`（读不到授权范围即拒绝），改成 `warn`/`off` 是主动放宽边界，
+  只在确认误伤且能承担后果时使用；`JINGWEI_WEBSHELL_TTL_HOURS` / `JINGWEI_MEMSHELL_TTL_HOURS`
+  控制落地物自动过期时间，长跑任务别把它调到超出作业窗口。
+- 仓库自带一份 `.env.example` 与两份 compose：根目录 `docker-compose.yml`（源码构建 / 本机自测）和
+  `deploy/docker-compose.yml`（Release 里给用户的）。两者的可注入变量由
+  `go test ./tools/envaudit/` 保持同步，新增运行时开关时那份测试会拦住漏写。
 
 ## 5. 启动与验收
 
@@ -117,7 +130,7 @@ curl -fsS http://127.0.0.1:9790/api/health
 期望健康检查返回：
 
 ```json
-{"ok":true,"service":"jingwei","version":"1.4.1"}
+{"ok":true,"service":"jingwei","version":"1.4.2"}
 ```
 
 从 v1.1.0 升级时注意：环境变量前缀已由 `ARTEX_` 改为 `JINGWEI_`，旧变量不再读取。
@@ -340,9 +353,9 @@ rm -rf server/webui/dist
 cp -r web/out server/webui/dist
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.4.1" -o dist/amd64/jingwei ./cmd/jingwei
+  -ldflags "-s -w -X main.version=1.4.2" -o dist/amd64/jingwei ./cmd/jingwei
 
-docker build --network=host --build-arg TARGETARCH=amd64 -t jingwei:1.4.1 .
+docker build --network=host --build-arg TARGETARCH=amd64 -t jingwei:1.4.2 .
 ```
 
 ARM64 构建时把 `GOARCH` 与 `TARGETARCH` 改为 `arm64`，并在对应架构的机器上
@@ -375,9 +388,14 @@ docker compose logs --tail=100 postgres
 
 ### 10.2 无法拉取 GHCR 镜像
 
-- 确认镜像版本存在：`docker manifest inspect ghcr.io/domren/jingwei:1.4.1`
+- 确认镜像版本存在：`docker manifest inspect ghcr.io/domren/jingwei:1.4.2`
 - 若 Package 是私有的，先按第 3 节登录；Token 需要 `read:packages`。
 - 确认 Docker 所在网络可以访问 `ghcr.io`。
+- 如果报错是 `proxyconnect tcp: dial tcp 127.0.0.1:<port>: connect: connection refused`，
+  问题不在镜像而在 dockerd 的代理：`/etc/systemd/system/docker.service.d/` 里配了 HTTP(S) 代理，
+  而代理进程此刻没在监听（本地科学上网软件关掉是最常见的成因）。要么把代理开起来，
+  要么删掉那个 drop-in 并 `systemctl daemon-reload && systemctl restart docker`。
+  注意这只影响拉取，本地已构建好的镜像与容器运行都不受影响。
 
 ### 10.3 端口冲突
 

@@ -15,9 +15,15 @@
 
 ---
 
-## Jingwei 1.4.1
+## Jingwei 1.4.2
 
-> 1.4.1 是一版纯安全加固，功能面与 1.4.0 一致、可原地升级：会话 cookie 只允许同站的变更请求
+> 1.4.2 是一版部署侧修复，功能面与 1.4.1 一致、可原地升级：`docker-compose.yml` 按白名单注入环境变量，
+> 导致代码里在读的 10 个运行时开关在容器里根本配不上——包括内网隧道的控制端地址
+> （`JINGWEI_PIVOT_SERVER`，缺它时 chisel / `ssh -D` / `ssh -L` 的自动部署命令整体不可用）、
+> 范围管控强度 `JINGWEI_GUARD_ENFORCEMENT`、两类落地物的 TTL 与模型调用墙钟。现在这些开关都进了
+> 两份 compose 与 `.env.example`，并新增一项审计测试锁住「代码读了但部署配不上」这一类缺陷；
+> 根 compose 的监听端口与 DSN 覆盖也与 Release 用的那份对齐（此前 DEPLOY 让改的端口变量不生效）。
+> 1.4.1 是一版纯安全加固：会话 cookie 只允许同站的变更请求
 > （显式 Bearer 不受影响）、目标范围与资产禁令在读取失败时改为**失败关闭**、工作区文件操作改用
 > `os.Root` 固定根目录（挡住软链越界与「检查后被替换」的竞态），另修掉代理地址重复拼协议头、
 > Skill 覆盖安装失败会丢旧版、演示站发现页崩溃三处。
@@ -73,6 +79,24 @@
 > 对话、任务执行与 Agent 自动规划需要先在「系统 → LLM」配置模型。
 
 ## 版本历史
+
+### 1.4.2 — 2026-11-04
+
+- **部署侧修复（无新功能，可原地升级；不需要重建数据库）**：`docker-compose.yml` 用白名单注入环境变量，
+  代码里 `os.Getenv` 读的 10 个运行时开关从来没被传进容器，在 `.env` 里写了也不生效：
+  `JINGWEI_PIVOT_SERVER`（内网隧道控制端地址）、`JINGWEI_GUARD_ENFORCEMENT`（范围管控强度）、
+  `JINGWEI_WEBSHELL_TTL_HOURS` / `JINGWEI_MEMSHELL_TTL_HOURS`（落地物过期）、`JINGWEI_LLM_STREAM`、
+  `JINGWEI_LLM_CALL_TIMEOUT`（根 compose 漏配）、`JINGWEI_BTW_MAX_OUTPUT_TOKENS`、
+  `JINGWEI_WEBCRACK_BRIDGE` / `JINGWEI_WEBCRACK_PYTHON`、`JINGWEI_CONFIG` / `JINGWEI_SKILL_DIR`。
+  其中控制端地址缺失会让隧道自动选型直接返回「未配置」，chisel 与 `ssh -D`/`ssh -L` 三条自动生成
+  部署命令的路在按文档部署的实例上整体不可用。
+- **端口与 DSN 覆盖对齐**：根 compose 的监听端口此前写死 `9790/9791`，文档让改的
+  `JINGWEI_WEB_PORT` / `JINGWEI_PROXY_PORT` 不起作用；`JINGWEI_PG_DSN` 也只能在 Release 那份里覆盖。
+  现在两份 compose 行为一致。
+- **新增审计测试**：`go test ./tools/envaudit/` 要求源码（非测试文件）里读的每个环境变量，
+  要么在两份 compose 与 `.env.example` 里都有落点，要么在豁免表里写明理由——防止这类缺陷复发。
+- **文档**：DEPLOY §4 补齐控制端地址与各开关的语义、默认值与安全含义（`JINGWEI_GUARD_ENFORCEMENT`
+  放宽等于主动降低越界拦截）；§10.2 新增「拉取失败通常是 dockerd 的代理进程没在监听」的判读方法。
 
 ### 1.4.1 — 2026-11-04
 
@@ -256,7 +280,7 @@
 ### 方式一：使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.4.1 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.4.2 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 # 编辑 .env：至少修改 POSTGRES_PASSWORD
@@ -268,8 +292,8 @@ docker compose up -d
 
 ```bash
 mkdir jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.4.1/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.4.1/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.4.2/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.4.2/deploy/.env.example
 # 编辑 .env 后启动
 docker compose pull
 docker compose up -d
@@ -283,7 +307,7 @@ docker compose up -d
 镜像发布在 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.4.1
+docker pull ghcr.io/domren/jingwei:1.4.2
 ```
 
 仓库维护者将 Package 设为公开后可直接拉取。若镜像仍为私有，请使用具备
@@ -301,7 +325,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u Domren --password-stdin
 | --- | :---: | --- |
 | `POSTGRES_PASSWORD` | 是 | 数据库密码，建议使用字母数字强随机值 |
 | `POSTGRES_USER` / `POSTGRES_DB` | 否 | 默认均为 `jingwei` |
-| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.4.1` |
+| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.4.2` |
 | `JINGWEI_WEB_PORT` | 否 | Web/API 宿主端口，默认 `9790` |
 | `JINGWEI_PROXY_PORT` | 否 | 流量代理宿主端口，默认 `9791`，仅绑定 `127.0.0.1` |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | 否 | 也可启动后在 UI 配置 |
@@ -376,11 +400,11 @@ cd web && npm ci && npm run build:static && cd ..
 # 2. 嵌入前端并编译 Linux 二进制
 rm -rf server/webui/dist && cp -r web/out server/webui/dist
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.4.1" -o dist/amd64/jingwei ./cmd/jingwei
+  -ldflags "-s -w -X main.version=1.4.2" -o dist/amd64/jingwei ./cmd/jingwei
 
 # 3. 构建运行镜像
 docker build --network=host --build-arg TARGETARCH=amd64 \
-  -t jingwei:1.4.1 .
+  -t jingwei:1.4.2 .
 ```
 
 本地开发运行后端与前端的方法见 [DEPLOY.md](DEPLOY.md#从源码开发)。
