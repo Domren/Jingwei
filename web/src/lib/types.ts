@@ -1465,6 +1465,22 @@ export interface InterceptPending {
 }
 
 // JudgeConfig: 模型兜底审批(仅当没有任何拦截规则命中时由模型判断)的全局配置。
+// 目标策略（范围/禁令）失败关闭的按任务拒绝计数，见 db/guard_denials.go。
+export interface GuardDenialStat {
+  task_id: number;
+  category: string;
+  denials: number;
+  mode: string;
+  last_reason: string;
+  last_at: string;
+}
+
+export interface GuardDenials {
+  window_hours: number;
+  mode: string;
+  denials: GuardDenialStat[];
+}
+
 export interface JudgeConfig {
   enabled: boolean;
   profile_id: number; // 0 = 跟随激活/默认配置

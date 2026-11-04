@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -92,6 +93,16 @@ func (p *guardTargetPolicy) Mode() string {
 	return mode
 }
 
+// deny records one refusal and returns it. Metering is best-effort: the decision
+// is already made, and a statistics write must not become a second failure path
+// inside the security gate itself.
+func (p *guardTargetPolicy) deny(taskID int64, category, reason string) (guard.ScopeVerdict, string) {
+	if p.pg != nil {
+		_ = p.pg.InsertGuardDenial(taskID, category, p.Mode(), reason)
+	}
+	return guard.ScopeOut, reason
+}
+
 // Check enforces, in order:
 //  1. global + task asset block rules (URL/domain/IP/CIDR; block always wins),
 //  2. the task's registered scope (only when it has host-matchable rules).
@@ -103,26 +114,29 @@ func (p *guardTargetPolicy) Check(taskID int64, urls, hosts []string) (guard.Sco
 		return guard.ScopeUnknown, ""
 	}
 	if p.pg == nil {
-		return guard.ScopeOut, "目标策略数据源不可用，请稍后重试"
+		return p.deny(taskID, pgdb.GuardDenialSourceUnavailable, "目标策略数据源不可用，请稍后重试")
 	}
 	domains, ips := splitTargetHosts(hosts)
 
 	blocks, err := p.pg.ListAssetInterceptRules()
 	if err != nil {
 		log.Printf("[guard][target] 读取全局资产拦截规则失败(拒绝): %v", err)
-		return guard.ScopeOut, "无法读取平台资产禁令，请稍后重试"
+		return p.deny(taskID, pgdb.GuardDenialBlockReadFailed,
+			fmt.Sprintf("无法读取平台资产禁令，请稍后重试（%v）", err))
 	}
 	if taskID > 0 {
 		tb, _, err := p.pg.Assets().TaskInterceptRulesSplit(taskID)
 		if err != nil {
 			log.Printf("[guard][target] 读取任务 %d 拦截规则失败(拒绝): %v", taskID, err)
-			return guard.ScopeOut, "无法读取任务资产禁令，请稍后重试"
+			return p.deny(taskID, pgdb.GuardDenialBlockReadFailed,
+				fmt.Sprintf("无法读取任务 %d 资产禁令，请稍后重试（%v）", taskID, err))
 		}
 		blocks = append(blocks, tb...)
 	}
 	if len(blocks) > 0 {
 		if rule, matched, ok := pgdb.MatchAssetInterceptRules(blocks, domains, ips, urls); ok {
-			return guard.ScopeOut, fmt.Sprintf("目标 %s %s，该资产被平台禁止测试", matched, rule.Reason())
+			return p.deny(taskID, pgdb.GuardDenialAssetBlock,
+				fmt.Sprintf("目标 %s %s，该资产被平台禁止测试", matched, rule.Reason()))
 		}
 	}
 
@@ -131,6 +145,8 @@ func (p *guardTargetPolicy) Check(taskID int64, urls, hosts []string) (guard.Sco
 	}
 	rules, err := p.scopeRules(taskID)
 	if err != nil {
+		// scopeRules 已在失败点记过类别（任务范围读不到 / 公司资产展不开），
+		// 这里只把裁决交回去，不重复计数。
 		return guard.ScopeOut, "无法读取任务授权范围，请稍后重试"
 	}
 	m := guard.NewScopeMatcher(rules)
@@ -146,8 +162,8 @@ func (p *guardTargetPolicy) Check(taskID int64, urls, hosts []string) (guard.Sco
 	if len(out) == 0 {
 		return guard.ScopeIn, ""
 	}
-	return guard.ScopeOut, fmt.Sprintf("目标 %s 不在本任务已登记范围内（登记范围: %s）",
-		strings.Join(dedupeStrings(out), ", "), scopeRuleSummary(rules))
+	return p.deny(taskID, pgdb.GuardDenialOutOfScope, fmt.Sprintf("目标 %s 不在本任务已登记范围内（登记范围: %s）",
+		strings.Join(dedupeStrings(out), ", "), scopeRuleSummary(rules)))
 }
 
 // scopeRules converts task_scope rows into host-matchable rules. ICP/keyword
@@ -157,6 +173,8 @@ func (p *guardTargetPolicy) scopeRules(taskID int64) ([]guard.ScopeRule, error) 
 	rows, err := p.pg.Assets().ListTaskScope(taskID)
 	if err != nil {
 		log.Printf("[guard][target] 读取任务 %d 测试范围失败(拒绝): %v", taskID, err)
+		_, _ = p.deny(taskID, pgdb.GuardDenialScopeReadFailed,
+			fmt.Sprintf("无法读取任务 %d 的授权范围，请稍后重试（%v）", taskID, err))
 		return nil, err
 	}
 	var rules []guard.ScopeRule
@@ -176,6 +194,10 @@ func (p *guardTargetPolicy) scopeRules(taskID int64) ([]guard.ScopeRule, error) 
 			if ts.CompanyID != nil && *ts.CompanyID > 0 {
 				companyRules, err := p.companyRules(*ts.CompanyID)
 				if err != nil {
+					// 类别按「哪一处读不到」分：任务范围本身读到了，是它登记的
+					// 公司资产展不开——操作员要去的是资产侧，不是范围页。
+					_, _ = p.deny(taskID, pgdb.GuardDenialCompanyExpandFailed,
+						fmt.Sprintf("展开公司 %d 的资产范围失败，请稍后重试（%v）", *ts.CompanyID, err))
 					return nil, err
 				}
 				rules = append(rules, companyRules...)
@@ -290,3 +312,29 @@ func dsnSecrets(dsn string) []string {
 }
 
 var reDSNPassword = regexp.MustCompile(`(?i)(?:password|pass)\s*=\s*(?:'([^']*)'|"([^"]*)"|([^\s]+))`)
+
+// guardDenialStats serves the fail-closed refusal ledger: per task and category,
+// how many tool calls the target policy turned away in the window, and the last
+// reason it gave. Since 1.4.1 an unreadable scope or block list denies the call
+// instead of allowing it, so a database wobble looks exactly like a scope
+// misconfiguration from the operator's side — this is what tells them apart.
+func (s *Server) guardDenialStats(w http.ResponseWriter, r *http.Request) {
+	pg := s.m.PG()
+	if pg == nil {
+		writeJSON(w, 200, map[string]any{"window_hours": 0, "denials": []pgdb.GuardDenialStat{}})
+		return
+	}
+	hours := atoiDefault(r.URL.Query().Get("hours"), 168)
+	if hours <= 0 || hours > 720 {
+		hours = 168
+	}
+	stats, err := pg.GuardDenialStats(time.Duration(hours)*time.Hour, 200)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if stats == nil {
+		stats = []pgdb.GuardDenialStat{}
+	}
+	writeJSON(w, 200, map[string]any{"window_hours": hours, "mode": s.guardEnforcement(), "denials": stats})
+}

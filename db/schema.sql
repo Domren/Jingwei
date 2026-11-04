@@ -2050,3 +2050,19 @@ CREATE INDEX IF NOT EXISTS idx_intranet_artifacts_expires
 DROP TRIGGER IF EXISTS trg_intranet_artifacts_upd ON intranet_artifacts;
 CREATE TRIGGER trg_intranet_artifacts_upd BEFORE UPDATE ON intranet_artifacts
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- 目标策略拒绝台账（见 db/guard_denials.go）。失败关闭的范围/禁令判定每拒一次记一行，
+-- 只记归属与原因类别，不记目标明文以外的大量参数。刻意不设外键：任务删除后仍要能回答
+-- 「这一周有多少工具调用是被策略挡掉的」。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS guard_denials (
+    id         BIGSERIAL PRIMARY KEY,
+    ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    task_id    BIGINT,
+    category   TEXT NOT NULL,
+    mode       TEXT NOT NULL DEFAULT 'strict',
+    reason     TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_guard_denials_task ON guard_denials(task_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_guard_denials_ts ON guard_denials(ts DESC);

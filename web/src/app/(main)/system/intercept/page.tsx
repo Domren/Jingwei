@@ -21,6 +21,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import type {
+  GuardDenials,
   InterceptAction,
   InterceptRule,
   JudgeConfig,
@@ -493,6 +494,99 @@ function JudgeCard() {
 
 // ---- deterministic target guard (no LLM required) ----
 
+
+// 目标策略拒绝的类别标签。失败关闭之后，「读不到策略」和「目标真的越界」在操作员
+// 眼里是同一句话（工具被拒），所以这里必须把成因分开写清楚——该去登记范围的是后者，
+// 前者只需要知道数据库当时不可用。
+const GUARD_DENIAL_LABELS: Record<string, string> = {
+  out_of_scope: "超出登记范围",
+  asset_block: "命中资产禁令",
+  scope_read_failed: "读不到任务范围",
+  company_expand_failed: "展不开公司资产",
+  block_read_failed: "读不到禁令",
+  source_unavailable: "策略数据源不可用",
+};
+
+function GuardDenialCard() {
+  const [data, setData] = React.useState<GuardDenials | null>(null);
+  const [loading, setLoading] = React.useState(false);
+
+  const load = React.useCallback(() => {
+    setLoading(true);
+    api
+      .interceptGuardDenials(168)
+      .then(setData)
+      .catch((e) => toast.error((e as Error).message))
+      .finally(() => setLoading(false));
+  }, []);
+
+  React.useEffect(() => load(), [load]);
+
+  const rows = data?.denials ?? [];
+  const total = rows.reduce((acc, r) => acc + r.denials, 0);
+
+  return (
+    <Card>
+      <CardContent className="p-4">
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <p className="text-sm font-medium">近 7 天被目标策略拒绝的调用</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              按任务与成因分组。范围/禁令读不到时调用会被拒绝（失败关闭），这不是配置错了——
+              数据库抖动也会走这一栏，所以成因分开计数。warn 模式同样计数，只是放行。
+            </p>
+          </div>
+          <Button variant="ghost" size="sm" className="h-7 shrink-0 text-xs" onClick={load} disabled={loading}>
+            刷新
+          </Button>
+        </div>
+        {rows.length === 0 ? (
+          <p className="text-xs text-muted-foreground">窗口内没有拒绝记录。</p>
+        ) : (
+          <>
+            <div className="mb-3 grid grid-cols-2 gap-3 sm:grid-cols-3">
+              <JudgeStat label="拒绝总数" value={String(total)} />
+              <JudgeStat label="涉及任务" value={String(new Set(rows.map((r) => r.task_id)).size)} />
+              <JudgeStat label="当前模式" value={data?.mode || "-"} />
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                  <tr>
+                    <th className="py-1 pr-3">任务</th>
+                    <th className="py-1 pr-3">成因</th>
+                    <th className="py-1 pr-3">次数</th>
+                    <th className="py-1 pr-3">模式</th>
+                    <th className="py-1">最近一次</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <tr key={`${r.task_id}-${r.category}`} className="border-t align-top">
+                      <td className="py-1.5 pr-3 tabular-nums">#{r.task_id || "-"}</td>
+                      <td className="py-1.5 pr-3 whitespace-nowrap">
+                        {GUARD_DENIAL_LABELS[r.category] || r.category}
+                      </td>
+                      <td className="py-1.5 pr-3 tabular-nums">{r.denials}</td>
+                      <td className="py-1.5 pr-3">{r.mode}</td>
+                      <td className="py-1.5">
+                        <div className="line-clamp-2 max-w-[28rem] text-muted-foreground">{r.last_reason}</div>
+                        <div className="text-[10px] text-muted-foreground/70">
+                          {new Date(r.last_at).toLocaleString()}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 const GUARD_MODES: { value: "strict" | "warn" | "off"; label: string; hint: string }[] = [
   { value: "strict", label: "强制拦截", hint: "范围外或命中资产禁令的调用会被拒绝，并提示模型先补范围" },
   { value: "warn", label: "仅告警", hint: "写入审计记录但放行调用，适合上线前观察误报" },
@@ -802,6 +896,7 @@ export default function InterceptPage() {
         {/* ---- tab: 拦截规则 ---- */}
         <TabsContent value="rules" className="mt-4 flex flex-col gap-4">
           <GuardModeCard />
+          <GuardDenialCard />
           <div className="flex items-center justify-between gap-3">
             <p className="text-xs text-muted-foreground">按优先级（数字越大越先）逐条匹配，首条命中的规则生效</p>
             <Button onClick={openNew} size="sm" className="shrink-0">

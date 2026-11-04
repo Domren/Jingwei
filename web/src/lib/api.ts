@@ -88,6 +88,7 @@ import type {
   JavaMemshell,
   JavaMemshellInput,
   JudgeConfig,
+  GuardDenials,
   JudgeUsage,
   LLMPoolStatus,
   LLMProfile,
@@ -1479,6 +1480,8 @@ export const api = {
   interceptGetJudgeConfig: () => get<JudgeConfig>("/intercept/judge"),
   interceptSetJudgeConfig: (cfg: JudgeConfig) => put<{ ok: boolean }>("/intercept/judge", cfg),
   interceptJudgeUsage: (days = 30) => get<JudgeUsage>(`/intercept/judge/usage?days=${days}`),
+  interceptGuardDenials: (hours = 168) =>
+    get<GuardDenials>(`/intercept/guard/denials?hours=${hours}`),
 
   // ---- commands (tool execution history, any tool) ----
   commands: (params?: { task?: string; q?: string; page?: number; size?: number }) => {
