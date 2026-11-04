@@ -30,8 +30,12 @@ type Target struct {
 	Raw  string     `json:"raw"`
 	Kind TargetKind `json:"kind"`
 	Host string     `json:"host"` // domain, IP or CIDR
+	Port int        `json:"port,omitempty"`
 	URL  string     `json:"url,omitempty"`
 }
+
+// Port 只在输入里写明了端口时非零。漏扫流程按自己的端口预设探测，会忽略它；
+// 弱口令检测把它当作三级端口决策的第一级——操作员写了端口就只测那个端口。
 
 var domainRE = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$`)
 
@@ -49,7 +53,8 @@ func ParseTargets(raws []string) ([]Target, error) {
 		if err != nil {
 			return nil, err
 		}
-		key := string(t.Kind) + "|" + strings.ToLower(t.Host) + "|" + t.URL
+		// 端口参与去重：10.0.0.1 与 10.0.0.1:2222 是两条不同的输入意图。
+		key := string(t.Kind) + "|" + strings.ToLower(t.Host) + "|" + strconv.Itoa(t.Port) + "|" + t.URL
 		if seen[key] {
 			continue
 		}
@@ -80,7 +85,39 @@ func ParseTarget(raw string) (Target, error) {
 		if u.Path == "" {
 			u.Path = "/"
 		}
-		return Target{Raw: raw, Kind: KindURL, Host: u.Hostname(), URL: u.String()}, nil
+		t := Target{Raw: raw, Kind: KindURL, Host: u.Hostname(), URL: u.String()}
+		if ps := u.Port(); ps != "" {
+			p, err := strconv.Atoi(ps)
+			if err != nil || p < 1 || p > 65535 {
+				return Target{}, fmt.Errorf("URL 端口无效（应为 1-65535）: %s", raw)
+			}
+			t.Port = p
+		}
+		return t, nil
+	}
+	// host:port：操作员写死端口时以它为准（弱口令检测的三级端口决策第一级）。
+	// SplitHostPort 拆不动的（裸 IPv6 ::1、2001:db8::1）不报错，继续往下走，
+	// 由 IP 分支给出「仅支持 IPv4」这种准确提示，而不是把 IPv6 误拆成 host:port。
+	if strings.Contains(raw, ":") {
+		if strings.Contains(raw, "/") {
+			return Target{}, fmt.Errorf("目标格式无效（host:port 不带路径，网段不带端口）: %s", raw)
+		}
+		if host, portStr, err := net.SplitHostPort(raw); err == nil {
+			port, perr := strconv.Atoi(portStr)
+			if perr != nil || port < 1 || port > 65535 {
+				return Target{}, fmt.Errorf("端口无效（应为 1-65535）: %s", raw)
+			}
+			t, err := ParseTarget(host)
+			if err != nil {
+				return Target{}, err
+			}
+			if t.Kind == KindURL || t.Kind == KindCIDR {
+				return Target{}, fmt.Errorf("host:port 的主机部分只能是 IP 或域名: %s", raw)
+			}
+			t.Raw = raw
+			t.Port = port
+			return t, nil
+		}
 	}
 	if strings.Contains(raw, "/") {
 		ip, ipnet, err := net.ParseCIDR(raw)
