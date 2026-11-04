@@ -112,6 +112,9 @@ JINGWEI_PROXY_PORT=9791
   注意 chisel 与 ssh 两条路用的**不是同一个端口**：`JINGWEI_PIVOT_SERVER` 的端口是 chisel server 监听的端口，
   `ssh -D` / `ssh -L` 回连控制端用的端口由 `JINGWEI_PIVOT_SSH_PORT` 单独指定（留空＝22，sshd 通常就在这）。
   两者合成一个值时必然有一条路是错的——目标会去 ssh 登录 chisel 的端口。
+  还要给控制端准备 **chisel server**（若要用 chisel 这条路）：必须带 `--reverse`，
+  因为平台生成的是 `chisel client <控制端> R:<端口>:socks` 这类反向请求——不带 `--reverse` 时服务端会直接拒绝，
+  隧道一条也建不起来。监听只绑目标可达的内网地址，用完关掉。
 - 其余运行时开关都在 `.env.example` 里带注释列出，留空即用内置默认值，改完需要
   `docker compose up -d` 重建容器才生效（`restart` 不会重读 `.env`）。其中两条与安全行为有关：
   `JINGWEI_GUARD_ENFORCEMENT` 默认 `strict`（读不到授权范围即拒绝），改成 `warn`/`off` 是主动放宽边界，

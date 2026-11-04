@@ -1312,6 +1312,34 @@ func intranetPivotSSHPort() (int, error) {
 	return n, nil
 }
 
+// chiselFingerprintArg renders the optional `--fingerprint` flag for a chisel
+// client. chisel has no "auto" value — passing one makes the client treat the
+// literal string as a SHA-256 fingerprint, so the handshake fails with
+// "Invalid fingerprint" and retries forever (found on chisel 1.13.0). Default is
+// therefore to omit the flag; operators who care about MITM on the pivot leg set
+// JINGWEI_PIVOT_CHISEL_FINGERPRINT to the base64 fingerprint the server prints.
+func chiselFingerprintArg() (string, error) {
+	fp := strings.TrimSpace(os.Getenv("JINGWEI_PIVOT_CHISEL_FINGERPRINT"))
+	if fp == "" {
+		return "", nil
+	}
+	if !chiselFingerprintRE.MatchString(fp) {
+		return "", fmt.Errorf("JINGWEI_PIVOT_CHISEL_FINGERPRINT 不是合法的 SHA-256 指纹（应为 43-44 位 base64，来自 chisel server 启动日志），实得 %q", fp)
+	}
+	return "--fingerprint " + shQuote(fp) + " ", nil
+}
+
+// chiselPinNote says whether the pivot leg's server key is pinned, so the plan
+// output tells the operator what trust they are getting.
+func chiselPinNote() string {
+	if strings.TrimSpace(os.Getenv("JINGWEI_PIVOT_CHISEL_FINGERPRINT")) == "" {
+		return "；未固定服务端指纹（信任控制端上那个 chisel server），要防中间人就配 JINGWEI_PIVOT_CHISEL_FINGERPRINT"
+	}
+	return "；已按 JINGWEI_PIVOT_CHISEL_FINGERPRINT 固定控制端指纹"
+}
+
+var chiselFingerprintRE = regexp.MustCompile(`^[A-Za-z0-9+/]{43}={0,1}$`)
+
 // autoSelectTunnelCommand picks the best deployment command based on what tools
 // are available on the target. 隧道自动选型：目标上有什么就用什么，优先选
 // 功能最强的工具（chisel > ssh > socat），而不是让操作员自己猜。
@@ -1340,9 +1368,16 @@ func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.Intranet
 				return "", pivotErr.Error(), listenSide
 			}
 			pivot, _ := intranetPivotEndpoint()
-			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("chisel client --fingerprint auto %s %d:socks", shQuote(pivot), listenPort))
-			reason = "目标有 chisel，用 chisel client 建 SOCKS5：监听端口开在控制端（" + pivot + "），出口在目标，" +
-				"所以控制端探测自己的 " + strconv.Itoa(listenPort) + " 即可，目标侧的端口检查验证不到它"
+			fpArg, fpErr := chiselFingerprintArg()
+			if fpErr != nil {
+				return "", fpErr.Error(), listenSide
+			}
+			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("chisel client %s%s R:%d:socks", fpArg, shQuote(pivot), listenPort))
+			reason = "目标有 chisel，用 `chisel client … R:" + strconv.Itoa(listenPort) + ":socks` 建 SOCKS5：" +
+				"R: 前缀让监听开在控制端、SOCKS 的出口在目标（2026-11-05 真机验证：经它可达仅内网段），" +
+				"控制端探测自己的 " + strconv.Itoa(listenPort) + " 即可，目标侧的端口检查验证不到它；" +
+				"前提：控制端的 chisel server 必须带 --reverse，否则这个 R: 请求会被服务端拒绝。" +
+				"不带 R: 的 `<port>:socks` 方向正好相反（目标监听、出口在控制端），打不到内网，别用。" + chiselPinNote()
 			return deploy, reason, db.IntranetListenSidePivot
 		} else if intranetHasBin(info, "ssh") {
 			if pivotErr != nil {
@@ -1393,18 +1428,24 @@ func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.Intranet
 			if pivotErr != nil {
 				return "", pivotErr.Error(), listenSide
 			}
-			pivot, _ := intranetPivotEndpoint()
-			spec := fmt.Sprintf("%d:%s:%d", listenPort, remoteHost, remotePort)
-			if kind == db.IntranetTunnelKindRemote {
-				spec = "R:" + spec
-			}
-			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("chisel client --fingerprint auto %s %s", shQuote(pivot), spec))
-			reason = "目标没有 socat/ssh，用 chisel 做端口转发：" +
-				map[bool]string{true: "R: 前缀让监听端口开在目标侧、目的地由控制端发起",
-					false: "监听端口开在控制端（" + pivot + "），目的地由目标发起，正是穿透内网要的方向"}[kind == db.IntranetTunnelKindRemote]
 			if kind != db.IntranetTunnelKindRemote {
-				return deploy, reason, db.IntranetListenSidePivot
+				// chisel 只有「一端监听、另一端拨号」两种形态，表达不了「目标监听且由目标拨号」，
+				// 那正是 port_forward（等价 socat）的方向。给一条反向的命令只会造成假成功。
+				return "", "chisel 表达不了 port_forward 的方向（R: 是控制端监听、由目标拨目的地；" +
+					"不带 R: 是目标监听、由控制端拨目的地），目标侧监听+目标侧发起请用 socat 或手写 deploy_command", listenSide
 			}
+			pivot, _ := intranetPivotEndpoint()
+			fpArg, fpErr := chiselFingerprintArg()
+			if fpErr != nil {
+				return "", fpErr.Error(), listenSide
+			}
+			spec := fmt.Sprintf("R:%d:%s:%d", listenPort, remoteHost, remotePort)
+			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("chisel client %s%s %s", fpArg, shQuote(pivot), spec))
+			reason = "目标没有 socat/ssh，用 chisel 做反向转发：" + spec +
+				" 让控制端监听 " + strconv.Itoa(listenPort) + "，对 " + remoteHost + ":" + strconv.Itoa(remotePort) +
+				" 的连接由目标发起，所以能打到只有目标可达的内网服务（2026-11-05 真机验证 200）。" +
+				"前提：控制端 chisel server 带 --reverse。" + chiselPinNote()
+			return deploy, reason, db.IntranetListenSidePivot
 		} else {
 			return "", "目标上没有 socat/ssh/chisel，无法自动生成转发命令；请手动提供 deploy_command", listenSide
 		}

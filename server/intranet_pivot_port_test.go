@@ -95,3 +95,55 @@ func TestAutoSelectTunnelChiselKeepsPivotPort(t *testing.T) {
 		t.Fatalf("chisel client 的 SOCKS 监听开在控制端: side=%q", side)
 	}
 }
+
+// chisel 1.13 不接受 `--fingerprint auto`：客户端把它当指纹校验，握手报
+// Invalid fingerprint 后无限重试。默认必须不带该参数，只有配了真指纹才带上。
+func TestAutoSelectTunnelChiselFingerprint(t *testing.T) {
+	t.Setenv("JINGWEI_PIVOT_SERVER", "10.0.0.5:8788")
+	t.Setenv("JINGWEI_PIVOT_CHISEL_FINGERPRINT", "")
+	chiselOnly := intranetProbeInfo{Bins: []string{"chisel"}}
+	socksTun := &db.IntranetTunnel{ID: 11, Kind: db.IntranetTunnelKindSocks5, ListenPort: 1080}
+
+	deploy, reason, _ := autoSelectTunnelCommand(db.IntranetTunnelKindSocks5, chiselOnly, socksTun)
+	if deploy == "" {
+		t.Fatalf("默认应当能生成 chisel 命令: reason=%q", reason)
+	}
+	if strings.Contains(deploy, "--fingerprint") {
+		t.Fatalf("默认不该带 --fingerprint: %q", deploy)
+	}
+	if !strings.Contains(reason, "未固定服务端指纹") {
+		t.Fatalf("理由要说明当前信任状态: %q", reason)
+	}
+
+	const fp = "llm64BPu/uaJXdhIZrhGqdRuJrqYBE/I2a5DtcViJNI="
+	t.Setenv("JINGWEI_PIVOT_CHISEL_FINGERPRINT", "  "+fp+"  ")
+	deploy, reason, _ = autoSelectTunnelCommand(db.IntranetTunnelKindSocks5, chiselOnly, socksTun)
+	if !strings.Contains(deploy, "--fingerprint '"+fp+"'") {
+		t.Fatalf("配了指纹就该带上（且要 shell 引用起来）: %q", deploy)
+	}
+	if !strings.Contains(reason, "已按 JINGWEI_PIVOT_CHISEL_FINGERPRINT 固定") {
+		t.Fatalf("理由要反映已固定: %q", reason)
+	}
+
+	// 端口转发分支同理，且 R: 形态不变。
+	fwd := &db.IntranetTunnel{ID: 12, Kind: db.IntranetTunnelKindRemote, ListenPort: 9001, RemoteHost: "10.99.0.10", RemotePort: 8000}
+	deploy, _, side := autoSelectTunnelCommand(db.IntranetTunnelKindRemote, chiselOnly, fwd)
+	if !strings.Contains(deploy, "--fingerprint '"+fp+"'") || !strings.Contains(deploy, "R:9001:10.99.0.10:8000") {
+		t.Fatalf("R: 形态的 chisel 命令要同时保住指纹与 spec: %q", deploy)
+	}
+	if side != db.IntranetListenSidePivot {
+		t.Fatalf("R: 的监听在控制端（真机实测 chisel server 持有该监听）: %q", side)
+	}
+
+	// 非法值（含当年那个 auto）必须拒绝生成，而不是照样下发一条连不上的命令。
+	for _, bad := range []string{"auto", "sha256:abc", "short", "'; touch /tmp/pwn #"} {
+		t.Setenv("JINGWEI_PIVOT_CHISEL_FINGERPRINT", bad)
+		deploy, reason, _ := autoSelectTunnelCommand(db.IntranetTunnelKindSocks5, chiselOnly, socksTun)
+		if deploy != "" {
+			t.Fatalf("指纹 %q 非法却生成了命令: %q", bad, deploy)
+		}
+		if !strings.Contains(reason, "JINGWEI_PIVOT_CHISEL_FINGERPRINT") {
+			t.Fatalf("拒绝理由要点名变量: %q", reason)
+		}
+	}
+}

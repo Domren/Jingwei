@@ -302,12 +302,20 @@ func TestAutoSelectTunnelUsesPivotServer(t *testing.T) {
 	if side != db.IntranetListenSideTarget {
 		t.Fatalf("socat listen side = %q, want target", side)
 	}
-	// chisel R:（反向转发）把监听开在目标，与控制端一侧的 chisel server 端口无关。
+	// chisel 的 R: 把监听开在**控制端**（chisel server 一侧），拨号目的地由目标发起——
+	// 2026-11-05 真机实测：`R:18474:10.99.0.10:8000` 的监听进程是控制端的 chisel server，
+	// 经它取到仅内网服务 200；不带 R: 的形态才是目标监听、控制端拨号。
 	rev := &db.IntranetTunnel{ID: 9, Kind: db.IntranetTunnelKindRemote, ListenHost: "0.0.0.0", ListenPort: 8888, RemoteHost: "127.0.0.1", RemotePort: 3000}
 	t.Setenv("JINGWEI_PIVOT_SERVER", "10.9.9.9:8788")
 	deploy, _, side = autoSelectTunnelCommand(rev.Kind, intranetProbeInfo{Bins: []string{"chisel"}}, rev)
-	if side != db.IntranetListenSideTarget || !strings.Contains(deploy, "R:8888:127.0.0.1:3000") {
+	if side != db.IntranetListenSidePivot || !strings.Contains(deploy, "R:8888:127.0.0.1:3000") {
 		t.Fatalf("chisel R: tunnel = %q side=%q", deploy, side)
+	}
+	// port_forward（目标监听且由目标拨号）这个方向 chisel 表达不了，必须拒绝而不是给反向命令。
+	pf := &db.IntranetTunnel{ID: 10, Kind: db.IntranetTunnelKindPort, ListenHost: "0.0.0.0", ListenPort: 8080, RemoteHost: "10.0.0.8", RemotePort: 80}
+	deploy, reason, _ = autoSelectTunnelCommand(pf.Kind, intranetProbeInfo{Bins: []string{"chisel"}}, pf)
+	if deploy != "" || !strings.Contains(reason, "socat") {
+		t.Fatalf("chisel 对 port_forward 应当拒绝并指向 socat: deploy=%q reason=%q", deploy, reason)
 	}
 }
 

@@ -6,6 +6,23 @@
 
 ### 修复
 
+- **chisel 隧道的两条命令此前一条都不对**（A1 真机验证抓到）：
+  1. 生成的 `chisel client --fingerprint auto …` 在 chisel 1.13.0 上不成立——`auto` 不是合法值，
+     客户端把整串当 SHA-256 指纹校验，报 `ssh: handshake failed: Invalid fingerprint` 并无限重试，
+     这条路从来没通过。现在默认**不带** `--fingerprint`，需要固定控制端密钥时再配
+     `JINGWEI_PIVOT_CHISEL_FINGERPRINT`（只接受 43–44 位 base64 真指纹；填错直接拒绝生成命令，
+     不下发一条连不上的隧道）。
+  2. 方向与监听侧标反了。真机实测：`R:<port>:socks` 与 `R:<port>:<host>:<port>` 的监听开在
+     **控制端**（chisel server 持有），拨号目的地由目标发起，因此能打到只有目标可达的内网服务
+     （实测 200）；不带 `R:` 的形态才是目标监听、控制端拨号。此前 SOCKS5 用的是不带 `R:` 的形态
+     却把 `listen_side` 标成 pivot——隧道建不起来还能理解，更糟的是它把「验证/拆除该看哪一侧」
+     也指错了。现已按实测改正，并把 `R:` 的监听侧从此前误标的 target 改成 pivot。
+  3. `port_forward`（目标侧监听且由目标拨目的地，等价 socat）这个方向 chisel 表达不了，
+     现在明确拒绝自动生成并指向 socat / 手写 `deploy_command`，不再下发一条反向的假成功命令。
+  用 chisel 时控制端需以 `chisel server --reverse` 运行，否则这些 `R:` 请求会被服务端拒绝（DEPLOY §4 已写）。
+
+### 修复
+
 - **隧道自动选型里 ssh 与 chisel 共用一个端口**：`JINGWEI_PIVOT_SERVER` 的端口既被 chisel client 用来拨控制端，
   又被生成的 `ssh -D` / `ssh -L` 当成 sshd 端口，而现实中 chisel 常在 8788、sshd 在 22 —— 只有一个值时
   必然有一条路是错的（目标会去 ssh 登录 chisel 端口）。新增 `JINGWEI_PIVOT_SSH_PORT`（留空＝22）只作用于
