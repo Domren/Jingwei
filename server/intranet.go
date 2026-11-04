@@ -1329,6 +1329,20 @@ func chiselFingerprintArg() (string, error) {
 	return "--fingerprint " + shQuote(fp) + " ", nil
 }
 
+// sshBindPrefix 同 chiselBindPrefix：ssh 的 -L 不写绑定地址时只听客户端回环。
+func sshBindPrefix(t *db.IntranetTunnel) string { return chiselBindPrefix(t) }
+
+// chiselBindPrefix 把隧道登记的监听地址翻译成 chisel 的绑定前缀。
+// 不写就默认 127.0.0.1，那样监听开在控制端回环上，跑在另一个网络命名空间里的
+// 平台进程（verify 与之后的代理扫描）根本拨不到——2026-11-05 真机验证就是这么暴露的。
+func chiselBindPrefix(t *db.IntranetTunnel) string {
+	h := strings.TrimSpace(t.ListenHost)
+	if h == "" || h == "0.0.0.0" || h == "::" {
+		return "0.0.0.0:"
+	}
+	return h + ":"
+}
+
 // chiselPinNote says whether the pivot leg's server key is pinned, so the plan
 // output tells the operator what trust they are getting.
 func chiselPinNote() string {
@@ -1372,7 +1386,7 @@ func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.Intranet
 			if fpErr != nil {
 				return "", fpErr.Error(), listenSide
 			}
-			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("chisel client %s%s R:%d:socks", fpArg, shQuote(pivot), listenPort))
+			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("chisel client %s%s R:%s%d:socks", fpArg, shQuote(pivot), chiselBindPrefix(t), listenPort))
 			reason = "目标有 chisel，用 `chisel client … R:" + strconv.Itoa(listenPort) + ":socks` 建 SOCKS5：" +
 				"R: 前缀让监听开在控制端、SOCKS 的出口在目标（2026-11-05 真机验证：经它可达仅内网段），" +
 				"控制端探测自己的 " + strconv.Itoa(listenPort) + " 即可，目标侧的端口检查验证不到它；" +
@@ -1419,8 +1433,8 @@ func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.Intranet
 			if sshErr != nil {
 				return "", sshErr.Error(), listenSide
 			}
-			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("ssh -N -L %d:%s:%d -p %d -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s",
-				listenPort, remoteHost, remotePort, sshPort, shQuote(pivotHost)))
+			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("ssh -N -L %s%d:%s:%d -p %d -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s",
+				sshBindPrefix(t), listenPort, remoteHost, remotePort, sshPort, shQuote(pivotHost)))
 			reason = "目标没有 socat，用 ssh -L 做端口转发（回连控制端 " + pivotHost + ":" + strconv.Itoa(sshPort) +
 				"；注意：-L 的目的地由控制端发起，" +
 				"只有控制端也能访问 " + remoteHost + " 时才有意义；穿透到控制端不可达的内网段请改用 socat/chisel 或手工 deploy_command）"
@@ -1439,7 +1453,7 @@ func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.Intranet
 			if fpErr != nil {
 				return "", fpErr.Error(), listenSide
 			}
-			spec := fmt.Sprintf("R:%d:%s:%d", listenPort, remoteHost, remotePort)
+			spec := fmt.Sprintf("R:%s%d:%s:%d", chiselBindPrefix(t), listenPort, remoteHost, remotePort)
 			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("chisel client %s%s %s", fpArg, shQuote(pivot), spec))
 			reason = "目标没有 socat/ssh，用 chisel 做反向转发：" + spec +
 				" 让控制端监听 " + strconv.Itoa(listenPort) + "，对 " + remoteHost + ":" + strconv.Itoa(remotePort) +

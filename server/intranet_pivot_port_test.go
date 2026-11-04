@@ -41,7 +41,7 @@ func TestAutoSelectTunnelSSHPortIsSeparate(t *testing.T) {
 	// 端口转发（ssh -L）同理。
 	fwd := &db.IntranetTunnel{ID: 2, Kind: db.IntranetTunnelKindPort, ListenPort: 8473, RemoteHost: "10.99.0.10", RemotePort: 8000}
 	deploy, reason, _ = autoSelectTunnelCommand(db.IntranetTunnelKindPort, sshOnly, fwd)
-	if !strings.Contains(deploy, "-L 8473:10.99.0.10:8000 -p 2201 ") {
+	if !strings.Contains(deploy, "-L 0.0.0.0:8473:10.99.0.10:8000 -p 2201 ") {
 		t.Fatalf("ssh -L 应当用配置端口 2201: %q", deploy)
 	}
 	if !strings.Contains(reason, "10.0.0.5:2201") {
@@ -128,7 +128,7 @@ func TestAutoSelectTunnelChiselFingerprint(t *testing.T) {
 	// 端口转发分支同理，且 R: 形态不变。
 	fwd := &db.IntranetTunnel{ID: 12, Kind: db.IntranetTunnelKindRemote, ListenPort: 9001, RemoteHost: "10.99.0.10", RemotePort: 8000}
 	deploy, _, side := autoSelectTunnelCommand(db.IntranetTunnelKindRemote, chiselOnly, fwd)
-	if !strings.Contains(deploy, "--fingerprint '"+fp+"'") || !strings.Contains(deploy, "R:9001:10.99.0.10:8000") {
+	if !strings.Contains(deploy, "--fingerprint '"+fp+"'") || !strings.Contains(deploy, "R:0.0.0.0:9001:10.99.0.10:8000") {
 		t.Fatalf("R: 形态的 chisel 命令要同时保住指纹与 spec: %q", deploy)
 	}
 	if side != db.IntranetListenSidePivot {
@@ -145,5 +145,38 @@ func TestAutoSelectTunnelChiselFingerprint(t *testing.T) {
 		if !strings.Contains(reason, "JINGWEI_PIVOT_CHISEL_FINGERPRINT") {
 			t.Fatalf("拒绝理由要点名变量: %q", reason)
 		}
+	}
+}
+
+// 监听地址写进命令：chisel 不写绑定地址时只听控制端回环，容器里的平台进程拨不到；
+// ssh -L 不写时只听客户端回环。两个都得带上登记值（2026-11-05 真机验证）。
+func TestAutoSelectTunnelHonoursListenHost(t *testing.T) {
+	t.Setenv("JINGWEI_PIVOT_SERVER", "10.0.0.5:8788")
+	t.Setenv("JINGWEI_PIVOT_CHISEL_FINGERPRINT", "")
+	chiselOnly := intranetProbeInfo{Bins: []string{"chisel"}}
+	sshOnly := intranetProbeInfo{Bins: []string{"ssh"}}
+
+	rev := &db.IntranetTunnel{ID: 21, Kind: db.IntranetTunnelKindRemote, ListenHost: "0.0.0.0", ListenPort: 9001, RemoteHost: "10.99.0.10", RemotePort: 8000}
+	deploy, _, _ := autoSelectTunnelCommand(rev.Kind, chiselOnly, rev)
+	if !strings.Contains(deploy, "R:0.0.0.0:9001:10.99.0.10:8000") {
+		t.Fatalf("chisel 反向要把监听地址写进 spec: %q", deploy)
+	}
+
+	bound := &db.IntranetTunnel{ID: 22, Kind: db.IntranetTunnelKindRemote, ListenHost: "127.0.0.1", ListenPort: 9002, RemoteHost: "10.99.0.10", RemotePort: 8000}
+	deploy, _, _ = autoSelectTunnelCommand(bound.Kind, chiselOnly, bound)
+	if !strings.Contains(deploy, "R:127.0.0.1:9002:") {
+		t.Fatalf("登记了具体监听地址就该照它绑，不能自作主张放宽: %q", deploy)
+	}
+
+	socks := &db.IntranetTunnel{ID: 23, Kind: db.IntranetTunnelKindSocks5, ListenHost: "0.0.0.0", ListenPort: 1080}
+	deploy, _, _ = autoSelectTunnelCommand(socks.Kind, chiselOnly, socks)
+	if !strings.Contains(deploy, "R:0.0.0.0:1080:socks") {
+		t.Fatalf("SOCKS5 也要带绑定地址: %q", deploy)
+	}
+
+	fwd := &db.IntranetTunnel{ID: 24, Kind: db.IntranetTunnelKindPort, ListenHost: "0.0.0.0", ListenPort: 8473, RemoteHost: "10.0.0.8", RemotePort: 80}
+	deploy, _, _ = autoSelectTunnelCommand(fwd.Kind, sshOnly, fwd)
+	if !strings.Contains(deploy, "-L 0.0.0.0:8473:10.0.0.8:80") {
+		t.Fatalf("ssh -L 不带绑定地址时只听回环，必须显式写出: %q", deploy)
 	}
 }
