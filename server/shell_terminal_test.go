@@ -22,7 +22,7 @@ func TestShellExecCarriesCwdAndExitCode(t *testing.T) {
 		got = append(got, script)
 		return markerEcho("uid=33(www-data)", "/var/www/html", 0), nil
 	}
-	res := shellExec(context.Background(), send, "/var/www", intranetOSPosix, "id", time.Second)
+	res := shellExec(context.Background(), send, "/var/www", intranetOSPosix, "", "id", time.Second)
 	if res.IsError || res.ExitCode != 0 {
 		t.Fatalf("clean command reported as failure: %+v", res)
 	}
@@ -41,7 +41,7 @@ func TestShellExecNonZeroExitIsError(t *testing.T) {
 	send := func(_ context.Context, _ string, _ time.Duration) (string, error) {
 		return markerEcho("ls: cannot access '/nope'", "/", 2), nil
 	}
-	res := shellExec(context.Background(), send, "/", intranetOSPosix, "ls /nope", time.Second)
+	res := shellExec(context.Background(), send, "/", intranetOSPosix, "", "ls /nope", time.Second)
 	if !res.IsError || res.ExitCode != 2 {
 		t.Fatalf("exit code 2 must surface as an error: %+v", res)
 	}
@@ -56,7 +56,7 @@ func TestShellExecWithoutTrailerIsNotSilentSuccess(t *testing.T) {
 	send := func(_ context.Context, _ string, _ time.Duration) (string, error) {
 		return "<html>404 Not Found</html>", nil
 	}
-	res := shellExec(context.Background(), send, "/", intranetOSPosix, "id", time.Second)
+	res := shellExec(context.Background(), send, "/", intranetOSPosix, "", "id", time.Second)
 	if res.MarkerOK || !res.IsError {
 		t.Fatalf("unparsed echo must be an error: %+v", res)
 	}
@@ -71,7 +71,7 @@ func TestShellExecDropsRelativeCwd(t *testing.T) {
 	send := func(_ context.Context, _ string, _ time.Duration) (string, error) {
 		return markerEcho("ok", "html", 0), nil
 	}
-	res := shellExec(context.Background(), send, "/", intranetOSPosix, "pwd", time.Second)
+	res := shellExec(context.Background(), send, "/", intranetOSPosix, "", "pwd", time.Second)
 	if res.Cwd != "" {
 		t.Fatalf("relative cwd accepted: %q", res.Cwd)
 	}
@@ -82,7 +82,7 @@ func TestShellExecClassifiesAbandonedWait(t *testing.T) {
 		<-ctx.Done()
 		return "", ctx.Err()
 	}
-	res := shellExec(context.Background(), send, "/", intranetOSPosix, "tail -f /dev/null", 20*time.Millisecond)
+	res := shellExec(context.Background(), send, "/", intranetOSPosix, "", "tail -f /dev/null", 20*time.Millisecond)
 	if !res.TimedOut || !res.IsError {
 		t.Fatalf("a deadline the platform gave up on must be labelled: %+v", res)
 	}
@@ -107,7 +107,7 @@ func TestShellExecClassifiesSenderDeadline(t *testing.T) {
 	send := func(_ context.Context, _ string, _ time.Duration) (string, error) {
 		return "", &url.Error{Op: "Post", URL: "http://127.0.0.1:8080/tpl.php", Err: shellDeadlineError{}}
 	}
-	res := shellExec(context.Background(), send, "/", intranetOSPosix, "tail -f /dev/null", time.Minute)
+	res := shellExec(context.Background(), send, "/", intranetOSPosix, "", "tail -f /dev/null", time.Minute)
 	if !res.TimedOut || !res.IsError {
 		t.Fatalf("a sender-side deadline must read as an abandoned wait: %+v", res)
 	}
@@ -122,7 +122,7 @@ func TestShellExecFirstCommandKeepsTargetDirectory(t *testing.T) {
 		got = append(got, script)
 		return markerEcho("/var/www/html/assets", "/var/www/html/assets", 0), nil
 	}
-	res := shellExec(context.Background(), send, "", intranetOSPosix, "pwd", time.Second)
+	res := shellExec(context.Background(), send, "", intranetOSPosix, "", "pwd", time.Second)
 	if len(got) != 1 {
 		t.Fatalf("scripts=%d", len(got))
 	}
@@ -145,7 +145,7 @@ func TestShellExecWindowsWrapperFromCache(t *testing.T) {
 		return "whoami\ndesktop\\admin\r\n" + intranetEcMarker + "0\r\n" +
 			intranetCwdMarker + "\r\nC:\\inetpub\r\n", nil
 	}
-	res := shellExec(context.Background(), send, `C:\inetpub`, intranetOSWindows, "whoami", time.Second)
+	res := shellExec(context.Background(), send, `C:\inetpub`, intranetOSWindows, "", "whoami", time.Second)
 	if len(got) != 1 {
 		t.Fatalf("a cached os_kind must not re-probe, scripts=%d", len(got))
 	}
@@ -166,7 +166,7 @@ func TestShellExecProbesOnceWhenFamilyUnknown(t *testing.T) {
 		}
 		return markerEcho("hi", `C:\`, 0), nil
 	}
-	res := shellExec(context.Background(), send, "", "", "whoami", time.Second)
+	res := shellExec(context.Background(), send, "", "", "", "whoami", time.Second)
 	if len(scripts) != 2 || scripts[0] != intranetOSProbe {
 		t.Fatalf("expected one probe then one command, got %q", scripts)
 	}
@@ -221,7 +221,7 @@ func TestShellExecReportsOnlyProbedFamily(t *testing.T) {
 		}
 		return "ok\n" + intranetCwdMarker + "/var/www\n" + intranetEcMarker + "0\n", nil
 	}
-	res := shellExec(context.Background(), silent, "", "", "id", time.Second)
+	res := shellExec(context.Background(), silent, "", "", "", "id", time.Second)
 	if res.IsError || res.ExitCode != 0 {
 		t.Fatalf("the turn itself must still succeed: %+v", res)
 	}
@@ -235,7 +235,7 @@ func TestShellExecReportsOnlyProbedFamily(t *testing.T) {
 		}
 		return "ok\n" + intranetCwdMarker + "C:\\inetpub\n" + intranetEcMarker + "0\n", nil
 	}
-	res = shellExec(context.Background(), answered, "", "", "whoami", time.Second)
+	res = shellExec(context.Background(), answered, "", "", "", "whoami", time.Second)
 	if res.OSKind != intranetOSWindows {
 		t.Fatalf("an answered probe must be reported so the caller can cache it: %q", res.OSKind)
 	}

@@ -46,9 +46,30 @@ const (
 
 	intranetOSPosix   = "posix"
 	intranetOSWindows = "windows"
+	// intranetShell* names the command interpreter the wrapper must speak to. It is
+	// deliberately finer than os: a Windows box can land in cmd.exe, PowerShell or
+	// (Git for Windows / Cygwin sshd) a POSIX shell, and the wrapper that works is
+	// decided by the interpreter, not by the OS.
+	intranetShellSh         = "sh"
+	intranetShellCmd        = "cmd"
+	intranetShellPowerShell = "powershell"
+
 	// intranetOSProbe works on both shells: cmd.exe expands %OS%, POSIX keeps
 	// it literal, so the marker only appears on Windows.
 	intranetOSProbe = `echo __JW_OS__%OS% & uname -s`
+	// intranetShellProbeSSH is the same idea without the `&` chain: PowerShell
+	// treats a bare `&` as the call operator and fails the whole line, which would
+	// leave the caller with no marker to classify.
+	intranetShellProbeSSH = `echo __JW_OS__%OS%`
+	// intranetOSMark / intranetWindowsOSValue are the shell probe's marker and the
+	// value cmd.exe substitutes for %OS%.
+	intranetOSMark         = "__JW_OS__"
+	intranetWindowsOSValue = "Windows_NT"
+	// intranetProbeScriptSSHWindows lists the tunnel tools cmd.exe can see. The
+	// `%NAME%` values must come back expanded: an unexpanded `%COMPUTERNAME%` is
+	// proof the line was echoed by some other interpreter.
+	intranetProbeScriptSSHWindows    = `echo __JW_HOST__%COMPUTERNAME% & echo __JW_KERNEL__%OS% & echo __JW_USER__%USERNAME% & echo __JW_BIN__cmd & if exist "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" echo __JW_BIN__powershell`
+	intranetProbeScriptSSHPowerShell = `Write-Output ("__JW_HOST__" + $env:COMPUTERNAME); Write-Output ("__JW_KERNEL__" + $env:OS); Write-Output ("__JW_USER__" + $env:USERNAME); Write-Output "__JW_BIN__powershell"; foreach ($b in @('socat','nc','ncat','ssh','chisel','python','python3','curl','busybox')) { if (Get-Command $b -ErrorAction SilentlyContinue) { Write-Output ("__JW_BIN__" + $b) } }`
 	// cmd.exe defaults to the OEM code page (GBK on zh-CN), which turns Chinese
 	// output into invalid UTF-8 after JSON encoding. Switch this command's
 	// console to UTF-8; the change is per child process, not persistent.
@@ -141,6 +162,51 @@ func intranetScript(cwd, command string) string {
 	return "cd " + shQuote(cwd) + " 2>/dev/null || cd /\n" +
 		"(\ntrap 'printf \"\\n" + intranetCwdMarker + "%s\\n" + intranetEcMarker + "%s\\n\" \"$PWD\" \"$?\"' EXIT\n" +
 		command + "\n) 2>&1\n"
+}
+
+// intranetScriptPowerShell is the PowerShell counterpart. Windows OpenSSH's
+// default shell is configurable, and a growing share of hosts ship PowerShell
+// rather than cmd.exe: cmd's `&` chaining is a syntax error there, so the whole
+// wrapper — including the trailing markers — never runs and the session looks
+// broken even though login worked. Statement separators are `;`, cwd is a
+// literal path, and $LASTEXITCODE is captured immediately because cmdlets leave
+// it at whatever the last *native* command set.
+func intranetScriptPowerShell(cwd, command string) string {
+	var b strings.Builder
+	b.WriteString("$ErrorActionPreference='Continue'; ")
+	// A POSIX-looking cwd ("/") is what a session row defaults to; cd-ing there
+	// under PowerShell would move the terminal to the current drive's root and
+	// then report *that* as the working directory. Same rule as the cmd wrapper:
+	// only a drive-absolute path is worth restoring.
+	if p := intranetWindowsCwd(cwd); p != "" {
+		if lit, ok := psQuotedLiteral(p); ok {
+			b.WriteString("if (Test-Path -LiteralPath " + lit + ") { Set-Location -LiteralPath " + lit + " }; ")
+		}
+	}
+	b.WriteString("& { " + command + " }; ")
+	// $LASTEXITCODE only exists once a native program has run in this process;
+	// a pure-cmdlet command must report 0, not an empty marker the parser reads as
+	// "no exit code at all".
+	b.WriteString("$__jwec = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }; ")
+	b.WriteString("Write-Output (\"" + intranetEcMarker + "\" + $__jwec); Write-Output \"" + intranetCwdMarker + "\"; (Get-Location).Path")
+	return b.String()
+}
+
+// psQuotedLiteral renders a path as a PowerShell single-quoted literal (”
+// doubles the quote). It refuses a path carrying a control character: PowerShell
+// takes backtick literally inside single quotes, but a newline would end the
+// statement and turn the rest of the path into a command.
+func psQuotedLiteral(cwd string) (string, bool) {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return "", false
+	}
+	for _, r := range cwd {
+		if r < 0x20 || r == 0x7f {
+			return "", false
+		}
+	}
+	return "'" + strings.ReplaceAll(cwd, "'", "''") + "'", true
 }
 
 // intranetScriptWindows is the cmd.exe counterpart. PHP system() on Windows
@@ -248,39 +314,119 @@ func parseCertutilBase64(raw string) ([]byte, error) {
 // cache that as POSIX, or a Windows box that was merely down keeps the wrong
 // wrapper after it comes back.
 func classifyOSProbe(raw string, err error) (kind string, ok bool) {
-	if err != nil || !strings.Contains(raw, "__JW_OS__") {
-		return intranetOSPosix, false
+	kind, _, ok = classifyShellProbe(raw, err)
+	return kind, ok
+}
+
+// classifyShellProbe is classifyOSProbe with the interpreter the echo came from.
+// The probe line is `echo __JW_OS__%OS% & uname -s`, which cmd.exe expands and
+// POSIX shells leave literal, so a marker on its own already picks the family.
+func classifyShellProbe(raw string, err error) (kind, shell string, ok bool) {
+	if err != nil || !strings.Contains(raw, intranetOSMark) {
+		return intranetOSPosix, intranetShellSh, false
 	}
-	if strings.Contains(raw, "__JW_OS__Windows_NT") {
-		return intranetOSWindows, true
+	if strings.Contains(raw, intranetOSMark+intranetWindowsOSValue) {
+		return intranetOSWindows, intranetShellCmd, true
 	}
-	return intranetOSPosix, true
+	return intranetOSPosix, intranetShellSh, true
+}
+
+// classifyPowerShellProbe is the second guess, used only after the chained probe
+// never answered. `%OS%` staying literal is what separates PowerShell from cmd;
+// sh and cmd both answer the chained probe, so a host that only replies to this
+// one is in an interpreter whose grammar rejects `&`.
+func classifyPowerShellProbe(raw string, err error) bool {
+	return err == nil && strings.Contains(raw, intranetOSMark)
+}
+
+// shellFamilyProbe asks the target which interpreter it is, in the syntax each
+// one can actually parse. One probe is not enough: the chained form is a
+// PowerShell parse error, so a PowerShell-only host answers nothing and the
+// caller would file it as "not a shell" — which is how Windows boxes got their
+// SSH sessions closed at creation instead of being driven.
+func shellFamilyProbe(ctx context.Context, send shellSender) (osKind, shell string, ok bool) {
+	pctx, pcancel := context.WithTimeout(ctx, 2*shellOSProbeTO+shellExecGrace)
+	defer pcancel()
+	raw, err := send(pctx, intranetOSProbe, shellOSProbeTO)
+	if kind, sh, confirmed := classifyShellProbe(raw, err); confirmed {
+		return kind, sh, true
+	}
+	if raw2, err2 := send(pctx, intranetShellProbeSSH, shellOSProbeTO); classifyPowerShellProbe(raw2, err2) {
+		return intranetOSWindows, intranetShellPowerShell, true
+	}
+	return intranetOSPosix, intranetShellSh, false
+}
+
+// shellWrapper picks the script builder for an interpreter family. An empty
+// shell falls back to the OS-level choice so webshell channels, which never
+// report an interpreter, keep using the cmd wrapper they always had.
+func shellWrapper(osKind, shell, cwd, command string) string {
+	if shell == intranetShellPowerShell {
+		return intranetScriptPowerShell(cwd, command)
+	}
+	if osKind == intranetOSWindows {
+		return intranetScriptWindows(cwd, command)
+	}
+	return intranetScript(cwd, command)
+}
+
+// intranetNotAShellReason names why a logged-in SSH session has no drivable
+// shell. Guessing "wrong shell" tells the operator nothing; these three answers
+// are actionable (change the account's shell, drop the forced command, wait for
+// the machine).
+func intranetNotAShellReason(raw string) string {
+	t := strings.ToLower(strings.TrimSpace(raw))
+	switch {
+	case strings.Contains(t, "this account is currently not available"),
+		strings.Contains(t, "no such user or invalid shell"):
+		return "目标账号的登录 shell 是 nologin/shell 类占位程序：SSH 能登录，但它不执行命令"
+	case strings.Contains(t, "forced command"), strings.Contains(t, "command=&&"),
+		strings.Contains(t, "no command specified"):
+		return "目标 sshd 给该账号配了 ForceCommand：平台的命令没有被交给 shell，而是被固定命令顶掉"
+	case strings.Contains(t, "connection closed"), strings.Contains(t, "channel 0: open failed"):
+		return "目标在收到命令前就关闭了会话（shell 被限制、账号被锁或 sshd 配置禁止 exec）"
+	case strings.TrimSpace(raw) == "":
+		return "目标对命令毫无回应（机器可达但 shell 起不来）"
+	default:
+		return "未解析到命令结束标记：已依次试过 sh/cmd/PowerShell 三种语法，目标回显的都不是平台认识的命令协议"
+	}
 }
 
 // intranetOS returns the target shell family, probing once and caching the
 // result in session metadata. Detection failures fall back to POSIX.
 func (s *Server) intranetOS(ctx context.Context, pg *db.DB, sess *db.IntranetSession) string {
-	if v, ok := sess.Metadata["os"].(string); ok && (v == intranetOSPosix || v == intranetOSWindows) {
-		return v
-	}
-	osKind := intranetOSPosix
-	// 探测失败（shell 暂时不可用、404 页面等）不能缓存为 posix：
-	// 否则 Windows 会话在 shell 恢复后仍会一直使用 POSIX wrapper。
-	raw, err := s.intranetSendScript(ctx, pg, sess, intranetOSProbe, 30*time.Second)
-	probed, ok := classifyOSProbe(raw, err)
-	if !ok {
-		return osKind
-	}
-	osKind = probed
-	if updated, err := pg.SetIntranetSessionMetadata(sess.ID, map[string]any{"os": osKind}); err == nil && updated != nil {
-		*sess = *updated
-	} else {
-		if sess.Metadata == nil {
-			sess.Metadata = map[string]any{}
-		}
-		sess.Metadata["os"] = osKind
-	}
+	osKind, _ := s.intranetShellFamily(ctx, pg, sess)
 	return osKind
+}
+
+// intranetShellFamily returns (操作系统族, 解释器) and caches both in session
+// metadata. os 只有 posix/windows 两个值——维持/健康检查等分支都按它判断，把
+// PowerShell 记成第三种值会让那些分支静默走错；解释器单独记在 shell 里。
+func (s *Server) intranetShellFamily(ctx context.Context, pg *db.DB, sess *db.IntranetSession) (string, string) {
+	osCached, _ := sess.Metadata["os"].(string)
+	shellCached, _ := sess.Metadata["shell"].(string)
+	if (osCached == intranetOSPosix || osCached == intranetOSWindows) && intranetShellKnown(shellCached) {
+		return osCached, shellCached
+	}
+	osKind, shell, ok := shellFamilyProbe(ctx, s.intranetSender(pg, sess))
+	if !ok {
+		// 探测没答复不能缓存成 posix+sh：否则 Windows 机器在 shell 恢复之后
+		// 还会一直用 POSIX wrapper（原来只有这一条纪律，解释器同样要守）。
+		return intranetOSPosix, intranetShellSh
+	}
+	if updated, err := pg.SetIntranetSessionMetadata(sess.ID, map[string]any{"os": osKind, "shell": shell}); err == nil && updated != nil {
+		*sess = *updated
+		return osKind, shell
+	}
+	if sess.Metadata == nil {
+		sess.Metadata = map[string]any{}
+	}
+	sess.Metadata["os"], sess.Metadata["shell"] = osKind, shell
+	return osKind, shell
+}
+
+func intranetShellKnown(shell string) bool {
+	return shell == intranetShellSh || shell == intranetShellCmd || shell == intranetShellPowerShell
 }
 
 // intranetIsSSH reports whether a session is carried by an SSH login instead of a
@@ -515,13 +661,20 @@ func (s *Server) intranetRunLocked(pg *db.DB, ctx context.Context, sess *db.Intr
 	// returns POSIX as a wrapper choice when its probe never answered, and feeding
 	// that guess in here would let one unreachable moment pin a cmd box to the
 	// POSIX wrapper for the life of the session.
-	cached := ""
+	cached, cachedShell := "", ""
 	if v, ok := sess.Metadata["os"].(string); ok && (v == intranetOSPosix || v == intranetOSWindows) {
 		cached = v
+		if sh, ok := sess.Metadata["shell"].(string); ok && intranetShellKnown(sh) {
+			cachedShell = sh
+		}
 	}
-	res := shellExec(ctx, s.intranetSender(pg, sess), sess.Cwd, cached, command, timeout)
-	if res.OSKind != "" && res.OSKind != cached {
-		if updated, merr := pg.SetIntranetSessionMetadata(sess.ID, map[string]any{"os": res.OSKind}); merr == nil && updated != nil {
+	res := shellExec(ctx, s.intranetSender(pg, sess), sess.Cwd, cached, cachedShell, command, timeout)
+	if res.OSKind != "" && (res.OSKind != cached || res.Shell != cachedShell) {
+		meta := map[string]any{"os": res.OSKind}
+		if intranetShellKnown(res.Shell) {
+			meta["shell"] = res.Shell
+		}
+		if updated, merr := pg.SetIntranetSessionMetadata(sess.ID, meta); merr == nil && updated != nil {
 			*sess = *updated
 		}
 	}
@@ -1227,9 +1380,13 @@ func (s *Server) intranetDownload(ctx context.Context, pg *db.DB, sess *db.Intra
 
 // intranetProbe collects OS/user/tool availability from the target.
 func (s *Server) intranetProbe(ctx context.Context, pg *db.DB, sess *db.IntranetSession) (intranetProbeInfo, intranetExecOutcome) {
+	osKind, shell := s.intranetShellFamily(ctx, pg, sess)
 	script := intranetProbeScript
-	if s.intranetOS(ctx, pg, sess) == intranetOSWindows {
-		script = `echo __JW_HOST__%COMPUTERNAME% & echo __JW_KERNEL__%OS% & echo __JW_USER__%USERNAME% & echo __JW_BIN__cmd & if exist "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" echo __JW_BIN__powershell`
+	switch {
+	case shell == intranetShellPowerShell:
+		script = intranetProbeScriptSSHPowerShell
+	case osKind == intranetOSWindows:
+		script = intranetProbeScriptSSHWindows
 	}
 	out := s.intranetRun(ctx, pg, sess, script, 30*time.Second)
 	info := intranetProbeInfo{Raw: truncateIntranetOutput(out.Output, 4000)}
@@ -3316,11 +3473,26 @@ func (s *Server) intranetOpenSSHSession(ctx context.Context, pg *db.DB, req intr
 	// SSH 没有「HTTP 壳一时抽风」这种借口：登录通了、标记协议却没跑起来，就是
 	// 目标上的 shell 不是预期的那种。留着 active 只会让后面每条命令都撞同一句错。
 	if out.IsError {
+		reason := displayOr(out.Note, strings.TrimSpace(out.Output))
+		// 只有目标确实回显了东西才谈「shell 不对」：连接层失败时 Output 是空的，
+		// 那时要说的是连不上/认证不过，而不是「这不是个 shell」——后者会把操作员
+		// 支去改账号的登录 shell，而真正的问题在网络上。
+		shellBroken := strings.TrimSpace(out.Output) != "" && !out.TimedOut
+		if shellBroken {
+			reason = intranetNotAShellReason(out.Output) + "（目标回显：" + truncateIntranetOutput(strings.TrimSpace(out.Output), 200) + "）"
+		}
 		_, _ = pg.UpdateIntranetSessionState(sess.ID, "", db.IntranetSessionClosed, "初始 SSH 探测失败")
+		if shellBroken {
+			// 口令是真的——握手与认证都过了，只是这个账号跑不了命令。把它记成 valid
+			// 并写清限制，横向移动台账才不会把一条确实可用的凭据当未验证丢掉；
+			// 但证据必须写明「无执行通道」，否则下一个调用会以为这壳能用。
+			_, _ = pg.MarkIntranetCredentialUsed(cred.ID, db.IntranetCredValid,
+				fmt.Sprintf("SSH 登录 %s:%d 成功，但账号没有可执行命令的 shell（会话 #%d 已关闭）：%s", host, port, sess.ID, reason))
+		}
 		if fresh, ferr := pg.GetIntranetSession(sess.ID); ferr == nil {
 			sess = fresh
 		}
-		return sess, info, fmt.Errorf("SSH 会话探测失败，已关闭：%s", displayOr(out.Note, strings.TrimSpace(out.Output)))
+		return sess, info, fmt.Errorf("SSH 会话探测失败，已关闭：%s", reason)
 	}
 	if !out.IsError {
 		// 登录成功是凭据最硬的证据：台账里的 SSH 凭据此前只会停在 untested。

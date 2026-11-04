@@ -420,7 +420,7 @@ func (s *Server) execJavaMemshell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ch := shellChannel{URL: ms.URL, Payload: payload}
-	res := shellExec(r.Context(), httpShellSender(ch), strings.TrimSpace(req.Cwd), req.OSKind, req.Command, clampShellTimeout(req.TimeoutSeconds))
+	res := shellExec(r.Context(), httpShellSender(ch), strings.TrimSpace(req.Cwd), req.OSKind, "", req.Command, clampShellTimeout(req.TimeoutSeconds))
 	if res.Output == "" && res.Note != "" {
 		res.Output = res.Note
 	}

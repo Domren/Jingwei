@@ -45,6 +45,12 @@ printf '__JW_RECON__end\n'
 // system() only executes the first line of a multi-line command.
 const intranetReconScriptWindows = intranetWindowsCodepage + `echo __JW_RECON__addr & ipconfig /all & echo __JW_RECON__route & route print & echo __JW_RECON__hosts & type "%SystemRoot%\System32\drivers\etc\hosts" & echo __JW_RECON__neigh & arp -a & echo __JW_RECON__listen & netstat -ano & echo __JW_RECON__end`
 
+// intranetReconScriptPowerShell is the same collection for a host whose SSH
+// default shell is PowerShell: `&` chaining is a parse error there, so the cmd
+// form would collect nothing and the operator would see an empty recon rather
+// than "this interpreter is different".
+const intranetReconScriptPowerShell = `Write-Output "__JW_RECON__addr"; ipconfig /all; Write-Output "__JW_RECON__route"; route print; Write-Output "__JW_RECON__hosts"; Get-Content "$env:SystemRoot\System32\drivers\etc\hosts"; Write-Output "__JW_RECON__neigh"; arp -a; Write-Output "__JW_RECON__listen"; netstat -ano; Write-Output "__JW_RECON__end"`
+
 type intranetRoute struct {
 	Destination string `json:"destination"`
 	Gateway     string `json:"gateway,omitempty"`
@@ -456,7 +462,11 @@ func intranetReconScopeCandidates(info intranetReconInfo) []string {
 func (s *Server) intranetRecon(ctx context.Context, pg *db.DB, sess *db.IntranetSession, requestScope bool) intranetReconResult {
 	res := intranetReconResult{SessionID: sess.ID}
 	script := intranetReconScript
-	if s.intranetOS(ctx, pg, sess) == intranetOSWindows {
+	osKind, shell := s.intranetShellFamily(ctx, pg, sess)
+	switch {
+	case shell == intranetShellPowerShell:
+		script = intranetReconScriptPowerShell
+	case osKind == intranetOSWindows:
 		script = intranetReconScriptWindows
 	}
 	out := s.intranetRun(ctx, pg, sess, script, intranetReconTimeout)

@@ -71,6 +71,7 @@ type shellExecResult struct {
 	Cwd        string `json:"cwd,omitempty"`
 	ExitCode   int    `json:"exit_code"`
 	OSKind     string `json:"os_kind,omitempty"`
+	Shell      string `json:"shell_kind,omitempty"`
 	DurationMS int64  `json:"duration_ms"`
 	TimedOut   bool   `json:"timed_out"`
 	MarkerOK   bool   `json:"marker_ok"`
@@ -121,6 +122,33 @@ func shellOSKindOf(ctx context.Context, send shellSender, cached string) (kind s
 	return classifyOSProbe(raw, err)
 }
 
+// shellFamilyOf is shellOSKindOf with the interpreter attached. Passing an empty
+// cached shell means "not known yet" — a webshell channel reports only its OS, so
+// those callers keep the cmd-or-sh choice the OS alone gives them.
+func shellFamilyOf(ctx context.Context, send shellSender, cachedOS, cachedShell string) (osKind, shell string, confirmed bool) {
+	if (cachedOS == intranetOSPosix || cachedOS == intranetOSWindows) && intranetShellKnown(cachedShell) {
+		return cachedOS, cachedShell, true
+	}
+	if cachedOS == intranetOSPosix || cachedOS == intranetOSWindows {
+		return cachedOS, shellForOS(cachedOS), true
+	}
+	osKind, shell, confirmed = shellFamilyProbe(ctx, send)
+	if confirmed && shellForOS(osKind) != shell {
+		// sh/cmd 之外的解释器只能由探测认出来；缓存里若只有 os，别把 cmd 当作默认。
+		return osKind, shell, true
+	}
+	return osKind, shell, confirmed
+}
+
+// shellForOS is the interpreter implied by the OS alone, for channels that cannot
+// tell us more: Windows means cmd.exe unless someone proved otherwise.
+func shellForOS(osKind string) string {
+	if osKind == intranetOSWindows {
+		return intranetShellCmd
+	}
+	return intranetShellSh
+}
+
 // shellSendDeadline says the transport gave up on its own per-request deadline.
 // The HTTP sender cuts off at exactly the command timeout, which is earlier than
 // our context (timeout + grace), so a long-running command reaches us as
@@ -136,8 +164,8 @@ func shellSendDeadline(err error) bool {
 // bare string. osKind is the cached family ("" = never probed) and the resolved
 // one comes back on the result for the caller to store where it belongs:
 // webshells.os_kind for a landed shell, session metadata for an intranet one.
-func shellExec(ctx context.Context, send shellSender, cwd, osKind, command string, timeout time.Duration) shellExecResult {
-	res := shellExecResult{ExitCode: -1, OSKind: osKind}
+func shellExec(ctx context.Context, send shellSender, cwd, osKind, shellKind, command string, timeout time.Duration) shellExecResult {
+	res := shellExecResult{ExitCode: -1, OSKind: osKind, Shell: shellKind}
 	if strings.TrimSpace(command) == "" {
 		res.IsError, res.Note = true, "命令不能为空"
 		return res
@@ -145,12 +173,12 @@ func shellExec(ctx context.Context, send shellSender, cwd, osKind, command strin
 	if timeout <= 0 {
 		timeout = shellExecDefaultTimeout
 	}
-	kind, confirmed := shellOSKindOf(ctx, send, osKind)
+	kind, shell, confirmed := shellFamilyOf(ctx, send, osKind, shellKind)
 	// The wrapper we run with and the family we report are different claims: an
 	// unprobed target still executes as POSIX, but reporting that would let the
 	// caller file a guess away as the target's operating system.
 	if confirmed {
-		res.OSKind = kind
+		res.OSKind, res.Shell = kind, shell
 	}
 	// An operator's first command should report where the web server actually put
 	// the process — the script directory — not the filesystem root. "cd ." leaves
@@ -160,10 +188,7 @@ func shellExec(ctx context.Context, send shellSender, cwd, osKind, command strin
 	if startCwd == "" && kind != intranetOSWindows {
 		startCwd = "."
 	}
-	script := intranetScript(startCwd, command)
-	if kind == intranetOSWindows {
-		script = intranetScriptWindows(cwd, command)
-	}
+	script := shellWrapper(kind, shell, startCwd, command)
 	cctx, cancel := context.WithTimeout(ctx, timeout+shellExecGrace)
 	defer cancel()
 	start := time.Now()
@@ -385,7 +410,7 @@ func (s *Server) execWebshellCommand(w http.ResponseWriter, r *http.Request) {
 	if k := strings.TrimSpace(req.OSKind); k == intranetOSPosix || k == intranetOSWindows {
 		kind = k
 	}
-	res := shellExec(r.Context(), httpShellSender(ch), cwd, kind, req.Command, clampShellTimeout(req.TimeoutSeconds))
+	res := shellExec(r.Context(), httpShellSender(ch), cwd, kind, "", req.Command, clampShellTimeout(req.TimeoutSeconds))
 	if res.Output == "" && res.Note != "" {
 		res.Output = res.Note
 	}
@@ -412,7 +437,7 @@ func (s *Server) webshellInfo(w http.ResponseWriter, r *http.Request) {
 	// Same rule as exec: the terminal's directory comes from the caller and is
 	// reported back, never stored on the shell record.
 	cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
-	res := shellExec(r.Context(), httpShellSender(ch), cwd, shell.OSKind, shellInfoScript(shell.OSKind), shellInfoProbeTO)
+	res := shellExec(r.Context(), httpShellSender(ch), cwd, shell.OSKind, "", shellInfoScript(shell.OSKind), shellInfoProbeTO)
 	if res.Cwd != "" {
 		cwd = res.Cwd
 	}
