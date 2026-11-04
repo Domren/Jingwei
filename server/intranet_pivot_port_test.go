@@ -18,11 +18,11 @@ func TestAutoSelectTunnelSSHPortIsSeparate(t *testing.T) {
 	// 没配 ssh 端口时用 22。
 	t.Setenv("JINGWEI_PIVOT_SSH_PORT", "")
 	deploy, reason, side := autoSelectTunnelCommand(db.IntranetTunnelKindSocks5, sshOnly, tun)
-	if deploy == "" || side != db.IntranetListenSideTarget {
-		t.Fatalf("ssh -D 应当生成部署命令且监听在目标侧: deploy=%q side=%q", deploy, side)
+	if deploy == "" || side != db.IntranetListenSidePivot {
+		t.Fatalf("ssh -R 应当生成部署命令且监听在控制端: deploy=%q side=%q", deploy, side)
 	}
 	if !strings.Contains(deploy, "-p 22 ") {
-		t.Fatalf("未配 JINGWEI_PIVOT_SSH_PORT 时 ssh -D 要用 22，实得: %q", deploy)
+		t.Fatalf("未配 JINGWEI_PIVOT_SSH_PORT 时 ssh -R 要用 22，实得: %q", deploy)
 	}
 	if strings.Contains(deploy, "-p 8788") {
 		t.Fatalf("ssh 不能去连 chisel 的 8788: %q", deploy)
@@ -35,17 +35,20 @@ func TestAutoSelectTunnelSSHPortIsSeparate(t *testing.T) {
 	t.Setenv("JINGWEI_PIVOT_SSH_PORT", "2201")
 	deploy, _, _ = autoSelectTunnelCommand(db.IntranetTunnelKindSocks5, sshOnly, tun)
 	if !strings.Contains(deploy, "-p 2201 ") {
-		t.Fatalf("ssh -D 应当用配置端口 2201: %q", deploy)
+		t.Fatalf("ssh -R 应当用配置端口 2201: %q", deploy)
 	}
 
-	// 端口转发（ssh -L）同理。
+	// 端口转发（ssh -R 带目的地）同理。
 	fwd := &db.IntranetTunnel{ID: 2, Kind: db.IntranetTunnelKindPort, ListenPort: 8473, RemoteHost: "10.99.0.10", RemotePort: 8000}
-	deploy, reason, _ = autoSelectTunnelCommand(db.IntranetTunnelKindPort, sshOnly, fwd)
-	if !strings.Contains(deploy, "-L 0.0.0.0:8473:10.99.0.10:8000 -p 2201 ") {
-		t.Fatalf("ssh -L 应当用配置端口 2201: %q", deploy)
+	deploy, reason, side = autoSelectTunnelCommand(db.IntranetTunnelKindPort, sshOnly, fwd)
+	if !strings.Contains(deploy, "-R 0.0.0.0:8473:10.99.0.10:8000 -p 2201 ") {
+		t.Fatalf("ssh -R 应当用配置端口 2201: %q", deploy)
+	}
+	if side != db.IntranetListenSidePivot {
+		t.Fatalf("ssh -R 的监听在控制端: %q", side)
 	}
 	if !strings.Contains(reason, "10.0.0.5:2201") {
-		t.Fatalf("ssh -L 的理由要写清控制端端口: %q", reason)
+		t.Fatalf("ssh -R 的理由要写清控制端端口: %q", reason)
 	}
 }
 
@@ -149,7 +152,7 @@ func TestAutoSelectTunnelChiselFingerprint(t *testing.T) {
 }
 
 // 监听地址写进命令：chisel 不写绑定地址时只听控制端回环，容器里的平台进程拨不到；
-// ssh -L 不写时只听客户端回环。两个都得带上登记值（2026-11-05 真机验证）。
+// ssh -R 不写时控制端 sshd 也只听回环。两个都得带上登记值（2026-11-05 真机验证）。
 func TestAutoSelectTunnelHonoursListenHost(t *testing.T) {
 	t.Setenv("JINGWEI_PIVOT_SERVER", "10.0.0.5:8788")
 	t.Setenv("JINGWEI_PIVOT_CHISEL_FINGERPRINT", "")
@@ -176,7 +179,57 @@ func TestAutoSelectTunnelHonoursListenHost(t *testing.T) {
 
 	fwd := &db.IntranetTunnel{ID: 24, Kind: db.IntranetTunnelKindPort, ListenHost: "0.0.0.0", ListenPort: 8473, RemoteHost: "10.0.0.8", RemotePort: 80}
 	deploy, _, _ = autoSelectTunnelCommand(fwd.Kind, sshOnly, fwd)
-	if !strings.Contains(deploy, "-L 0.0.0.0:8473:10.0.0.8:80") {
-		t.Fatalf("ssh -L 不带绑定地址时只听回环，必须显式写出: %q", deploy)
+	if !strings.Contains(deploy, "-R 0.0.0.0:8473:10.0.0.8:80") {
+		t.Fatalf("ssh -R 不带绑定地址时控制端只听回环，必须显式写出: %q", deploy)
+	}
+
+	// 登记了具体监听地址时照它绑，不放宽。
+	bindFwd := &db.IntranetTunnel{ID: 25, Kind: db.IntranetTunnelKindPort, ListenHost: "172.17.0.1", ListenPort: 8474, RemoteHost: "10.0.0.8", RemotePort: 80}
+	deploy, _, _ = autoSelectTunnelCommand(bindFwd.Kind, sshOnly, bindFwd)
+	if !strings.Contains(deploy, "-R 172.17.0.1:8474:10.0.0.8:80") {
+		t.Fatalf("ssh -R 要按登记的监听地址绑: %q", deploy)
+	}
+}
+
+// ssh -R 拨的是控制端那个目标可连入的 sshd，用户名默认取目标侧登录名——两边不同名时
+// BatchMode 直接认证失败。JINGWEI_PIVOT_SSH_USER 用来钉住它，非法值必须拒绝而不是下发。
+func TestAutoSelectTunnelPivotSSHUser(t *testing.T) {
+	t.Setenv("JINGWEI_PIVOT_SERVER", "10.0.0.5:8788")
+	t.Setenv("JINGWEI_PIVOT_SSH_PORT", "2222")
+	sshOnly := intranetProbeInfo{Bins: []string{"ssh"}}
+	tun := &db.IntranetTunnel{ID: 31, Kind: db.IntranetTunnelKindSocks5, ListenPort: 1080}
+
+	t.Setenv("JINGWEI_PIVOT_SSH_USER", "")
+	deploy, _, _ := autoSelectTunnelCommand(db.IntranetTunnelKindSocks5, sshOnly, tun)
+	if !strings.Contains(deploy, "'10.0.0.5'") || strings.Contains(deploy, "@10.0.0.5") {
+		t.Fatalf("未配用户名时只给地址，由 ssh 用目标侧登录名: %q", deploy)
+	}
+
+	t.Setenv("JINGWEI_PIVOT_SSH_USER", "  pivot ")
+	deploy, reason, _ := autoSelectTunnelCommand(db.IntranetTunnelKindSocks5, sshOnly, tun)
+	if !strings.Contains(deploy, "'pivot@10.0.0.5'") {
+		t.Fatalf("配了用户名要拼进 ssh 目的地址: %q", deploy)
+	}
+	if strings.Contains(reason, "JINGWEI_PIVOT_SSH_USER 不是合法用户名") {
+		t.Fatalf("合法用户名不该被拒: %q", reason)
+	}
+
+	for _, bad := range []string{"a b", "pivot;touch /tmp/pwn", "$(id)", "root@x", "piv/ot"} {
+		t.Setenv("JINGWEI_PIVOT_SSH_USER", bad)
+		deploy, reason, _ := autoSelectTunnelCommand(db.IntranetTunnelKindSocks5, sshOnly, tun)
+		if deploy != "" {
+			t.Fatalf("用户名 %q 非法却生成了命令: %q", bad, deploy)
+		}
+		if !strings.Contains(reason, "JINGWEI_PIVOT_SSH_USER") {
+			t.Fatalf("拒绝理由要点名变量: %q", reason)
+		}
+	}
+
+	// IPv6 控制端地址要带方括号，否则 ssh 把冒号当 user:host 分隔。
+	t.Setenv("JINGWEI_PIVOT_SSH_USER", "pivot")
+	t.Setenv("JINGWEI_PIVOT_SERVER", "[fd00::5]:8788")
+	deploy, _, _ = autoSelectTunnelCommand(db.IntranetTunnelKindSocks5, sshOnly, tun)
+	if !strings.Contains(deploy, "'pivot@[fd00::5]'") {
+		t.Fatalf("IPv6 控制端地址要引用并加括号: %q", deploy)
 	}
 }

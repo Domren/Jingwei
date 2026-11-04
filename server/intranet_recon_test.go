@@ -269,8 +269,8 @@ func TestAutoSelectTunnelUsesPivotServer(t *testing.T) {
 	if strings.Contains(deploy, "YOUR_C2") {
 		t.Fatalf("placeholder leaked: %s", deploy)
 	}
-	// chisel client 不带 R: 时监听开在控制端：记成 target 会让 verify 在目标上查一个
-	// 从来不存在端口，把好隧道判死。
+	// chisel 的 R: 把监听开在控制端（chisel server 一侧）：记成 target 会让 verify 在目标
+	// 上查一个从来不存在端口，把好隧道判死。
 	if side != db.IntranetListenSidePivot {
 		t.Fatalf("chisel socks5 listen side = %q, want %q", side, db.IntranetListenSidePivot)
 	}
@@ -278,13 +278,20 @@ func TestAutoSelectTunnelUsesPivotServer(t *testing.T) {
 		t.Fatalf("chisel deploy must record the pid on the target too: %s", deploy)
 	}
 
-	// ssh -D 在目标上开监听，选型不能把监听侧写成 pivot。
-	sshSide, _, side := autoSelectTunnelCommand(tr.Kind, intranetProbeInfo{Bins: []string{"ssh"}}, tr)
-	if side != db.IntranetListenSideTarget {
-		t.Fatalf("ssh -D listen side = %q, want target", side)
+	// ssh 变体同理：不带目的地的 -R 让控制端 sshd 监听，目的地由目标上的 ssh 客户端拨。
+	// 2026-11-05 真机：同一台只有 OpenSSH 的目标，-D 打仅内网段超时、-R 拿到 200。
+	sshSide, sshReason, side := autoSelectTunnelCommand(tr.Kind, intranetProbeInfo{Bins: []string{"ssh"}}, tr)
+	if side != db.IntranetListenSidePivot {
+		t.Fatalf("ssh -R listen side = %q, want pivot", side)
 	}
-	if !strings.Contains(sshSide, "ssh -N -D 0.0.0.0:1080") || !strings.Contains(sshSide, "BatchMode=yes") {
-		t.Fatalf("ssh -D deploy = %s", sshSide)
+	if !strings.Contains(sshSide, "ssh -N -R 0.0.0.0:1080") || !strings.Contains(sshSide, "BatchMode=yes") {
+		t.Fatalf("ssh -R deploy = %s", sshSide)
+	}
+	if strings.Contains(sshSide, "-D ") {
+		t.Fatalf("不该再生成 -D（出口在控制端，穿透不到目标侧网段）: %s", sshSide)
+	}
+	if !strings.Contains(sshReason, "GatewayPorts") {
+		t.Fatalf("理由要写明控制端 sshd 的 GatewayPorts 前提: %s", sshReason)
 	}
 
 	t.Setenv("JINGWEI_PIVOT_SERVER", "")

@@ -104,17 +104,23 @@ JINGWEI_PROXY_PORT=9791
   此时调小为 `300s` 可让 worker 尽快放弃卡住的那一次并继续推进。
 - 如果需要限制访问来源，建议保持 `JINGWEI_PROXY_PORT` 只绑定 `127.0.0.1`，
   公网只开放反向代理端口。
-- **内网横向前必须先配 `JINGWEI_PIVOT_SERVER`**：隧道（chisel / `ssh -D` / `ssh -L`）的自动部署命令
+- **内网横向前必须先配 `JINGWEI_PIVOT_SERVER`**：隧道（chisel / `ssh -R`）的自动部署命令
   需要一个**目标机能访问到**的控制端地址，格式 `host:port`（只写主机名时按 chisel 默认的 8788 处理）。
   没配时深度利用的隧道「自动生成」会直接返回「未配置 JINGWEI_PIVOT_SERVER」，只能手写 `deploy_command`。
   单机组网常见填法是宿主机在靶机可达网段的地址；这个地址会被写进下发到目标机的命令里，
   所以别用公网监听口，用完把控制端端口关掉。
   注意 chisel 与 ssh 两条路用的**不是同一个端口**：`JINGWEI_PIVOT_SERVER` 的端口是 chisel server 监听的端口，
-  `ssh -D` / `ssh -L` 回连控制端用的端口由 `JINGWEI_PIVOT_SSH_PORT` 单独指定（留空＝22，sshd 通常就在这）。
+  `ssh -R` 回连控制端用的端口由 `JINGWEI_PIVOT_SSH_PORT` 单独指定（留空＝22，sshd 通常就在这）。
   两者合成一个值时必然有一条路是错的——目标会去 ssh 登录 chisel 的端口。
+  ssh 这条路还要配 `JINGWEI_PIVOT_SSH_USER`：留空时 ssh 沿用**目标侧**的登录名，两端不同名就直接认证失败，
+  而命令是 `BatchMode` 跑的，现象是隧道秒挂而不是卡在口令。
   还要给控制端准备 **chisel server**（若要用 chisel 这条路）：必须带 `--reverse`，
   因为平台生成的是 `chisel client <控制端> R:<端口>:socks` 这类反向请求——不带 `--reverse` 时服务端会直接拒绝，
   隧道一条也建不起来。监听只绑目标可达的内网地址，用完关掉。
+  用 `ssh -R` 时控制端那个 sshd 必须把 `GatewayPorts` 设为 `clientspecified`（或 `yes`）并允许端口转发，
+  否则它拒绝在非回环地址上监听：ssh 进程活着、控制端却没有监听，verify 会以「端口不可达」失败。
+  两条路都是「控制端监听、由目标往外拨号」，这正是穿透到**只有目标可达**的网段所需的朝向；
+  `ssh -D` / `ssh -L` 的目的地由控制端发起，打不到那种网段，平台不再生成它们。
 - 其余运行时开关都在 `.env.example` 里带注释列出，留空即用内置默认值，改完需要
   `docker compose up -d` 重建容器才生效（`restart` 不会重读 `.env`）。其中两条与安全行为有关：
   `JINGWEI_GUARD_ENFORCEMENT` 默认 `strict`（读不到授权范围即拒绝），改成 `warn`/`off` 是主动放宽边界，

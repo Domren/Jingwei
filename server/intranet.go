@@ -1299,7 +1299,7 @@ func intranetPivotEndpoint() (string, error) {
 // intranetPivotSSHPort returns the port the SSH variants of a tunnel dial.
 // It cannot reuse JINGWEI_PIVOT_SERVER's port: that one is chisel's server port
 // (8788 by default), while sshd is nearly always 22 — one value cannot serve both,
-// and the generated `ssh -D`/`ssh -L` would otherwise try to log into chisel.
+// and the generated `ssh -R` would otherwise try to log into chisel.
 func intranetPivotSSHPort() (int, error) {
 	raw := strings.TrimSpace(os.Getenv("JINGWEI_PIVOT_SSH_PORT"))
 	if raw == "" {
@@ -1311,6 +1311,32 @@ func intranetPivotSSHPort() (int, error) {
 	}
 	return n, nil
 }
+
+// intranetPivotSSHDest returns the ssh destination for the `-R` variants: the
+// control-end address, optionally with an explicit user. Without a user, ssh
+// dials with the *target-side* account's name, which only works when both ends
+// happen to use the same name — usually not the case, and the failure is a
+// silent auth reject under BatchMode. JINGWEI_PIVOT_SSH_USER pins it instead.
+func intranetPivotSSHDest() (string, error) {
+	host, _, err := intranetPivotServer()
+	if err != nil {
+		return "", err
+	}
+	addr := host
+	if strings.Contains(addr, ":") && !strings.HasPrefix(addr, "[") {
+		addr = "[" + addr + "]"
+	}
+	user := strings.TrimSpace(os.Getenv("JINGWEI_PIVOT_SSH_USER"))
+	if user == "" {
+		return shQuote(addr), nil
+	}
+	if !pivotSSHUserRE.MatchString(user) {
+		return "", fmt.Errorf("JINGWEI_PIVOT_SSH_USER 不是合法用户名（仅限字母、数字与 . _ -，长 1-64）: %q", user)
+	}
+	return shQuote(user + "@" + addr), nil
+}
+
+var pivotSSHUserRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
 // chiselFingerprintArg renders the optional `--fingerprint` flag for a chisel
 // client. chisel has no "auto" value — passing one makes the client treat the
@@ -1329,7 +1355,7 @@ func chiselFingerprintArg() (string, error) {
 	return "--fingerprint " + shQuote(fp) + " ", nil
 }
 
-// sshBindPrefix 同 chiselBindPrefix：ssh 的 -L 不写绑定地址时只听客户端回环。
+// sshBindPrefix 同 chiselBindPrefix：ssh -R 不写绑定地址时只听控制端回环，容器里的平台进程拨不到。
 func sshBindPrefix(t *db.IntranetTunnel) string { return chiselBindPrefix(t) }
 
 // chiselBindPrefix 把隧道登记的监听地址翻译成 chisel 的绑定前缀。
@@ -1360,9 +1386,11 @@ var chiselFingerprintRE = regexp.MustCompile(`^[A-Za-z0-9+/]{43}={0,1}$`)
 //
 // listenSide says where the listener actually ends up, which is not always the
 // target: chisel client creates the SOCKS/forward listener on its server (the
-// control end), while socat, ssh -D and ssh -L listen where they run — the
-// target. Verify and teardown must look on that side or they "fail" a working
-// tunnel and re-check a port that was never there.
+// control end) and so does `ssh -R` — both dial out to the control end and let
+// the *target* connect onward, which is what makes them reach segments only the
+// target can see. socat listens where it runs, i.e. the target. Verify and
+// teardown must look on that side or they "fail" a working tunnel and re-check a
+// port that was never there.
 func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.IntranetTunnel) (deploy, reason, listenSide string) {
 	listenPort := t.ListenPort
 	remoteHost := t.RemoteHost
@@ -1373,9 +1401,9 @@ func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.Intranet
 
 	switch kind {
 	case db.IntranetTunnelKindSocks5:
-		// SOCKS5: chisel > ssh -D
+		// SOCKS5: chisel > ssh -R
 		if listenPort <= 0 {
-			return "", "SOCKS5 需要 listen_port（目标上的 SOCKS 监听端口）", listenSide
+			return "", "SOCKS5 需要 listen_port（隧道 SOCKS 的监听端口）", listenSide
 		}
 		if intranetHasBin(info, "chisel") {
 			if pivotErr != nil {
@@ -1401,19 +1429,33 @@ func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.Intranet
 			if sshErr != nil {
 				return "", sshErr.Error(), listenSide
 			}
-			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("ssh -N -D 0.0.0.0:%d -p %d -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s",
-				listenPort, sshPort, shQuote(pivotHost)))
-			reason = "目标有 ssh，用 ssh -D 建 SOCKS5（目标监听 " + strconv.Itoa(listenPort) +
-				"，回连控制端 " + pivotHost + ":" + strconv.Itoa(sshPort) +
-				"；BatchMode 下要求目标到控制端已免密，否则会立刻失败而不是卡在口令提示。注意 -D 的出口在控制端，" +
-				"只能让目标借用控制端的网络，不能用于访问控制端不可达的内网段）"
+			// 「监听开在控制端、目的地由目标拨号」这个方向，OpenSSH 只有不带目的地的 -R 能表达：
+			// 控制端 sshd 把连接转回目标上的 ssh 客户端，由它在目标侧拨目的地。-D/-L 的目的地
+			// 一律由远端（这里是控制端）发起，等于什么都没穿透。2026-11-05 真机：同一台只有
+			// OpenSSH 的目标，-D 打仅内网段超时，-R 拿到 200。
+			bind := sshBindPrefix(t)
+			sshDest, destErr := intranetPivotSSHDest()
+			if destErr != nil {
+				return "", destErr.Error(), listenSide
+			}
+			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("ssh -N -R %s%d -p %d -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s",
+				bind, listenPort, sshPort, sshDest))
+			reason = "目标没有 chisel 但有 ssh，用 `ssh -N -R " + bind + strconv.Itoa(listenPort) +
+				"` 建 SOCKS5：不带目的地的 -R 让控制端 sshd 监听 " + strconv.Itoa(listenPort) +
+				"，连接转回目标上的 ssh 客户端、由它在目标侧拨目的地，所以能打到只有目标可达的内网段" +
+				"（2026-11-05 真机验证 200；-D/-L 的目的地都由控制端发起，打不到这种段，别用）。" +
+				"前提：控制端要有一个目标能连进来的 sshd（地址取 " +
+				pivotHost + ":" + strconv.Itoa(sshPort) +
+				"），目标到它已免密（BatchMode 下不免密会立刻失败而不是卡在口令），" +
+				"且 sshd 的 GatewayPorts 为 clientspecified/yes，否则绑定 " + bind +
+				" 会被拒（现象：ssh 会话存活但控制端没有监听，verify 失败）"
+			return deploy, reason, db.IntranetListenSidePivot
 		} else {
 			return "", "目标上没有 chisel/ssh，无法自动建 SOCKS5；请手动提供 deploy_command", listenSide
 		}
-		return deploy, reason, listenSide
 
 	case db.IntranetTunnelKindPort, db.IntranetTunnelKindRemote:
-		// 端口转发：socat > ssh -L > chisel
+		// 端口转发：socat > ssh -R > chisel
 		if remoteHost == "" || remotePort <= 0 || listenPort <= 0 {
 			return "", "需要 listen_port、remote_host 与 remote_port", listenSide
 		}
@@ -1433,11 +1475,19 @@ func autoSelectTunnelCommand(kind string, info intranetProbeInfo, t *db.Intranet
 			if sshErr != nil {
 				return "", sshErr.Error(), listenSide
 			}
-			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("ssh -N -L %s%d:%s:%d -p %d -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s",
-				sshBindPrefix(t), listenPort, remoteHost, remotePort, sshPort, shQuote(pivotHost)))
-			reason = "目标没有 socat，用 ssh -L 做端口转发（回连控制端 " + pivotHost + ":" + strconv.Itoa(sshPort) +
-				"；注意：-L 的目的地由控制端发起，" +
-				"只有控制端也能访问 " + remoteHost + " 时才有意义；穿透到控制端不可达的内网段请改用 socat/chisel 或手工 deploy_command）"
+			bind := sshBindPrefix(t)
+			sshDest, destErr := intranetPivotSSHDest()
+			if destErr != nil {
+				return "", destErr.Error(), listenSide
+			}
+			deploy = intranetBackgroundTunnel(t.ID, fmt.Sprintf("ssh -N -R %s%d:%s:%d -p %d -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s",
+				bind, listenPort, remoteHost, remotePort, sshPort, sshDest))
+			reason = "目标没有 socat，用 ssh -R 做端口转发：控制端 sshd 监听 " + bind + strconv.Itoa(listenPort) +
+				"，对 " + remoteHost + ":" + strconv.Itoa(remotePort) + " 的连接由目标发起，所以能打到只有目标可达的内网服务" +
+				"（2026-11-05 真机验证：目标只有 OpenSSH 时经它读到仅内网主机的 SSH banner；-L 的目的地由控制端发起，" +
+				"只有控制端也能访问 " + remoteHost + " 时才有意义，别用它做穿透）。前提：控制端有目标能连进来的 sshd（" +
+				pivotHost + ":" + strconv.Itoa(sshPort) + "）、目标到它已免密，且 sshd 的 GatewayPorts 为 clientspecified/yes"
+			return deploy, reason, db.IntranetListenSidePivot
 		} else if intranetHasBin(info, "chisel") {
 			if pivotErr != nil {
 				return "", pivotErr.Error(), listenSide
@@ -2004,7 +2054,7 @@ func (s *Server) intranetStopTunnel(ctx context.Context, tunnelID int64, note st
 		}
 		// 拆完必须回看一眼端口：kill 打偏（pid 已复用）或没有权限时，监听进程还在，
 		// 而台账即将被写成 stopped——撤离之后无人再来查这个洞。复核看的是 listen_side
-		// 那一侧：socat 与 ssh -D/-L 的监听开在目标，chisel client（不带 R:）的监听开在
+		// 那一侧：socat 的监听开在目标，chisel client（不带 R:）与 ssh -R 的监听开在
 		// 控制端，只有 client 进程断开后控制端才会收起那个端口。在错误的一侧复核，会把
 		// 已经断掉的隧道报成 JW_TUNNEL_FAIL（等于没复核），也会把还活着的端口漏掉。
 		recheck := ""

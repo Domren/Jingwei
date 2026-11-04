@@ -19,7 +19,7 @@
 
 > 1.4.2 是一版部署侧修复，功能面与 1.4.1 一致、可原地升级：`docker-compose.yml` 按白名单注入环境变量，
 > 导致代码里在读的 10 个运行时开关在容器里根本配不上——包括内网隧道的控制端地址
-> （`JINGWEI_PIVOT_SERVER`，缺它时 chisel / `ssh -D` / `ssh -L` 的自动部署命令整体不可用）、
+> （`JINGWEI_PIVOT_SERVER`，缺它时 chisel 与 ssh 隧道的自动部署命令整体不可用）、
 > 范围管控强度 `JINGWEI_GUARD_ENFORCEMENT`、两类落地物的 TTL 与模型调用墙钟。现在这些开关都进了
 > 两份 compose 与 `.env.example`，并新增一项审计测试锁住「代码读了但部署配不上」这一类缺陷；
 > 根 compose 的监听端口与 DSN 覆盖也与 Release 用的那份对齐（此前 DEPLOY 让改的端口变量不生效）。
@@ -88,7 +88,7 @@
   `JINGWEI_WEBSHELL_TTL_HOURS` / `JINGWEI_MEMSHELL_TTL_HOURS`（落地物过期）、`JINGWEI_LLM_STREAM`、
   `JINGWEI_LLM_CALL_TIMEOUT`（根 compose 漏配）、`JINGWEI_BTW_MAX_OUTPUT_TOKENS`、
   `JINGWEI_WEBCRACK_BRIDGE` / `JINGWEI_WEBCRACK_PYTHON`、`JINGWEI_CONFIG` / `JINGWEI_SKILL_DIR`。
-  其中控制端地址缺失会让隧道自动选型直接返回「未配置」，chisel 与 `ssh -D`/`ssh -L` 三条自动生成
+  其中控制端地址缺失会让隧道自动选型直接返回「未配置」，chisel 与 ssh 两条自动生成
   部署命令的路在按文档部署的实例上整体不可用。
 - **端口与 DSN 覆盖对齐**：根 compose 的监听端口此前写死 `9790/9791`，文档让改的
   `JINGWEI_WEB_PORT` / `JINGWEI_PROXY_PORT` 不起作用；`JINGWEI_PG_DSN` 也只能在 Release 那份里覆盖。

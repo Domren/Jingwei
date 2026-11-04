@@ -46,10 +46,13 @@ services:
       JINGWEI_TRAFFIC_DEBUG: ${JINGWEI_TRAFFIC_DEBUG:-}
       # ---- 运行时可调项（留空＝用代码内置默认值，行为与不配一致）----
       # 内网隧道的控制端地址：目标可访问的 host:port，裸主机名默认按 chisel 的 8788 处理。
-      # 不配它，自动生成 chisel / ssh -D / ssh -L 部署命令这条路整个关着。
+      # 不配它，自动生成 chisel / ssh -R 部署命令这条路整个关着。
       JINGWEI_PIVOT_SERVER: ${JINGWEI_PIVOT_SERVER:-}
-      # ssh -D / ssh -L 回连控制端用的端口（sshd 常在 22，与 chisel 的 8788 不是一回事）。留空＝22。
+      # ssh -R 变体回连控制端用的端口（sshd 常在 22，与 chisel 的 8788 不是一回事）。留空＝22。
       JINGWEI_PIVOT_SSH_PORT: ${JINGWEI_PIVOT_SSH_PORT:-}
+      # ssh -R 登录控制端 sshd 用的用户名。留空＝沿用目标侧登录名，两端不同名时 BatchMode
+      # 会直接认证失败；填非法值则拒绝生成命令。该侧 sshd 还需 GatewayPorts=clientspecified/yes。
+      JINGWEI_PIVOT_SSH_USER: ${JINGWEI_PIVOT_SSH_USER:-}
       # 可选：固定 chisel 控制端的服务端密钥指纹（chisel server 启动日志里的 Fingerprint）。
       # 留空＝不校验；填非法值会直接拒绝生成命令，不会下发一条连不上的 chisel 命令。
       JINGWEI_PIVOT_CHISEL_FINGERPRINT: ${JINGWEI_PIVOT_CHISEL_FINGERPRINT:-}

@@ -285,7 +285,7 @@ func (s *Server) toolIntranetBatchExec() actool.CoreTool {
 
 func (s *Server) toolIntranetTunnel() actool.CoreTool {
 	return wrTool("intranet_tunnel",
-		"内网隧道生命周期（两阶段）：action=create 先登记计划（socks5/port_forward/reverse_forward），probe 探测目标环境，plan 生成部署命令（端口转发需要目标有 socat，否则要手写 deploy_command；chisel/ssh 需要平台已配置 JINGWEI_PIVOT_SERVER），deploy 后台启动并登记受管资源（TTL 到期自动拆除），verify 校验监听，teardown 拆除并释放资源，status/list 查询。部署成功后会返回 access 提示（socks5 隧道给出可用的 socks5:// 代理地址）。隧道台账用 listen_side 记录监听端口开在哪一侧：target（socat、ssh -D/-L、chisel R:）或 pivot（chisel client 不带 R:，监听在控制端）；verify 与拆除复核都按这一侧做，在错误的一侧复核会把好隧道判成失败。部署到未登记范围的内网主机前，先用 intranet_request_scope 申请并由人审批。",
+		"内网隧道生命周期（两阶段）：action=create 先登记计划（socks5/port_forward/reverse_forward），probe 探测目标环境，plan 生成部署命令（chisel/ssh 变体需要平台已配置 JINGWEI_PIVOT_SERVER，没有这些工具又需要端口转发时得手写 deploy_command），deploy 后台启动并登记受管资源（TTL 到期自动拆除），verify 校验监听，teardown 拆除并释放资源，status/list 查询。部署成功后会返回 access 提示（socks5 隧道给出可用的 socks5:// 代理地址）。隧道台账用 listen_side 记录监听端口开在哪一侧：target（socat；chisel client 不带 R:）或 pivot（chisel client 带 R:、ssh -R，监听开在控制端）；verify 与拆除复核都按这一侧做，在错误的一侧复核会把好隧道判成失败。要打只有目标可达的内网段，出口必须在目标侧——即控制端监听的 pivot 形态（chisel R: 或 ssh -R）；socat 也是目标侧出口，但监听在目标，平台得能直接连到目标那个端口。部署到未登记范围的内网主机前，先用 intranet_request_scope 申请并由人审批。",
 		objSchema(map[string]any{
 			"action":           strParam("create/probe/plan/deploy/verify/teardown/status/list（必填）"),
 			"tunnel_id":        intranetIntParam("隧道 ID（除 create/list 外必填）"),
@@ -293,9 +293,9 @@ func (s *Server) toolIntranetTunnel() actool.CoreTool {
 			"task_id":          intranetIntParam("归属任务 ID（可选，默认当前任务）"),
 			"name":             strParam("隧道名称（可选）"),
 			"kind":             strParam("socks5 / port_forward / reverse_forward，默认 port_forward"),
-			"listen_host":      strParam("监听地址，默认 127.0.0.1"),
+			"listen_host":      strParam("监听地址：留空或 0.0.0.0 表示全接口（pivot 侧监听必须让平台进程拨得到，别填 127.0.0.1）"),
 			"listen_port":      intranetIntParam("监听端口（1-65535）"),
-			"listen_side":      strParam("监听端口所在侧：target（默认，socat/ssh -D/-L/chisel R:）或 pivot（chisel client 不带 R:，监听开在控制端）；plan 自动选型会改写它，手写 deploy_command 时用这里纠正"),
+			"listen_side":      strParam("监听端口所在侧：target（默认，socat/chisel 不带 R:）或 pivot（chisel 带 R:、ssh -R，监听开在控制端）；plan 自动选型会改写它，手写 deploy_command 时用这里纠正"),
 			"remote_host":      strParam("转发目标主机"),
 			"remote_port":      intranetIntParam("转发目标端口"),
 			"deploy_command":   strParam("自定义部署命令（可选；支持 echo JW_PID:$! 便于回收）；plan 时传 auto 可按目标当前工具重新自动选型"),
