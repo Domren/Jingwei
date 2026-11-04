@@ -1575,12 +1575,43 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Preserve the old installation until the replacement has been staged.
+	// If the final rename fails, restore the old directory instead of losing it.
+	backup := ""
 	if overwrite {
-		_ = os.RemoveAll(skillPath)
+		if _, err := os.Lstat(skillPath); err == nil {
+			backup, err = os.MkdirTemp(s.skillDir, ".backup-*")
+			if err != nil {
+				writeErr(w, 500, "准备备份失败："+err.Error())
+				return
+			}
+			if err := os.Remove(backup); err != nil {
+				writeErr(w, 500, "准备备份失败："+err.Error())
+				return
+			}
+			if err := os.Rename(skillPath, backup); err != nil {
+				writeErr(w, 500, "备份原 skill 失败："+err.Error())
+				return
+			}
+		} else if !os.IsNotExist(err) {
+			writeErr(w, 500, "检查原 skill 失败："+err.Error())
+			return
+		}
 	}
 	if err := os.Rename(tmp, skillPath); err != nil {
+		if backup != "" {
+			if restoreErr := os.Rename(backup, skillPath); restoreErr != nil {
+				writeErr(w, 500, fmt.Sprintf("安装失败：%v；原 skill 恢复失败，备份保留在 %s：%v", err, backup, restoreErr))
+				return
+			}
+		}
 		writeErr(w, 500, "安装失败："+err.Error())
 		return
+	}
+	if backup != "" {
+		if err := os.RemoveAll(backup); err != nil {
+			log.Printf("[skills] 旧版备份未能清理 %s: %v", backup, err)
+		}
 	}
 	writeJSON(w, 201, map[string]any{"name": name, "files": entries})
 }

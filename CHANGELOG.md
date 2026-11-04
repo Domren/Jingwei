@@ -8,6 +8,68 @@
 
 - 暂无。
 
+## [1.4.1] - 2026-11-04（安全加固：cookie 同站门、策略失败关闭、工作区固定根）
+
+本版没有新功能，是 1.4.0 之后的一批安全与健壮性修复。功能面与 1.4.0 完全一致，可直接原地升级。
+
+### 安全
+
+- **会话 cookie 只允许同站的变更请求**：`requireAuth` 之前对所有写操作只看「有没有有效会话」，
+  不区分这个 cookie 是不是被别的站点借来发的——本地部署时 `127.0.0.1:9790` 上没有 CSRF 防护，
+  任意恶意网页都能让浏览器替操作员改配置、删数据、投放载荷。现在带会话 cookie 的
+  `POST`/`PUT`/`PATCH`/`DELETE` 必须先过同站判定：优先看 `Sec-Fetch-Site`（`same-origin`/`same-site` 放行，
+  `cross-site` 直接拒），头缺失时才比 `Origin` 的 scheme + host + 有效端口（含 http↔80、https↔443 的
+  默认端口等价）；**两个头都没有就拒绝**，不做「看起来无害就放过」。显式带 `Authorization` 的请求
+  不属于浏览器的附带凭据，保持豁免，CLI 与脚本不受影响。
+- **目标范围与资产禁令改为失败关闭**：`guardTargetPolicy` 原先在数据库读失败时打一行日志然后**放行**
+  （理由是「瞬时抖动不该让所有工具调用失败」），代价是抖动期间平台资产禁令和任务授权范围同时消失，
+  agent 可以打到范围外的主机而只留下一条日志。现在读全局资产禁令、任务禁令、任务测试范围、
+  公司资产展开任一失败，都返回 `ScopeOut` 并给出中文原因（「无法读取任务授权范围，请稍后重试」）；
+  策略数据源整个不可用（`pg == nil`）同样拒绝。**行为变化要预期**：数据库抖动现在会让工具调用直接失败，
+  而不是悄悄放开范围——对红队工具这是正确的取向。
+- **工作区文件操作固定到根目录内**：原来靠「先 `filepath.Clean` 拼绝对路径、再 `os.Stat` 检查前缀」
+  挡越界，两个问题都在：软链本身合法但跟进去就出了根；检查和真正读写之间目录被换成软链（TOCTOU）
+  也挡不住。现在七个接口（list / read / write / mkdir / delete / download / upload）统一改用
+  `os.OpenRoot` 拿到的 `*os.Root` 做全部 I/O——约束由内核按目录 fd 强制，路径换了也不出这个根；
+  `wsResolve` 额外逐级 `Lstat` 拒绝已存在的软链；`download` 从按路径二次解析的 `http.ServeFile`
+  换成 `http.ServeContent`（直接喂 root 内打开的文件）。工作区没有重命名接口，无遗漏面。
+
+### 修复
+
+- **自定义 HTTP 工具的代理地址被重复拼协议头**：录制代理地址本身带 `http://` 时，代码又补一次前缀，
+  拼出 `http://http://127.0.0.1:8788`，工具请求全部走不通。现在只在没有 scheme 时才补。
+- **Skill 覆盖安装失败会把旧版一起丢掉**：`overwrite` 分支先 `os.RemoveAll(旧目录)` 再装新目录，
+  新目录安装失败时旧版已经没了——用户既没有新版也回不去旧版。改成先把旧目录 `rename` 成
+  `.backup-*`，装成功才清理备份；装失败就 `rename` 回来；连回滚也失败时**把备份目录路径报给用户**，
+  而不是留一句「安装失败」。
+- **演示数据模式下「发现」页崩溃**：mock 数据集没有实现 `/exploration/findings/systems` 与 `/ids`，
+  页面按任务/系统分组时读到 `undefined.length` 直接抛运行时错误。现在补齐两个端点，并按后端的
+  「主系统」选择口径归属（`service` > `endpoint` > `app` > `subdomain` > `ip` > `root_domain`，
+  带 host:port 与路径后缀），分页参数非法时退回默认值。
+
+### 验证
+
+- 新增 4 个测试文件、9 个测试：`auth_csrf_test.go`（跨站 cookie 写被拒 / bearer 豁免）、
+  `guard_policy_failclosed_test.go`（读失败与无库都返回 `ScopeOut`）、
+  `workspace_root_test.go` 与 `workspace_test.go`（软链替换竞态、上传不跟软链、越界拒绝）、
+  `skill_upload_test.go` 补覆盖安装失败保旧版、`customtool_test.go` 补代理地址不重复拼。
+  全部通过；`gofmt` 与 `go vet ./server/...` 干净。
+- 全量测试两种 DSN 写法各一轮：`go test ./...`（URI）与 `go test ./db/... ./server/... ./agent/...`
+  （keyword/value）均无失败。
+- mock 发现页做了视觉核对（不只是「不报错」）：起 `NEXT_PUBLIC_MOCK=1` 的站点，四个页签逐个点开并
+  展开任务分组，无脚本报错、无错误浮层，分组正常显示 3 个任务 / 9 个系统与各级严重度计数。
+- 确认 CSRF 门不会挡现有前端：全站没有 `<form method=post>`，也没有 `sendBeacon`，写操作一律走
+  同源 `fetch`（浏览器必带 `Origin`）。CORS 侧仍是「只有 loopback 同源才允许带凭据」，
+  `Access-Control-Allow-Origin: *` 不构成跨源读取敏感数据的路径。
+
+### 升级
+
+- 原地升级即可：`docker compose pull && docker compose up -d`。数据库结构无变更，
+  不需要重新登录，也不需要重投 webshell。
+- 若你的部署依赖「用 cookie 但从别的源发写请求」（例如自己写的浏览器插件跨源调用），
+  这类调用在本版会被 `403 跨站 cookie 请求不允许执行变更操作` 拒绝；改用显式 `Authorization` 即可。
+- 若数据库不稳定，现在会看到工具调用被拒绝并提示「请稍后重试」，这是设计行为，不是回归。
+
 ## [1.4.0] - 2026-11-03（WebShell 与内网能力强化）
 
 ### 新增

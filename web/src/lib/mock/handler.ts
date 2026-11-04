@@ -461,6 +461,49 @@ function mockAssetMatchesDSL(asset: Asset, dsl: string): boolean {
   return query.split(/\s+/).every((term) => haystack.includes(term));
 }
 
+// mockApplySystemScope matches the backend's primary-system selection: each
+// finding belongs to the most specific resolvable asset, not every linked host.
+function mockSystemOfFinding(finding: (typeof mockFindings)[number]) {
+  const rank: Record<string, number> = { service: 0, endpoint: 1, app: 2, subdomain: 3, ip: 4, root_domain: 5 };
+  let selected: { system: string; label: string; host?: string; port?: number; service?: string; rank: number } | undefined;
+  for (const ref of finding.assets ?? []) {
+    const asset = mockAssets.find((item) => String(item.id) === ref.id);
+    if (!asset) continue;
+    let host = (asset.domain || asset.ip || "").trim();
+    let port = asset.port ?? 0;
+    if (asset.url) {
+      try {
+        const url = new URL(asset.url);
+        if (!host) host = url.hostname.replace(/^\[|\]$/g, "");
+        if (!port) port = Number(url.port) || (url.protocol === "https:" ? 443 : url.protocol === "http:" ? 80 : 0);
+      } catch { /* Unparseable URL has no usable host. */ }
+    }
+    let system: string;
+    if (!host && asset.type === "app" && asset.app_name) {
+      host = asset.app_name;
+      system = `app:${host}`;
+    } else if (host) {
+      host = host.toLowerCase();
+      system = port ? `svc:${host}:${port}` : `host:${host}`;
+      if (asset.type === "service" && asset.url) {
+        try {
+          const path = new URL(asset.url).pathname.toLowerCase();
+          if (path && path !== "/") system += path;
+        } catch { /* Keep the host bucket. */ }
+      }
+    } else continue;
+    const priority = rank[asset.type] ?? 9;
+    if (selected && priority >= selected.rank) continue;
+    const label = system.startsWith("app:") ? host : `${host}${port ? `:${port}` : ""}${system.startsWith("svc:") && system.includes("/") ? ` ${system.slice(system.indexOf("/")).replace(/\/$/, "")}` : ""}`;
+    selected = { system, label, host, port, service: asset.type === "service" ? asset.service_name || asset.service_type : asset.type === "endpoint" ? "http" : asset.type === "app" ? "app" : "", rank: priority };
+  }
+  return selected ?? { system: "__none__", label: "未关联系统", rank: 10 };
+}
+
+function mockApplySystemScope(list: (typeof mockFindings)[number][], system: string | null) {
+  return system ? list.filter((finding) => mockSystemOfFinding(finding).system === system) : list;
+}
+
 // mockFilterFindings 应用发现页的公共筛选(严重度/状态/类型/任务/关键词),资产
 // 子树筛选另走 mockApplyAssetScope —— 与后端 FindingFilter.where() 的分工一致。
 function mockFilterFindings(q: URLSearchParams): (typeof mockFindings)[number][] {
@@ -1925,9 +1968,44 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     const list = mockApplyAssetScope(mockFilterFindings(q), null);
     return { nodes: mockBuildAssetTree(list), finding_total: list.length, truncated: false };
   }
+  if (path === "/exploration/findings/systems") {
+    const list = mockApplyAssetScope(mockFilterFindings(q), q.get("asset_scope"));
+    const bySystem = new Map<string, {
+      system: string; label: string; host?: string; port?: number; service?: string;
+      count: number; critical: number; high: number; medium: number; low: number; last_found_at: string;
+    }>();
+    let findingTotal = 0;
+    for (const finding of list) {
+      const info = mockSystemOfFinding(finding);
+      if (q.get("system") && q.get("system") !== info.system) continue;
+      findingTotal++;
+      const group = bySystem.get(info.system) ?? {
+        system: info.system, label: info.label, host: info.host, port: info.port, service: info.service,
+        count: 0, critical: 0, high: 0, medium: 0, low: 0, last_found_at: "",
+      };
+      group.count++;
+      group[finding.severity]++;
+      if (finding.ts > group.last_found_at) group.last_found_at = finding.ts;
+      bySystem.set(info.system, group);
+    }
+    const items = [...bySystem.values()].sort((a, b) => {
+      const weight = (g: typeof a) => g.critical * 1000 + g.high * 100 + g.medium * 10 + g.low;
+      return weight(b) - weight(a) || b.count - a.count || b.last_found_at.localeCompare(a.last_found_at) || a.label.localeCompare(b.label);
+    });
+    const rawPage = Number(q.get("page") ?? 1);
+    const rawLimit = Number(q.get("limit") ?? 50);
+    const page = Number.isFinite(rawPage) && rawPage > 0 ? Math.floor(rawPage) : 1;
+    const pageSize = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(200, Math.floor(rawLimit)) : 50;
+    return { items: items.slice((page - 1) * pageSize, page * pageSize), total: items.length,
+      finding_total: findingTotal, page, page_size: pageSize };
+  }
+  if (path === "/exploration/findings/ids") {
+    const list = mockApplySystemScope(mockApplyAssetScope(mockFilterFindings(q), q.get("asset_scope")), q.get("system"));
+    return { ids: list.map((finding) => Number(finding.finding_id ?? finding.id)).filter(Number.isFinite), count: list.length };
+  }
   if (path === "/exploration/findings/groups") {
     const severityOrder = { critical: 4, high: 3, medium: 2, low: 1 } as const;
-    const list = mockApplyAssetScope(mockFilterFindings(q), q.get("asset_scope"));
+    const list = mockApplySystemScope(mockApplyAssetScope(mockFilterFindings(q), q.get("asset_scope")), q.get("system"));
 
     const grouped = new Map<string, typeof list>();
     for (const finding of list) {
@@ -2169,7 +2247,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     // 全局:带 page/limit → 分页对象;否则裸数组(dashboard)。
     if (!q.has("page") && !q.has("limit")) return mockFindings.map(withFid);
     const sev = { critical: 4, high: 3, medium: 2, low: 1 } as const;
-    const list = mockApplyAssetScope(mockFilterFindings(q), q.get("asset_scope"));
+    const list = mockApplySystemScope(mockApplyAssetScope(mockFilterFindings(q), q.get("asset_scope")), q.get("system"));
     list.sort((a, b) =>
       q.get("sort") === "severity"
         ? sev[b.severity] - sev[a.severity] || +new Date(b.ts) - +new Date(a.ts)

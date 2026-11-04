@@ -15,8 +15,12 @@
 
 ---
 
-## Jingwei 1.4.0
+## Jingwei 1.4.1
 
+> 1.4.1 是一版纯安全加固，功能面与 1.4.0 一致、可原地升级：会话 cookie 只允许同站的变更请求
+> （显式 Bearer 不受影响）、目标范围与资产禁令在读取失败时改为**失败关闭**、工作区文件操作改用
+> `os.Root` 固定根目录（挡住软链越界与「检查后被替换」的竞态），另修掉代理地址重复拼协议头、
+> Skill 覆盖安装失败会丢旧版、演示站发现页崩溃三处。
 > 1.4.0 把 WebShell 与内网这条线做成可用工具：加密 v2 协议（密钥不出现在流量里、AEAD、时间戳 + nonce
 > 防重放、随机载体、Windows 壳）、大马文件管理、Java 内存马五类注入、PHP 半持久化，以及一条壳一个对话框的
 > WebShell 工作台（虚拟终端 / 文件管理 / 系统信息），内网 SSH 会话复用同一个终端组件。同时把签名根密钥与
@@ -69,6 +73,22 @@
 > 对话、任务执行与 Agent 自动规划需要先在「系统 → LLM」配置模型。
 
 ## 版本历史
+
+### 1.4.1 — 2026-11-04
+
+- **安全加固（无新功能，可原地升级）**：
+  - 会话 cookie 的写操作（`POST`/`PUT`/`PATCH`/`DELETE`）必须同站：优先按 `Sec-Fetch-Site` 判定，
+    头缺失时校验 `Origin` 的协议 + 主机 + 有效端口，两者都没有就拒绝；显式 `Authorization` 请求豁免。
+  - 目标范围与资产禁令改为**失败关闭**：读平台禁令、任务范围、公司资产展开任一失败即拒绝工具调用，
+    不再「记一行日志然后放行」；数据库抖动会表现为工具调用失败并提示稍后重试，这是设计行为。
+  - 工作区七个文件接口统一改用 `os.Root` 固定根目录，软链跟不出去，也挡住「检查通过后目录被换成
+    软链」的竞态；下载不再按路径二次解析。
+- **修复**：自定义 HTTP 工具的代理地址重复拼协议头（`http://http://…`）导致工具请求全挂；
+  Skill 覆盖安装先删旧版、新版装失败就两头落空——改为先备份再换，失败回滚，回滚也失败时告知备份路径；
+  演示数据模式（`NEXT_PUBLIC_MOCK=1`）下「发现」页按任务/系统分组时崩溃。
+- **验证**：新增 4 个测试文件 9 个测试（跨站 cookie、策略失败关闭、软链替换竞态、上传不跟软链、
+  skill 回滚、代理地址不重复拼）；全量测试 URI 与 keyword 两种 DSN 写法各一轮无失败；
+  演示站发现页四个页签逐个点开确认渲染正常，不只是「不报错」。
 
 ### 1.4.0 — 2026-11-03
 
@@ -236,7 +256,7 @@
 ### 方式一：使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.4.0 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.4.1 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 # 编辑 .env：至少修改 POSTGRES_PASSWORD
@@ -248,8 +268,8 @@ docker compose up -d
 
 ```bash
 mkdir jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.4.0/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.4.0/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.4.1/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.4.1/deploy/.env.example
 # 编辑 .env 后启动
 docker compose pull
 docker compose up -d
@@ -263,7 +283,7 @@ docker compose up -d
 镜像发布在 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.4.0
+docker pull ghcr.io/domren/jingwei:1.4.1
 ```
 
 仓库维护者将 Package 设为公开后可直接拉取。若镜像仍为私有，请使用具备
@@ -281,7 +301,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u Domren --password-stdin
 | --- | :---: | --- |
 | `POSTGRES_PASSWORD` | 是 | 数据库密码，建议使用字母数字强随机值 |
 | `POSTGRES_USER` / `POSTGRES_DB` | 否 | 默认均为 `jingwei` |
-| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.4.0` |
+| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.4.1` |
 | `JINGWEI_WEB_PORT` | 否 | Web/API 宿主端口，默认 `9790` |
 | `JINGWEI_PROXY_PORT` | 否 | 流量代理宿主端口，默认 `9791`，仅绑定 `127.0.0.1` |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | 否 | 也可启动后在 UI 配置 |
@@ -356,11 +376,11 @@ cd web && npm ci && npm run build:static && cd ..
 # 2. 嵌入前端并编译 Linux 二进制
 rm -rf server/webui/dist && cp -r web/out server/webui/dist
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.4.0" -o dist/amd64/jingwei ./cmd/jingwei
+  -ldflags "-s -w -X main.version=1.4.1" -o dist/amd64/jingwei ./cmd/jingwei
 
 # 3. 构建运行镜像
 docker build --network=host --build-arg TARGETARCH=amd64 \
-  -t jingwei:1.4.0 .
+  -t jingwei:1.4.1 .
 ```
 
 本地开发运行后端与前端的方法见 [DEPLOY.md](DEPLOY.md#从源码开发)。

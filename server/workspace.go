@@ -25,16 +25,60 @@ const (
 	maxWorkspaceUpload = 512 << 20 // 512 MiB per upload request
 )
 
-// wsResolve maps a user-supplied relative path to an absolute path INSIDE the work
-// dir. It returns ok=false if the path would escape the root. filepath.Clean on a
-// rooted copy collapses any ".." so nothing can climb above the root.
-func (s *Server) wsResolve(rel string) (string, bool) {
-	base := filepath.Clean(s.m.dir)
-	rel = strings.TrimPrefix(strings.TrimSpace(rel), "/")
-	clean := filepath.Clean("/" + rel) // e.g. "/a/../../etc" → "/etc" (still rooted at "/")
-	abs := filepath.Clean(filepath.Join(base, clean))
-	if abs != base && !strings.HasPrefix(abs, base+string(os.PathSeparator)) {
+// wsRelative first validates the API path and returns a workspace-relative
+// name. os.Root then keeps each filesystem operation beneath the pinned root.
+func (s *Server) wsRelative(rel string) (string, bool) {
+	rel = strings.TrimSpace(rel)
+	if rel == "" {
+		return ".", true
+	}
+	if filepath.IsAbs(rel) || strings.HasPrefix(rel, "/") || strings.Contains(rel, "\\") {
 		return "", false
+	}
+	clean := filepath.Clean(rel)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	return clean, true
+}
+
+// wsRoot pins the directory for the duration of a request. Root operations do
+// not escape it even if a directory is replaced with a symlink concurrently.
+func (s *Server) wsRoot() (*os.Root, error) {
+	return os.OpenRoot(s.m.dir)
+}
+
+// wsResolve retains the absolute-path contract for existing callers, while
+// rejecting symlinks already present at check time. Handlers must use wsRoot
+// for actual I/O, because this check alone cannot prevent a replacement race.
+func (s *Server) wsResolve(rel string) (string, bool) {
+	clean, ok := s.wsRelative(rel)
+	if !ok {
+		return "", false
+	}
+	base := filepath.Clean(s.m.dir)
+	abs := filepath.Join(base, clean)
+	root, err := s.wsRoot()
+	if err != nil {
+		return "", false
+	}
+	defer root.Close()
+	current := ""
+	for _, part := range strings.Split(clean, string(os.PathSeparator)) {
+		if part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := root.Lstat(current)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return "", false
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", false
+		}
 	}
 	return abs, true
 }
@@ -64,7 +108,13 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	fi, err := os.Stat(abs)
+	root, err := s.wsRoot()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	defer root.Close()
+	fi, err := root.Stat(s.wsRel(abs))
 	if err != nil {
 		writeErr(w, 404, "路径不存在")
 		return
@@ -73,7 +123,13 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "不是目录")
 		return
 	}
-	ents, err := os.ReadDir(abs)
+	dir, err := root.Open(s.wsRel(abs))
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	defer dir.Close()
+	ents, err := dir.ReadDir(-1)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -110,9 +166,21 @@ func (s *Server) wsRead(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	fi, err := os.Stat(abs)
+	root, err := s.wsRoot()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	defer root.Close()
+	file, err := root.Open(s.wsRel(abs))
 	if err != nil {
 		writeErr(w, 404, "文件不存在")
+		return
+	}
+	defer file.Close()
+	fi, err := file.Stat()
+	if err != nil {
+		writeErr(w, 500, err.Error())
 		return
 	}
 	if fi.IsDir() {
@@ -123,7 +191,7 @@ func (s *Server) wsRead(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"path": s.wsRel(abs), "size": fi.Size(), "too_large": true, "binary": true})
 		return
 	}
-	data, err := os.ReadFile(abs)
+	data, err := io.ReadAll(io.LimitReader(file, maxWorkspaceRead+1))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -150,16 +218,30 @@ func (s *Server) wsWrite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
+	root, err := s.wsRoot()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	defer root.Close()
+	rel := s.wsRel(abs)
+	if fi, err := root.Stat(rel); err == nil && fi.IsDir() {
 		writeErr(w, 400, "目标是目录")
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+	if err := root.MkdirAll(filepath.Dir(rel), 0o755); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if err := os.WriteFile(abs, []byte(req.Content), 0o644); err != nil {
+	file, err := root.OpenFile(rel, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
 		writeErr(w, 500, err.Error())
+		return
+	}
+	_, copyErr := io.WriteString(file, req.Content)
+	closeErr := file.Close()
+	if copyErr != nil || closeErr != nil {
+		writeErr(w, 500, "写入文件失败")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "path": s.wsRel(abs)})
@@ -179,7 +261,13 @@ func (s *Server) wsMkdir(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	if err := os.MkdirAll(abs, 0o755); err != nil {
+	root, err := s.wsRoot()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	defer root.Close()
+	if err := root.MkdirAll(s.wsRel(abs), 0o755); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -198,11 +286,18 @@ func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "不能删除工作区根目录")
 		return
 	}
-	if _, err := os.Stat(abs); err != nil {
+	root, err := s.wsRoot()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	defer root.Close()
+	rel := s.wsRel(abs)
+	if _, err := root.Lstat(rel); err != nil {
 		writeErr(w, 404, "路径不存在")
 		return
 	}
-	if err := os.RemoveAll(abs); err != nil {
+	if err := root.RemoveAll(rel); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -216,7 +311,19 @@ func (s *Server) wsDownload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	fi, err := os.Stat(abs)
+	root, err := s.wsRoot()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	defer root.Close()
+	file, err := root.Open(s.wsRel(abs))
+	if err != nil {
+		writeErr(w, 404, "文件不存在")
+		return
+	}
+	defer file.Close()
+	fi, err := file.Stat()
 	if err != nil || fi.IsDir() {
 		writeErr(w, 404, "文件不存在")
 		return
@@ -224,7 +331,7 @@ func (s *Server) wsDownload(w http.ResponseWriter, r *http.Request) {
 	name := filepath.Base(abs)
 	// RFC 5987 filename* keeps non-ASCII names intact; plain filename is the fallback.
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+sanitizeFilename(name)+"\"; filename*=UTF-8''"+url.PathEscape(name))
-	http.ServeFile(w, r, abs)
+	http.ServeContent(w, r, name, fi.ModTime(), file)
 }
 
 // POST /api/workspace/upload?path=<dir> — multipart form field "file" (one or more).
@@ -234,7 +341,20 @@ func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
-	if fi, err := os.Stat(dirAbs); err != nil || !fi.IsDir() {
+	root, err := s.wsRoot()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	defer root.Close()
+	dir, err := root.Open(s.wsRel(dirAbs))
+	if err != nil {
+		writeErr(w, 400, "目标目录不存在")
+		return
+	}
+	fi, err := dir.Stat()
+	dir.Close()
+	if err != nil || !fi.IsDir() {
 		writeErr(w, 400, "目标目录不存在")
 		return
 	}
@@ -258,13 +378,31 @@ func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
 		if !okd {
 			continue
 		}
-		if err := saveUpload(hdr, destAbs); err != nil {
+		if err := saveUploadRoot(root, hdr, s.wsRel(destAbs)); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
 		saved++
 	}
 	writeJSON(w, 200, map[string]any{"uploaded": saved})
+}
+
+func saveUploadRoot(root *os.Root, hdr *multipart.FileHeader, rel string) error {
+	src, err := hdr.Open()
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	out, err := root.OpenFile(rel, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, src)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
 
 func saveUpload(hdr *multipart.FileHeader, dest string) error {

@@ -185,3 +185,17 @@ func TestHTTPToolTruncatesLargeBody(t *testing.T) {
 		t.Fatalf("oversized http body was not truncated: len=%d", len(out))
 	}
 }
+
+func TestHTTPProxyTransportKeepsProxyURL(t *testing.T) {
+	m := &Manager{globalProxy: "http://127.0.0.1:8788"}
+	server := &Server{m: m}
+	transport := server.httpProxyTransport(httpExec{UseRecordingProxy: true})
+	if transport == nil || transport.Proxy == nil {
+		t.Fatal("expected recording proxy transport")
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
+	proxy, err := transport.Proxy(req)
+	if err != nil || proxy == nil || proxy.String() != m.ProxyAddr() {
+		t.Fatalf("proxy = %v, err = %v; want %s", proxy, err, m.ProxyAddr())
+	}
+}

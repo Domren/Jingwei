@@ -29,8 +29,8 @@ const (
 
 // guardTargetPolicy implements guard.TargetPolicy on top of PostgreSQL:
 // platform + task asset block rules first, then the task's registered scope.
-// Fail-open on read errors (logged): a transient DB hiccup must not brick all
-// agent tool calls.
+// Target checks fail closed when the policy data source is unavailable. A
+// temporary database error must not turn strict scope or asset blocks off.
 type guardTargetPolicy struct {
 	pg      *pgdb.DB
 	envMode string
@@ -102,19 +102,23 @@ func (p *guardTargetPolicy) Check(taskID int64, urls, hosts []string) (guard.Sco
 	if len(urls) == 0 && len(hosts) == 0 {
 		return guard.ScopeUnknown, ""
 	}
+	if p.pg == nil {
+		return guard.ScopeOut, "目标策略数据源不可用，请稍后重试"
+	}
 	domains, ips := splitTargetHosts(hosts)
 
 	blocks, err := p.pg.ListAssetInterceptRules()
 	if err != nil {
-		log.Printf("[guard][target] 读取全局资产拦截规则失败(放行): %v", err)
-		blocks = nil
+		log.Printf("[guard][target] 读取全局资产拦截规则失败(拒绝): %v", err)
+		return guard.ScopeOut, "无法读取平台资产禁令，请稍后重试"
 	}
 	if taskID > 0 {
-		if tb, _, err := p.pg.Assets().TaskInterceptRulesSplit(taskID); err != nil {
-			log.Printf("[guard][target] 读取任务 %d 拦截规则失败(放行): %v", taskID, err)
-		} else {
-			blocks = append(blocks, tb...)
+		tb, _, err := p.pg.Assets().TaskInterceptRulesSplit(taskID)
+		if err != nil {
+			log.Printf("[guard][target] 读取任务 %d 拦截规则失败(拒绝): %v", taskID, err)
+			return guard.ScopeOut, "无法读取任务资产禁令，请稍后重试"
 		}
+		blocks = append(blocks, tb...)
 	}
 	if len(blocks) > 0 {
 		if rule, matched, ok := pgdb.MatchAssetInterceptRules(blocks, domains, ips, urls); ok {
@@ -125,7 +129,10 @@ func (p *guardTargetPolicy) Check(taskID int64, urls, hosts []string) (guard.Sco
 	if taskID <= 0 {
 		return guard.ScopeUnknown, ""
 	}
-	rules := p.scopeRules(taskID)
+	rules, err := p.scopeRules(taskID)
+	if err != nil {
+		return guard.ScopeOut, "无法读取任务授权范围，请稍后重试"
+	}
 	m := guard.NewScopeMatcher(rules)
 	if !m.HasRules() {
 		return guard.ScopeUnknown, ""
@@ -146,11 +153,11 @@ func (p *guardTargetPolicy) Check(taskID int64, urls, hosts []string) (guard.Sco
 // scopeRules converts task_scope rows into host-matchable rules. ICP/keyword
 // rows carry no host constraint and are deliberately skipped; company rows are
 // expanded to the company's assets (cached).
-func (p *guardTargetPolicy) scopeRules(taskID int64) []guard.ScopeRule {
+func (p *guardTargetPolicy) scopeRules(taskID int64) ([]guard.ScopeRule, error) {
 	rows, err := p.pg.Assets().ListTaskScope(taskID)
 	if err != nil {
-		log.Printf("[guard][target] 读取任务 %d 测试范围失败(放行): %v", taskID, err)
-		return nil
+		log.Printf("[guard][target] 读取任务 %d 测试范围失败(拒绝): %v", taskID, err)
+		return nil, err
 	}
 	var rules []guard.ScopeRule
 	for _, ts := range rows {
@@ -167,26 +174,30 @@ func (p *guardTargetPolicy) scopeRules(taskID int64) []guard.ScopeRule {
 			}
 		case "company":
 			if ts.CompanyID != nil && *ts.CompanyID > 0 {
-				rules = append(rules, p.companyRules(*ts.CompanyID)...)
+				companyRules, err := p.companyRules(*ts.CompanyID)
+				if err != nil {
+					return nil, err
+				}
+				rules = append(rules, companyRules...)
 			}
 		}
 	}
-	return rules
+	return rules, nil
 }
 
-func (p *guardTargetPolicy) companyRules(companyID int64) []guard.ScopeRule {
+func (p *guardTargetPolicy) companyRules(companyID int64) ([]guard.ScopeRule, error) {
 	p.companyMu.Lock()
 	if e, ok := p.companies[companyID]; ok && time.Since(e.fetchedAt) < companyScopeTTL {
 		rules := e.rules
 		p.companyMu.Unlock()
-		return rules
+		return rules, nil
 	}
 	p.companyMu.Unlock()
 
 	domains, ips, truncated, err := p.pg.Assets().CompanyScopeHosts(companyID, companyScopeMaxRows)
 	if err != nil {
-		log.Printf("[guard][target] 展开公司 %d 范围失败(放行): %v", companyID, err)
-		return nil
+		log.Printf("[guard][target] 展开公司 %d 范围失败(拒绝): %v", companyID, err)
+		return nil, err
 	}
 	if truncated {
 		log.Printf("[guard][target] 公司 %d 资产超过 %d 条，范围匹配仅覆盖已加载部分", companyID, companyScopeMaxRows)
@@ -201,7 +212,7 @@ func (p *guardTargetPolicy) companyRules(companyID int64) []guard.ScopeRule {
 	p.companyMu.Lock()
 	p.companies[companyID] = companyScopeEntry{rules: rules, fetchedAt: time.Now()}
 	p.companyMu.Unlock()
-	return rules
+	return rules, nil
 }
 
 func splitTargetHosts(hosts []string) (domains, ips []string) {

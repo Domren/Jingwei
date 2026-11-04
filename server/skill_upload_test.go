@@ -267,3 +267,42 @@ func TestSkillNameFromFrontmatterQuoted(t *testing.T) {
 		t.Fatalf("name = %q, want 中文技能", got)
 	}
 }
+
+func TestUploadSkillOverwriteKeepsReplacement(t *testing.T) {
+	dir := t.TempDir()
+	old := filepath.Join(dir, "中文技能")
+	if err := os.MkdirAll(old, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(old, "SKILL.md"), []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	data := buildZip(t, zipFile{name: "中文技能/SKILL.md", body: zhSkillMD, method: zip.Deflate})
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	file, err := mw.CreateFormFile("file", "skill.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/skills/upload?overwrite=true", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rr := httptest.NewRecorder()
+	(&Server{skillDir: dir}).fsUploadSkill(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status %d: %s", rr.Code, rr.Body.String())
+	}
+	got, err := os.ReadFile(filepath.Join(old, "SKILL.md"))
+	if err != nil || string(got) != zhSkillMD {
+		t.Fatalf("replacement: %q, %v", got, err)
+	}
+	backups, err := filepath.Glob(filepath.Join(dir, ".backup-*"))
+	if err != nil || len(backups) != 0 {
+		t.Fatalf("backup remains: %v, %v", backups, err)
+	}
+}

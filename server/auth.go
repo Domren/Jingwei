@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -321,6 +323,56 @@ func (s *Server) validSession(r *http.Request) error {
 	return s.authenticateToken(extractToken(r))
 }
 
+// isCookieMutation identifies state-changing requests authenticated by the
+// browser's HttpOnly session cookie. Bearer requests are not ambient browser
+// state and are not covered by this same-site gate.
+func isCookieMutation(r *http.Request) bool {
+	if r.Header.Get("Authorization") != "" {
+		return false
+	}
+	if _, err := r.Cookie(authCookieName); err != nil {
+		return false
+	}
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+// sameSiteMutation trusts Sec-Fetch-Site when present and otherwise verifies
+// Origin's scheme + host + effective port against the request host. This is not
+// content routing: it only decides whether a browser cookie may carry a write.
+func sameSiteMutation(r *http.Request) bool {
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))) {
+	case "same-origin", "same-site":
+		return true
+	case "cross-site":
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" || origin == "null" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return false
+	}
+	host, port, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		host = r.Host
+		port = ""
+	}
+	if !strings.EqualFold(u.Hostname(), host) {
+		return false
+	}
+	if op := u.Port(); op != "" {
+		return op == port || (port == "" && ((u.Scheme == "https" && op == "443") || (u.Scheme == "http" && op == "80")))
+	}
+	return port == "" || (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80")
+}
+
 func noStore(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
 }
@@ -343,6 +395,10 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			} else {
 				writeErr(w, 503, errDataSourceUnavailable)
 			}
+			return
+		}
+		if isCookieMutation(r) && !sameSiteMutation(r) {
+			writeErr(w, http.StatusForbidden, "跨站 cookie 请求不允许执行变更操作")
 			return
 		}
 		// Authenticated API responses must never be reused by a shared cache.
