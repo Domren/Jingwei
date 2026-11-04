@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### 变更
+
+- **镜像里的 `@playwright/*` 不再装 `@latest`**：`@playwright/mcp`、`@playwright/cli`、`playwright`
+  此前每次构建都拉当时最新版，于是同一个提交重建两次可能得到两套浏览器工具——镜像内容与代码
+  提交对不上，上游接口一变就只在某次重建后炸，而且没有回退路径。现在由三个构建参数钉住
+  （`PLAYWRIGHT_MCP_VERSION` / `PLAYWRIGHT_CLI_VERSION` / `PLAYWRIGHT_VERSION`，默认值即
+  2026-11-05 实测可用的一组：0.0.84 / 0.1.23 / 1.64.1），要升级时改这三行，CI 无需改动。
+
 ### 新增
 
 - **失败关闭的目标策略现在按任务与成因计数**（可观测性清账项）：1.4.1 把「读不到授权范围 /

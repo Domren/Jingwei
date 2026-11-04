@@ -112,8 +112,14 @@ ARG PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
 # （npm 报 "you are behind a proxy or have bad network settings"）。留空＝用 npm 默认源，
 # CI 行为不变；本机构建传 --build-arg NPM_REGISTRY=https://registry.npmmirror.com 即可。
 ARG NPM_REGISTRY=
+# 版本钉死（2026-11-05 起）：这三个包此前写 @latest，于是每次构建拉到的是当时最新版，
+# 镜像内容与代码提交对不上，浏览器 MCP/CLI 的接口一变就只在某次重建后炸，而且回不去。
+# 默认值就是本机验证过能用的那一组；要升级时改这三行，别改回 @latest。
+ARG PLAYWRIGHT_MCP_VERSION=0.0.84
+ARG PLAYWRIGHT_CLI_VERSION=0.1.23
+ARG PLAYWRIGHT_VERSION=1.64.1
 RUN export PLAYWRIGHT_DOWNLOAD_HOST="${PLAYWRIGHT_DOWNLOAD_HOST}" \
-    && npm install -g ${NPM_REGISTRY:+--registry=${NPM_REGISTRY}} @playwright/mcp@latest @playwright/cli@latest playwright@latest \
+    && npm install -g ${NPM_REGISTRY:+--registry=${NPM_REGISTRY}} @playwright/mcp@${PLAYWRIGHT_MCP_VERSION} @playwright/cli@${PLAYWRIGHT_CLI_VERSION} playwright@${PLAYWRIGHT_VERSION} \
     && playwright-cli --help \
     && (playwright install --with-deps chromium || echo "WARN: playwright chromium install failed, browser features degraded") \
     && rm -rf /var/lib/apt/lists/*
