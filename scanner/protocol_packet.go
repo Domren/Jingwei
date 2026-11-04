@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"encoding/hex"
 	"fmt"
 	"net"
 	"strings"
@@ -31,12 +32,7 @@ func ProtocolBannerPacket(proto, addr string, raw []byte) string {
 	fmt.Fprintf(b, "# 响应字节: %d\n", len(raw))
 	b.WriteString("# 复现命令:\n")
 	b.WriteString(bannerReproCommands(addr, len(raw)))
-	if isPrintablePayload(raw) {
-		b.WriteString("\n# ---- 原始响应数据（逐字节文本，行尾已标注）----\n")
-		b.WriteString(escapeControlLines(string(raw)))
-	}
-	b.WriteString("\n# ---- 原始响应数据（hexdump，与抓包字节一致）----\n")
-	b.WriteString(hexdump(raw))
+	b.WriteString(protocolPayloadSection("响应", raw))
 	return strings.TrimRight(b.String(), "\n")
 }
 
@@ -61,6 +57,63 @@ func bannerReproCommands(addr string, size int) string {
 	return fmt.Sprintf("#   nc -w 2 %s %s | xxd | head -%d\n"+
 		"#   python3 -c 'import socket;print(repr(socket.create_connection((%q, %s), 3).recv(%d)))'\n",
 		quoted, port, lines, host, port, size)
+}
+
+// ProtocolExchangePacket renders a request/response byte pair for a probe that
+// spoke to the service (a credential attempt, a protocol query). It cannot reuse
+// ProtocolBannerPacket's framing: that one says "未发送任何应用层请求字节", and a
+// dictionary attempt did send bytes — recording the wrong capture method makes the
+// evidence unreproducible, because the reader would connect and see a different
+// response than the one on file.
+func ProtocolExchangePacket(proto, addr string, req, resp []byte) string {
+	proto = strings.TrimSpace(proto)
+	if proto == "" {
+		proto = "tcp"
+	}
+	b := &strings.Builder{}
+	fmt.Fprintf(b, "# 协议: %s (TCP)\n", strings.ToUpper(proto))
+	fmt.Fprintf(b, "# 端点: %s\n", addr)
+	fmt.Fprintf(b, "# 采集方式: 主动发送下列请求字节后读取服务端响应，两侧字节都要一致才能复现\n")
+	fmt.Fprintf(b, "# 请求字节: %d\n", len(req))
+	fmt.Fprintf(b, "# 响应字节: %d\n", len(resp))
+	b.WriteString("# 复现命令:\n")
+	b.WriteString(exchangeReproCommand(addr, req))
+	b.WriteString(protocolPayloadSection("请求", req))
+	b.WriteString(protocolPayloadSection("响应", resp))
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// protocolPayloadSection prints verbatim text when it is printable, always hex,
+// because an authentication response is usually binary and the text view alone
+// would silently drop the bytes that carry the verdict.
+func protocolPayloadSection(label string, raw []byte) string {
+	if len(raw) == 0 {
+		return fmt.Sprintf("\n# ---- 原始%s数据 ----\n（无字节）\n", label)
+	}
+	b := &strings.Builder{}
+	if isPrintablePayload(raw) {
+		fmt.Fprintf(b, "\n# ---- 原始%s数据（逐字节文本，行尾已标注）----\n", label)
+		b.WriteString(escapeControlLines(string(raw)))
+	}
+	fmt.Fprintf(b, "\n# ---- 原始%s数据（hexdump，与抓包字节一致）----\n", label)
+	b.WriteString(hexdump(raw))
+	return b.String()
+}
+
+// exchangeReproCommand sends the exact request bytes and prints the reply. The
+// request goes as hex so that \0, \r\n and non-UTF8 protocol fields survive a
+// copy-paste; a quoted shell string would not.
+func exchangeReproCommand(addr string, req []byte) string {
+	host, port := addr, ""
+	if h, p, err := net.SplitHostPort(addr); err == nil {
+		host, port = h, p
+	}
+	if port == "" {
+		return "#   （端点缺少端口号，无法给出可执行的复现命令）\n"
+	}
+	return fmt.Sprintf("#   python3 -c 'import socket;s=socket.create_connection((%q, %s), 5);"+
+		"s.sendall(bytes.fromhex(%q));print(repr(s.recv(65535)))'\n",
+		host, port, hex.EncodeToString(req))
 }
 
 func isPrintablePayload(raw []byte) bool {

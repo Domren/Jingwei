@@ -1,6 +1,8 @@
 package scanner
 
 import (
+	"bytes"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -70,5 +72,32 @@ func TestProtocolBannerPacketIPv6(t *testing.T) {
 func TestHexdumpEmpty(t *testing.T) {
 	if got := hexdump(nil); got != "" {
 		t.Errorf("hexdump(nil)=%q, want empty", got)
+	}
+}
+
+// 认证尝试发过请求字节，就不能套 banner 格式（那句「未发送任何应用层请求字节」会变成假记录），
+// 而且复现命令要能真的把同一串字节再发一遍——请求里的 \r\n 与非 ASCII 字节必须存活。
+func TestProtocolExchangePacketSendsRequestBytes(t *testing.T) {
+	req := []byte("AUTH p\x00ss\r\n")
+	got := ProtocolExchangePacket("redis", "192.0.2.7:6379", req, []byte("-WRONGPASS\r\n"))
+	for _, want := range []string{"# 协议: REDIS", "192.0.2.7:6379", "原始请求数据", "原始响应数据", "-WRONGPASS"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("exchange packet lost %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, bannerCaptureNote) {
+		t.Errorf("主动请求不能记成被动采集:\n%s", got)
+	}
+	// 复现命令里的 hex 必须与请求字节逐字节一致，否则照抄命令得到的是另一个请求。
+	h := hex.EncodeToString(req)
+	if !strings.Contains(got, `bytes.fromhex("`+h+`")`) {
+		t.Errorf("repro command lost the exact request bytes:\n%s", got)
+	}
+	back, err := hex.DecodeString(h)
+	if err != nil || !bytes.Equal(back, req) {
+		t.Errorf("hex round trip broke the request: %v %q", err, back)
+	}
+	if !strings.Contains(ProtocolExchangePacket("redis", "[fd00::1]:6379", req, nil), `("fd00::1", 6379)`) {
+		t.Errorf("ipv6 host lost:\n%s", ProtocolExchangePacket("redis", "[fd00::1]:6379", req, nil))
 	}
 }
