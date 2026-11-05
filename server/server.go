@@ -2371,6 +2371,22 @@ func (s *Server) getFinding(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, dto)
 }
 
+// findingExportExternal 过滤出对外报告允许出现的条目：已确认 / 已修复 / 已处理 / 风险接受。
+// 未确认与已撤销（误报、重复、忽略）不在其中——「对外版只含已确认项」是这条导出的定义。
+func findingExportExternal(fs []*db.DBFinding) ([]*db.DBFinding, int) {
+	allow := map[string]bool{"confirmed": true, "fixed": true, "resolved": true, "risk_accepted": true}
+	kept := make([]*db.DBFinding, 0, len(fs))
+	excluded := 0
+	for _, f := range fs {
+		if allow[f.Status] {
+			kept = append(kept, f)
+		} else {
+			excluded++
+		}
+	}
+	return kept, excluded
+}
+
 // findingsExport 导出发现页的漏洞。
 //
 //	scope   = filtered（沿用页面筛选）| all（全部）| selected（勾选的 ids）
@@ -2459,6 +2475,13 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		if err := s.attachFindingScreenshots(fs); err != nil {
 			log.Printf("[export] 加载取证截图失败: %v", err)
 		}
+	}
+	// 对外版只保留已确认的处置状态。未确认（pending/in_progress）与被证伪/重复/忽略的
+	// 条目一律排除：交付件里写一条后来被证伪的漏洞，比少写一条的代价大得多。
+	excluded := 0
+	if q.Get("audience") == "external" {
+		fs, excluded = findingExportExternal(fs)
+		w.Header().Set("X-Findings-Excluded", strconv.Itoa(excluded))
 	}
 	now := time.Now()
 	// 毫秒后缀避免同一秒内多次导出(例如两个漏扫任务接连导出)互相覆盖。

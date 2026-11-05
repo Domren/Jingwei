@@ -309,8 +309,11 @@ export default function FindingsPage() {
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(() => new Set());
   // 导出弹窗状态:范围(当前筛选/全部/选中) × 格式(md 单文件/md 分文件 zip/csv/json)。
   const [exportOpen, setExportOpen] = React.useState(false);
+  const [exportExternal, setExportExternal] = React.useState(false);
   const [exportScope, setExportScope] = React.useState<"filtered" | "all" | "selected">("filtered");
-  const [exportFormat, setExportFormat] = React.useState<"docx" | "md-single" | "md-zip" | "html" | "csv" | "json">("docx");
+  const [exportFormat, setExportFormat] = React.useState<"docx" | "md-single" | "md-zip" | "html" | "csv" | "json">(
+    "docx",
+  );
   const [includeOriginals, setIncludeOriginals] = React.useState(false);
   const [reviewing, setReviewing] = React.useState(false);
   const [exporting, setExporting] = React.useState(false);
@@ -347,9 +350,10 @@ export default function FindingsPage() {
   async function doExport() {
     setExporting(true);
     try {
-      await api.exportFindings({
+      const result = await api.exportFindings({
         format: exportFormat,
         scope: exportScope,
+        audience: exportExternal ? "external" : "internal",
         filters: {
           severity,
           status,
@@ -363,7 +367,11 @@ export default function FindingsPage() {
         includeOriginals,
       });
       setExportOpen(false);
-      toast.success("已下载导出文件，并保存到工作区 reports/ 目录");
+      if (exportExternal && result.excluded > 0) {
+        toast.success(`已下载对外版导出，并排除 ${result.excluded} 条未确认/已撤销条目`);
+      } else {
+        toast.success("已下载导出文件，并保存到工作区 reports/ 目录");
+      }
     } catch (e) {
       toast.error(`导出失败：${(e as Error).message}`);
     } finally {
@@ -1619,6 +1627,22 @@ export default function FindingsPage() {
               </RadioGroup>
             </div>
 
+            <div className="flex items-start gap-2 rounded-md border p-3">
+              <Checkbox
+                id="export-external"
+                checked={exportExternal}
+                onCheckedChange={(v) => setExportExternal(v === true)}
+              />
+              <div className="grid gap-1">
+                <label htmlFor="export-external" className="text-sm">
+                  对外交付版（只含已确认项）
+                </label>
+                <span className="text-xs text-muted-foreground">
+                  未确认、误报、重复、忽略的条目会被自动排除，并在完成后提示排除条数。
+                </span>
+              </div>
+            </div>
+
             <div className="flex flex-col gap-2">
               <span className="text-xs text-muted-foreground">导出格式</span>
               <div className="flex items-center gap-2">
@@ -1633,7 +1657,8 @@ export default function FindingsPage() {
               </div>
               <RadioGroup value={exportFormat} onValueChange={(v) => setExportFormat(v as typeof exportFormat)}>
                 <label htmlFor="export-format-docx" className="flex items-center gap-2 text-sm">
-                  <RadioGroupItem id="export-format-docx" value="docx" /> Word 报告（.docx，封面/目录/章节分页，含真实报文）
+                  <RadioGroupItem id="export-format-docx" value="docx" /> Word
+                  报告（.docx，封面/目录/章节分页，含真实报文）
                 </label>
                 <label htmlFor="export-format-html" className="flex items-center gap-2 text-sm">
                   <RadioGroupItem id="export-format-html" value="html" /> HTML 分页报告（封面/目录/章节页，可打印 PDF）

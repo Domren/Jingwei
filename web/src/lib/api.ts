@@ -763,10 +763,13 @@ export const api = {
     ids?: string[];
     includeOriginals?: boolean;
     consolidated?: boolean;
-  }): Promise<{ filename: string; workspacePath: string }> => {
+    /** external = 对外交付版：后端只保留已确认/已修复/已处理/风险接受的条目。 */
+    audience?: "internal" | "external";
+  }): Promise<{ filename: string; workspacePath: string; excluded: number }> => {
     const p = new URLSearchParams({ format: opts.format, scope: opts.scope });
     p.set("mode", opts.consolidated === false ? "raw" : "consolidated");
     p.set("include_originals", String(opts.includeOriginals ?? false));
+    if (opts.audience === "external") p.set("audience", "external");
     if (opts.scope === "selected") {
       p.set("ids", (opts.ids ?? []).join(","));
     } else if (opts.scope === "filtered" && opts.filters) {
@@ -780,6 +783,7 @@ export const api = {
     const m = disp.match(/filename="?([^"]+)"?/);
     const filename = m?.[1] ?? `findings-export`;
     const workspacePath = r.headers.get("X-Workspace-Path") ?? "";
+    const excluded = Number(r.headers.get("X-Findings-Excluded") ?? "0") || 0;
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -788,7 +792,7 @@ export const api = {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-    return { filename, workspacePath };
+    return { filename, workspacePath, excluded };
   },
   getFinding: (id: string, contextTaskId?: string) =>
     get<Finding>(
