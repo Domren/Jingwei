@@ -310,10 +310,11 @@ export default function FindingsPage() {
   // 导出弹窗状态:范围(当前筛选/全部/选中) × 格式(md 单文件/md 分文件 zip/csv/json)。
   const [exportOpen, setExportOpen] = React.useState(false);
   const [exportExternal, setExportExternal] = React.useState(false);
+  const [exportScopeNote, setExportScopeNote] = React.useState("");
   const [exportScope, setExportScope] = React.useState<"filtered" | "all" | "selected">("filtered");
-  const [exportFormat, setExportFormat] = React.useState<"docx" | "md-single" | "md-zip" | "html" | "csv" | "json">(
-    "docx",
-  );
+  const [exportFormat, setExportFormat] = React.useState<
+    "docx" | "md-single" | "md-zip" | "client-md" | "html" | "csv" | "json"
+  >("docx");
   const [includeOriginals, setIncludeOriginals] = React.useState(false);
   const [reviewing, setReviewing] = React.useState(false);
   const [exporting, setExporting] = React.useState(false);
@@ -354,6 +355,7 @@ export default function FindingsPage() {
         format: exportFormat,
         scope: exportScope,
         audience: exportExternal ? "external" : "internal",
+        scopeNote: exportFormat === "client-md" ? exportScopeNote : undefined,
         filters: {
           severity,
           status,
@@ -1643,6 +1645,20 @@ export default function FindingsPage() {
               </div>
             </div>
 
+            {exportFormat === "client-md" && (
+              <Field>
+                <FieldLabel htmlFor="export-scope-note">授权与范围声明（写入客户报告）</FieldLabel>
+                <InputGroup>
+                  <InputGroupInput
+                    id="export-scope-note"
+                    value={exportScopeNote}
+                    onChange={(e) => setExportScopeNote(e.target.value)}
+                    placeholder="例如：授权编号 A-2026-11，测试范围 10.0.0.0/8，有效期至 2026-12-31"
+                  />
+                </InputGroup>
+              </Field>
+            )}
+
             <div className="flex flex-col gap-2">
               <span className="text-xs text-muted-foreground">导出格式</span>
               <div className="flex items-center gap-2">
@@ -1662,6 +1678,10 @@ export default function FindingsPage() {
                 </label>
                 <label htmlFor="export-format-html" className="flex items-center gap-2 text-sm">
                   <RadioGroupItem id="export-format-html" value="html" /> HTML 分页报告（封面/目录/章节页，可打印 PDF）
+                </label>
+                <label htmlFor="export-format-client-md" className="flex items-center gap-2 text-sm">
+                  <RadioGroupItem id="export-format-client-md" value="client-md" /> 客户交付版 Markdown（中英双语 ·
+                  只含已确认项 · 按资产分组修复建议 · 报文附录）
                 </label>
                 <label htmlFor="export-format-md-single" className="flex items-center gap-2 text-sm">
                   <RadioGroupItem id="export-format-md-single" value="md-single" /> Markdown 汇总报告（单个 .md 文件）
