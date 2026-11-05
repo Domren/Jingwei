@@ -45,7 +45,9 @@ var intranetScriptCatalog = []intranetScriptDef{
 		Command: `find / -xdev -perm -4000 -type f 2>/dev/null | head -100`,
 		Note:    "常见的本地提权面"},
 	{ID: "linux-sshkeys", Name: "SSH 公钥", OS: "linux", Parser: "ssh_keys",
-		Command: `cat /root/.ssh/authorized_keys "$HOME/.ssh/authorized_keys" 2>/dev/null`,
+		// 没有 authorized_keys 是正常答案，不该记成「脚本失败」：逐文件判断存在再 cat，
+		// 整个 for 的退出码就是 0。同时把来源文件标出来，维持痕迹要能指到具体路径。
+		Command: `for f in /root/.ssh/authorized_keys "$HOME/.ssh/authorized_keys"; do if [ -s "$f" ]; then echo "# $f"; cat "$f"; fi; done`,
 		Note:    "已授权的公钥（可作维持痕迹）"},
 	{ID: "linux-containers", Name: "容器", OS: "linux", Parser: "containers",
 		Command: `docker ps --format '{{.Names}}|{{.Image}}|{{.Ports}}' 2>/dev/null; podman ps 2>/dev/null | head -50`,
@@ -157,15 +159,22 @@ func parseIntranetScriptOutput(parser, output string) map[string]any {
 			items = append(items, trim)
 		}
 	case "ssh_keys":
+		file := ""
 		for _, l := range lines {
 			trim := strings.TrimSpace(l)
+			// 脚本用「# <路径>」标出每条公钥来自哪个 authorized_keys：维持痕迹
+			// 要能指到具体文件，光有公钥内容不够。
+			if strings.HasPrefix(trim, "# ") {
+				file = strings.TrimSpace(trim[2:])
+				continue
+			}
 			if strings.HasPrefix(trim, "ssh-") || strings.HasPrefix(trim, "ecdsa-") || strings.HasPrefix(trim, "sk-") {
 				parts := strings.Fields(trim)
 				kind, comment := parts[0], ""
 				if len(parts) > 2 {
 					comment = strings.Join(parts[2:], " ")
 				}
-				items = append(items, map[string]any{"type": kind, "comment": comment})
+				items = append(items, map[string]any{"type": kind, "comment": comment, "file": file})
 			}
 		}
 	case "containers":

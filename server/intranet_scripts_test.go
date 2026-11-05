@@ -40,11 +40,22 @@ func TestParseIntranetScriptOutput(t *testing.T) {
 		t.Fatalf("sudo items = %+v", items)
 	}
 
-	keys := "ssh-ed25519 AAAAC3Nza alice@laptop\n# comment\n"
+	// 脚本按「# <路径>」分段输出，公钥条目要带上来源文件：维持痕迹得指到具体文件。
+	keys := "# /root/.ssh/authorized_keys\nssh-ed25519 AAAAC3Nza alice@laptop\nssh-rsa AAAAB3 bob@server\n# /home/jw/.ssh/authorized_keys\necdsa-sha2-nistp256 AAAAE2 carol@pc\n"
 	out = parseIntranetScriptOutput("ssh_keys", keys)
 	items = out["items"].([]any)
-	if len(items) != 1 || items[0].(map[string]any)["comment"] != "alice@laptop" {
-		t.Fatalf("ssh key = %+v", items)
+	if len(items) != 3 {
+		t.Fatalf("ssh keys = %+v", items)
+	}
+	wantFile := []string{"/root/.ssh/authorized_keys", "/root/.ssh/authorized_keys", "/home/jw/.ssh/authorized_keys"}
+	for i, want := range wantFile {
+		got := items[i].(map[string]any)["file"]
+		if got != want {
+			t.Fatalf("第 %d 条公钥的来源文件 = %v，期望 %q（全部：%+v）", i, got, want, items)
+		}
+	}
+	if items[2].(map[string]any)["type"] != "ecdsa-sha2-nistp256" {
+		t.Fatalf("类型解析不对: %+v", items[2])
 	}
 
 	patches := "HotFixID  InstalledOn\nKB5034441  1/9/2024\nKB5034123  1/10/2024\n"

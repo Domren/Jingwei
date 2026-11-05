@@ -149,8 +149,18 @@ func ClientMarkdown(in ClientReportInput) string {
 			}
 			continue
 		}
-		b.WriteString("**请求 / Request**\n\n```http\n" + strings.TrimRight(f.HTTPRequest, "\n") + "\n```\n\n")
-		b.WriteString("**响应 / Response**\n\n```http\n" + strings.TrimRight(f.HTTPResponse, "\n") + "\n```\n\n")
+		// 被动读取型证据（端口横幅之类）没有请求字节。留一个空的代码块在客户
+		// 报告里看起来像导出坏了，写清楚「没发过请求」才是可信的表述。
+		req := strings.TrimRight(f.HTTPRequest, "\n")
+		if strings.TrimSpace(req) == "" {
+			req = "（无请求字节：被动读取 / No request bytes: passive read）"
+		}
+		resp := strings.TrimRight(f.HTTPResponse, "\n")
+		if strings.TrimSpace(resp) == "" {
+			resp = "（无响应正文 / No response body captured）"
+		}
+		b.WriteString("**请求 / Request**\n\n```http\n" + req + "\n```\n\n")
+		b.WriteString("**响应 / Response**\n\n```http\n" + resp + "\n```\n\n")
 	}
 	return b.String()
 }
@@ -174,6 +184,11 @@ func clientRemediation(f *db.DBFinding) string {
 		return "对文件路径做白名单校验并规范化，禁止将用户输入直接拼入包含/读取路径。/ Validate paths against an allowlist and canonicalize before use."
 	case strings.Contains(key, "ssrf"):
 		return "对出站请求做目标白名单与内网地址拦截，禁止跟随重定向到非授权目标。/ Enforce an egress allowlist and block private/metadata ranges."
+	case strings.Contains(key, "exposed") || strings.Contains(key, "unauthorized") ||
+		strings.Contains(key, "对外暴露") || strings.Contains(key, "未授权") ||
+		strings.Contains(key, "redis") || strings.Contains(key, "mongodb") || strings.Contains(key, "memcached") ||
+		strings.Contains(key, "elasticsearch") || strings.Contains(key, "zookeeper"):
+		return "把服务绑定到内网或回环地址，用防火墙限制可访问来源，启用认证（支持时再开 TLS）并关闭危险命令；这类服务不应以默认配置对外网开放。/ Bind the service to internal/loopback interfaces, restrict sources by firewall, enable authentication (and TLS where supported), and disable dangerous commands; do not expose such services to the internet with default settings."
 	case strings.Contains(key, "info") || strings.Contains(key, "泄露") || strings.Contains(key, "disclosure"):
 		return "关闭生产环境的调试与目录列举，移除响应中的版本与内部路径信息。/ Disable debug endpoints and remove version/path details from responses."
 	default:

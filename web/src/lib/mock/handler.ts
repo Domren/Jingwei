@@ -50,6 +50,11 @@ const mockTaskCategories = structuredClone(D.taskCategories);
 const mockConversations = structuredClone(D.conversations);
 const mockRetests: FindingRetest[] = [];
 const mockRetestMessages: Record<number, Activity[]> = {};
+const mockManagedResources = structuredClone(D.managedResources);
+const mockPortListeners = structuredClone(D.portListeners);
+const mockNotifyMeta = structuredClone(D.notifyMeta);
+const mockNotifyChannels = structuredClone(D.notifyChannels);
+const mockNotifyDeliveries = structuredClone(D.notifyDeliveries);
 
 // ── 关联流量证据(finding traffic) ─────────────────────────────────────────────
 // 后端把请求/响应快照独立存到 evidence 表,前端详情页用 FindingTrafficPanel 展示。
@@ -2654,6 +2659,28 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       };
     }
     if (m === "POST") throw new Error("演示模式不支持旁路提问");
+  }
+
+  // ── 受管资源台账与端口审计 ──
+  if (path === "/managed-resources" && m === "GET") {
+    const status = q.get("status") ?? "";
+    const rows = mockManagedResources.filter((r) => !status || r.status === status);
+    return { resources: rows, total: rows.length };
+  }
+  if (path === "/managed-resources/audit" && m === "GET") {
+    return {
+      checked_at: new Date().toISOString(),
+      listeners: mockPortListeners,
+      unmanaged: mockPortListeners.filter((l) => !l.managed && !l.platform),
+      allow_ports: [8787, 8788, 55432],
+    };
+  }
+
+  // ── 漏洞推送（通知）──
+  if (path === "/notify/meta" && m === "GET") return mockNotifyMeta;
+  if (path === "/notify/channels" && m === "GET") return { channels: mockNotifyChannels };
+  if (path === "/notify/deliveries" && m === "GET") {
+    return { deliveries: mockNotifyDeliveries, total: mockNotifyDeliveries.length, page: 1, page_size: 50 };
   }
 
   // ── 写操作兜底：成功但不落库 ──

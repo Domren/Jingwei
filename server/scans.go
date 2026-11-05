@@ -330,10 +330,13 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 
 	if nrun.TimedOut {
 		r.logf("scan", "nuclei 执行超时（%ds），保留已产出的结果", r.task.TimeoutSeconds)
-		// 只报 nuclei 条数会让人以为这一轮什么都没留下：超时前已经入库的资产探测、
-		// 弱口令与服务暴露发现同样是这次扫描的产出。
-		return "failed", "failed", fmt.Sprintf("扫描超时（%ds），已保留 %d 条 POC 结果、%d 条发现（含应用层探测、弱口令与服务暴露）",
-			r.task.TimeoutSeconds, stored, findings+exposureFindings), summary
+		// 超时要分开报「POC 结果 / 发现」和「这一轮已经入库的其它产出」。只写前两者
+		// 的数字（超时轮常常是 0），会让人以为连应用层探测和目录枚举也没做，
+		// 而那些行确实已经在库里、可以直接接着看。
+		return "failed", "failed", fmt.Sprintf(
+			"扫描超时（%ds）：POC 结果 %d 条、发现 %d 条；本轮已入库的还有应用层系统 %d 个、目录入口 %d 条",
+			r.task.TimeoutSeconds, stored, findings+exposureFindings,
+			summaryInt(summary, "app_systems"), summaryInt(summary, "dir_entries")), summary
 	}
 	if r.ctx.Err() != nil {
 		return r.aborted("扫描已中断", summary)
@@ -362,8 +365,9 @@ func (r *scanRun) aborted(errMsg string, summary map[string]any) (string, string
 	if errors.Is(r.ctx.Err(), context.DeadlineExceeded) {
 		// 中断可能发生在探测阶段之后：这一轮已经入库的结果与发现要照 summary 报出来，
 		// 否则超时文案只说「扫描超时」，看不出还有东西可查。
-		return "failed", "failed", fmt.Sprintf("扫描超时（%ds），已保留 %d 条结果、%d 条发现",
-			r.task.TimeoutSeconds, summaryInt(summary, "results"), summaryInt(summary, "findings")), summary
+		return "failed", "failed", fmt.Sprintf("扫描超时（%ds）：结果 %d 条、发现 %d 条；应用层系统 %d 个、目录入口 %d 条已入库",
+			r.task.TimeoutSeconds, summaryInt(summary, "results"), summaryInt(summary, "findings"),
+			summaryInt(summary, "app_systems"), summaryInt(summary, "dir_entries")), summary
 	}
 	return "failed", "failed", errMsg, summary
 }

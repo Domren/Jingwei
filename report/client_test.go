@@ -43,3 +43,29 @@ func TestClientMarkdown(t *testing.T) {
 		t.Fatalf("客户报告混入未确认项:\n%s", md)
 	}
 }
+
+// 端口探测类发现没有请求字节，也常常落进修复建议映射的默认分支——这两条在客户
+// 报告里都很难看：一个空的 ```http 块像是导出坏了，一句「按标准方案处理」没有信息量。
+func TestClientMarkdownPassiveFinding(t *testing.T) {
+	fs := []*db.DBFinding{
+		{ID: 4, Name: "Redis 服务对外暴露", VulnClass: "exposed-service-redis", Severity: "high",
+			Status: "confirmed", Summary: "6379 可从扫描网段直连", AssetIDs: []int64{30},
+			HTTPRequest: "", HTTPResponse: "-ERR unknown command 'PING'"},
+	}
+	md := ClientMarkdown(ClientReportInput{
+		Findings: fs, Assets: map[int64]string{30: "10.99.0.10"},
+		GeneratedAt: time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC),
+	})
+	for _, want := range []string{
+		"无请求字节：被动读取", // 空请求块要写成一句话，而不是留空
+		"绑定到内网或回环地址", // 暴露/未授权访问类要给出具体处置，不能落到兜底文案
+		"-ERR unknown command",
+	} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("客户报告缺 %q:\n%s", want, md)
+		}
+	}
+	if strings.Contains(md, "```http\n\n```") {
+		t.Fatalf("报告里出现空的报文代码块:\n%s", md)
+	}
+}
