@@ -2131,3 +2131,22 @@ CREATE TABLE IF NOT EXISTS cred_dicts (
 -- G2：落地物到期前的主动告警标记。告警发出后写入该列，避免每个扫描周期
 -- 重复推送同一条；落地物撤销/删除后该行随之消失。
 ALTER TABLE intranet_artifacts ADD COLUMN IF NOT EXISTS expiry_notified_at TIMESTAMPTZ;
+
+-- F3：内网信息收集脚本的运行台账。每条脚本一次执行一行，stdout 与结构化
+-- 提取结果都落库——报告与横向决策要用的是结构化的端口/账号/计划任务，
+-- 而不是一大段需要人肉阅读的终端输出。
+CREATE TABLE IF NOT EXISTS intranet_script_runs (
+    id         BIGSERIAL PRIMARY KEY,
+    session_id BIGINT REFERENCES intranet_sessions(id) ON DELETE SET NULL,
+    task_id    BIGINT,
+    script_id  TEXT NOT NULL,
+    name       TEXT NOT NULL DEFAULT '',
+    os         TEXT NOT NULL DEFAULT '',
+    command    TEXT NOT NULL DEFAULT '',
+    exit_code  INTEGER,
+    status     TEXT NOT NULL DEFAULT 'done',
+    output     TEXT NOT NULL DEFAULT '',
+    parsed     JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_intranet_script_runs_session ON intranet_script_runs(session_id, id DESC);

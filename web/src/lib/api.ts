@@ -85,6 +85,8 @@ import type {
   IntranetReuseTarget,
   IntranetScopeRequest,
   IntranetScopeRequestInput,
+  IntranetScript,
+  IntranetScriptRun,
   IntranetSession,
   IntranetSessionEvent,
   IntranetSessionInput,
@@ -1711,6 +1713,11 @@ export const api = {
       webshell: Webshell;
       result: IntranetExecResult;
     }>(`/intranet/sessions/${id}/failover`, { webshell_id: webshellId }),
+  intranetScripts: () => get<{ scripts: IntranetScript[] }>("/intranet/scripts").then((r) => arr(r.scripts)),
+  intranetScriptRuns: (sessionId: number) =>
+    get<{ runs: IntranetScriptRun[] }>(`/intranet/sessions/${sessionId}/scripts`).then((r) => arr(r.runs)),
+  runIntranetScript: (sessionId: number, scriptId: string) =>
+    post<{ run: IntranetScriptRun }>(`/intranet/sessions/${sessionId}/scripts`, { script_id: scriptId }),
   intranetExec: (id: number, command: string, timeoutSeconds?: number, osKind?: string) =>
     post<{ result: IntranetExecResult; session: IntranetSession }>(`/intranet/sessions/${id}/exec`, {
       command,

@@ -2689,6 +2689,29 @@ export interface IntelligencePage {
   enabled: boolean;
 }
 
+// ---- 内网信息收集脚本（F3） ----
+export interface IntranetScript {
+  id: string;
+  name: string;
+  os: string;
+  command: string;
+  note?: string;
+}
+
+export interface IntranetScriptRun {
+  id: number;
+  session_id?: number;
+  script_id: string;
+  name: string;
+  os: string;
+  command: string;
+  exit_code?: number;
+  status: string;
+  output?: string;
+  parsed: { kind?: string; count?: number; items?: unknown[] } & Record<string, unknown>;
+  created_at: string;
+}
+
 // ---- 扫描增量（两次扫描对比） ----
 export interface ScanDiffItem {
   template_id: string;

@@ -57,6 +57,8 @@ import type {
   IntranetEvacuationReport,
   IntranetExecResult,
   IntranetScopeRequest,
+  IntranetScript,
+  IntranetScriptRun,
   IntranetSession,
   IntranetSessionEvent,
   IntranetTunnel,
@@ -65,7 +67,7 @@ import type {
 } from "@/lib/types";
 
 import { FieldRow, fmtTime } from "../_components/deep-ui";
-import { ShellTerminal, fmtDuration, shellExitBadge } from "../_components/shell-terminal";
+import { fmtDuration, ShellTerminal, shellExitBadge } from "../_components/shell-terminal";
 
 // ExecOutcome 是「一次操作一个结果」的展示：终端页签已经习惯的退出码、耗时与
 // 「超时」，在上传/下载页签里也不该退化成把 note 拼进输出的一坨文本——那正是
@@ -212,7 +214,12 @@ const PERSIST_KIND_META: Record<string, PersistKindMeta> = {
   cron: {
     label: "cron 计划任务",
     os: "linux",
-    schedule: { label: "cron 表达式", hint: "5 段或 @reboot/@daily 等", placeholder: "*/10 * * * *", fallback: "*/10 * * * *" },
+    schedule: {
+      label: "cron 表达式",
+      hint: "5 段或 @reboot/@daily 等",
+      placeholder: "*/10 * * * *",
+      fallback: "*/10 * * * *",
+    },
     command: true,
   },
   systemd: { label: "systemd 系统服务", os: "linux", command: true },
@@ -286,9 +293,8 @@ function credentialLabel(c: IntranetCredential) {
 function tunnelEndpoint(t: IntranetTunnel) {
   // 监听端在控制端（chisel client 不带 R:）时，listen_host 是 chisel server 的绑定地址，
   // 要连的是控制端；写成目标地址会把人引向一个从未开过的端口。
-  const listen = t.listen_side === "pivot"
-    ? `控制端:${t.listen_port}`
-    : `${t.listen_host || "0.0.0.0"}:${t.listen_port}`;
+  const listen =
+    t.listen_side === "pivot" ? `控制端:${t.listen_port}` : `${t.listen_host || "0.0.0.0"}:${t.listen_port}`;
   if (t.kind === "socks5") return listen;
   return `${listen} → ${t.remote_host || "?"}:${t.remote_port || "?"}`;
 }
@@ -519,6 +525,10 @@ export default function DeepIntranetPage() {
   // 其它标签页跑过的命令）。两者分开而不是混成一份输出：事件里没有退出码和结束标记，
   // 硬塞进终端只会显示假的 exit 0。
   const [termSession, setTermSession] = React.useState<IntranetSession | null>(null);
+  const [scriptSession, setScriptSession] = React.useState<IntranetSession | null>(null);
+  const [scriptCatalog, setScriptCatalog] = React.useState<IntranetScript[]>([]);
+  const [scriptRuns, setScriptRuns] = React.useState<IntranetScriptRun[]>([]);
+  const [scriptBusy, setScriptBusy] = React.useState(false);
   const [termEvents, setTermEvents] = React.useState<IntranetSessionEvent[]>([]);
   const [termMode, setTermMode] = React.useState("exec");
   const [uploadFile, setUploadFile] = React.useState<File | null>(null);
@@ -539,6 +549,32 @@ export default function DeepIntranetPage() {
       // 读不到历史不影响执行
     }
   }, []);
+
+  const openScripts = React.useCallback(async (sess: IntranetSession) => {
+    setScriptSession(sess);
+    setScriptRuns([]);
+    try {
+      const [catalog, runs] = await Promise.all([api.intranetScripts(), api.intranetScriptRuns(sess.id)]);
+      setScriptCatalog(catalog);
+      setScriptRuns(runs);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "读取信息收集脚本失败");
+    }
+  }, []);
+
+  async function runScript(scriptId: string) {
+    if (!scriptSession) return;
+    setScriptBusy(true);
+    try {
+      const r = await api.runIntranetScript(scriptSession.id, scriptId);
+      setScriptRuns((prev) => [r.run, ...prev.filter((x) => x.id !== r.run.id)]);
+      toast.success(`已执行「${r.run.name}」`);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "脚本执行失败");
+    } finally {
+      setScriptBusy(false);
+    }
+  }
 
   const openTerminal = React.useCallback(
     (session: IntranetSession) => {
@@ -1303,7 +1339,8 @@ export default function DeepIntranetPage() {
         <TabsContent value="sessions" className="flex min-h-0 flex-1 flex-col gap-3">
           {sessions.length === 0 ? (
             <div className="rounded-md border border-dashed py-12 text-center text-muted-foreground text-sm">
-              还没有内网会话。有 Web 服务的目标先添加 webshell；只有 22 端口的内网主机登记好凭据后，点右上角「新建会话」选 SSH。
+              还没有内网会话。有 Web 服务的目标先添加 webshell；只有 22
+              端口的内网主机登记好凭据后，点右上角「新建会话」选 SSH。
             </div>
           ) : (
             <Table>
@@ -1377,6 +1414,14 @@ export default function DeepIntranetPage() {
                           >
                             <SquareTerminalIcon className="size-3.5" />
                             终端
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            disabled={s.status !== "active"}
+                            onClick={() => void openScripts(s)}
+                          >
+                            信息收集
                           </Button>
                           <Button
                             variant="ghost"
@@ -1545,7 +1590,8 @@ export default function DeepIntranetPage() {
         <TabsContent value="credentials" className="flex min-h-0 flex-1 flex-col gap-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <p className="text-muted-foreground text-sm">
-              弱口令命中与横向验证过的账号都汇总在这里，按 host+账号+口令 去重；从泄露页面、配置文件里读出的口令可用「登记凭据」手工入账。
+              弱口令命中与横向验证过的账号都汇总在这里，按 host+账号+口令
+              去重；从泄露页面、配置文件里读出的口令可用「登记凭据」手工入账。
               台账只回写「有没有口令」，明文不下发到浏览器：复用验证与 SSH 会话都由平台按凭据 ID 取用。
             </p>
             <div className="flex flex-wrap items-center gap-2">
@@ -1676,8 +1722,8 @@ export default function DeepIntranetPage() {
           </div>
           {shownArtifacts.length === 0 ? (
             <div className="rounded-md border border-dashed py-12 text-center text-muted-foreground text-sm">
-              暂无落地物记录。通过会话上传的新文件会自动登记；cron / systemd / at / profile / SSH
-              公钥以及 Windows 的 schtasks / 注册表 / 服务 / WMI / 启动文件夹可用右上角「部署 / 登记」创建。
+              暂无落地物记录。通过会话上传的新文件会自动登记；cron / systemd / at / profile / SSH 公钥以及 Windows 的
+              schtasks / 注册表 / 服务 / WMI / 启动文件夹可用右上角「部署 / 登记」创建。
             </div>
           ) : (
             <Table>
@@ -1971,7 +2017,8 @@ export default function DeepIntranetPage() {
           <DialogHeader>
             <DialogTitle>新建内网会话</DialogTitle>
             <DialogDescription>
-              会话不驻留进程：Webshell 承载的会话每次执行都复用所选 webshell，SSH 承载的会话复用凭据台账里的账号。工作目录由平台维护。
+              会话不驻留进程：Webshell 承载的会话每次执行都复用所选 webshell，SSH
+              承载的会话复用凭据台账里的账号。工作目录由平台维护。
             </DialogDescription>
           </DialogHeader>
           <form
@@ -2133,6 +2180,83 @@ export default function DeepIntranetPage() {
       </Dialog>
 
       {/* 终端 */}
+      <Dialog open={Boolean(scriptSession)} onOpenChange={(o) => !o && setScriptSession(null)}>
+        <DialogContent className="flex max-h-[92vh] flex-col sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>信息收集脚本</DialogTitle>
+            <DialogDescription>
+              {scriptSession
+                ? `会话「${scriptSession.name || scriptSession.host || `#${scriptSession.id}`}」· 结果按结构化条目与原始输出一起入库`
+                : ""}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
+            <div className="flex flex-wrap gap-1.5">
+              {scriptCatalog
+                .filter((sc) => {
+                  const os = String(scriptSession?.metadata?.os ?? "");
+                  if (os === "windows") return sc.os === "windows";
+                  if (os === "posix") return sc.os === "linux";
+                  return true;
+                })
+                .map((sc) => (
+                  <Button
+                    key={sc.id}
+                    size="sm"
+                    variant="outline"
+                    disabled={scriptBusy}
+                    title={sc.note || sc.command}
+                    onClick={() => void runScript(sc.id)}
+                  >
+                    {sc.name}
+                  </Button>
+                ))}
+            </div>
+            <div className="space-y-2">
+              {scriptRuns.length === 0 ? (
+                <p className="text-xs text-muted-foreground">还没有运行记录。点上面的脚本执行一条只读收集。</p>
+              ) : (
+                scriptRuns.map((run) => (
+                  <div key={run.id} className="rounded-md border p-2">
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <span className="font-medium">
+                        {run.name} <span className="font-mono text-muted-foreground">{run.script_id}</span>
+                      </span>
+                      <span className="text-muted-foreground">
+                        {run.status === "done" ? "完成" : "失败"} · 退出码 {run.exit_code ?? "—"} ·{" "}
+                        {fmtTime(run.created_at)}
+                      </span>
+                    </div>
+                    <div className="mt-1 text-[11px] text-muted-foreground">
+                      结构化条目 {String(run.parsed?.count ?? 0)} 条
+                    </div>
+                    {Array.isArray(run.parsed?.items) && run.parsed.items.length > 0 && (
+                      <pre className="mt-1 max-h-40 overflow-auto rounded bg-muted/30 p-2 font-mono text-[11px] whitespace-pre-wrap">
+                        {run.parsed.items
+                          .slice(0, 50)
+                          .map((it) => (typeof it === "string" ? it : JSON.stringify(it)))
+                          .join("\n")}
+                      </pre>
+                    )}
+                    {run.output && (
+                      <details className="mt-1">
+                        <summary className="cursor-pointer text-[11px] text-muted-foreground">原始输出</summary>
+                        <pre className="mt-1 max-h-48 overflow-auto rounded bg-muted/20 p-2 font-mono text-[11px] whitespace-pre-wrap">
+                          {run.output}
+                        </pre>
+                      </details>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+          <DialogFooter>
+            <Button onClick={() => setScriptSession(null)}>关闭</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={Boolean(termSession)} onOpenChange={(o) => !o && setTermSession(null)}>
         <DialogContent className="sm:max-w-4xl">
           <DialogHeader>
@@ -2377,7 +2501,10 @@ export default function DeepIntranetPage() {
                 </SelectContent>
               </Select>
             </FieldRow>
-            <FieldRow label="监听侧" hint="规划自动选型会改写；手写部署命令时用它纠正，验证与拆除复核都按这里记的一侧进行">
+            <FieldRow
+              label="监听侧"
+              hint="规划自动选型会改写；手写部署命令时用它纠正，验证与拆除复核都按这里记的一侧进行"
+            >
               <Select
                 value={tunnelForm.listen_side}
                 onValueChange={(v) => setTunnelForm({ ...tunnelForm, listen_side: v })}
@@ -2811,7 +2938,10 @@ export default function DeepIntranetPage() {
             </FieldRow>
             {artifactMode === "persist" ? (
               <>
-                <FieldRow label="模块" hint={`当前模块适用于 ${persistMeta.os === "windows" ? "Windows" : "Linux/Unix"} 目标`}>
+                <FieldRow
+                  label="模块"
+                  hint={`当前模块适用于 ${persistMeta.os === "windows" ? "Windows" : "Linux/Unix"} 目标`}
+                >
                   <Select
                     value={artifactForm.persist_kind}
                     onValueChange={(v) => {
@@ -2958,10 +3088,9 @@ export default function DeepIntranetPage() {
           <DialogHeader>
             <DialogTitle>撤离清理</DialogTitle>
             <DialogDescription>
-              按落地物台账 id 倒序撤销并验证，随后复核残留、拆除任务隧道、释放受管资源并关闭会话。
-              内存马会在父 webshell 之前清理（父 shell 反注册优先，失败则端点自移除）；未确认移除时保留父
-              webshell 并列入残留。webshell 默认只探活并列入残留提醒；显式开启后才会对 v2 载荷执行自删除与
-              404/标记复核。
+              按落地物台账 id 倒序撤销并验证，随后复核残留、拆除任务隧道、释放受管资源并关闭会话。 内存马会在父 webshell
+              之前清理（父 shell 反注册优先，失败则端点自移除）；未确认移除时保留父 webshell 并列入残留。webshell
+              默认只探活并列入残留提醒；显式开启后才会对 v2 载荷执行自删除与 404/标记复核。
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-4">
@@ -2997,11 +3126,7 @@ export default function DeepIntranetPage() {
               自删除本任务会话绑定的 v2 webshell（旧版协议仍需手工清理）
             </label>
             <label htmlFor="evac-rescan" className="flex items-center gap-2 text-sm">
-              <Checkbox
-                id="evac-rescan"
-                checked={evacuateScan}
-                onCheckedChange={(v) => setEvacuateScan(Boolean(v))}
-              />
+              <Checkbox id="evac-rescan" checked={evacuateScan} onCheckedChange={(v) => setEvacuateScan(Boolean(v))} />
               撤离后重新执行验证命令做残留复核
             </label>
             <div className="flex flex-wrap items-center gap-2">
