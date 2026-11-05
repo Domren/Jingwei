@@ -2150,3 +2150,18 @@ CREATE TABLE IF NOT EXISTS intranet_script_runs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_intranet_script_runs_session ON intranet_script_runs(session_id, id DESC);
+
+-- F4：客户授权清单（一等公民）。启用的清单存在时，agent 与任务的目标判定
+-- 必须落在某条有效授权内且不命中其排除项；没有任何清单时保持历史行为（不强制）。
+CREATE TABLE IF NOT EXISTS authorizations (
+    id         BIGSERIAL PRIMARY KEY,
+    name       TEXT NOT NULL,
+    targets    TEXT[] NOT NULL DEFAULT '{}',
+    exclusions TEXT[] NOT NULL DEFAULT '{}',
+    starts_at  TIMESTAMPTZ,
+    ends_at    TIMESTAMPTZ,
+    enabled    BOOLEAN NOT NULL DEFAULT true,
+    note       TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_authorizations_active ON authorizations(enabled, ends_at);

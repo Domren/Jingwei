@@ -2689,6 +2689,29 @@ export interface IntelligencePage {
   enabled: boolean;
 }
 
+// ---- 客户授权清单（F4） ----
+export interface Authorization {
+  id: number;
+  name: string;
+  targets: string[];
+  exclusions: string[];
+  starts_at?: string;
+  ends_at?: string;
+  enabled: boolean;
+  note: string;
+  created_at: string;
+}
+
+export interface AuthorizationInput {
+  name: string;
+  targets: string[];
+  exclusions: string[];
+  starts_at?: string;
+  ends_at?: string;
+  enabled?: boolean;
+  note?: string;
+}
+
 // ---- 内网信息收集脚本（F3） ----
 export interface IntranetScript {
   id: string;

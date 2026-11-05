@@ -11,9 +11,12 @@ import (
 // a database hiccup showing up as out_of_scope would be a different fix than an
 // operator forgetting to register the scope.
 const (
-	GuardDenialOutOfScope      = "out_of_scope"
-	GuardDenialAssetBlock      = "asset_block"
-	GuardDenialScopeReadFailed = "scope_read_failed"
+	GuardDenialOutOfScope = "out_of_scope"
+	// GuardDenialOutOfAuthorization：启用了客户授权清单时，目标不在任何有效
+	// 授权内（或命中了授权排除项）。
+	GuardDenialOutOfAuthorization = "out_of_authorization"
+	GuardDenialAssetBlock         = "asset_block"
+	GuardDenialScopeReadFailed    = "scope_read_failed"
 	// GuardDenialCompanyExpandFailed is the third read that can fail closed: the
 	// task scope registered a company, and the company's asset list could not be
 	// expanded. Operators see the same refusal, but the fix is on the asset side.

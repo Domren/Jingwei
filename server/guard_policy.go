@@ -42,6 +42,10 @@ type guardTargetPolicy struct {
 
 	companyMu sync.Mutex
 	companies map[int64]companyScopeEntry
+
+	authzMu sync.Mutex
+	authz   []*pgdb.Authorization
+	authzAt time.Time
 }
 
 type companyScopeEntry struct {
@@ -140,6 +144,34 @@ func (p *guardTargetPolicy) Check(taskID int64, urls, hosts []string) (guard.Sco
 		}
 	}
 
+	// 客户授权清单（F4）：只要平台里存在任何一条**有效**授权，目标就必须落在
+	// 某条授权内且不命中其排除项；没有有效授权时保持历史行为（不强制）。
+	// 读取失败按拒绝处理——授权清单读不到时放行，等于把「有授权才能打」变成
+	// 「数据库挂了就能打」。
+	auths, aerr := p.activeAuthorizations()
+	if aerr != nil {
+		log.Printf("[guard][target] 读取客户授权清单失败(拒绝): %v", aerr)
+		return p.deny(taskID, pgdb.GuardDenialScopeReadFailed,
+			fmt.Sprintf("无法读取客户授权清单，请稍后重试（%v）", aerr))
+	}
+	if len(auths) > 0 {
+		var out []string
+		for _, h := range hosts {
+			probe := h
+			if hostname, _, herr := net.SplitHostPort(h); herr == nil {
+				probe = hostname
+			}
+			if !authorizationAllows(auths, probe) {
+				out = append(out, h)
+			}
+		}
+		if len(out) > 0 {
+			return p.deny(taskID, pgdb.GuardDenialOutOfAuthorization,
+				fmt.Sprintf("目标 %s 不在任何有效的客户授权清单内（有效授权: %s）",
+					strings.Join(dedupeStrings(out), ", "), authorizationSummary(auths)))
+		}
+	}
+
 	if taskID <= 0 {
 		return guard.ScopeUnknown, ""
 	}
@@ -164,6 +196,26 @@ func (p *guardTargetPolicy) Check(taskID int64, urls, hosts []string) (guard.Sco
 	}
 	return p.deny(taskID, pgdb.GuardDenialOutOfScope, fmt.Sprintf("目标 %s 不在本任务已登记范围内（登记范围: %s）",
 		strings.Join(dedupeStrings(out), ", "), scopeRuleSummary(rules)))
+}
+
+// activeAuthorizations 读取有效授权清单，缓存 30 秒（授权改动很少，而每个
+// 目标检查都查库不值得）。读取失败不缓存，下一次会重试。
+func (p *guardTargetPolicy) activeAuthorizations() ([]*pgdb.Authorization, error) {
+	p.authzMu.Lock()
+	if !p.authzAt.IsZero() && time.Since(p.authzAt) < 30*time.Second {
+		v := p.authz
+		p.authzMu.Unlock()
+		return v, nil
+	}
+	p.authzMu.Unlock()
+	list, err := p.pg.ListActiveAuthorizations()
+	if err != nil {
+		return nil, err
+	}
+	p.authzMu.Lock()
+	p.authz, p.authzAt = list, time.Now()
+	p.authzMu.Unlock()
+	return list, nil
 }
 
 // scopeRules converts task_scope rows into host-matchable rules. ICP/keyword

@@ -8,6 +8,14 @@ import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -17,7 +25,7 @@ import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { AssetInterceptKind, AssetInterceptRule } from "@/lib/types";
+import type { AssetInterceptKind, AssetInterceptRule, Authorization } from "@/lib/types";
 
 // ---- kind 元信息 ----
 
@@ -96,6 +104,17 @@ export default function AssetInterceptPage() {
   const [editing, setEditing] = React.useState<AssetInterceptRule | null>(null);
   const [form, setForm] = React.useState<RuleForm>(defaultForm());
   const [saving, setSaving] = React.useState(false);
+  const [authzList, setAuthzList] = React.useState<Authorization[]>([]);
+  const [authzOpen, setAuthzOpen] = React.useState(false);
+  const [authzSaving, setAuthzSaving] = React.useState(false);
+  const [authzForm, setAuthzForm] = React.useState({
+    name: "",
+    targets: "",
+    exclusions: "",
+    starts: "",
+    ends: "",
+    note: "",
+  });
 
   const load = React.useCallback(async () => {
     try {
@@ -107,9 +126,51 @@ export default function AssetInterceptPage() {
     }
   }, []);
 
+  const loadAuthz = React.useCallback(async () => {
+    try {
+      setAuthzList(await api.authorizations());
+    } catch {
+      toast.error("加载客户授权清单失败");
+    }
+  }, []);
+
   React.useEffect(() => {
     load();
-  }, [load]);
+    void loadAuthz();
+  }, [load, loadAuthz]);
+
+  async function saveAuthz() {
+    setAuthzSaving(true);
+    try {
+      await api.createAuthorization({
+        name: authzForm.name,
+        targets: authzForm.targets.split(/[\n,，\s]+/).filter(Boolean),
+        exclusions: authzForm.exclusions.split(/[\n,，\s]+/).filter(Boolean),
+        starts_at: authzForm.starts || undefined,
+        ends_at: authzForm.ends || undefined,
+        note: authzForm.note,
+      });
+      toast.success("授权已登记");
+      setAuthzOpen(false);
+      setAuthzForm({ name: "", targets: "", exclusions: "", starts: "", ends: "", note: "" });
+      await loadAuthz();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "登记失败");
+    } finally {
+      setAuthzSaving(false);
+    }
+  }
+
+  async function removeAuthz(a: Authorization) {
+    if (!window.confirm(`删除授权「${a.name}」？删除后该范围不再自动放行。`)) return;
+    try {
+      await api.deleteAuthorization(a.id);
+      toast.success("已删除");
+      await loadAuthz();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "删除失败");
+    }
+  }
 
   function set(patch: Partial<RuleForm>) {
     setForm((f) => ({ ...f, ...patch }));
@@ -347,6 +408,119 @@ export default function AssetInterceptPage() {
           </SheetFooter>
         </SheetContent>
       </Sheet>
+
+      <Card>
+        <CardContent className="space-y-3 p-4">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-medium">客户授权清单</h2>
+              <p className="mt-1 text-xs text-muted-foreground">
+                存在任何一条<strong>有效</strong>授权时，agent 与任务的目标必须落在某条授权内且不命中排除项；没有有效授权时不强制。
+                范围支持 IP / CIDR / 域名（裸域名同时匹配其子域），排除项优先。
+              </p>
+            </div>
+            <Button size="sm" onClick={() => setAuthzOpen(true)}>
+              <PlusIcon className="h-4 w-4" />
+              新增授权
+            </Button>
+          </div>
+          {authzList.length === 0 ? (
+            <p className="py-6 text-center text-xs text-muted-foreground">暂无授权清单</p>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>名称</TableHead>
+                  <TableHead>范围</TableHead>
+                  <TableHead>排除</TableHead>
+                  <TableHead className="w-44">有效期</TableHead>
+                  <TableHead className="w-20">启用</TableHead>
+                  <TableHead className="w-16" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {authzList.map((a) => (
+                  <TableRow key={a.id}>
+                    <TableCell className="text-sm">{a.name}</TableCell>
+                    <TableCell className="max-w-64 truncate font-mono text-xs" title={a.targets.join(" ")}>
+                      {a.targets.join("、")}
+                    </TableCell>
+                    <TableCell className="max-w-48 truncate font-mono text-xs" title={a.exclusions.join(" ")}>
+                      {a.exclusions.length ? a.exclusions.join("、") : "—"}
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {(a.starts_at ? new Date(a.starts_at).toLocaleDateString("zh-CN") : "长期") +
+                        " → " +
+                        (a.ends_at ? new Date(a.ends_at).toLocaleDateString("zh-CN") : "长期")}
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant="outline">{a.enabled ? "启用" : "停用"}</Badge>
+                    </TableCell>
+                    <TableCell>
+                      <Button size="sm" variant="ghost" onClick={() => void removeAuthz(a)}>
+                        <Trash2Icon className="size-4" />
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+
+      <Dialog open={authzOpen} onOpenChange={setAuthzOpen}>
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>新增客户授权</DialogTitle>
+            <DialogDescription>范围一行一个（也可用逗号/空格分隔）。</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="authz-name">名称</Label>
+              <Input id="authz-name" value={authzForm.name} onChange={(e) => setAuthzForm((f) => ({ ...f, name: e.target.value }))} />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="authz-targets">授权范围</Label>
+              <Textarea
+                id="authz-targets"
+                value={authzForm.targets}
+                onChange={(e) => setAuthzForm((f) => ({ ...f, targets: e.target.value }))}
+                placeholder={"10.0.0.0/8\ncorp.com\n203.0.113.10"}
+                className="min-h-20 font-mono text-xs"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="authz-exclusions">排除项</Label>
+              <Textarea
+                id="authz-exclusions"
+                value={authzForm.exclusions}
+                onChange={(e) => setAuthzForm((f) => ({ ...f, exclusions: e.target.value }))}
+                placeholder={"10.9.9.9"}
+                className="min-h-16 font-mono text-xs"
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="authz-start">开始日期</Label>
+                <Input id="authz-start" type="date" value={authzForm.starts} onChange={(e) => setAuthzForm((f) => ({ ...f, starts: e.target.value }))} />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="authz-end">结束日期</Label>
+                <Input id="authz-end" type="date" value={authzForm.ends} onChange={(e) => setAuthzForm((f) => ({ ...f, ends: e.target.value }))} />
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="authz-note">备注</Label>
+              <Input id="authz-note" value={authzForm.note} onChange={(e) => setAuthzForm((f) => ({ ...f, note: e.target.value }))} />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setAuthzOpen(false)}>取消</Button>
+            <Button onClick={() => void saveAuthz()} disabled={authzSaving}>{authzSaving ? "保存中…" : "保存"}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

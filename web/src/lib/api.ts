@@ -17,6 +17,8 @@ import type {
   AssetInterceptRule,
   AssetInterceptRuleInput,
   Audit,
+  Authorization,
+  AuthorizationInput,
   BatchCategoryItem,
   BatchControlItem,
   ChatAttachment,
@@ -1434,6 +1436,9 @@ export const api = {
     post<{ ok: boolean; enabled: boolean }>(`/intercept/rules/${id}/toggle`, { enabled }),
 
   // ---- asset intercept rules（资产拦截：全局黑名单） ----
+  authorizations: () => get<{ authorizations: Authorization[] }>("/authorizations").then((r) => arr(r.authorizations)),
+  createAuthorization: (input: AuthorizationInput) => post<Authorization>("/authorizations", input),
+  deleteAuthorization: (id: number) => del<{ deleted: boolean }>(`/authorizations/${id}`),
   assetInterceptRules: () => get<{ rules: AssetInterceptRule[] }>("/asset-intercept/rules").then((r) => arr(r.rules)),
   createAssetInterceptRule: (rule: Pick<AssetInterceptRule, "enabled" | "kind" | "pattern" | "note">) =>
     post<AssetInterceptRule>("/asset-intercept/rules", rule),
