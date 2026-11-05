@@ -943,6 +943,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/scans/{id}/assets", s.listScanTaskAssets)
 	mux.HandleFunc("GET /api/scans/{id}/results", s.listScanTaskResults)
 	mux.HandleFunc("GET /api/scans/{id}/auto", s.getScanAuto)
+	mux.HandleFunc("GET /api/scans/{id}/diff", s.scanDiffHandler)
 
 	// 弱口令检测（独立模块）：任务、结果与协议目录
 	mux.HandleFunc("GET /api/credscan/protocols", s.credProtocols)

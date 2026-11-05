@@ -551,3 +551,38 @@ LIMIT $1`, limit)
 	}
 	return out, total, rows.Err()
 }
+
+// ListScanTaskResultsForDiff 取一次扫描的全部结果行，供两次扫描的增量对比使用。
+// 与列表接口不同，这里不设上限：diff 少一条就会把「还在」误报成「消失」。
+func (d *DB) ListScanTaskResultsForDiff(taskID int64) ([]ScanTaskResult, error) {
+	rows, err := d.Query(`SELECT id, finding_id, template_id, name, severity, host, matched_at, type,
+       curl_command, extracted::text, raw::text, created_at
+FROM scan_task_results WHERE scan_task_id=$1 ORDER BY id`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ScanTaskResult{}
+	for rows.Next() {
+		var r ScanTaskResult
+		var extractedRaw, rawRaw string
+		if err := rows.Scan(&r.ID, &r.FindingID, &r.TemplateID, &r.Name, &r.Severity, &r.Host,
+			&r.MatchedAt, &r.Type, &r.Curl, &extractedRaw, &rawRaw, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(extractedRaw), &r.Extracted)
+		_ = json.Unmarshal([]byte(rawRaw), &r.Raw)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// PreviousDoneScanTask 取编号小于 id 的最近一个已完成扫描，作为增量对比的默认基线。
+func (d *DB) PreviousDoneScanTask(id int64) (*ScanTask, error) {
+	t, err := scanOneScanTask(d.QueryRow(`SELECT `+scanTaskCols+` FROM scan_tasks
+WHERE id < $1 AND status = 'done' ORDER BY id DESC LIMIT 1`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return t, err
+}

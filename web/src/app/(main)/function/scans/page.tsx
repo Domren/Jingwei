@@ -37,7 +37,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { POCTemplate, ScanAsset, ScanAutoResult, ScanMode, ScanResult, ScanTask } from "@/lib/types";
+import type { POCTemplate, ScanAsset, ScanAutoResult, ScanDiff, ScanMode, ScanResult, ScanTask } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import {
@@ -213,6 +213,10 @@ export default function ScansPage() {
   const POC_PAGE_SIZE = 20;
 
   const [detailId, setDetailId] = React.useState<number | null>(null);
+  const [diffTaskId, setDiffTaskId] = React.useState<number | null>(null);
+  const [diffAgainst, setDiffAgainst] = React.useState<number | null>(null);
+  const [diff, setDiff] = React.useState<ScanDiff | null>(null);
+  const [diffLoading, setDiffLoading] = React.useState(false);
   const [detailTask, setDetailTask] = React.useState<ScanTask | null>(null);
   const [detailAssets, setDetailAssets] = React.useState<ScanAsset[]>([]);
   const [detailResults, setDetailResults] = React.useState<ScanResult[]>([]);
@@ -501,6 +505,33 @@ export default function ScansPage() {
   }
 
   const pocPages = Math.max(1, Math.ceil(pocTotal / POC_PAGE_SIZE));
+  async function openDiff(taskId: number) {
+    setDiffTaskId(taskId);
+    setDiffAgainst(null);
+    setDiff(null);
+    setDiffLoading(true);
+    try {
+      setDiff(await api.scanDiff(taskId));
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "读取增量失败");
+    } finally {
+      setDiffLoading(false);
+    }
+  }
+
+  async function reloadDiff(against: number) {
+    if (diffTaskId == null) return;
+    setDiffAgainst(against);
+    setDiffLoading(true);
+    try {
+      setDiff(await api.scanDiff(diffTaskId, against));
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "读取增量失败");
+    } finally {
+      setDiffLoading(false);
+    }
+  }
+
   const running = scans.some((s) => s.status === "running" || s.status === "queued");
   const detailRunning = detailTask?.status === "running" || detailTask?.status === "queued";
   const detailAutoConfirmed = (detailAuto?.records ?? []).filter((r) => r.verdict === "confirmed").length;
@@ -617,6 +648,11 @@ export default function ScansPage() {
                         <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => setDetailId(task.id)}>
                           详情
                         </Button>
+                        {task.status === "done" && (
+                          <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => void openDiff(task.id)}>
+                            对比
+                          </Button>
+                        )}
                         {active ? (
                           <Button
                             variant="ghost"
@@ -659,6 +695,173 @@ export default function ScansPage() {
           </TableBody>
         </Table>
       </div>
+
+      {/* 两次扫描的增量对比 */}
+      <Dialog open={diffTaskId != null} onOpenChange={(open) => !open && setDiffTaskId(null)}>
+        <DialogContent className="flex max-h-[92vh] flex-col sm:max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>扫描增量对比</DialogTitle>
+            <DialogDescription>
+              「消失」会区分「已修复（本轮未复现）」与「目标不可达」——后者说明这次没测到，不是修好了。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
+            <div className="flex items-center gap-2">
+              <Label className="text-xs">对比基线</Label>
+              <Select value={diff ? String(diff.against_id) : ""} onValueChange={(v) => void reloadDiff(Number(v))}>
+                <SelectTrigger className="h-8 w-80">
+                  <SelectValue placeholder="最近的已完成扫描" />
+                </SelectTrigger>
+                <SelectContent>
+                  {scans
+                    .filter((s) => s.status === "done" && s.id !== diffTaskId)
+                    .map((s) => (
+                      <SelectItem key={s.id} value={String(s.id)}>
+                        #{s.id} {s.name || "未命名"} · {fmtTime(s.created_at)}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+              {diffLoading && <Loader2Icon className="size-4 animate-spin text-muted-foreground" />}
+            </div>
+
+            {diff && (
+              <>
+                <div className="flex flex-wrap gap-2 text-xs">
+                  <Badge variant="outline">本轮 {diff.current_total} 条</Badge>
+                  <Badge variant="outline">基线 {diff.against_total} 条</Badge>
+                  <Badge variant="outline" className="border-red-500/30 bg-red-500/10 text-red-600">
+                    新增 {diff.new.length}
+                  </Badge>
+                  <Badge variant="outline" className="border-sky-500/30 bg-sky-500/10 text-sky-600">
+                    消失 {diff.gone.length}
+                  </Badge>
+                  <Badge variant="outline" className="border-amber-500/30 bg-amber-500/10 text-amber-600">
+                    等级变化 {diff.severity_changed.length}
+                  </Badge>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="text-xs font-medium">新增</div>
+                  <div className="overflow-auto rounded-md border">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>模板</TableHead>
+                          <TableHead className="w-24">等级</TableHead>
+                          <TableHead className="w-40">主机</TableHead>
+                          <TableHead>命中地址</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {diff.new.length === 0 ? (
+                          <TableRow>
+                            <TableCell colSpan={4} className="h-12 text-center text-xs text-muted-foreground">
+                              无
+                            </TableCell>
+                          </TableRow>
+                        ) : (
+                          diff.new.map((x) => (
+                            <TableRow key={x.key}>
+                              <TableCell className="max-w-56 truncate text-xs" title={x.name || x.template_id}>
+                                {x.name || x.template_id}
+                              </TableCell>
+                              <TableCell className="text-xs">{x.severity || "—"}</TableCell>
+                              <TableCell className="font-mono text-xs">{x.host}</TableCell>
+                              <TableCell className="max-w-72 truncate font-mono text-xs" title={x.matched_at}>
+                                {x.matched_at}
+                              </TableCell>
+                            </TableRow>
+                          ))
+                        )}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="text-xs font-medium">消失</div>
+                  <div className="overflow-auto rounded-md border">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>模板</TableHead>
+                          <TableHead className="w-24">等级</TableHead>
+                          <TableHead className="w-40">主机</TableHead>
+                          <TableHead>原因</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {diff.gone.length === 0 ? (
+                          <TableRow>
+                            <TableCell colSpan={4} className="h-12 text-center text-xs text-muted-foreground">
+                              无
+                            </TableCell>
+                          </TableRow>
+                        ) : (
+                          diff.gone.map((x) => (
+                            <TableRow key={x.key}>
+                              <TableCell className="max-w-56 truncate text-xs" title={x.name || x.template_id}>
+                                {x.name || x.template_id}
+                              </TableCell>
+                              <TableCell className="text-xs">{x.severity || "—"}</TableCell>
+                              <TableCell className="font-mono text-xs">{x.host}</TableCell>
+                              <TableCell className="text-xs text-muted-foreground">{x.reason}</TableCell>
+                            </TableRow>
+                          ))
+                        )}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="text-xs font-medium">等级变化</div>
+                  <div className="overflow-auto rounded-md border">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>模板</TableHead>
+                          <TableHead className="w-40">等级</TableHead>
+                          <TableHead className="w-40">主机</TableHead>
+                          <TableHead>命中地址</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {diff.severity_changed.length === 0 ? (
+                          <TableRow>
+                            <TableCell colSpan={4} className="h-12 text-center text-xs text-muted-foreground">
+                              无
+                            </TableCell>
+                          </TableRow>
+                        ) : (
+                          diff.severity_changed.map((x) => (
+                            <TableRow key={x.key}>
+                              <TableCell className="max-w-56 truncate text-xs" title={x.name || x.template_id}>
+                                {x.name || x.template_id}
+                              </TableCell>
+                              <TableCell className="text-xs">
+                                {x.old_severity} → <span className="font-medium">{x.new_severity}</span>
+                              </TableCell>
+                              <TableCell className="font-mono text-xs">{x.host}</TableCell>
+                              <TableCell className="max-w-72 truncate font-mono text-xs" title={x.matched_at}>
+                                {x.matched_at}
+                              </TableCell>
+                            </TableRow>
+                          ))
+                        )}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+          <DialogFooter>
+            <Button onClick={() => setDiffTaskId(null)}>关闭</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Create */}
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>

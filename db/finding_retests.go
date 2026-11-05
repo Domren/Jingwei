@@ -225,16 +225,34 @@ func (d *DB) FinishFindingRetest(id int64, status, reason string) error {
 	if err != nil {
 		return err
 	}
-	var finalStatus, verdict string
+	var finalStatus, verdict, retestSummary, retestEvidence string
+	var retestID int64
+	var finishedAt time.Time
 	err = tx.QueryRow(`UPDATE finding_retests SET
 	status=CASE WHEN $2='completed' AND verdict='' THEN 'failed' ELSE $2 END,
 	error=CASE WHEN $2='completed' AND verdict='' THEN 'Agent 未保存复测结论，请查看会话后重新复测' ELSE $3 END,
-	finished_at=now() WHERE id=$1 AND status IN ('pending','running') RETURNING status,verdict`, id, status, reason).Scan(&finalStatus, &verdict)
+	finished_at=now() WHERE id=$1 AND status IN ('pending','running')
+	RETURNING status,verdict,id,summary,evidence,finished_at`, id, status, reason).
+		Scan(&finalStatus, &verdict, &retestID, &retestSummary, &retestEvidence, &finishedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil // A replay must not overwrite a later manual triage decision.
 	}
 	if err != nil {
 		return err
+	}
+	if finalStatus == "completed" {
+		// 复测结论要进报告：报告是交付物，修复验证不能只活在详情页的复测面板里。
+		// 追加而不是覆盖——每一轮复测都是一段独立的验证记录。
+		label := map[string]string{"fixed": "已修复", "reproduced": "仍可复现", "inconclusive": "无法确认"}[verdict]
+		if label != "" {
+			section := fmt.Sprintf("\n\n---\n\n## 修复验证（复测 #%d，%s）\n\n- **结论**：%s\n\n%s\n\n%s\n",
+				retestID, finishedAt.Format("2006-01-02 15:04"), label,
+				strings.TrimSpace(retestSummary), strings.TrimSpace(retestEvidence))
+			if _, err := tx.Exec(`UPDATE findings SET report = CASE WHEN report='' THEN $2 ELSE report || $2 END WHERE id=$1`,
+				findingID, section); err != nil {
+				return err
+			}
+		}
 	}
 	if finalStatus == "completed" && verdict == "fixed" {
 		// 走带通知的版本，与人工在详情页改状态共用同一套语义。
@@ -248,6 +266,19 @@ func (d *DB) FinishFindingRetest(id int64, status, reason string) error {
 		// 牵动 server 侧调用点与多处测试，超出本次改动的范围。
 		if _, _, _, _, err := SetFindingStatusTx(context.Background(), tx, findingID, FindingFixed); err != nil {
 			return err
+		}
+	}
+	if finalStatus == "completed" && verdict == "reproduced" {
+		// 复测仍可复现：如果之前被判成已修复/已处理，把它重新打开成「已确认」。
+		// 自动 reopen 只在结论是 reproduced 时发生，inconclusive 不动状态。
+		var cur string
+		if err := tx.QueryRow(`SELECT status FROM findings WHERE id=$1`, findingID).Scan(&cur); err != nil {
+			return err
+		}
+		if cur == FindingFixed || cur == FindingResolved {
+			if _, _, _, _, err := SetFindingStatusTx(context.Background(), tx, findingID, FindingConfirmed); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()

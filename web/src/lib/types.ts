@@ -2689,6 +2689,35 @@ export interface IntelligencePage {
   enabled: boolean;
 }
 
+// ---- 扫描增量（两次扫描对比） ----
+export interface ScanDiffItem {
+  template_id: string;
+  name: string;
+  severity: string;
+  host: string;
+  matched_at: string;
+  key: string;
+}
+
+export interface ScanGoneItem extends ScanDiffItem {
+  reason: string;
+}
+
+export interface ScanSeverityChange extends ScanDiffItem {
+  old_severity: string;
+  new_severity: string;
+}
+
+export interface ScanDiff {
+  current_id: number;
+  against_id: number;
+  current_total: number;
+  against_total: number;
+  new: ScanDiffItem[];
+  gone: ScanGoneItem[];
+  severity_changed: ScanSeverityChange[];
+}
+
 // ---- 弱口令检测（界面名） ----
 export type CredTaskStatus = "queued" | "running" | "done" | "failed" | "canceled";
 

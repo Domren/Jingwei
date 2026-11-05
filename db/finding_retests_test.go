@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -107,8 +108,10 @@ func TestRetestAtomicDeduplicationAndHistory(t *testing.T) {
 		t.Fatal("overwrote sealed result", err)
 	}
 	f, _ := d.GetFinding(fid)
-	if f.Status != FindingFixed || f.Evidence != "changed evidence" || f.Report != "" {
-		t.Fatal("fixed retest did not update only triage", f)
+	// 原证据不得被复测覆盖；状态只随结论变；报告里追加「修复验证」段（D2 的新契约：
+	// 复测结论要进交付物，不能只活在详情页的复测面板里）。
+	if f.Status != FindingFixed || f.Evidence != "changed evidence" || !strings.Contains(f.Report, "修复验证") {
+		t.Fatal("fixed retest must keep evidence, set triage and append verification section", f)
 	}
 	next, _, created, err := d.CreateFindingRetest(ctx, fid, "second")
 	if err != nil || !created || next.ID == r.ID {
@@ -239,5 +242,57 @@ func TestRetestFixedTriageOnlyAfterSuccessfulCompletion(t *testing.T) {
 				t.Fatal("replayed completion overwrote triage", err, f)
 			}
 		})
+	}
+}
+
+// D2：复测结论要写进报告（交付物），并且 reproduced 能把「已修复」重新打开。
+func TestRetestVerdictAppendsReportAndReopens(t *testing.T) {
+	d, fid := retestDB(t)
+	ctx := t.Context()
+
+	run := func(verdict, summary, evidence string) int64 {
+		t.Helper()
+		r, _, created, err := d.CreateFindingRetest(ctx, fid, "复测")
+		if err != nil || !created {
+			t.Fatalf("create: %v %v", created, err)
+		}
+		if ok, err := d.StartFindingRetest(ctx, r.ID); err != nil || !ok {
+			t.Fatalf("start=%t %v", ok, err)
+		}
+		if err := d.RecordFindingRetestResult(ctx, *r.ConversationID, verdict, summary, evidence); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.FinishFindingRetest(r.ID, "completed", ""); err != nil {
+			t.Fatal(err)
+		}
+		return r.ID
+	}
+
+	first := run("fixed", "修复版本已验证", "原 payload 不再生效，对照请求正常")
+	var status, report string
+	if err := d.QueryRow(`SELECT status, report FROM findings WHERE id=$1`, fid).Scan(&status, &report); err != nil {
+		t.Fatal(err)
+	}
+	if status != FindingFixed {
+		t.Fatalf("fixed 结论后状态 = %q", status)
+	}
+	if !strings.Contains(report, "修复验证（复测 #") || !strings.Contains(report, "已修复") ||
+		!strings.Contains(report, "原 payload 不再生效") {
+		t.Fatalf("报告缺修复验证段: %q", report)
+	}
+
+	second := run("reproduced", "补丁被绕过", "同一 payload 在两台前端节点均可复现")
+	if err := d.QueryRow(`SELECT status, report FROM findings WHERE id=$1`, fid).Scan(&status, &report); err != nil {
+		t.Fatal(err)
+	}
+	if status != FindingConfirmed {
+		t.Fatalf("reproduced 后应重新打开为 confirmed，实际 %q", status)
+	}
+	if !strings.Contains(report, "仍可复现") || !strings.Contains(report, "补丁被绕过") {
+		t.Fatalf("第二轮复测未进报告: %q", report)
+	}
+	if !strings.Contains(report, "复测 #"+strconv.FormatInt(first, 10)) ||
+		!strings.Contains(report, "复测 #"+strconv.FormatInt(second, 10)) {
+		t.Fatalf("报告应保留两轮复测记录: %q", report)
 	}
 }

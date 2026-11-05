@@ -121,6 +121,7 @@ import type {
   PromptVersion,
   ScanAsset,
   ScanAutoResult,
+  ScanDiff,
   ScanResult,
   ScanTask,
   ScanTaskInput,
@@ -1552,6 +1553,7 @@ export const api = {
   scanAssets: (id: number) => get<{ assets: ScanAsset[] }>(`/scans/${id}/assets`),
   scanResults: (id: number) => get<{ results: ScanResult[] }>(`/scans/${id}/results`),
   scanAuto: (id: number) => get<ScanAutoResult>(`/scans/${id}/auto`),
+  scanDiff: (id: number, against?: number) => get<ScanDiff>(`/scans/${id}/diff${against ? `?against=${against}` : ""}`),
 
   // ---- 弱口令检测（界面名） ----
   credProtocols: () =>
