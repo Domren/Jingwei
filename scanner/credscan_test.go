@@ -28,14 +28,14 @@ type credFakeAdapter struct {
 
 func (a *credFakeAdapter) Protocol() string { return a.protocol }
 
-func (a *credFakeAdapter) Identify(ctx context.Context, addr string) (bool, string, error) {
+func (a *credFakeAdapter) Identify(ctx context.Context, ep CredEndpoint) (bool, string, error) {
 	a.mu.Lock()
 	a.idCalls++
 	a.mu.Unlock()
 	return a.identify, "FAKE-BANNER", a.idErr
 }
 
-func (a *credFakeAdapter) Try(ctx context.Context, addr string, cred Credential) (CredAttempt, error) {
+func (a *credFakeAdapter) Try(ctx context.Context, ep CredEndpoint, cred Credential) (CredAttempt, error) {
 	a.mu.Lock()
 	a.tryCalls++
 	delay := a.tryDelay
@@ -200,11 +200,11 @@ func TestCredPlanThreeTierPortDecision(t *testing.T) {
 
 // 引擎在协议没被确认之前不得进入字典循环。
 func TestCredRunDoesNotGuessProtocolFromPort(t *testing.T) {
-	adapter := &credFakeAdapter{protocol: "redis", identify: false}
+	adapter := &credFakeAdapter{protocol: credTestProto, identify: false}
 	RegisterCredAdapter(adapter)
-	defer unregisterCredAdapter("redis")
+	defer unregisterCredAdapter(credTestProto)
 
-	plan := []CredEndpoint{{Host: "10.0.0.9", Port: 6379, Protocol: "redis",
+	plan := []CredEndpoint{{Host: "10.0.0.9", Port: 6379, Protocol: credTestProto,
 		ProtocolSource: CredProtocolSourceDefaultPort}}
 	c := &credCollector{}
 	if err := CredRun(context.Background(), plan, []Credential{{Username: "u", Password: "p"}},
@@ -223,14 +223,14 @@ func TestCredRunDoesNotGuessProtocolFromPort(t *testing.T) {
 // 预算耗尽必须留下「不可判定」的记录，而不是静默少一批结果：
 // 报告里少了行，读者就会以为测过了。
 func TestCredRunBudgetRecordsInconclusive(t *testing.T) {
-	adapter := &credFakeAdapter{protocol: "redis", identify: true, outcome: CredDeny, tryDelay: 40 * time.Millisecond}
+	adapter := &credFakeAdapter{protocol: credTestProto, identify: true, outcome: CredDeny, tryDelay: 40 * time.Millisecond}
 	RegisterCredAdapter(adapter)
-	defer unregisterCredAdapter("redis")
+	defer unregisterCredAdapter(credTestProto)
 
 	plan := []CredEndpoint{}
 	for i := 0; i < 12; i++ {
 		plan = append(plan, CredEndpoint{Host: fmt.Sprintf("10.9.%d.%d", i/256, i%256),
-			Port: 6379, Protocol: "redis", ProtocolConfirmed: true})
+			Port: 6379, Protocol: credTestProto, ProtocolConfirmed: true})
 	}
 	creds := []Credential{{Username: "a", Password: "1"}, {Username: "b", Password: "2"}}
 	c := &credCollector{}
@@ -257,10 +257,10 @@ func TestCredRunBudgetRecordsInconclusive(t *testing.T) {
 // 连续传输层失败到阈值后停止连接；锁定提示立刻停止该端点。
 func TestCredRunStopLossAndLockout(t *testing.T) {
 	t.Run("stop-loss", func(t *testing.T) {
-		adapter := &credFakeAdapter{protocol: "redis", identify: true, outcome: CredUnreachable}
+		adapter := &credFakeAdapter{protocol: credTestProto, identify: true, outcome: CredUnreachable}
 		RegisterCredAdapter(adapter)
-		defer unregisterCredAdapter("redis")
-		plan := []CredEndpoint{{Host: "10.0.0.30", Port: 6379, Protocol: "redis", ProtocolConfirmed: true}}
+		defer unregisterCredAdapter(credTestProto)
+		plan := []CredEndpoint{{Host: "10.0.0.30", Port: 6379, Protocol: credTestProto, ProtocolConfirmed: true}}
 		creds := make([]Credential, 0, 10)
 		for i := 0; i < 10; i++ {
 			creds = append(creds, Credential{Username: "u", Password: string(rune('a' + i))})
@@ -281,10 +281,10 @@ func TestCredRunStopLossAndLockout(t *testing.T) {
 	})
 
 	t.Run("locked 立刻停手", func(t *testing.T) {
-		adapter := &credFakeAdapter{protocol: "ssh", identify: true, outcome: CredLocked}
+		adapter := &credFakeAdapter{protocol: credTestProtoLock, identify: true, outcome: CredLocked}
 		RegisterCredAdapter(adapter)
-		defer unregisterCredAdapter("ssh")
-		plan := []CredEndpoint{{Host: "10.0.0.31", Port: 22, Protocol: "ssh", ProtocolConfirmed: true}}
+		defer unregisterCredAdapter(credTestProtoLock)
+		plan := []CredEndpoint{{Host: "10.0.0.31", Port: 22, Protocol: credTestProtoLock, ProtocolConfirmed: true}}
 		c := &credCollector{}
 		if err := CredRun(context.Background(), plan,
 			[]Credential{{Username: "root", Password: "a"}, {Username: "root", Password: "b"}},
@@ -334,10 +334,10 @@ func TestCredRunMissingAdapterIsNotDeny(t *testing.T) {
 
 // 适配器没给态（或给了空态）不能被当成拒绝。
 func TestCredRunEmptyOutcomeBecomesInconclusive(t *testing.T) {
-	adapter := &credFakeAdapter{protocol: "redis", identify: true, outcome: "", tryErr: errors.New("connection reset")}
+	adapter := &credFakeAdapter{protocol: credTestProto, identify: true, outcome: "", tryErr: errors.New("connection reset")}
 	RegisterCredAdapter(adapter)
-	defer unregisterCredAdapter("redis")
-	plan := []CredEndpoint{{Host: "10.0.0.42", Port: 6379, Protocol: "redis", ProtocolConfirmed: true}}
+	defer unregisterCredAdapter(credTestProto)
+	plan := []CredEndpoint{{Host: "10.0.0.42", Port: 6379, Protocol: credTestProto, ProtocolConfirmed: true}}
 	c := &credCollector{}
 	if err := CredRun(context.Background(), plan, []Credential{{Username: "a", Password: "b"}},
 		CredOptions{}, c.emit); err != nil {
@@ -354,7 +354,7 @@ func TestCredRunRejectsEmptyInputs(t *testing.T) {
 	if err := CredRun(context.Background(), nil, []Credential{{Username: "a"}}, CredOptions{}, c.emit); err == nil {
 		t.Fatal("空计划必须报错")
 	}
-	plan := []CredEndpoint{{Host: "10.0.0.1", Port: 6379, Protocol: "redis", ProtocolConfirmed: true}}
+	plan := []CredEndpoint{{Host: "10.0.0.1", Port: 6379, Protocol: credTestProto, ProtocolConfirmed: true}}
 	if err := CredRun(context.Background(), plan, nil, CredOptions{}, c.emit); err == nil {
 		t.Fatal("空字典不能当成「已验证不存在弱口令」")
 	}
@@ -366,10 +366,10 @@ func TestCredRunRejectsEmptyInputs(t *testing.T) {
 // 限速是「对同一个端点别把认证请求打成一串连发」：触发锁定策略的目标，连发就是锁号。
 // 断言的是间隔，不是绝对耗时——计时器在负载下只会更慢，不会更快。
 func TestCredRunRateLimitSpacesAttempts(t *testing.T) {
-	adapter := &credFakeAdapter{protocol: "redis", identify: true, outcome: CredDeny}
+	adapter := &credFakeAdapter{protocol: credTestProto, identify: true, outcome: CredDeny}
 	RegisterCredAdapter(adapter)
-	defer unregisterCredAdapter("redis")
-	plan := []CredEndpoint{{Host: "10.0.0.50", Port: 6379, Protocol: "redis", ProtocolConfirmed: true}}
+	defer unregisterCredAdapter(credTestProto)
+	plan := []CredEndpoint{{Host: "10.0.0.50", Port: 6379, Protocol: credTestProto, ProtocolConfirmed: true}}
 	creds := []Credential{{Username: "a", Password: "1"}, {Username: "b", Password: "2"}, {Username: "c", Password: "3"}}
 
 	c := &credCollector{}
@@ -382,10 +382,10 @@ func TestCredRunRateLimitSpacesAttempts(t *testing.T) {
 		t.Fatalf("限速不该少试: tries=%d", tries)
 	}
 
-	adapter2 := &credFakeAdapter{protocol: "mysql", identify: true, outcome: CredDeny}
+	adapter2 := &credFakeAdapter{protocol: credTestProtoSlow, identify: true, outcome: CredDeny}
 	RegisterCredAdapter(adapter2)
-	defer unregisterCredAdapter("mysql")
-	plan2 := []CredEndpoint{{Host: "10.0.0.51", Port: 3306, Protocol: "mysql", ProtocolConfirmed: true}}
+	defer unregisterCredAdapter(credTestProtoSlow)
+	plan2 := []CredEndpoint{{Host: "10.0.0.51", Port: 3306, Protocol: credTestProtoSlow, ProtocolConfirmed: true}}
 	c2 := &credCollector{}
 	start = time.Now()
 	if err := CredRun(context.Background(), plan2, creds, CredOptions{}, c2.emit); err != nil {
@@ -402,14 +402,14 @@ func TestCredRunRateLimitSpacesAttempts(t *testing.T) {
 
 // 手工停任务同样不能少行：取消和预算耗尽是两种收尾，读者要能分清是自己停的手还是时间用完了。
 func TestCredRunCancelStillRecordsEveryRow(t *testing.T) {
-	adapter := &credFakeAdapter{protocol: "redis", identify: true, outcome: CredDeny, tryDelay: 25 * time.Millisecond}
+	adapter := &credFakeAdapter{protocol: credTestProto, identify: true, outcome: CredDeny, tryDelay: 25 * time.Millisecond}
 	RegisterCredAdapter(adapter)
-	defer unregisterCredAdapter("redis")
+	defer unregisterCredAdapter(credTestProto)
 
 	plan := []CredEndpoint{}
 	for i := 0; i < 8; i++ {
 		plan = append(plan, CredEndpoint{Host: fmt.Sprintf("10.9.%d.1", i), Port: 6379,
-			Protocol: "redis", ProtocolConfirmed: true})
+			Protocol: credTestProto, ProtocolConfirmed: true})
 	}
 	creds := []Credential{{Username: "a", Password: "1"}, {Username: "b", Password: "2"}}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -477,6 +477,14 @@ func TestCredProtocolSupportTable(t *testing.T) {
 		}
 	}
 }
+
+// 测试桩用的协议名。不能借用 redis/ssh/mysql：真适配器在 init 里就占了这些名字，
+// 借用会触发 RegisterCredAdapter 的重复注册保护（那保护本来就是防两份实现互相漂移）。
+const (
+	credTestProto     = "credtest"
+	credTestProtoLock = "credtest-lock"
+	credTestProtoSlow = "credtest-slow"
+)
 
 func unregisterCredAdapter(protocol string) {
 	credAdapterMu.Lock()

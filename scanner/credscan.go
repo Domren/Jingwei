@@ -67,7 +67,26 @@ type CredEndpoint struct {
 	// ProtocolConfirmed 为 false 时，适配器必须先做握手识别，认不出来就报 inconclusive；
 	// 引擎绝不允许「按默认端口表猜的协议」直接进字典循环。
 	ProtocolConfirmed bool
-	TaskHint          string
+	// Params 是协议自己的额外参数（PostgreSQL/MongoDB 的库名、MongoDB 的 authSource）。
+	// 用约定键名，不给每个协议加字段：适配器不认识的键必须被忽略而不是报错。
+	Params map[string]string
+}
+
+// CredParamDatabase / CredParamAuthSource 是 Params 的约定键名。
+const (
+	CredParamDatabase   = "database"
+	CredParamAuthSource = "auth_source"
+	// CredParamMechanism 用来点名认证机制（SCRAM-SHA-1 与 SCRAM-SHA-256 这类）。
+	// 一个协议里的不同机制是不同数学，验一个不等于验全部，所以必须能被显式指定。
+	CredParamMechanism = "mechanism"
+)
+
+// CredParam 取协议参数，缺省回落到 def（Params 为 nil 也要能用，所以是函数而不是方法）。
+func CredParam(ep CredEndpoint, key, def string) string {
+	if v := strings.TrimSpace(ep.Params[key]); v != "" {
+		return v
+	}
+	return def
 }
 
 const (
@@ -116,17 +135,23 @@ func CredProtocolSupported(protocol string) bool {
 
 // CredAttempt 是一次尝试的完整记录，含证据字节。
 type CredAttempt struct {
-	Host     string        `json:"host"`
-	Port     int           `json:"port"`
-	Protocol string        `json:"protocol"`
-	Cred     Credential    `json:"cred"`
-	Outcome  CredOutcome   `json:"outcome"`
-	Banner   string        `json:"banner,omitempty"`
-	RawReq   []byte        `json:"-"`
-	RawResp  []byte        `json:"-"`
-	Attempts int           `json:"attempts"`
-	Elapsed  time.Duration `json:"elapsed_ms"`
-	Reason   string        `json:"reason,omitempty"`
+	Host     string      `json:"host"`
+	Port     int         `json:"port"`
+	Protocol string      `json:"protocol"`
+	Cred     Credential  `json:"cred"`
+	Outcome  CredOutcome `json:"outcome"`
+	Banner   string      `json:"banner,omitempty"`
+	// TLS 为真时上面的字节是 TLS 通道内的明文。不标出来，复现命令就会写成一条裸 socket
+	// ——照着发必然拿不到同样的响应。
+	TLS     bool   `json:"tls,omitempty"`
+	RawReq  []byte `json:"-"`
+	RawResp []byte `json:"-"`
+	// EvidenceText 非空时 Evidence 直接用它。SSH 这类「KEX 之后全是密文」的协议需要
+	// 自己写证据，套通用模板会生成一条照做也复现不出结论的裸 socket 命令。
+	EvidenceText string        `json:"-"`
+	Attempts     int           `json:"attempts"`
+	Elapsed      time.Duration `json:"elapsed_ms"`
+	Reason       string        `json:"reason,omitempty"`
 }
 
 // Evidence 出证据文本。非 HTTP 协议走 #81 定下的原始字节通道：请求与响应都要能逐字节复现。
@@ -134,6 +159,9 @@ type CredAttempt struct {
 // 请求字节，banner 格式那句「扫描器未发送任何应用层请求字节」就成了假记录。
 // 口令在这里是明文——它本来就是「可用凭据」这份发现的内容，脱敏会删掉结论本身。
 func (a CredAttempt) Evidence() string {
+	if strings.TrimSpace(a.EvidenceText) != "" {
+		return a.EvidenceText
+	}
 	if len(a.RawReq) == 0 && len(a.RawResp) == 0 {
 		// 没有字节的结果只能是「没测出来」，此时 reason 就是全部可解释的信息。
 		if strings.TrimSpace(a.Reason) == "" {
@@ -147,6 +175,9 @@ func (a CredAttempt) Evidence() string {
 		head = ProtocolExchangePacket(a.Protocol, addr, a.RawReq, a.RawResp)
 	}
 	tail := "\n凭据: " + a.Cred.Username + " / " + a.Cred.Password
+	if a.TLS {
+		tail += "\n以上字节是 TLS 通道内的明文；复现要用支持 TLS 的客户端（psql / mysql --ssl-mode / openssl s_client），裸 socket 发不出去"
+	}
 	if r := strings.TrimSpace(a.Reason); r != "" {
 		tail += "\n判定说明: " + r
 	}
@@ -162,9 +193,12 @@ func (a CredAttempt) Evidence() string {
 type CredAdapter interface {
 	Protocol() string
 	// Identify 在字典循环之前确认端口上的协议。返回 confirmed=false 时引擎不得继续猜测。
-	Identify(ctx context.Context, addr string) (confirmed bool, banner string, err error)
+	Identify(ctx context.Context, ep CredEndpoint) (confirmed bool, banner string, err error)
 	// Try 验证一组凭据。实现不得在 ctx 已取消时返回 hit。
-	Try(ctx context.Context, addr string, cred Credential) (CredAttempt, error)
+	//
+	// 收整个端点而不是地址串：库名、MongoDB 的 authSource 这类协议参数挂在端点上，
+	// 只给 addr 的话适配器就拿不到它们，只能靠调用方改全局状态——那是并发结果互相污染的起点。
+	Try(ctx context.Context, ep CredEndpoint, cred Credential) (CredAttempt, error)
 }
 
 var (
@@ -465,7 +499,6 @@ type credEndpointState struct {
 // 写成「任务已取消」，读者分不清是自己停的手还是时间用完了。
 func runCredEndpoint(ctx, runCtx context.Context, endpoint CredEndpoint, creds []Credential,
 	opts CredOptions, rate <-chan time.Time, state *credEndpointState, emit func(CredAttempt)) {
-	addr := net.JoinHostPort(endpoint.Host, fmt.Sprint(endpoint.Port))
 	attemptNo := 0
 	stopReason := func() string {
 		switch {
@@ -502,7 +535,11 @@ func runCredEndpoint(ctx, runCtx context.Context, endpoint CredEndpoint, creds [
 		if rate != nil {
 			waitCredRate(runCtx, rate)
 		}
-		confirmed, banner, err := adapter.Identify(runCtx, addr)
+		// 单次尝试的上限归引擎，不归适配器：一个卡住的握手如果不被掐掉，就会把整批
+		// 预算吃掉，剩下的端点全部记成「预算耗尽」——那些行跟这台机器没关系。
+		ictx, icancel := context.WithTimeout(runCtx, credAttemptTimeout)
+		confirmed, banner, err := adapter.Identify(ictx, endpoint)
+		icancel()
 		if err != nil || !confirmed {
 			reason := "端口上没有确认出该协议的握手特征"
 			if err != nil {
@@ -543,7 +580,9 @@ func runCredEndpoint(ctx, runCtx context.Context, endpoint CredEndpoint, creds [
 		}
 		attemptNo++
 		start := time.Now()
-		res, err := adapter.Try(runCtx, addr, cred)
+		tctx, tcancel := context.WithTimeout(runCtx, credAttemptTimeout)
+		res, err := adapter.Try(tctx, endpoint, cred)
+		tcancel()
 		res.Host, res.Port, res.Protocol, res.Cred = endpoint.Host, endpoint.Port, endpoint.Protocol, cred
 		res.Attempts = attemptNo
 		res.Elapsed = time.Since(start).Truncate(time.Millisecond)
