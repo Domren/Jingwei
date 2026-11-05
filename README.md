@@ -15,9 +15,16 @@
 
 ---
 
-## Jingwei 1.4.2
+## Jingwei 1.5.0
 
-> 1.4.2 是一版部署侧修复，功能面与 1.4.1 一致、可原地升级：`docker-compose.yml` 按白名单注入环境变量，
+> 1.5.0 把「弱口令检测」做成可用模块：21 个协议、六态结论（命中 / 明确拒绝 / 连不上 / 账号锁定 / 不可判定 /
+> 不支持）、每次尝试都留原始报文，内部版与对外版两份报告；端口按三级决策且**默认端口表只决定测哪个端口、
+> 绝不用于推断协议**；同一账号连续被拒即止试，避免把账号打进锁定。同时把**客户授权清单**做成目标策略的
+> 一等输入——只要存在有效授权，agent 与界面直接建的扫描/弱口令任务都必须落在授权内；新增**客户交付版报告**
+> （中英双语、按资产分组、CVSS、报文附录）与两次扫描的增量视图。1.4.x 的收尾项（隧道真机修复、PowerShell
+> 会话、目标策略计数、跨源收紧）一并计入本版。
+>
+> 此前版本摘要：1.4.2 是部署侧修复——`docker-compose.yml` 按白名单注入环境变量，
 > 导致代码里在读的 10 个运行时开关在容器里根本配不上——包括内网隧道的控制端地址
 > （`JINGWEI_PIVOT_SERVER`，缺它时 chisel 与 ssh 隧道的自动部署命令整体不可用）、
 > 范围管控强度 `JINGWEI_GUARD_ENFORCEMENT`、两类落地物的 TTL 与模型调用墙钟。现在这些开关都进了
@@ -34,6 +41,13 @@
 > 1.3.x 修复登录入口的验证码/限速/请求边界与 JWT 不可撤销问题，并在 1.3.0 补齐利用闭环：
 > 影响升级与弱口令自动链、内网横向、可撤销的权限维持台账、按台账逆序撤离。
 
+- **弱口令检测**：21 个协议（Redis / PostgreSQL / MySQL / MongoDB / SSH / Socks5 / FTP / Telnet / Web Basic /
+  WebDAV / Tomcat 管理台 / Elasticsearch / Memcached / Zookeeper / POP3 / IMAP / SMTP（含 SSL）/ LDAP / LDAPS / VNC），
+  六态结论区分「验证过不存在」与「没测出来」，每条结论带逐字节的原始报文；只产出事实，**不自动登录、不复用**。
+- **客户授权清单**：IP/CIDR/域名 + 排除项 + 有效期。存在有效授权时，任何任务（含界面直接建的扫描与弱口令）
+  的目标都必须落在授权内，拒绝原因点名是哪条授权不管用。
+- **客户交付版报告**：中英双语标签、授权与范围声明、按受影响资产分组的明细与修复建议汇总、CVSS、原始报文附录，
+  只含已确认项；发现页另有「对外交付版」导出（排除未确认/误报/重复/忽略）。
 - **加密 v2 WebShell**：握手派生会话密钥，密钥离流量；AEAD 加密 + 时间戳/nonce 防重放 + 随机载体，
   同一密钥可生成不同外观载荷（填充、注释、函数名随机化）并带 SHA-256 载荷指纹与自检。
 - **大马与内存马**：v2 通道上的文件管理（目录列表、分块读写、重命名、删除、改权限，PHP/JSP/ASPX 三套）；
@@ -79,6 +93,19 @@
 > 对话、任务执行与 Agent 自动规划需要先在「系统 → LLM」配置模型。
 
 ## 版本历史
+
+### 1.5.0 — 2026-11-05
+
+- **弱口令检测**（深度利用 → 弱口令检测）：21 协议、六态、原始报文；任务/字典/进度/报告/LLM 工具齐全；
+  真机验证台 27 条用例 / 21 个协议全过，真机逼出 12 条线上缺陷并逐条修掉；SNMP 与二档 8 个协议如实标「暂不支持」。
+- **客户授权清单与目标策略**：授权清单 + 排除项 + 时间窗；范围外目标在创建与执行两处都被拒（不建任务、不发包）；
+  拒绝按任务与成因计数，拦截页可见。
+- **客户交付版报告与对外导出**：`format=client-md` 与 `audience=external`，只含已确认项，口令打码或省略报文。
+- **增量视图与复测**：两次扫描对比区分「已修复」与「目标不可达」；复测结论追加进漏洞报告并联动状态。
+- **内网与通知**：信息收集脚本库（15 条只读脚本、结构化入库）、撤离后台账外残留扫描、落地物到期/复测/残留事件通知。
+- **修复**：隧道自动选型（A1 真机四条）、非精卫载荷的措辞、构建换源；统一测试暴露的 14 条缺陷全部修复
+  （路由未注册、提交漏文件、数组列读不回、CORS 通配等），详见 `docs/进度手册.md` §5.6。
+- **验证**：四组合全量测试全绿；浏览器端到端；平台自身安全回归 20 项全 PASS。
 
 ### 1.4.2 — 2026-11-04
 
@@ -280,7 +307,7 @@
 ### 方式一：使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.4.2 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.5.0 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 # 编辑 .env：至少修改 POSTGRES_PASSWORD
@@ -292,8 +319,8 @@ docker compose up -d
 
 ```bash
 mkdir jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.4.2/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.4.2/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.5.0/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.5.0/deploy/.env.example
 # 编辑 .env 后启动
 docker compose pull
 docker compose up -d
@@ -307,7 +334,7 @@ docker compose up -d
 镜像发布在 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.4.2
+docker pull ghcr.io/domren/jingwei:1.5.0
 ```
 
 仓库维护者将 Package 设为公开后可直接拉取。若镜像仍为私有，请使用具备
@@ -325,7 +352,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u Domren --password-stdin
 | --- | :---: | --- |
 | `POSTGRES_PASSWORD` | 是 | 数据库密码，建议使用字母数字强随机值 |
 | `POSTGRES_USER` / `POSTGRES_DB` | 否 | 默认均为 `jingwei` |
-| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.4.2` |
+| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.5.0` |
 | `JINGWEI_WEB_PORT` | 否 | Web/API 宿主端口，默认 `9790` |
 | `JINGWEI_PROXY_PORT` | 否 | 流量代理宿主端口，默认 `9791`，仅绑定 `127.0.0.1` |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | 否 | 也可启动后在 UI 配置 |
@@ -400,11 +427,11 @@ cd web && npm ci && npm run build:static && cd ..
 # 2. 嵌入前端并编译 Linux 二进制
 rm -rf server/webui/dist && cp -r web/out server/webui/dist
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.4.2" -o dist/amd64/jingwei ./cmd/jingwei
+  -ldflags "-s -w -X main.version=1.5.0" -o dist/amd64/jingwei ./cmd/jingwei
 
 # 3. 构建运行镜像
 docker build --network=host --build-arg TARGETARCH=amd64 \
-  -t jingwei:1.4.2 .
+  -t jingwei:1.5.0 .
 ```
 
 本地开发运行后端与前端的方法见 [DEPLOY.md](DEPLOY.md#从源码开发)。
