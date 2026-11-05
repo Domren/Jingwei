@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/notify"
 	"github.com/Autumn-27/jingwei/scanner"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -350,6 +352,15 @@ func (s *Server) intranetEvacuate(ctx context.Context, pg *db.DB, opts intranetE
 	s.intranetEvacuateWebshells(ctx, pg, opts.TaskID, rep, opts.DryRun, opts.DeleteWebshells, blockedShells)
 
 	rep.finish(opts.DryRun)
+	// H3：撤离有残留是运维事件，走通知渠道；dry-run 只是预览，不发。
+	if !opts.DryRun && len(rep.Residual) > 0 {
+		if _, err := pg.AddNotificationEvent(ctx, notify.EventEvacuationFailed, 0, notify.Snapshot{
+			Kind: notify.EventEvacuationFailed, TaskID: opts.TaskID,
+			Name: "撤离清理有残留", VulnClass: "system", Severity: "high", Summary: rep.Summary,
+		}); err != nil {
+			log.Printf("[intranet][evacuate] 写入残留告警事件失败 task=%d: %v", opts.TaskID, err)
+		}
+	}
 	return rep
 }
 

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/Autumn-27/jingwei/notify"
 )
 
 const FindingRetestAgentKey = "retester"
@@ -252,6 +254,28 @@ func (d *DB) FinishFindingRetest(id int64, status, reason string) error {
 				findingID, section); err != nil {
 				return err
 			}
+		}
+	}
+	if finalStatus == "completed" && (verdict == "fixed" || verdict == "reproduced") {
+		// H3：复测结论变化是运维事件。它是系统事件，不参与漏洞过滤条件，
+		// 只走通知渠道队列；查询字段失败不影响提交。
+		var fname, vulnclass, fseverity string
+		var ftask sql.NullInt64
+		if err := tx.QueryRow(`SELECT name, vulnclass, severity, task_id FROM findings WHERE id=$1`, findingID).
+			Scan(&fname, &vulnclass, &fseverity, &ftask); err == nil {
+			label := "仍可复现"
+			if verdict == "fixed" {
+				label = "已修复"
+			}
+			snap := notify.Snapshot{
+				Kind: notify.EventRetestVerdict, FindingID: findingID, Name: fname,
+				VulnClass: vulnclass, Severity: fseverity,
+				Summary: "复测结论：" + label + " — " + retestSummary,
+			}
+			if ftask.Valid {
+				snap.TaskID = ftask.Int64
+			}
+			RecordNotificationEventTx(context.Background(), tx, notify.EventRetestVerdict, findingID, snap)
 		}
 	}
 	if finalStatus == "completed" && verdict == "fixed" {

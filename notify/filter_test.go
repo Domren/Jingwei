@@ -141,3 +141,17 @@ func TestMatchStatusChangeRequiresOptIn(t *testing.T) {
 		t.Fatal("创建事件不应依赖 on_status_change")
 	}
 }
+
+// H3：运维事件不按漏洞过滤条件裁剪——渠道只收 critical、只关心某个任务，
+// 也要收到「落地物到期 / 撤离残留」这类系统事件。
+func TestSystemEventsBypassVulnFilters(t *testing.T) {
+	f := Filter{MinSeverity: "critical", TaskIDs: []int64{42}, VulnClassInclude: []string{"sqli"}}
+	for _, kind := range []string{EventArtifactExpiring, EventRetestVerdict, EventEvacuationFailed} {
+		if !Match(f, Snapshot{Kind: kind, Severity: "high", TaskID: 7, VulnClass: "system"}) {
+			t.Fatalf("%s 被漏洞过滤条件拦掉了", kind)
+		}
+	}
+	if Match(f, Snapshot{Kind: EventFindingCreated, Severity: "high", TaskID: 7, VulnClass: "xss"}) {
+		t.Fatal("漏洞事件不该借道系统事件绕过过滤")
+	}
+}

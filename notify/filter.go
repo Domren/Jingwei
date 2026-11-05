@@ -70,7 +70,19 @@ func (f Filter) Validate() error {
 //
 // **永不返回 error**，理由同 ParseFilter：任何内部异常都按「命中」处理。
 // 判定顺序：事件类型 → 级别门槛 → 任务/资产范围 → 漏洞类型关键词。
+// IsSystemKind 报告事件是否属于运维事件：它们不按漏洞过滤条件裁剪。
+func IsSystemKind(kind string) bool {
+	switch kind {
+	case EventArtifactExpiring, EventRetestVerdict, EventEvacuationFailed:
+		return true
+	}
+	return false
+}
+
 func Match(f Filter, s Snapshot) bool {
+	if IsSystemKind(s.Kind) {
+		return true
+	}
 	// 状态变更事件只有显式开启的渠道才接收。默认关，因为绝大多数使用者
 	// 期望「推送」指的是「发现新漏洞」，而不是流水账式地跟进每个状态流转。
 	if s.Kind == EventFindingStatusChanged && !f.OnStatusChange {

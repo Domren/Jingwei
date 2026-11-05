@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/Autumn-27/jingwei/notify"
 )
 
 const (
@@ -30,6 +32,51 @@ func (s *Server) runIntranetArtifactExpiry(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.intranetArtifactExpirySweep(ctx, lastAttempt, reported)
+			s.intranetArtifactExpiryNoticeSweep(ctx)
+		}
+	}
+}
+
+// intranetArtifactExpiryNoticeSweep 在到期前 24 小时推一次告警（G2）。
+// 用 expiry_notified_at 做幂等标记：推送失败不标记，下个周期重试；
+// 事件走通知渠道队列，投递失败还有既有的重试与记录。
+func (s *Server) intranetArtifactExpiryNoticeSweep(ctx context.Context) {
+	pg := s.m.pg
+	if pg == nil {
+		return
+	}
+	arts, err := pg.ListArtifactsExpiringSoon(24*time.Hour, 100)
+	if err != nil {
+		log.Printf("[intranet][ttl] 查询即将到期落地物失败: %v", err)
+		return
+	}
+	for _, art := range arts {
+		if ctx.Err() != nil {
+			return
+		}
+		name := art.Name
+		if name == "" {
+			name = art.Path
+		}
+		exp := ""
+		if art.ExpiresAt != nil {
+			exp = art.ExpiresAt.Format("2006-01-02 15:04")
+		}
+		taskID := int64(0)
+		if art.TaskID != nil {
+			taskID = *art.TaskID
+		}
+		summary := fmt.Sprintf("落地物 #%d（%s · %s）将于 %s 到期，到期后会尝试自动撤销；请确认是否仍需维持。",
+			art.ID, art.Kind, name, exp)
+		if _, err := pg.AddNotificationEvent(ctx, notify.EventArtifactExpiring, 0, notify.Snapshot{
+			Kind: notify.EventArtifactExpiring, TaskID: taskID,
+			Name: "落地物即将到期", VulnClass: "system", Severity: "high", Summary: summary,
+		}); err != nil {
+			log.Printf("[intranet][ttl] 写入到期告警事件失败 #%d: %v", art.ID, err)
+			continue
+		}
+		if err := pg.MarkArtifactExpiryNotified(art.ID); err != nil {
+			log.Printf("[intranet][ttl] 标记到期告警失败 #%d: %v", art.ID, err)
 		}
 	}
 }

@@ -295,4 +295,16 @@ func TestRetestVerdictAppendsReportAndReopens(t *testing.T) {
 		!strings.Contains(report, "复测 #"+strconv.FormatInt(second, 10)) {
 		t.Fatalf("报告应保留两轮复测记录: %q", report)
 	}
+	// H3：两轮复测各产生一条运维事件（不参与漏洞过滤）。
+	var events int
+	if err := d.QueryRow(`SELECT count(*) FROM notification_events WHERE kind=$1 AND finding_id=$2`,
+		"retest_verdict", fid).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 2 {
+		t.Fatalf("复测事件数 = %d，应为 2", events)
+	}
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM notification_events WHERE kind='retest_verdict' AND finding_id=$1`, fid)
+	})
 }

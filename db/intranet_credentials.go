@@ -241,3 +241,33 @@ RETURNING `+intranetCredentialCols, id, status, strings.TrimSpace(evidence)))
 	}
 	return c, err
 }
+
+// ListArtifactsExpiringSoon 列出「即将到期且尚未告警」的落地物。
+func (d *DB) ListArtifactsExpiringSoon(within time.Duration, limit int) ([]*IntranetArtifact, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	rows, err := d.Query(`SELECT `+intranetArtifactCols+` FROM intranet_artifacts
+WHERE status='active' AND expires_at IS NOT NULL AND expiry_notified_at IS NULL
+  AND expires_at > now() AND expires_at <= now() + $1::interval
+ORDER BY expires_at LIMIT $2`, within.String(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*IntranetArtifact{}
+	for rows.Next() {
+		art, err := scanIntranetArtifact(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, art)
+	}
+	return out, rows.Err()
+}
+
+// MarkArtifactExpiryNotified 标记已告警。
+func (d *DB) MarkArtifactExpiryNotified(id int64) error {
+	_, err := d.Exec(`UPDATE intranet_artifacts SET expiry_notified_at=now() WHERE id=$1`, id)
+	return err
+}

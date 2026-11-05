@@ -25,6 +25,12 @@ const (
 const (
 	EventFindingCreated       = "finding_created"
 	EventFindingStatusChanged = "finding_status_changed"
+	// 运维事件（H3/G2）：不是漏洞，不参与漏洞过滤条件（任务/资产/类型/级别门槛），
+	// 启用的渠道一律接收。它们发生在平台自己身上——落地物快到期、复测结论变化、
+	// 撤离有残留——漏推一条的代价比多推一条大。
+	EventArtifactExpiring = "artifact_expiring"
+	EventRetestVerdict    = "retest_verdict"
+	EventEvacuationFailed = "evacuation_residual"
 )
 
 // InitKind 是 config 里为空的 kind 的兜底值。
