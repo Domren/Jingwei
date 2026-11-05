@@ -59,3 +59,18 @@ curl -s -X POST -H "Cookie: jingwei_token=$(cat /tmp/jw.token)" -H 'Content-Type
 
 脚本里的默认值对应本机 WSL 的 Ubuntu-1 边界靶机（Apache :8080 / Tomcat9 :8081 / sshd :2201，
 从容器内经桥网关 `172.23.0.1` 访问）。换靶机时用上面的环境变量覆盖即可。
+
+## i2-mock-crawl.js — 演示站逐页巡检
+
+这个脚本不打真实例：它遍历**静态导出的每一个页面**（默认 `web/out`），逐页打开，记录脚本错误
+与正文长度。演示模式的接口是本地假路由，漏一个路径就表现为「页面空白」或 `undefined.length`
+崩溃，而这类崩溃在真实实例上不会出现——所以它是独立的一道检查，不依赖靶机。
+
+```bash
+cd web && NEXT_PUBLIC_MOCK=1 NEXT_EXPORT=1 npx next build   # 产出带假数据的 web/out
+python3 -m http.server 3006 --directory out                 # 或在别处起静态服务，用 MOCK_BASE 指过去
+MOCK_BASE=http://127.0.0.1:3006 OUT_DIR=out node ../tools/e2e/i2-mock-crawl.js
+```
+
+期望输出：`有脚本错误的页面=0`、`正文过短的页面` 只包含 `/404/`。跑完记得把 `web/out` 用正式
+构建覆盖回去——`server/webui/dist` 是从它拷进二进制的。
