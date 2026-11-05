@@ -85,12 +85,21 @@ if [ -f "$LABRUN" ]; then
   cat > /tmp/jw-cred-lab-mail-down.sh <<'EOF'
 rm -f /etc/dovecot/conf.d/99-jw-cred-lab.conf /etc/dovecot/jw-cred-lab.passwd
 systemctl restart dovecot >/dev/null 2>&1 || service dovecot restart >/dev/null 2>&1 || true
+if [ ! -f /tmp/jw-cred-lab/dovecot-was-active ]; then
+  systemctl stop dovecot >/dev/null 2>&1 || true
+  systemctl disable dovecot >/dev/null 2>&1 || true
+fi
+rm -f /tmp/jw-cred-lab/dovecot-was-active
 if [ -f /tmp/jw-cred-lab/main.cf.orig ]; then
   cp /tmp/jw-cred-lab/main.cf.orig /etc/postfix/main.cf
   cp /tmp/jw-cred-lab/master.cf.orig /etc/postfix/master.cf
   rm -f /tmp/jw-cred-lab/main.cf.orig /tmp/jw-cred-lab/master.cf.orig
 fi
 systemctl restart postfix >/dev/null 2>&1 || service postfix restart >/dev/null 2>&1 || true
+if [ ! -f /tmp/jw-cred-lab/postfix-was-active ]; then
+  systemctl stop postfix >/dev/null 2>&1 || true
+fi
+rm -f /tmp/jw-cred-lab/postfix-was-active
 if [ -f /tmp/jw-cred-lab/postfix-installed-by-lab ]; then
   DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq postfix >/dev/null 2>&1 || true
   rm -f /tmp/jw-cred-lab/postfix-installed-by-lab
@@ -117,6 +126,11 @@ LDIF
 ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/ldap-tls-del.ldif >/dev/null 2>&1 || true
 sed -i '/^SLAPD_SERVICES=/d' /etc/default/slapd
 systemctl restart slapd >/dev/null 2>&1 || service slapd restart >/dev/null 2>&1 || true
+if [ ! -f /tmp/jw-cred-lab/slapd-was-active ]; then
+  systemctl stop slapd >/dev/null 2>&1 || true
+  systemctl disable slapd >/dev/null 2>&1 || true
+fi
+rm -f /tmp/jw-cred-lab/slapd-was-active
 if [ -f /tmp/jw-cred-lab/slapd-installed-by-lab ]; then
   DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq slapd ldap-utils >/dev/null 2>&1 || true
   rm -f /tmp/jw-cred-lab/slapd-installed-by-lab
