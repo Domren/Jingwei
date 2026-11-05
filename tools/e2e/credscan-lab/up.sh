@@ -28,6 +28,8 @@ P_SOCKS=10800
 P_SOCKS_OPEN=10801
 P_U1_SSH=2201
 P_U1_MYSQL=3306
+P_U1_TOMCAT=8081
+P_ES=9200
 LABRUN=${JW_LAB_RUN:-/root/lab-ubuntu/wslrun.sh}
 LAB_DISTRO=${JW_LAB_DISTRO:-Ubuntu-1}
 
@@ -49,6 +51,10 @@ if extra:
     case["params"] = json.loads(extra)
 if flags:
     case.update(json.loads(flags))
+# 同一个 (协议, 标签, host, port) 只保留一条：up.sh 会反复跑，重复条目会让
+# 真机用例把同一件事测两遍，还会让「共 N 条」这种计数失真。
+key = (proto, label, host, int(port))
+d["cases"] = [c for c in d["cases"] if (c.get("protocol"), c.get("label"), c.get("host"), c.get("port")) != key]
 d["cases"].append(case)
 json.dump(d, open(p, "w"), indent=1)
 PY
@@ -92,6 +98,24 @@ if restart_redis $P_REDIS_OPEN; then
   add_case redis "未开认证" 127.0.0.1 $P_REDIS_OPEN "" "" "suiyi123" hit deny
 else
   bad "redis(无认证) 没起来"
+fi
+
+# ── Memcached：文本协议、默认无认证 ─────────────────────────────────────────
+# 端口用 11212 而不是默认 11211：本机可能已有 memcached 在跑，杀掉别人的实例
+# 或者复用它的状态都会让「预期结果」与线上对不上。
+pkill -f "memcached -p 11212" 2>/dev/null
+# 等旧实例真的放开端口再起新的：pkill 是异步的，新实例绑定失败会直接退出，
+# 而 wait_port 会对着还没死透的旧实例返回成功——清单里的口令于是对不上线上。
+for _ in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ':11212 ' || break; sleep 0.3; done
+rm -f "$LAB_DIR/memcached.pid"
+memcached -p 11212 -l 127.0.0.1 -u root -d -P "$LAB_DIR/memcached.pid" 2>/dev/null
+sleep 0.5
+if [ -s "$LAB_DIR/memcached.pid" ] && kill -0 "$(cat "$LAB_DIR/memcached.pid")" 2>/dev/null \
+   && wait_port 127.0.0.1 11212 10; then
+  # 没有认证，所以「空凭据」才是命中；非空口令只能判「不构成可用凭据」。
+  add_case memcached "文本协议未开认证" 127.0.0.1 11212 "" "" "anyuser/anypass" hit deny
+else
+  bad "memcached 没起来（没装？apt-get install memcached）"
 fi
 
 # ── PostgreSQL：一个实例里做出 scram / md5 / trust 三种认证 ──────────────────
@@ -148,6 +172,33 @@ EOF"
   add_case postgresql "md5" 127.0.0.1 $P_PG jwmd5 "$MD5_PW" "buhaig-1" hit deny '{"database":"postgres"}' '{"expect_tls":true}'
   # trust 那条：能用的是「这个账号不需要口令」。空口令命中，非空口令只能是不可判定。
   add_case postgresql "trust" 127.0.0.1 $P_PG jwtrust "" "cancha1" hit inconclusive '{"database":"postgres"}' '{"expect_tls":true}'
+fi
+
+# ── Elasticsearch 8：X-Pack Basic 认证 ───────────────────────────────────────
+# HTTP 层关掉 TLS（认证语义不变：没有凭据 401、正确凭据 200），否则适配器还得为
+# 一个测试服务实现证书信任。单节点模式的 bootstrap 检查需要 vm.max_map_count。
+ES_PW=$(genpw)
+if docker image inspect elasticsearch:8.15.3 >/dev/null 2>&1; then
+  docker rm -f jw-cred-es >/dev/null 2>&1
+  sysctl -w vm.max_map_count=262144 >/dev/null 2>&1 || true
+  docker run -d --name jw-cred-es -p 127.0.0.1:$P_ES:9200 \
+    -e discovery.type=single-node -e xpack.security.enabled=true \
+    -e xpack.security.http.ssl.enabled=false -e xpack.security.transport.ssl.enabled=false \
+    -e ELASTIC_PASSWORD="$ES_PW" -e ES_JAVA_OPTS="-Xms512m -Xmx512m" \
+    elasticsearch:8.15.3 >/dev/null || bad "elasticsearch 容器起不来"
+  es_ready=0
+  for i in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 2 -u "elastic:$ES_PW" http://127.0.0.1:$P_ES/ 2>/dev/null)
+    [ "$code" = "200" ] && { es_ready=1; break; }
+    sleep 2
+  done
+  if [ "$es_ready" = "1" ]; then
+    add_case elasticsearch "X-Pack Basic" 127.0.0.1 $P_ES elastic "$ES_PW" "buhaig-$ES_PW" hit deny
+  else
+    bad "elasticsearch 在 120s 内没有就绪"
+  fi
+else
+  note "跳过 Elasticsearch：本机没有 elasticsearch:8.15.3 镜像（skopeo copy ... docker-daemon:...）"
 fi
 
 # ── MongoDB：root 用户同时带 SCRAM-SHA-256 与 SCRAM-SHA-1 两套凭据 ───────────
@@ -307,6 +358,106 @@ EOF
   fi
 else
   note "跳过 SSH/MySQL：没有 $LABRUN（边界靶机不在这台机器上时设 JW_LAB_RUN 指过去）"
+fi
+
+# ── HTTP 家族：Apache Basic 认证与 WebDAV（Ubuntu-1）──────────────────────────
+# 一个 .conf 起两个端口：8092 是普通 Basic 认证目录，8093 是要求认证的 DAV 目录。
+# 用系统 Apache 而不是自写 HTTP 服务：401/207 的边界行为（realm、DAV 头、PROPFIND 语义）
+# 只有真服务才会按标准给。
+HTTP_PW=$(genpw)
+if [ -f "$LABRUN" ]; then
+  cat > "$LAB_DIR/u1-apache-lab.sh" <<EOF
+set -e
+mkdir -p /var/www/jw-cred-lab/sub
+echo "jw cred lab" > /var/www/jw-cred-lab/index.html
+htpasswd -bc /etc/apache2/jw-cred-lab.htpasswd jwcred '$HTTP_PW' >/dev/null
+cat > /etc/apache2/conf-available/jw-cred-lab.conf <<'CONF'
+Listen 8092
+Listen 8093
+<VirtualHost *:8092>
+  DocumentRoot /var/www/jw-cred-lab
+  <Directory /var/www/jw-cred-lab>
+    AuthType Basic
+    AuthName "JW Lab Basic"
+    AuthUserFile /etc/apache2/jw-cred-lab.htpasswd
+    Require valid-user
+  </Directory>
+</VirtualHost>
+<VirtualHost *:8093>
+  DocumentRoot /var/www/jw-cred-lab
+  <Directory /var/www/jw-cred-lab>
+    DAV On
+    AuthType Basic
+    AuthName "JW Lab DAV"
+    AuthUserFile /etc/apache2/jw-cred-lab.htpasswd
+    Require valid-user
+  </Directory>
+</VirtualHost>
+CONF
+a2enmod dav dav_fs auth_basic >/dev/null 2>&1 || true
+a2enconf jw-cred-lab >/dev/null 2>&1
+apache2ctl configtest >/dev/null 2>&1 && apache2ctl graceful >/dev/null 2>&1
+echo APACHE-LAB-OK
+EOF
+  if bash "$LABRUN" "$LAB_DISTRO" "$LAB_DIR/u1-apache-lab.sh" 2>&1 | grep -q APACHE-LAB-OK \
+     && wait_port 127.0.0.1 8092 15 && wait_port 127.0.0.1 8093 15; then
+    add_case http-basic "Apache Basic" 127.0.0.1 8092 jwcred "$HTTP_PW" "buhaig-$HTTP_PW" hit deny
+    # 用子目录而不是文档根：Apache 2.4.52 对 DocumentRoot 本身的 PROPFIND 返回 405
+    # （对同名路径下的子目录返回 207），这是服务端行为，不是适配器要迁就的缺陷。
+    add_case webdav "Apache mod_dav" 127.0.0.1 8093 jwcred "$HTTP_PW" "buhaig-$HTTP_PW" hit deny '{"path":"/sub/"}' 
+  else
+    note "跳过：Ubuntu-1 上的 Apache Basic/WebDAV 没起来"
+  fi
+
+  # Tomcat 管理控制台：tomcat9-admin 提供 /manager，认证是 Basic + manager-gui 角色。
+  # 用户写进 tomcat-users.xml（先备份，down.sh 恢复），验完把包卸掉。
+  TOMCAT_PW=$(genpw)
+  cat > "$LAB_DIR/u1-tomcat-user.sh" <<EOF
+if [ ! -f /etc/tomcat9/tomcat-users.xml ]; then echo NO_TOMCAT; exit 0; fi
+if ! dpkg -l tomcat9-admin 2>/dev/null | grep -q '^ii'; then
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tomcat9-admin >/dev/null 2>&1 || true
+fi
+[ -f /tmp/jw-cred-lab-tomcat-users.orig ] || cp /etc/tomcat9/tomcat-users.xml /tmp/jw-cred-lab-tomcat-users.orig
+python3 - /etc/tomcat9/tomcat-users.xml '$TOMCAT_PW' <<'PY2'
+import re,sys
+p,pw=sys.argv[1],sys.argv[2]
+s=open(p).read()
+s=re.sub(r'\s*<user username="jwcred"[^>]*/>','',s)
+if 'rolename="manager-gui"' not in s:
+    s=s.replace('</tomcat-users>','  <role rolename="manager-gui"/>\n</tomcat-users>')
+s=s.replace('</tomcat-users>','  <user username="jwcred" password="%s" roles="manager-gui"/>\n</tomcat-users>' % pw)
+open(p,'w').write(s)
+PY2
+systemctl restart tomcat9 >/dev/null 2>&1 || service tomcat9 restart >/dev/null 2>&1 || true
+sleep 2
+code=\$(curl -s -o /dev/null -w '%{http_code}' -m 5 -u "jwcred:$TOMCAT_PW" http://127.0.0.1:8081/manager/html)
+[ "\$code" = "200" ] && echo TOMCAT-OK || echo "TOMCAT-CODE-\$code"
+EOF
+  if bash "$LABRUN" "$LAB_DISTRO" "$LAB_DIR/u1-tomcat-user.sh" 2>&1 | grep -q TOMCAT-OK \
+     && wait_port 127.0.0.1 $P_U1_TOMCAT 10; then
+    add_case tomcat-console "Tomcat manager" 127.0.0.1 $P_U1_TOMCAT jwcred "$TOMCAT_PW" "buhaig-$TOMCAT_PW" hit deny
+  else
+    note "跳过：Ubuntu-1 的 Tomcat manager 没起来（tomcat9-admin 装不上？）"
+  fi
+fi
+
+# ── Zookeeper：四字命令是否放开（Ubuntu-1:2181）────────────────────────────────
+if [ -f "$LABRUN" ]; then
+  cat > "$LAB_DIR/u1-zk.sh" <<'EOF'
+if ! dpkg -l zookeeperd 2>/dev/null | grep -q '^ii' && ! dpkg -l zookeeper 2>/dev/null | grep -q '^ii'; then
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zookeeperd >/dev/null 2>&1 || true
+fi
+systemctl restart zookeeper >/dev/null 2>&1 || service zookeeper restart >/dev/null 2>&1 || true
+sleep 3
+out=\$(printf 'ruok' | timeout 3 nc 127.0.0.1 2181 2>/dev/null)
+[ "\$out" = "imok" ] && echo ZK-OK || echo "ZK-NO-\$out"
+EOF
+  if bash "$LABRUN" "$LAB_DISTRO" "$LAB_DIR/u1-zk.sh" 2>&1 | grep -q ZK-OK \
+     && wait_port 127.0.0.1 2181 10; then
+    add_case zookeeper "四字命令未设防" 127.0.0.1 2181 "" "" "anyuser/anypass" hit deny
+  else
+    note "跳过：Ubuntu-1 的 Zookeeper 没起来"
+  fi
 fi
 
 chmod 600 "$LAB_JSON"

@@ -79,6 +79,9 @@ const (
 	// CredParamMechanism 用来点名认证机制（SCRAM-SHA-1 与 SCRAM-SHA-256 这类）。
 	// 一个协议里的不同机制是不同数学，验一个不等于验全部，所以必须能被显式指定。
 	CredParamMechanism = "mechanism"
+	// CredParamPath 是 HTTP 家族（Basic / WebDAV / 控制台）的登录路径：
+	// 后台经常挂在 /manager、/dav 这类前缀下，路径写死会让适配器只测首页。
+	CredParamPath = "path"
 )
 
 // CredParam 取协议参数，缺省回落到 def（Params 为 nil 也要能用，所以是函数而不是方法）。

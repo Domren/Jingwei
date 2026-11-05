@@ -19,6 +19,10 @@ type CredDictionary struct {
 var credBuiltin = CredDictionary{
 	Profile: "builtin",
 	Credentials: []Credential{
+		// 空口令本身是一组必须测的组合：Redis 未开认证、memcached /
+		// Zookeeper 这类根本没有认证的服务，只有它才会命中。放在最前面，
+		// 无认证目标第一条就能出结论，不必先把 25 组口令打一遍。
+		{},
 		{Username: "root", Password: "root"},
 		{Username: "root", Password: "123456"},
 		{Username: "root", Password: "toor"},
