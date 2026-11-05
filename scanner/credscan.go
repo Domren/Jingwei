@@ -365,12 +365,17 @@ type CredOptions struct {
 	Budget      time.Duration // 整个任务的墙钟预算，<=0 用默认
 	// StopLossAfter 是同一端点连续多少次传输层失败后放弃该端点（<=0 用默认）。
 	StopLossAfter int
+	// StopAfterDenies 是同一账号连续多少次「明确拒绝」后停止再试该账号（<=0 用默认）。
+	// 防的是账号锁定：拒绝是「这组口令不对」，连着错 N 次就可能把账号锁死，
+	// 余下的口令组只能记「没测」，不能拿别人的账号去赌。
+	StopAfterDenies int
 }
 
 const (
 	credDefaultConcurrency = 16
 	credDefaultBudget      = 10 * time.Minute
 	credDefaultStopLoss    = 3
+	credDefaultDenyStop    = 5
 )
 
 func (o CredOptions) normalized() CredOptions {
@@ -385,6 +390,9 @@ func (o CredOptions) normalized() CredOptions {
 	}
 	if o.StopLossAfter <= 0 {
 		o.StopLossAfter = credDefaultStopLoss
+	}
+	if o.StopAfterDenies <= 0 {
+		o.StopAfterDenies = credDefaultDenyStop
 	}
 	return o
 }
@@ -491,6 +499,11 @@ type credEndpointState struct {
 	consec    int
 	abandoned bool
 	locked    bool
+	// denyUser 记「这个用户名连续被拒了几次」。按账号而不是按端点计数：
+	// root 错了 5 次不代表 admin 也会被锁，为 root 停手不该牺牲 admin 的覆盖。
+	denyUser map[string]int
+	// blockedUser 是已经停手的目标账号，余下口令组记不可判定。
+	blockedUser map[string]bool
 }
 
 // runCredEndpoint 跑完一个端点，并保证「要么发起尝试，要么留下一行交代为什么没试」——
@@ -565,6 +578,8 @@ func runCredEndpoint(ctx, runCtx context.Context, endpoint CredEndpoint, creds [
 		state.mu.Lock()
 		done := state.locked || state.abandoned
 		consec, locked := state.consec, state.locked
+		userBlocked := state.blockedUser[cred.Username]
+		userDenies := state.denyUser[cred.Username]
 		state.mu.Unlock()
 		if done {
 			reason := "该端点已触发账号锁定，余下凭据不再尝试"
@@ -573,6 +588,14 @@ func runCredEndpoint(ctx, runCtx context.Context, endpoint CredEndpoint, creds [
 			}
 			emit(CredAttempt{Host: endpoint.Host, Port: endpoint.Port, Protocol: endpoint.Protocol,
 				Cred: cred, Outcome: CredInconclusive, Reason: reason})
+			continue
+		}
+		if userBlocked {
+			// 账号已经连续被拒到达上限：再试可能把它锁死。余下的口令组是「没测」，
+			// 不是「也错了」——拒绝只能由服务端亲口说。
+			emit(CredAttempt{Host: endpoint.Host, Port: endpoint.Port, Protocol: endpoint.Protocol,
+				Cred: cred, Outcome: CredInconclusive, Attempts: 0,
+				Reason: fmt.Sprintf("账号 %q 连续 %d 次认证失败，为避免触发账号锁定已停止尝试该账号", cred.Username, userDenies)})
 			continue
 		}
 		if rate != nil {
@@ -608,9 +631,24 @@ func runCredEndpoint(ctx, runCtx context.Context, endpoint CredEndpoint, creds [
 			state.mu.Lock()
 			state.locked = true
 			state.mu.Unlock()
-		case CredHit, CredDeny:
+		case CredDeny:
 			state.mu.Lock()
 			state.consec = 0
+			if state.denyUser == nil {
+				state.denyUser = map[string]int{}
+			}
+			state.denyUser[cred.Username]++
+			if state.denyUser[cred.Username] >= opts.StopAfterDenies {
+				if state.blockedUser == nil {
+					state.blockedUser = map[string]bool{}
+				}
+				state.blockedUser[cred.Username] = true
+			}
+			state.mu.Unlock()
+		case CredHit:
+			state.mu.Lock()
+			state.consec = 0
+			delete(state.denyUser, cred.Username)
 			state.mu.Unlock()
 		}
 		emit(res)

@@ -45,6 +45,7 @@ type Server struct {
 	engine      *Engine
 	ctx         context.Context
 	scanMgr     *scanManager
+	credMgr     *credManager
 	deepMgr     *deepManager
 	resourceMgr *resourceManager
 
@@ -306,6 +307,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		go s.runCredentialProcessor()
 		s.scanMgr = newScanManager(s)
 		s.scanMgr.start(ctx)
+		s.credMgr = newCredManager(s)
+		s.credMgr.start(ctx)
 		s.deepMgr = newDeepManager(s)
 		s.deepMgr.start(ctx)
 		s.resourceMgr.start(ctx)
@@ -940,6 +943,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/scans/{id}/assets", s.listScanTaskAssets)
 	mux.HandleFunc("GET /api/scans/{id}/results", s.listScanTaskResults)
 	mux.HandleFunc("GET /api/scans/{id}/auto", s.getScanAuto)
+
+	// 弱口令检测（独立模块）：任务、结果与协议目录
+	mux.HandleFunc("GET /api/credscan/protocols", s.credProtocols)
+	mux.HandleFunc("GET /api/credscan/dicts", s.listCredDicts)
+	mux.HandleFunc("POST /api/credscan/dicts", s.saveCredDict)
+	mux.HandleFunc("DELETE /api/credscan/dicts/{name}", s.deleteCredDict)
+	mux.HandleFunc("GET /api/credscan/tasks", s.listCredTasks)
+	mux.HandleFunc("POST /api/credscan/tasks", s.createCredTask)
+	mux.HandleFunc("POST /api/credscan/tasks/batch-delete", s.batchDeleteCredTasks)
+	mux.HandleFunc("GET /api/credscan/tasks/{id}", s.getCredTask)
+	mux.HandleFunc("DELETE /api/credscan/tasks/{id}", s.deleteCredTask)
+	mux.HandleFunc("POST /api/credscan/tasks/{id}/cancel", s.cancelCredTask)
+	mux.HandleFunc("GET /api/credscan/tasks/{id}/results", s.listCredTaskResults)
+	mux.HandleFunc("GET /api/credscan/tasks/{id}/report", s.credTaskReport)
 
 	// 深度利用：漏洞验证 / 漏洞利用 / WAF 绕过 / Webshell 注入 / Webshell 管理
 	mux.HandleFunc("GET /api/deep/tasks", s.listDeepTasks)

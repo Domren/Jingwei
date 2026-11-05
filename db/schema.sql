@@ -2066,3 +2066,64 @@ CREATE TABLE IF NOT EXISTS guard_denials (
 );
 CREATE INDEX IF NOT EXISTS idx_guard_denials_task ON guard_denials(task_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_guard_denials_ts ON guard_denials(ts DESC);
+
+-- ---------------------------------------------------------------------------
+-- 弱口令检测（界面名）任务与结果，见 db/credscan.go。内部标识保持 credscan。
+-- 结果的六态 outcome（hit/deny/unreachable/locked/inconclusive/unsupported）
+-- 与 scanner.CredOutcome 一一对应；「少一行＝说谎」这条规矩在存储层同样成立：
+-- 每个端点×凭据都要有一行，连不上与没测出来也不能省。
+-- 口令与证据都是明文字节：这一列存的是发现本身（报告要能复现），
+-- 需要密封复用的凭据在 intranet_credentials，两处的用途不同，别混。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS cred_tasks (
+    id           BIGSERIAL PRIMARY KEY,
+    name         TEXT NOT NULL DEFAULT '',
+    targets      JSONB NOT NULL DEFAULT '[]',
+    protocols    JSONB NOT NULL DEFAULT '[]',
+    options      JSONB NOT NULL DEFAULT '{}',
+    dict_profile TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'queued',
+    stage        TEXT NOT NULL DEFAULT 'queued',
+    progress     JSONB NOT NULL DEFAULT '{}',
+    summary      JSONB NOT NULL DEFAULT '{}',
+    log          TEXT NOT NULL DEFAULT '',
+    error        TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at   TIMESTAMPTZ,
+    finished_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_cred_tasks_created ON cred_tasks(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_cred_tasks_status ON cred_tasks(status, id);
+
+CREATE TABLE IF NOT EXISTS cred_results (
+    id                 BIGSERIAL PRIMARY KEY,
+    task_id            BIGINT NOT NULL REFERENCES cred_tasks(id) ON DELETE CASCADE,
+    host               TEXT NOT NULL,
+    port               INTEGER NOT NULL,
+    protocol           TEXT NOT NULL DEFAULT '',
+    protocol_source    TEXT NOT NULL DEFAULT '',
+    protocol_confirmed BOOLEAN NOT NULL DEFAULT false,
+    params             JSONB NOT NULL DEFAULT '{}',
+    username           TEXT NOT NULL DEFAULT '',
+    password           TEXT NOT NULL DEFAULT '',
+    outcome            TEXT NOT NULL,
+    banner             TEXT NOT NULL DEFAULT '',
+    evidence           TEXT NOT NULL DEFAULT '',
+    tls                BOOLEAN NOT NULL DEFAULT false,
+    reason             TEXT NOT NULL DEFAULT '',
+    attempts           INTEGER NOT NULL DEFAULT 0,
+    elapsed_ms         BIGINT NOT NULL DEFAULT 0,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_cred_results_task ON cred_results(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_cred_results_outcome ON cred_results(task_id, outcome, id);
+CREATE INDEX IF NOT EXISTS idx_cred_results_endpoint ON cred_results(task_id, host, port, id);
+
+-- 操作员导入的弱口令字典（B10）。内置精简字典在代码里（scanner/credscan_dict.go），
+-- 这张表只存导入档；cred_tasks.dict_profile 记名字，报告才能说清用的是哪本字典。
+CREATE TABLE IF NOT EXISTS cred_dicts (
+    name       TEXT PRIMARY KEY,
+    entries    TEXT NOT NULL,
+    entry_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

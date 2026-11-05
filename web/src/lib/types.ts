@@ -2688,3 +2688,65 @@ export interface IntelligencePage {
   counts: Record<IntelligenceKind, number>;
   enabled: boolean;
 }
+
+// ---- 弱口令检测（界面名） ----
+export type CredTaskStatus = "queued" | "running" | "done" | "failed" | "canceled";
+
+export interface CredTask {
+  id: number;
+  name: string;
+  targets: string[];
+  protocols: string[];
+  options: Record<string, unknown>;
+  dict_profile: string;
+  status: CredTaskStatus;
+  stage: string;
+  progress: Record<string, number>;
+  summary: Record<string, unknown>;
+  log?: string;
+  error?: string;
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+}
+
+export interface CredResult {
+  id: number;
+  task_id: number;
+  host: string;
+  port: number;
+  protocol: string;
+  protocol_source: string;
+  protocol_confirmed: boolean;
+  params?: Record<string, string>;
+  username: string;
+  password: string;
+  outcome: string;
+  banner?: string;
+  evidence?: string;
+  tls?: boolean;
+  reason?: string;
+  attempts: number;
+  elapsed_ms: number;
+  created_at: string;
+}
+
+export interface CredProtocolInfo {
+  name: string;
+  default_port: number;
+  supported: boolean;
+}
+
+export interface CredDict {
+  name: string;
+  entry_count: number;
+  created_at: string;
+}
+
+export interface CredTaskInput {
+  name?: string;
+  targets: string[];
+  protocols: string[];
+  options?: Record<string, unknown>;
+  dict_profile?: string;
+}

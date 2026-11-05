@@ -27,7 +27,7 @@ func (s *Server) deepTools() []actool.CoreTool {
 		s.toolWebshellRegister(),
 		s.toolGetDeepTask(),
 		s.toolSolveSliderCaptcha(),
-	}, append(s.intranetTools(), s.resourceTools()...)...)
+	}, append(s.credscanTools(), append(s.intranetTools(), s.resourceTools()...)...)...)
 }
 
 type deepToolInput struct {

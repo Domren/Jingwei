@@ -24,6 +24,8 @@ type credFakeAdapter struct {
 	tryCalls  int
 	tryDelay  time.Duration
 	portCheck int
+	// tryFn 按凭据决定结果（nil 时用固定 outcome），用于按账号断言止损行为。
+	tryFn func(Credential) CredOutcome
 }
 
 func (a *credFakeAdapter) Protocol() string { return a.protocol }
@@ -46,7 +48,11 @@ func (a *credFakeAdapter) Try(ctx context.Context, ep CredEndpoint, cred Credent
 		case <-ctx.Done():
 		}
 	}
-	return CredAttempt{Outcome: a.outcome, RawResp: []byte("RESP"), RawReq: []byte("REQ")}, a.tryErr
+	outcome := a.outcome
+	if a.tryFn != nil {
+		outcome = a.tryFn(cred)
+	}
+	return CredAttempt{Outcome: outcome, RawResp: []byte("RESP"), RawReq: []byte("REQ")}, a.tryErr
 }
 
 func (a *credFakeAdapter) counts() (int, int) {
@@ -490,4 +496,41 @@ func unregisterCredAdapter(protocol string) {
 	credAdapterMu.Lock()
 	defer credAdapterMu.Unlock()
 	delete(credAdapters, strings.ToLower(protocol))
+}
+
+// 同一账号连续被拒到达上限后停手：余下的口令组是「没测」，不是「也错了」。
+// 停手按账号而不是按端点——root 被拒不该拖累 admin 的覆盖。
+func TestCredRunStopsDeniedAccountBeforeLockout(t *testing.T) {
+	adapter := &credFakeAdapter{protocol: credTestProto, identify: true,
+		tryFn: func(Credential) CredOutcome { return CredDeny }}
+	RegisterCredAdapter(adapter)
+	defer unregisterCredAdapter(credTestProto)
+
+	plan := []CredEndpoint{{Host: "10.0.0.60", Port: 6379, Protocol: credTestProto, ProtocolConfirmed: true}}
+	creds := []Credential{
+		{Username: "root", Password: "a"},
+		{Username: "root", Password: "b"},
+		{Username: "root", Password: "c"},
+		{Username: "admin", Password: "a"},
+	}
+	c := &credCollector{}
+	if err := CredRun(context.Background(), plan, creds, CredOptions{StopAfterDenies: 2}, c.emit); err != nil {
+		t.Fatal(err)
+	}
+	rows := c.all()
+	if len(rows) != len(creds) {
+		t.Fatalf("每个口令组都要留一行: %d", len(rows))
+	}
+	if rows[0].Outcome != CredDeny || rows[1].Outcome != CredDeny {
+		t.Fatalf("前两次应当是明确拒绝: %+v", rows[:2])
+	}
+	if rows[2].Outcome != CredInconclusive || !strings.Contains(rows[2].Reason, "避免触发账号锁定") {
+		t.Fatalf("到达上限后 root 的第三组应当停手并说明原因: %+v", rows[2])
+	}
+	if rows[3].Outcome != CredDeny {
+		t.Fatalf("admin 是另一个账号，不该被 root 的失败拖累: %+v", rows[3])
+	}
+	if _, tries := adapter.counts(); tries != 3 {
+		t.Fatalf("停手之后不能再发起尝试: tries=%d", tries)
+	}
 }

@@ -28,7 +28,12 @@ import type {
   ConvTokenSummary,
   CoverageAssetRefs,
   CoverageGraphData,
+  CredDict,
   CredentialTrafficDetail,
+  CredProtocolInfo,
+  CredResult,
+  CredTask,
+  CredTaskInput,
   DailyTokenBucket,
   DeepTask,
   DeepTaskInput,
@@ -58,6 +63,7 @@ import type {
   FindingsPage,
   FindingTraffic,
   FindingTrafficDetail,
+  GuardDenials,
   IntelligencePage,
   IntentAsset,
   InterceptApprovalFilter,
@@ -88,7 +94,6 @@ import type {
   JavaMemshell,
   JavaMemshellInput,
   JudgeConfig,
-  GuardDenials,
   JudgeUsage,
   LLMPoolStatus,
   LLMProfile,
@@ -1480,8 +1485,7 @@ export const api = {
   interceptGetJudgeConfig: () => get<JudgeConfig>("/intercept/judge"),
   interceptSetJudgeConfig: (cfg: JudgeConfig) => put<{ ok: boolean }>("/intercept/judge", cfg),
   interceptJudgeUsage: (days = 30) => get<JudgeUsage>(`/intercept/judge/usage?days=${days}`),
-  interceptGuardDenials: (hours = 168) =>
-    get<GuardDenials>(`/intercept/guard/denials?hours=${hours}`),
+  interceptGuardDenials: (hours = 168) => get<GuardDenials>(`/intercept/guard/denials?hours=${hours}`),
 
   // ---- commands (tool execution history, any tool) ----
   commands: (params?: { task?: string; q?: string; page?: number; size?: number }) => {
@@ -1544,6 +1548,45 @@ export const api = {
   scanAssets: (id: number) => get<{ assets: ScanAsset[] }>(`/scans/${id}/assets`),
   scanResults: (id: number) => get<{ results: ScanResult[] }>(`/scans/${id}/results`),
   scanAuto: (id: number) => get<ScanAutoResult>(`/scans/${id}/auto`),
+
+  // ---- 弱口令检测（界面名） ----
+  credProtocols: () =>
+    get<{ protocols: CredProtocolInfo[]; dictionaries: string[]; dicts?: CredDict[]; outcomes: string[] }>(
+      "/credscan/protocols",
+    ),
+  saveCredDict: (name: string, content: string) => post<CredDict>("/credscan/dicts", { name, content }),
+  deleteCredDict: (name: string) => del<{ deleted: boolean }>(`/credscan/dicts/${encodeURIComponent(name)}`),
+  credTasks: (limit = 50) => get<{ tasks: CredTask[] }>(`/credscan/tasks?limit=${limit}`),
+  credTask: (id: number) => get<{ task: CredTask; counts: Record<string, number> }>(`/credscan/tasks/${id}`),
+  createCredTask: (input: CredTaskInput) => post<CredTask>("/credscan/tasks", input),
+  cancelCredTask: (id: number) => post<{ canceled: boolean }>(`/credscan/tasks/${id}/cancel`, {}),
+  deleteCredTask: (id: number) => del<{ deleted: number }>(`/credscan/tasks/${id}`),
+  deleteCredTasks: (ids: number[]) => post<{ deleted: number }>("/credscan/tasks/batch-delete", { ids }),
+  downloadCredReport: async (id: number, internal: boolean): Promise<string> => {
+    const r = await fetch(`/api/credscan/tasks/${id}/report?internal=${internal ? 1 : 0}`);
+    if (!r.ok) throw new Error(`report: ${r.status}`);
+    const blob = await r.blob();
+    const disp = r.headers.get("Content-Disposition") ?? "";
+    const m = disp.match(/filename="?([^"]+)"?/);
+    const filename = m?.[1] ?? `credscan-${id}.md`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    return filename;
+  },
+  credTaskResults: (id: number, params?: { outcome?: string; host?: string; offset?: number; limit?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.outcome) sp.set("outcome", params.outcome);
+    if (params?.host) sp.set("host", params.host);
+    sp.set("offset", String(params?.offset ?? 0));
+    sp.set("limit", String(params?.limit ?? 500));
+    return get<{ results: CredResult[]; total: number }>(`/credscan/tasks/${id}/results?${sp}`);
+  },
 
   // ---- Deep exploitation ----
   deepTasks: (params?: { kind?: string; limit?: number; offset?: number }) => {
