@@ -1,7 +1,9 @@
 package db
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -32,13 +34,31 @@ type AuthorizationInput struct {
 	Note       string
 }
 
-const authorizationCols = `id, name, targets, exclusions, starts_at, ends_at, enabled, note, created_at`
+const authorizationCols = `id, name, targets::text, exclusions::text, starts_at, ends_at, enabled, note, created_at`
 
 func scanAuthorization(row interface{ Scan(...any) error }) (*Authorization, error) {
-	var a Authorization
-	if err := row.Scan(&a.ID, &a.Name, &a.Targets, &a.Exclusions, &a.StartsAt, &a.EndsAt,
+	var (
+		a             Authorization
+		targetsRaw    string
+		exclusionsRaw string
+	)
+	if err := row.Scan(&a.ID, &a.Name, &targetsRaw, &exclusionsRaw, &a.StartsAt, &a.EndsAt,
 		&a.Enabled, &a.Note, &a.CreatedAt); err != nil {
 		return nil, err
+	}
+	// 解析失败必须报错，不能退化成空清单：授权清单为空意味着「不限制目标」，
+	// 把读不出当成空值等于把「有授权才能打」变成「数据脏了就能打」。
+	if err := json.Unmarshal([]byte(targetsRaw), &a.Targets); err != nil {
+		return nil, fmt.Errorf("授权 %d 的 targets 不是合法的字符串数组: %w", a.ID, err)
+	}
+	if err := json.Unmarshal([]byte(exclusionsRaw), &a.Exclusions); err != nil {
+		return nil, fmt.Errorf("授权 %d 的 exclusions 不是合法的字符串数组: %w", a.ID, err)
+	}
+	if a.Targets == nil {
+		a.Targets = []string{}
+	}
+	if a.Exclusions == nil {
+		a.Exclusions = []string{}
 	}
 	return &a, nil
 }
@@ -63,16 +83,19 @@ func (d *DB) CreateAuthorization(in AuthorizationInput) (*Authorization, error) 
 		return nil, errors.New("授权名称不能为空")
 	}
 	targets := normalizeAuthzPatterns(in.Targets)
+	exclusions := normalizeAuthzPatterns(in.Exclusions)
 	if len(targets) == 0 {
 		return nil, errors.New("授权至少需要一个目标范围（IP / CIDR / 域名后缀）")
 	}
 	if in.EndsAt != nil && in.StartsAt != nil && !in.EndsAt.After(*in.StartsAt) {
 		return nil, errors.New("授权结束时间必须晚于开始时间")
 	}
+	// 数组列按本仓库的既有做法存 JSONB（jsonStringArray + ::text 读回）：
+	// TEXT[] 在 pgx 的文本协议下读回来是 "{a,b}" 这种字面量，扫不进 []string。
 	row := d.QueryRow(`INSERT INTO authorizations(name, targets, exclusions, starts_at, ends_at, enabled, note)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING `+authorizationCols,
-		name, targets, normalizeAuthzPatterns(in.Exclusions), in.StartsAt, in.EndsAt, in.Enabled,
+		name, jsonStringArray(targets), jsonStringArray(exclusions), in.StartsAt, in.EndsAt, in.Enabled,
 		strings.TrimSpace(in.Note))
 	return scanAuthorization(row)
 }
@@ -81,7 +104,7 @@ func (d *DB) ListAuthorizations(limit int) ([]*Authorization, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
-	rows, err := d.Query(`SELECT ` + authorizationCols + ` FROM authorizations ORDER BY id DESC LIMIT $1`)
+	rows, err := d.Query(`SELECT `+authorizationCols+` FROM authorizations ORDER BY id DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}

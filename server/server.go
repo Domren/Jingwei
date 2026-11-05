@@ -53,6 +53,11 @@ type Server struct {
 	jwtKey    []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
 	basicAuth basicAuthGate
 
+	// apiMux 是 Handler() 造出的 /api 路由表。留着是为了让用例能问「这个路径到底
+	// 注册了没有」——直接调 handler 的测试测不到这一层，功能就可能在界面里点了没反应
+	// （见 routes_wired_test.go 与进度手册 §5）。
+	apiMux *http.ServeMux
+
 	// Admin sessions are JWT + a server-side token version. The version is
 	// cached here because it is read on every authenticated request; password
 	// changes replace it in the database and the cache atomically enough for the
@@ -993,6 +998,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/deep/java-chains/status", s.javaChainsStatus)
 	// 内网两阶段 MVP：会话 / 隧道 / 范围审批 / 任务交接（与 agent 工具共用数据）
 	s.registerIntranet(mux)
+	// 内网信息收集脚本库（F3）：脚本目录、按会话执行与历史。
+	mux.HandleFunc("GET /api/intranet/scripts", s.listIntranetScripts)
+	mux.HandleFunc("GET /api/intranet/sessions/{id}/scripts", s.listIntranetScriptRuns)
+	mux.HandleFunc("POST /api/intranet/sessions/{id}/scripts", s.runIntranetScript)
+	// 客户授权清单（F4）：guard 裁决的输入，属平台级配置，紧挨拦截规则注册。
+	mux.HandleFunc("GET /api/authorizations", s.listAuthorizations)
+	mux.HandleFunc("POST /api/authorizations", s.createAuthorization)
+	mux.HandleFunc("DELETE /api/authorizations/{id}", s.deleteAuthorization)
 	mux.HandleFunc("GET /api/managed-resources", s.listManagedResources)
 	mux.HandleFunc("POST /api/managed-resources/{id}/release", s.releaseManagedResource)
 	mux.HandleFunc("GET /api/managed-resources/audit", s.auditLocalPortsHandler)
@@ -1152,6 +1165,7 @@ func (s *Server) Handler() http.Handler {
 	// frontend (no JWT required; the optional Basic Auth gate wraps both). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
 	api := cors(s.requireAuth(mux))
+	s.apiMux = mux // 给路由装配用例：见 routes_wired_test.go
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())

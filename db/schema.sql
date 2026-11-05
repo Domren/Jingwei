@@ -2156,8 +2156,8 @@ CREATE INDEX IF NOT EXISTS idx_intranet_script_runs_session ON intranet_script_r
 CREATE TABLE IF NOT EXISTS authorizations (
     id         BIGSERIAL PRIMARY KEY,
     name       TEXT NOT NULL,
-    targets    TEXT[] NOT NULL DEFAULT '{}',
-    exclusions TEXT[] NOT NULL DEFAULT '{}',
+    targets    JSONB NOT NULL DEFAULT '[]'::jsonb,
+    exclusions JSONB NOT NULL DEFAULT '[]'::jsonb,
     starts_at  TIMESTAMPTZ,
     ends_at    TIMESTAMPTZ,
     enabled    BOOLEAN NOT NULL DEFAULT true,
@@ -2165,3 +2165,24 @@ CREATE TABLE IF NOT EXISTS authorizations (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_authorizations_active ON authorizations(enabled, ends_at);
+
+-- 授权清单的数组列最初建成 TEXT[]，pgx 在文本协议下把它读成 "{a,b}" 字面量，
+-- 扫不进 []string（读一次错一次）。改成与其余数组列一致的 JSONB。
+-- 已经建过表的库就地转换，只在列还是数组类型时执行。
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = current_schema()
+                 AND table_name = 'authorizations' AND column_name = 'targets' AND data_type = 'ARRAY') THEN
+        -- 顺序有讲究：先 DROP DEFAULT。改列类型时 Postgres 会把列上**原有的**默认值
+        -- 重新按新类型校验，'{}'::text[] 转不成 jsonb，直接 ALTER TYPE 会报
+        -- 「default for column "targets" cannot be cast automatically」。
+        -- 另外每条都用 EXECUTE：schema.sql 整份一次送进服务端，普通语句会按改动前的
+        -- 表结构统一解析，后面的 SET DEFAULT 同样会被旧类型卡住。
+        EXECUTE 'ALTER TABLE authorizations ALTER COLUMN targets DROP DEFAULT';
+        EXECUTE 'ALTER TABLE authorizations ALTER COLUMN exclusions DROP DEFAULT';
+        EXECUTE 'ALTER TABLE authorizations ALTER COLUMN targets TYPE JSONB USING to_jsonb(targets)';
+        EXECUTE 'ALTER TABLE authorizations ALTER COLUMN exclusions TYPE JSONB USING to_jsonb(exclusions)';
+        EXECUTE 'ALTER TABLE authorizations ALTER COLUMN targets SET DEFAULT ''[]''::jsonb';
+        EXECUTE 'ALTER TABLE authorizations ALTER COLUMN exclusions SET DEFAULT ''[]''::jsonb';
+    END IF;
+END $$;
