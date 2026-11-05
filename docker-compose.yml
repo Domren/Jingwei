@@ -44,6 +44,9 @@ services:
       JAVA_CHAINS_CALLBACK_HOST: ${JAVA_CHAINS_CALLBACK_HOST:-127.0.0.1}
       # 抓包记录诊断：置 1 后每条完成流量都会打一行日志（定位"代理能转发但抓不到包"）
       JINGWEI_TRAFFIC_DEBUG: ${JINGWEI_TRAFFIC_DEBUG:-}
+      # 仅本机开发用：置 1 后允许回环来源（如 next dev 的 :3000）携带凭据跨源访问 API。
+      # 生产环境不要开——管理 API 一旦对任意站点开口子，同机/同网段的恶意页面就能借会话读数据。
+      JINGWEI_DEV_CORS: ${JINGWEI_DEV_CORS:-}
       # ---- 运行时可调项（留空＝用代码内置默认值，行为与不配一致）----
       # 内网隧道的控制端地址：目标可访问的 host:port，裸主机名默认按 chisel 的 8788 处理。
       # 不配它，自动生成 chisel / ssh -R 部署命令这条路整个关着。
