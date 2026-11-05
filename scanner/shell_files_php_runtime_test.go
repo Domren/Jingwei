@@ -60,24 +60,9 @@ func TestShellV2PHPFileManagerRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	port := freeLocalPort(t)
-	var logs bytes.Buffer
-	cmd := exec.Command(php, "-S", fmt.Sprintf("127.0.0.1:%d", port), "-t", dir)
-	cmd.Stdout = &logs
-	cmd.Stderr = &logs
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-		if t.Failed() {
-			t.Logf("php -S output:\n%s", logs.String())
-		}
-	})
-	waitTCP(t, fmt.Sprintf("127.0.0.1:%d", port))
+	addr := startPHPServer(t, php, dir)
 
-	url := fmt.Sprintf("http://127.0.0.1:%d/shell.php", port)
+	url := fmt.Sprintf("http://%s/shell.php", addr)
 	client := NewDeepClient(10 * time.Second)
 	ctx := context.Background()
 	if alive, note := CheckShellAlive(ctx, client, url, payload); !alive {
@@ -234,25 +219,9 @@ func TestShellV2PHPPersistFileManagerRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	port := freeLocalPort(t)
-	var logs bytes.Buffer
-	cmd := exec.Command(php, "-S", fmt.Sprintf("127.0.0.1:%d", port), "-t", dir,
-		"-d", "auto_prepend_file="+prependPath)
-	cmd.Stdout = &logs
-	cmd.Stderr = &logs
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-		if t.Failed() {
-			t.Logf("php -S output:\n%s", logs.String())
-		}
-	})
-	waitTCP(t, fmt.Sprintf("127.0.0.1:%d", port))
+	addr := startPHPServer(t, php, dir, "-d", "auto_prepend_file="+prependPath)
 
-	url := fmt.Sprintf("http://127.0.0.1:%d/index.php", port)
+	url := fmt.Sprintf("http://%s/index.php", addr)
 	client := NewDeepClient(10 * time.Second)
 	ctx := context.Background()
 

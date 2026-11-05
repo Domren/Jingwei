@@ -52,27 +52,12 @@ func TestShellV2PHPSemiPersistRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	port := freeLocalPort(t)
-	var logs bytes.Buffer
-	cmd := exec.Command(php, "-S", fmt.Sprintf("127.0.0.1:%d", port), "-t", dir,
+	addr := startPHPServer(t, php, dir,
 		"-d", "auto_prepend_file="+shellPath,
 		"-d", "display_errors=1",
 		"-d", "error_reporting=E_ALL")
-	cmd.Stdout = &logs
-	cmd.Stderr = &logs
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-		if t.Failed() {
-			t.Logf("php -S output:\n%s", logs.String())
-		}
-	})
-	waitTCP(t, fmt.Sprintf("127.0.0.1:%d", port))
 
-	url := fmt.Sprintf("http://127.0.0.1:%d/index.php", port)
+	url := fmt.Sprintf("http://%s/index.php", addr)
 	client := NewDeepClient(5 * time.Second)
 
 	// Unrelated traffic must render the original app and pick up no globals.

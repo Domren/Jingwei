@@ -49,6 +49,10 @@ func newNotifyFixture(t *testing.T) *notifyFixture {
 	// （防 SSRF 打到同机服务与云元数据）。测试显式打开这个开关；
 	// 守卫「默认拒绝」的行为由 notify 包的 ssrf_test.go 覆盖。
 	t.Setenv(notify.AllowLocalTargetsEnv, "1")
+	// 投递循环必须关掉：step() 会遍历所有启用渠道，和本用例逐渠道调用的
+	// stepRealtime/stepDigest 抢同一批投递行。抢输的一侧一条都发不出去，
+	// 于是断言变成「看机器心情」——串行跑时这条用例就是这么红的。
+	t.Setenv(notifyLoopDisableEnv, "1")
 	s, _, request := trafficEvidenceServer(t)
 	pg := s.m.pg
 

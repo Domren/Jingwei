@@ -77,7 +77,7 @@ func TestCredTaskAPIRejectsUnsupportedAndBadInput(t *testing.T) {
 		{"不支持的三档协议", map[string]any{
 			"targets": []string{"10.0.0.1"}, "protocols": []string{"rdp"}}, "该协议暂不支持"},
 		{"没有适配器的协议", map[string]any{
-			"targets": []string{"10.0.0.1"}, "protocols": []string{"memcached"}}, "该协议暂不支持"},
+			"targets": []string{"10.0.0.1"}, "protocols": []string{"snmp"}}, "该协议暂不支持"},
 		{"空目标", map[string]any{
 			"targets": []string{" "}, "protocols": []string{"ssh"}}, "至少需要一个目标"},
 		{"非法目标", map[string]any{

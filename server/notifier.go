@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -97,9 +99,22 @@ func newNotifier(s *Server) *Notifier {
 	return &Notifier{s: s, pg: s.m.pg, buckets: map[int64]*notifyBucket{}}
 }
 
-// Run 循环直到 ctx 结束。由 server.New 启动一次。
+// notifyLoopDisableEnv 关掉进程内的投递循环。
+//
+// step() 会遍历库里**所有**启用渠道并投递，而 server 包的用例要逐渠道调用
+// stepRealtime/stepDigest 来断言「这一步发出了什么」。两者共用同一批投递行，
+// 后台 tick 抢先领走时，用例那边就表现为「假接收端一条都没收到」——失败与否
+// 取决于机器快慢。用例通过它把自己造的循环关掉，生产不设置这个变量。
+const notifyLoopDisableEnv = "JINGWEI_NOTIFY_LOOP_DISABLED"
+
+func notifyLoopDisabled() bool {
+	v := strings.TrimSpace(os.Getenv(notifyLoopDisableEnv))
+	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// Run 循环直到 ctx 结束。
 func (n *Notifier) Run(ctx context.Context) {
-	if n.pg == nil {
+	if n.pg == nil || notifyLoopDisabled() {
 		return
 	}
 	t := time.NewTicker(notifyTick)

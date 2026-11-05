@@ -45,24 +45,9 @@ func TestShellV2PHPRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	port := freeLocalPort(t)
-	var logs bytes.Buffer
-	cmd := exec.Command(php, "-S", fmt.Sprintf("127.0.0.1:%d", port), "-t", dir)
-	cmd.Stdout = &logs
-	cmd.Stderr = &logs
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-		if t.Failed() {
-			t.Logf("php -S output:\n%s", logs.String())
-		}
-	})
-	waitTCP(t, fmt.Sprintf("127.0.0.1:%d", port))
+	addr := startPHPServer(t, php, dir)
 
-	url := fmt.Sprintf("http://127.0.0.1:%d/shell.php", port)
+	url := fmt.Sprintf("http://%s/shell.php", addr)
 	client := NewDeepClient(5 * time.Second)
 	alive, note := CheckShellAlive(context.Background(), client, url, payload)
 	if !alive {
@@ -164,18 +149,9 @@ func TestShellV2PHPSelfDeleteRuntime(t *testing.T) {
 	if err := os.WriteFile(shellPath, []byte(payload.Content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	port := freeLocalPort(t)
-	cmd := exec.Command(php, "-S", fmt.Sprintf("127.0.0.1:%d", port), "-t", dir)
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-	})
-	waitTCP(t, fmt.Sprintf("127.0.0.1:%d", port))
+	addr := startPHPServer(t, php, dir)
 
-	url := fmt.Sprintf("http://127.0.0.1:%d/selfdel.php", port)
+	url := fmt.Sprintf("http://%s/selfdel.php", addr)
 	client := NewDeepClient(5 * time.Second)
 	if alive, note := CheckShellAlive(context.Background(), client, url, payload); !alive {
 		t.Fatalf("alive check failed: %s", note)
@@ -217,16 +193,48 @@ func freeLocalPort(t *testing.T) int {
 	return port
 }
 
-func waitTCP(t *testing.T, addr string) {
-	t.Helper()
-	deadline := time.Now().Add(8 * time.Second)
+func waitTCPReady(addr string, wait time.Duration) bool {
+	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
-			return
+			return true
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("php server did not start on %s", addr)
+	return false
+}
+
+// startPHPServer 起一个 php -S 静态服务，返回它监听的地址。端口是「先查后用」的：
+// 并行跑测试时 freeLocalPort 空出来的端口下一秒就可能被别的包占走，php 报地址占用后
+// 直接退出，再等 8 秒只会得到「服务没起来」这条假线索。所以端口撞了就换一个重来。
+func startPHPServer(t *testing.T, php, dir string, extra ...string) string {
+	t.Helper()
+	var logs bytes.Buffer
+	for attempt := 1; ; attempt++ {
+		addr := fmt.Sprintf("127.0.0.1:%d", freeLocalPort(t))
+		cmd := exec.Command(php, append([]string{"-S", addr, "-t", dir}, extra...)...)
+		logs.Reset()
+		cmd.Stdout = &logs
+		cmd.Stderr = &logs
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if waitTCPReady(addr, 5*time.Second) {
+			t.Cleanup(func() {
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+				if t.Failed() {
+					t.Logf("php -S output:\n%s", logs.String())
+				}
+			})
+			return addr
+		}
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		if attempt >= 5 {
+			t.Fatalf("php -S 连着 5 个端口都没起来，最后一次输出：\n%s", logs.String())
+		}
+	}
 }
