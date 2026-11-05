@@ -762,7 +762,7 @@ export const api = {
   // exportFindings 触发发现页导出并下载文件。scope=selected 时传 ids(finding_id 列表);
   // scope=filtered 时传当前筛选(沿用 FindingQuery 的筛选字段);scope=all 忽略筛选。
   exportFindings: async (opts: {
-    format: "docx" | "md-single" | "md-zip" | "html" | "csv" | "json";
+    format: "docx" | "md-single" | "md-zip" | "client-md" | "html" | "csv" | "json";
     scope: "filtered" | "all" | "selected";
     filters?: Omit<FindingQuery, "page" | "pageSize">;
     ids?: string[];
@@ -770,11 +770,13 @@ export const api = {
     consolidated?: boolean;
     /** external = 对外交付版：后端只保留已确认/已修复/已处理/风险接受的条目。 */
     audience?: "internal" | "external";
+    scopeNote?: string;
   }): Promise<{ filename: string; workspacePath: string; excluded: number }> => {
     const p = new URLSearchParams({ format: opts.format, scope: opts.scope });
     p.set("mode", opts.consolidated === false ? "raw" : "consolidated");
     p.set("include_originals", String(opts.includeOriginals ?? false));
     if (opts.audience === "external") p.set("audience", "external");
+    if (opts.scopeNote) p.set("scope_note", opts.scopeNote);
     if (opts.scope === "selected") {
       p.set("ids", (opts.ids ?? []).join(","));
     } else if (opts.scope === "filtered" && opts.filters) {

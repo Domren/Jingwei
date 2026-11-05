@@ -3200,6 +3200,17 @@ export default function DeepIntranetPage() {
                     </ul>
                   </div>
                 ) : null}
+                {(evacuateReport.ledger_external?.length ?? 0) > 0 ? (
+                  <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-2">
+                    <div className="mb-1 font-medium text-amber-700 text-xs dark:text-amber-400">
+                      台账外痕迹（{evacuateReport.ledger_external?.length}）——
+                      可能是目标原有配置，也可能是残留，按内容判断
+                    </div>
+                    <pre className="max-h-48 overflow-auto font-mono text-[11px] whitespace-pre-wrap">
+                      {evacuateReport.ledger_external?.join("\n")}
+                    </pre>
+                  </div>
+                ) : null}
                 {evacuateReport.items.length > 0 ? (
                   <ScrollArea className="max-h-64">
                     <Table>

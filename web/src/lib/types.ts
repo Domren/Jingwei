@@ -2261,6 +2261,8 @@ export interface IntranetEvacuationReport {
   scan: IntranetEvacuationScan;
   items: IntranetEvacuationItem[];
   residual: string[];
+  /** 不在台账内的目标侧痕迹（G1）：可能是原有运维配置，也可能是残留，按内容人工判断。 */
+  ledger_external?: string[];
   summary: string;
 }
 

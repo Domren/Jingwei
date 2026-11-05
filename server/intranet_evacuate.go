@@ -71,7 +71,11 @@ type intranetEvacuationReport struct {
 	Scan       intranetEvacuationScan   `json:"scan"`
 	Items      []intranetEvacuationItem `json:"items"`
 	Residual   []string                 `json:"residual"`
-	Summary    string                   `json:"summary"`
+	// LedgerExternal 是「不在台账内」的目标侧痕迹（G1）：计划任务、服务、
+	// 公钥、近期落地文件里，既不属于本次任务的任何落地物、也没有精卫标记的条目。
+	// 它们可能是目标原有配置，也可能是台账之外的残留——按内容人工判断。
+	LedgerExternal []string `json:"ledger_external,omitempty"`
+	Summary        string   `json:"summary"`
 }
 
 func intranetEvacuationDetail(out intranetExecOutcome) string {
@@ -311,6 +315,10 @@ func (s *Server) intranetEvacuate(ctx context.Context, pg *db.DB, opts intranetE
 		rep.Items = append(rep.Items, item)
 	}
 
+	// 3.5 台账外残留扫描（G1）：必须在关闭会话之前跑，否则目标侧就没人执行了。
+	// dry-run 也跑（只读），让预览阶段就能看到可疑痕迹。
+	s.intranetLedgerExternalScan(ctx, pg, opts.TaskID, rep)
+
 	// 4. 会话：最后关闭；已关闭的会话不再列入 active 查询。
 	sessions, _, serr := pg.ListIntranetSessions(db.IntranetSessionActive, opts.TaskID, 500, 0)
 	if serr != nil {
@@ -362,6 +370,87 @@ func (s *Server) intranetEvacuate(ctx context.Context, pg *db.DB, opts intranetE
 		}
 	}
 	return rep
+}
+
+// intranetLedgerExternalScan 在目标上找「台账之外」的痕迹（G1）。
+//
+// 判定口径：把本次任务的全部落地物（含已撤销的）路径/名称当作排除词，凡是
+// 计划任务、systemd 服务、authorized_keys 或近期落地文件里出现这些路径的，
+// 说明台账知道它的来历；再排除带精卫标记的行。剩下的原样列出来并标注类别，
+// **不判断是不是恶意**——目标原本就有的运维任务与真正的残留长得一样，报告
+// 把事实交给人，处置建议写清楚即可。
+func (s *Server) intranetLedgerExternalScan(ctx context.Context, pg *db.DB, taskID int64, rep *intranetEvacuationReport) {
+	sessions, _, err := pg.ListIntranetSessions("active", taskID, 1, 0)
+	if err != nil || len(sessions) == 0 {
+		rep.LedgerExternal = append(rep.LedgerExternal, "（跳过）没有可用会话，无法检查目标台账外痕迹")
+		return
+	}
+	sess := sessions[0]
+	if os, _ := sess.Metadata["os"].(string); os == intranetOSWindows {
+		rep.LedgerExternal = append(rep.LedgerExternal, "（跳过）Windows 目标的台账外扫描不在本版范围，仅覆盖 POSIX")
+		return
+	}
+	arts, _, err := pg.ListIntranetArtifacts(db.IntranetArtifactFilter{TaskID: taskID, Limit: 200})
+	if err != nil {
+		rep.LedgerExternal = append(rep.LedgerExternal, "（跳过）读取落地物台账失败，无法建立排除词："+err.Error())
+		return
+	}
+	needles := []string{"jingwei", "精卫"}
+	for _, a := range arts {
+		for _, v := range []string{a.Path, a.Name} {
+			v = strings.TrimSpace(v)
+			if len(v) >= 4 {
+				needles = append(needles, strings.ToLower(v))
+			}
+		}
+	}
+	commands := []struct{ label, command string }{
+		{"cron", `(crontab -l 2>/dev/null; ls -la /etc/cron.d /etc/cron.daily 2>/dev/null) | head -120`},
+		{"service", `systemctl list-unit-files --type=service --no-pager 2>/dev/null | head -200`},
+		{"ssh-key", `cat /root/.ssh/authorized_keys "$HOME/.ssh/authorized_keys" 2>/dev/null`},
+		{"recent-file", `find /tmp /var/tmp /dev/shm -maxdepth 2 -type f -mmin -1440 2>/dev/null | head -100`},
+	}
+	added := 0
+	for _, c := range commands {
+		out := s.intranetExec(ctx, pg, sess, c.command, 20*time.Second)
+		for _, line := range ledgerExternalFilter(out.Output, c.label, needles) {
+			rep.LedgerExternal = append(rep.LedgerExternal, line)
+			added++
+			if added >= 40 {
+				rep.LedgerExternal = append(rep.LedgerExternal, "…其余条目已截断（上限 40 条）")
+				return
+			}
+		}
+	}
+	if added == 0 {
+		rep.LedgerExternal = append(rep.LedgerExternal, "未发现台账之外的明显痕迹")
+	}
+}
+
+// ledgerExternalFilter 把一段目标输出过滤成「不在台账内」的行，并加类别前缀。
+// 纯函数：台账排除词由调用方从落地物构造。
+func ledgerExternalFilter(output, label string, needles []string) []string {
+	out := []string{}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimRight(line, "\r")
+		trim := strings.TrimSpace(line)
+		if trim == "" || strings.HasPrefix(trim, "#") {
+			continue
+		}
+		lower := strings.ToLower(trim)
+		accounted := false
+		for _, n := range needles {
+			if n != "" && strings.Contains(lower, n) {
+				accounted = true
+				break
+			}
+		}
+		if accounted {
+			continue
+		}
+		out = append(out, label+": "+trim)
+	}
+	return out
 }
 
 // intranetEvacuateMemshells removes every memory shell tied to the task (by

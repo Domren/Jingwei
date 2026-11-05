@@ -2451,7 +2451,7 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer os.RemoveAll(stage)
-	needsBodies := format == "md-zip" || format == "md-single" || format == "html" || format == "docx"
+	needsBodies := format == "md-zip" || format == "md-single" || format == "client-md" || format == "html" || format == "docx"
 	if err = s.evidenceStore().StageFindingsExport(r.Context(), fs, stage, needsBodies); err != nil {
 		evidenceError(w, err)
 		return
@@ -2507,6 +2507,32 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch format {
+	case "client-md":
+		// H1 客户交付版：确定性模板 + 中英双语标签 + 按资产分组的修复建议 +
+		// 原始报文附录。只含已确认项由报告构造函数再过滤一次。
+		assetNames := map[int64]string{}
+		for id, a := range s.resolveFindingAssets(fs) {
+			if a == nil {
+				continue
+			}
+			switch {
+			case strings.TrimSpace(a.URL) != "":
+				assetNames[id] = a.URL
+			case strings.TrimSpace(a.Domain) != "":
+				assetNames[id] = a.Domain
+			default:
+				assetNames[id] = a.IP
+			}
+		}
+		data := []byte(report.ClientMarkdown(report.ClientReportInput{
+			Findings: fs, Assets: assetNames, GeneratedAt: now,
+			ScopeNote: strings.TrimSpace(q.Get("scope_note")),
+		}))
+		name := "client-report-" + stamp + ".md"
+		setDownload("text/markdown; charset=utf-8", name)
+		rel, saveErr := s.saveWorkspaceExportBytes(name, data)
+		announce(name, rel, saveErr)
+		_, _ = w.Write(data)
 	case "md-single":
 		data := []byte(report.FindingsMarkdown(fs, now))
 		name := "findings-" + stamp + ".md"
