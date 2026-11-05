@@ -478,6 +478,8 @@ MAIL_PW=$(genpw)
 if [ -f "$LABRUN" ]; then
   cat > "$LAB_DIR/u1-mail.sh" <<EOF
 export DEBIAN_FRONTEND=noninteractive
+systemctl is-active dovecot >/dev/null 2>&1 && touch /tmp/jw-cred-lab/dovecot-was-active || true
+systemctl is-active postfix >/dev/null 2>&1 && touch /tmp/jw-cred-lab/postfix-was-active || true
 dpkg -l dovecot-imapd 2>/dev/null | grep -q '^ii' || touch /tmp/jw-cred-lab/dovecot-installed-by-lab
 apt-get install -y -qq dovecot-imapd dovecot-pop3d >/dev/null 2>&1
 id jwcred >/dev/null 2>&1 || useradd -m -s /bin/bash jwcred
@@ -564,6 +566,7 @@ EOF
   LDAP_PW=$(genpw)
   cat > "$LAB_DIR/u1-ldap.sh" <<EOF
 export DEBIAN_FRONTEND=noninteractive
+systemctl is-active slapd >/dev/null 2>&1 && touch /tmp/jw-cred-lab/slapd-was-active || true
 ADMIN_PW='JwLabAdmin2026x'
 if ! dpkg -l slapd 2>/dev/null | grep -q '^ii'; then
   touch /tmp/jw-cred-lab/slapd-installed-by-lab
