@@ -80,6 +80,68 @@ EOF
   rm -f /tmp/jw-cred-lab-zk-down.sh
 fi
 
+# 边界靶机上的邮件 / LDAP / VNC 验证服务
+if [ -f "$LABRUN" ]; then
+  cat > /tmp/jw-cred-lab-mail-down.sh <<'EOF'
+rm -f /etc/dovecot/conf.d/99-jw-cred-lab.conf /etc/dovecot/jw-cred-lab.passwd
+systemctl restart dovecot >/dev/null 2>&1 || service dovecot restart >/dev/null 2>&1 || true
+if [ -f /tmp/jw-cred-lab/main.cf.orig ]; then
+  cp /tmp/jw-cred-lab/main.cf.orig /etc/postfix/main.cf
+  cp /tmp/jw-cred-lab/master.cf.orig /etc/postfix/master.cf
+  rm -f /tmp/jw-cred-lab/main.cf.orig /tmp/jw-cred-lab/master.cf.orig
+fi
+systemctl restart postfix >/dev/null 2>&1 || service postfix restart >/dev/null 2>&1 || true
+if [ -f /tmp/jw-cred-lab/postfix-installed-by-lab ]; then
+  DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq postfix >/dev/null 2>&1 || true
+  rm -f /tmp/jw-cred-lab/postfix-installed-by-lab
+fi
+if [ -f /tmp/jw-cred-lab/dovecot-installed-by-lab ]; then
+  DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq dovecot-imapd dovecot-pop3d >/dev/null 2>&1 || true
+  rm -f /tmp/jw-cred-lab/dovecot-installed-by-lab
+fi
+echo MAIL-DOWN
+EOF
+  bash "$LABRUN" "$LAB_DISTRO" /tmp/jw-cred-lab-mail-down.sh 2>&1 | grep -q MAIL-DOWN \
+    && note "已清理 Ubuntu-1 的 dovecot/postfix 验证配置" || note "Ubuntu-1 的邮件服务清理未完成（靶机没开？）"
+  rm -f /tmp/jw-cred-lab-mail-down.sh
+
+  cat > /tmp/jw-cred-lab-ldap-down.sh <<'EOF'
+ldapdelete -x -H ldap://127.0.0.1:389 -D "cn=admin,dc=lab,dc=local" -w "JwLabAdmin2026x"   "uid=jwcred,ou=people,dc=lab,dc=local" "ou=people,dc=lab,dc=local" >/dev/null 2>&1 || true
+cat > /tmp/ldap-tls-del.ldif <<LDIF
+dn: cn=config
+changetype: modify
+delete: olcTLSCertificateFile
+-
+delete: olcTLSCertificateKeyFile
+LDIF
+ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/ldap-tls-del.ldif >/dev/null 2>&1 || true
+sed -i '/^SLAPD_SERVICES=/d' /etc/default/slapd
+systemctl restart slapd >/dev/null 2>&1 || service slapd restart >/dev/null 2>&1 || true
+if [ -f /tmp/jw-cred-lab/slapd-installed-by-lab ]; then
+  DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq slapd ldap-utils >/dev/null 2>&1 || true
+  rm -f /tmp/jw-cred-lab/slapd-installed-by-lab
+fi
+echo LDAP-DOWN
+EOF
+  bash "$LABRUN" "$LAB_DISTRO" /tmp/jw-cred-lab-ldap-down.sh 2>&1 | grep -q LDAP-DOWN \
+    && note "已清理 Ubuntu-1 的 LDAP 验证条目与 TLS 配置" || note "Ubuntu-1 的 LDAP 清理未完成（靶机没开？）"
+  rm -f /tmp/jw-cred-lab-ldap-down.sh
+
+  cat > /tmp/jw-cred-lab-vnc-down.sh <<'EOF'
+pkill -f "Xtigervnc :1" 2>/dev/null
+rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
+rm -rf /home/jwcred/.vnc
+if [ -f /tmp/jw-cred-lab/tigervnc-installed-by-lab ]; then
+  DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq tigervnc-standalone-server tigervnc-common >/dev/null 2>&1 || true
+  rm -f /tmp/jw-cred-lab/tigervnc-installed-by-lab
+fi
+echo VNC-DOWN
+EOF
+  bash "$LABRUN" "$LAB_DISTRO" /tmp/jw-cred-lab-vnc-down.sh 2>&1 | grep -q VNC-DOWN \
+    && note "已停止 Ubuntu-1 的 TigerVNC 并清理口令文件" || note "Ubuntu-1 的 VNC 清理未完成（靶机没开？）"
+  rm -f /tmp/jw-cred-lab-vnc-down.sh
+fi
+
 # 边界靶机上的专用账号（靶机没开时静默跳过，别把清理失败说成已清理）
 LABRUN=${JW_LAB_RUN:-/root/lab-ubuntu/wslrun.sh}
 LAB_DISTRO=${JW_LAB_DISTRO:-Ubuntu-1}

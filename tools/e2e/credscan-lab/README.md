@@ -20,7 +20,8 @@ JW_CRED_LAB=1 go test ./scanner -run TestCred -count=1          # 引擎单测 +
 tools/e2e/credscan-lab/down.sh                                  # 关服务、恢复系统配置、删临时账号
 ```
 
-`up.sh` 可以反复跑：口令每次**现生成**（同一 (协议, 标签, 主机, 端口) 的条目会被替换而不是追加）并写进 `/tmp/jw-cred-lab/lab.json`（600 权限，不落仓库、
+`up.sh` 可以反复跑：口令每次**现生成**（同一 (协议, 标签, 主机, 端口) 的条目会被替换而不是追加），
+Ubuntu-1 上的软件包只有在本轮新装时才由 `down.sh` 卸载（用 `/tmp/jw-cred-lab/*-installed-by-lab` 标记）并写进 `/tmp/jw-cred-lab/lab.json`（600 权限，不落仓库、
 不打印），检测到上一次遗留的实例时会重启并重新登记，避免「服务在跑但口令已经换了」这种
 假失败（WRONGPASS / Authentication failed 都是这么来的，别把它当成适配器的缺陷）。
 没开 `JW_CRED_LAB=1` 或缺清单文件时测试直接 Skip——所以普通 `go test ./...` 不碰网络。
@@ -46,6 +47,11 @@ tools/e2e/credscan-lab/down.sh                                  # 关服务、�
 | Elasticsearch | 8.15 X-Pack Basic（HTTP 层关 TLS，认证语义不变） | 容器 `jw-cred-es`，127.0.0.1:9200 |
 | Memcached | 文本协议、默认无认证（`version` 有应答即命中空凭据） | 宿主机 11212 |
 | Zookeeper | 四字命令 `ruok` 有应答（3.4 默认放开） | Ubuntu-1:2181 |
+| SMTP | postfix（2525 上的 SASL 入口）+ dovecot auth 套接字；`AUTH PLAIN` 235/535 | Ubuntu-1:2525 |
+| POP3 / IMAP | dovecot + passwd-file（文件必须 root:dovecot 0640） | Ubuntu-1:110 / 143 |
+| POP3-SSL / IMAP-SSL | dovecot 隐式 TLS（安装时自签证书） | Ubuntu-1:995 / 993 |
+| LDAP / LDAPS | slapd + `uid=jwcred,ou=people,dc=lab,dc=local` 简单 bind；LDAPS 用自签证书（`SLAPD_SERVICES` 要含 `ldaps:///`） | Ubuntu-1:389 / 636 |
+| VNC | TigerVNC VncAuth（`-BlacklistThreshold 1000` 关闭验证期间的黑名单） | Ubuntu-1:5901 |
 
 每个用例都断言四件事：`Identify` 在真服务上确认协议**且留下非空 banner**（报告要能说明凭什么）；
 正确凭据落到清单声明的结果态；错误凭据落到 `deny` 并**同样留下证据**；清单里写了 `expect_tls` 的用例，

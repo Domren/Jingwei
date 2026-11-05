@@ -127,8 +127,11 @@ func TestCredLabEmptyCredentialNotHit(t *testing.T) {
 		t.Skip("未开真机验证")
 	}
 	for _, c := range lab.Cases {
-		if c.Protocol == "redis" || c.Protocol == "postgresql" {
-			continue // 这两类的「无认证/trust」就是空口令本身，另有专门用例
+		switch c.Protocol {
+		case "redis", "postgresql", "ldap", "ldaps", "memcached", "zookeeper":
+			// 这几类的「无认证 / trust / 匿名绑定」就是空口令本身的事实，
+			// 另有专门用例；拿空凭据去测它们，本来就该命中。
+			continue
 		}
 		ep := c.endpoint()
 		got := runCredLab(t, ep, []Credential{{}})

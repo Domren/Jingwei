@@ -295,6 +295,9 @@ socks pass {
 }
 EOF
 pkill -f "danted -D -f $SOCKD" 2>/dev/null
+# 与 memcached 同理：pkill 是异步的，立刻起新实例会绑定失败，而 wait_port
+# 会对着还没死透的旧实例返回成功。
+for _ in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ":$P_SOCKS " || break; sleep 0.3; done
 danted -D -f "$SOCKD" >/dev/null 2>&1 &
 echo $! > "$LAB_DIR/danted.pid"
 if wait_port 127.0.0.1 $P_SOCKS 15; then
@@ -429,8 +432,12 @@ s=s.replace('</tomcat-users>','  <user username="jwcred" password="%s" roles="ma
 open(p,'w').write(s)
 PY2
 systemctl restart tomcat9 >/dev/null 2>&1 || service tomcat9 restart >/dev/null 2>&1 || true
-sleep 2
-code=\$(curl -s -o /dev/null -w '%{http_code}' -m 5 -u "jwcred:$TOMCAT_PW" http://127.0.0.1:8081/manager/html)
+code=000
+for i in \$(seq 1 20); do
+  sleep 1
+  code=\$(curl -s -o /dev/null -w '%{http_code}' -m 5 -u "jwcred:$TOMCAT_PW" http://127.0.0.1:8081/manager/html)
+  [ "\$code" = "200" ] && break
+done
 [ "\$code" = "200" ] && echo TOMCAT-OK || echo "TOMCAT-CODE-\$code"
 EOF
   if bash "$LABRUN" "$LAB_DISTRO" "$LAB_DIR/u1-tomcat-user.sh" 2>&1 | grep -q TOMCAT-OK \
@@ -448,8 +455,12 @@ if ! dpkg -l zookeeperd 2>/dev/null | grep -q '^ii' && ! dpkg -l zookeeper 2>/de
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zookeeperd >/dev/null 2>&1 || true
 fi
 systemctl restart zookeeper >/dev/null 2>&1 || service zookeeper restart >/dev/null 2>&1 || true
-sleep 3
-out=\$(printf 'ruok' | timeout 3 nc 127.0.0.1 2181 2>/dev/null)
+out=""
+for i in \$(seq 1 20); do
+  sleep 1
+  out=\$(printf 'ruok' | timeout 3 nc 127.0.0.1 2181 2>/dev/null)
+  [ "\$out" = "imok" ] && break
+done
 [ "\$out" = "imok" ] && echo ZK-OK || echo "ZK-NO-\$out"
 EOF
   if bash "$LABRUN" "$LAB_DISTRO" "$LAB_DIR/u1-zk.sh" 2>&1 | grep -q ZK-OK \
@@ -457,6 +468,189 @@ EOF
     add_case zookeeper "四字命令未设防" 127.0.0.1 2181 "" "" "anyuser/anypass" hit deny
   else
     note "跳过：Ubuntu-1 的 Zookeeper 没起来"
+  fi
+fi
+
+# ── 邮件协议：dovecot（POP3/IMAP + 隐式 TLS）+ postfix（SMTP AUTH）──────────────
+# dovecot 的 passwd-file 由 auth 进程（用户 dovecot）读取，权限必须是 root:dovecot 0640；
+# 0600 root 会让认证返回「临时失败」，表现为口令明明对却 deny。
+MAIL_PW=$(genpw)
+if [ -f "$LABRUN" ]; then
+  cat > "$LAB_DIR/u1-mail.sh" <<EOF
+export DEBIAN_FRONTEND=noninteractive
+dpkg -l dovecot-imapd 2>/dev/null | grep -q '^ii' || touch /tmp/jw-cred-lab/dovecot-installed-by-lab
+apt-get install -y -qq dovecot-imapd dovecot-pop3d >/dev/null 2>&1
+id jwcred >/dev/null 2>&1 || useradd -m -s /bin/bash jwcred
+printf 'jwcred:{PLAIN}%s\n' '$MAIL_PW' > /etc/dovecot/jw-cred-lab.passwd
+chown root:dovecot /etc/dovecot/jw-cred-lab.passwd
+chmod 640 /etc/dovecot/jw-cred-lab.passwd
+cat > /etc/dovecot/conf.d/99-jw-cred-lab.conf <<'CONF'
+disable_plaintext_auth = no
+auth_mechanisms = plain login
+passdb {
+  driver = passwd-file
+  args = /etc/dovecot/jw-cred-lab.passwd
+}
+userdb {
+  driver = passwd
+}
+protocols = imap pop3
+service imap-login {
+  inet_listener imap {
+    port = 143
+  }
+  inet_listener imaps {
+    port = 993
+    ssl = yes
+  }
+}
+service pop3-login {
+  inet_listener pop3 {
+    port = 110
+  }
+  inet_listener pop3s {
+    port = 995
+    ssl = yes
+  }
+}
+service auth {
+  unix_listener /var/spool/postfix/private/auth {
+    mode = 0660
+    user = postfix
+    group = postfix
+  }
+}
+CONF
+systemctl restart dovecot >/dev/null 2>&1 || service dovecot restart >/dev/null 2>&1
+# postfix：只做 2525 上的 SASL 认证入口，验证完恢复配置
+if ! dpkg -l postfix 2>/dev/null | grep -q '^ii'; then
+  touch /tmp/jw-cred-lab/postfix-installed-by-lab
+  echo "postfix postfix/main_mailer_type select Local only" | debconf-set-selections
+  echo "postfix postfix/mailname string lab.local" | debconf-set-selections
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postfix >/dev/null 2>&1 || true
+fi
+[ -f /tmp/jw-cred-lab/main.cf.orig ] || cp /etc/postfix/main.cf /tmp/jw-cred-lab/main.cf.orig
+[ -f /tmp/jw-cred-lab/master.cf.orig ] || cp /etc/postfix/master.cf /tmp/jw-cred-lab/master.cf.orig
+postconf -e "smtpd_sasl_type = dovecot" >/dev/null 2>&1
+postconf -e "smtpd_sasl_path = private/auth" >/dev/null 2>&1
+postconf -e "smtpd_sasl_auth_enable = yes" >/dev/null 2>&1
+postconf -e "smtpd_sasl_security_options = noanonymous" >/dev/null 2>&1
+postconf -e "smtpd_tls_security_level = none" >/dev/null 2>&1
+postconf -e "inet_interfaces = loopback-only" >/dev/null 2>&1
+grep -q '^2525 ' /etc/postfix/master.cf || echo '2525      inet  n       -       y       -       -       smtpd' >> /etc/postfix/master.cf
+systemctl restart postfix >/dev/null 2>&1 || service postfix restart >/dev/null 2>&1
+sleep 2
+ok=0
+for i in \$(seq 1 20); do
+  printf 'EHLO probe\r\nQUIT\r\n' | timeout 3 nc 127.0.0.1 2525 2>/dev/null | grep -q '^220' && { ok=1; break; }
+  sleep 0.5
+done
+[ "\$ok" = "1" ] && echo MAIL-OK || echo MAIL-FAIL
+EOF
+  if bash "$LABRUN" "$LAB_DISTRO" "$LAB_DIR/u1-mail.sh" 2>&1 | grep -q MAIL-OK \
+     && wait_port 127.0.0.1 110 15 && wait_port 127.0.0.1 143 15 \
+     && wait_port 127.0.0.1 993 15 && wait_port 127.0.0.1 995 15 \
+     && wait_port 127.0.0.1 2525 15; then
+    add_case pop3 "dovecot" 127.0.0.1 110 jwcred "$MAIL_PW" "buhaig-$MAIL_PW" hit deny
+    add_case imap "dovecot" 127.0.0.1 143 jwcred "$MAIL_PW" "buhaig-$MAIL_PW" hit deny
+    add_case pop3-ssl "dovecot" 127.0.0.1 995 jwcred "$MAIL_PW" "buhaig-$MAIL_PW" hit deny
+    add_case imap-ssl "dovecot" 127.0.0.1 993 jwcred "$MAIL_PW" "buhaig-$MAIL_PW" hit deny
+    add_case smtp "postfix SASL" 127.0.0.1 2525 jwcred "$MAIL_PW" "buhaig-$MAIL_PW" hit deny
+  else
+    note "跳过：Ubuntu-1 的邮件服务没起来（dovecot/postfix）"
+  fi
+
+  # ── LDAP / LDAPS：slapd + 自签证书 ─────────────────────────────────────────
+  LDAP_PW=$(genpw)
+  cat > "$LAB_DIR/u1-ldap.sh" <<EOF
+export DEBIAN_FRONTEND=noninteractive
+ADMIN_PW='JwLabAdmin2026x'
+if ! dpkg -l slapd 2>/dev/null | grep -q '^ii'; then
+  touch /tmp/jw-cred-lab/slapd-installed-by-lab
+  debconf-set-selections <<SEL
+slapd slapd/internal/generated_adminpw password \$ADMIN_PW
+slapd slapd/password2 password \$ADMIN_PW
+slapd slapd/internal/adminpw password \$ADMIN_PW
+slapd slapd/password1 password \$ADMIN_PW
+slapd slapd/domain string lab.local
+slapd shared/organization string JW Lab
+slapd slapd/backend select MDB
+SEL
+  apt-get install -y -qq slapd ldap-utils >/dev/null 2>&1 || true
+  touch /tmp/jw-cred-lab/slapd-installed-by-lab
+fi
+systemctl restart slapd >/dev/null 2>&1 || service slapd restart >/dev/null 2>&1
+sleep 2
+cat > /tmp/ldap-lab.ldif <<LDIF
+dn: ou=people,dc=lab,dc=local
+objectClass: organizationalUnit
+ou: people
+
+dn: uid=jwcred,ou=people,dc=lab,dc=local
+objectClass: inetOrgPerson
+uid: jwcred
+sn: Lab
+cn: jwcred
+userPassword: $LDAP_PW
+LDIF
+ldapadd -x -H ldap://127.0.0.1:389 -D "cn=admin,dc=lab,dc=local" -w "\$ADMIN_PW" -f /tmp/ldap-lab.ldif >/dev/null 2>&1 || true
+# 每次重跑都重置成新口令（ldapadd 已存在时不会覆盖）
+ldapmodify -x -H ldap://127.0.0.1:389 -D "cn=admin,dc=lab,dc=local" -w "\$ADMIN_PW" >/dev/null 2>&1 <<LDIF
+dn: uid=jwcred,ou=people,dc=lab,dc=local
+changetype: modify
+replace: userPassword
+userPassword: $LDAP_PW
+LDIF
+mkdir -p /etc/ldap/ssl
+[ -f /etc/ldap/ssl/ldap.key ] || openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=127.0.0.1" -keyout /etc/ldap/ssl/ldap.key -out /etc/ldap/ssl/ldap.crt >/dev/null 2>&1
+chown openldap:openldap /etc/ldap/ssl/ldap.* 2>/dev/null || true
+chmod 640 /etc/ldap/ssl/ldap.key
+cat > /tmp/ldap-tls.ldif <<LDIF
+dn: cn=config
+changetype: modify
+replace: olcTLSCertificateFile
+olcTLSCertificateFile: /etc/ldap/ssl/ldap.crt
+-
+replace: olcTLSCertificateKeyFile
+olcTLSCertificateKeyFile: /etc/ldap/ssl/ldap.key
+LDIF
+ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/ldap-tls.ldif >/dev/null 2>&1 || true
+grep -q '^SLAPD_SERVICES=.*ldaps:///' /etc/default/slapd || printf '\nSLAPD_SERVICES="ldap:/// ldaps:/// ldapi:///"\n' >> /etc/default/slapd
+systemctl restart slapd >/dev/null 2>&1 || service slapd restart >/dev/null 2>&1
+sleep 2
+echo LDAP-DONE
+EOF
+  if bash "$LABRUN" "$LAB_DISTRO" "$LAB_DIR/u1-ldap.sh" 2>&1 | grep -q LDAP-DONE \
+     && wait_port 127.0.0.1 389 15 && wait_port 127.0.0.1 636 15; then
+    DN="uid=jwcred,ou=people,dc=lab,dc=local"
+    add_case ldap "slapd" 127.0.0.1 389 "$DN" "$LDAP_PW" "buhaig-$LDAP_PW" hit deny
+    add_case ldaps "slapd + 自签证书" 127.0.0.1 636 "$DN" "$LDAP_PW" "buhaig-$LDAP_PW" hit deny
+  else
+    note "跳过：Ubuntu-1 的 slapd 没起来（389/636）"
+  fi
+
+  # ── VNC：TigerVNC 的 VncAuth（DES 挑战应答）───────────────────────────────
+  VNC_PW=$(genpw 8)
+  cat > "$LAB_DIR/u1-vnc.sh" <<EOF
+export DEBIAN_FRONTEND=noninteractive
+dpkg -l tigervnc-standalone-server 2>/dev/null | grep -q '^ii' || touch /tmp/jw-cred-lab/tigervnc-installed-by-lab
+apt-get install -y -qq tigervnc-standalone-server tigervnc-common >/dev/null 2>&1 || true
+id jwcred >/dev/null 2>&1 || useradd -m -s /bin/bash jwcred
+mkdir -p /home/jwcred/.vnc
+printf '%s\n' '$VNC_PW' | vncpasswd -f > /home/jwcred/.vnc/passwd
+chmod 600 /home/jwcred/.vnc/passwd
+chown -R jwcred:jwcred /home/jwcred/.vnc
+pkill -f "Xtigervnc :1" 2>/dev/null; sleep 1
+rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
+su - jwcred -c "nohup /usr/bin/Xtigervnc :1 -geometry 800x600 -localhost -SecurityTypes VncAuth -rfbauth /home/jwcred/.vnc/passwd -AlwaysShared -BlacklistThreshold 1000 -BlacklistTimeout 0 >/tmp/xtigervnc.log 2>&1 &"
+sleep 3
+ss -ltn | grep -q ':5901 ' && echo VNC-OK || echo VNC-FAIL
+EOF
+  if bash "$LABRUN" "$LAB_DISTRO" "$LAB_DIR/u1-vnc.sh" 2>&1 | grep -q VNC-OK \
+     && wait_port 127.0.0.1 5901 10; then
+    add_case vnc "tigervnc VncAuth" 127.0.0.1 5901 "" "$VNC_PW" "buhaig-$VNC_PW" hit deny
+  else
+    note "跳过：Ubuntu-1 的 TigerVNC 没起来（Xtigervnc 在 WSL 的 WDDM 下可能启动失败）"
   fi
 fi
 

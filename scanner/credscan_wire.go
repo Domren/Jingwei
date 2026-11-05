@@ -73,14 +73,24 @@ func (w *credWire) close() { _ = w.conn.Close() }
 // 上限用来防一个一直吐字节的对端把内存吃掉。读到的字节同样进证据——SSH 的认证结论
 // 只有这一段是明文，漏记它就等于「拒绝」这一行没有任何可复现的东西。
 func (w *credWire) readLine(max int) ([]byte, error) {
+	return w.readLineWithin(max, credFirstReadWait)
+}
+
+// readLineWithin 与 readLine 相同，但可以指定首字节的耐心。邮件服务的 SASL
+// 认证往往要经过一个外部 auth 进程，第一字节可能比 banner 慢得多——拿 banner 的
+// 6 秒去等 AUTH 应答，会把「慢」判成「不回话」。
+func (w *credWire) readLineWithin(max int, wait time.Duration) ([]byte, error) {
 	if max <= 0 {
 		max = 512
+	}
+	if wait <= 0 {
+		wait = credFirstReadWait
 	}
 	out := make([]byte, 0, 64)
 	one := make([]byte, 1)
 	defer func() { w.recordRead(out) }()
 	for len(out) < max {
-		_ = w.conn.SetReadDeadline(w.readDeadline(credFirstReadWait))
+		_ = w.conn.SetReadDeadline(w.readDeadline(wait))
 		n, err := w.conn.Read(one)
 		if n > 0 {
 			out = append(out, one[0])
