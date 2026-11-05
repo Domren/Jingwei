@@ -211,6 +211,18 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 	if reason, blocked := scanTargetBlockReason(rules, targets); blocked {
 		return "failed", "failed", "目标命中资产拦截规则，已拒绝扫描：" + reason, summary
 	}
+	// 资产禁令之外还要过客户授权清单（F4）：这一层此前只挂在 agent 工具与内网执行上，
+	// 从漏扫页建的任务绕过它（见 guard_targets.go）。
+	gURLs, gHosts, gerr := guardProbeTargets(targets)
+	if gerr != nil {
+		return "failed", "failed", gerr.Error(), summary
+	}
+	if deny, warn := guardCheckTargets(r.s.targetPolicy(), gURLs, gHosts); deny != "" {
+		r.logf("guard", "目标被平台拒绝，未发起扫描：%s", deny)
+		return "failed", "failed", "目标被平台拒绝，未发起扫描：" + deny, summary
+	} else if warn != "" {
+		r.logf("guard", "%s", warn)
+	}
 	if proxy := strings.TrimSpace(r.task.Proxy); proxy != "" {
 		normalized, err := scanner.NormalizeProxyURL(proxy)
 		if err != nil {
@@ -1643,6 +1655,17 @@ func (s *Server) createScanTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if ipEstimate > 256 {
 		writeErr(w, 400, "目标展开后最多 256 个 IP，请缩小 CIDR 或减少目标")
+		return
+	}
+	// 客户授权清单在创建阶段就拒（与弱口令检测一致）：拒绝原因要点名是哪条授权不管用，
+	// 让人去补授权，而不是建一个跑一半失败的任务。
+	gURLs, gHosts, gerr := guardProbeTargets(targets)
+	if gerr != nil {
+		writeErr(w, 400, gerr.Error())
+		return
+	}
+	if deny, _ := guardCheckTargets(s.targetPolicy(), gURLs, gHosts); deny != "" {
+		writeErr(w, 400, "目标被平台拒绝，未创建任务："+deny)
 		return
 	}
 	mode := strings.ToLower(strings.TrimSpace(req.Mode))

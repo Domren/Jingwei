@@ -150,6 +150,17 @@ func (r *credRun) execute() (status, errMsg string, summary map[string]any) {
 	if err != nil {
 		return fail("没有可测端点：%v", err)
 	}
+	// 建任务与真正开跑之间，客户授权清单可能已经变了（到期、被删、目标挪出范围）。
+	// 认证包一旦发出去就收不回来，所以执行前再问一次，拒绝就一个包都不发。
+	urls, hosts, gerr := guardProbeTargets(targets)
+	if gerr != nil {
+		return fail("%v", gerr)
+	}
+	if deny, warn := guardCheckTargets(r.s.targetPolicy(), urls, hosts); deny != "" {
+		return fail("目标被平台拒绝，未发起任何连接：%s", deny)
+	} else if warn != "" {
+		_ = r.pg.AppendCredTaskLog(r.task.ID, "告警："+warn)
+	}
 	creds, dictProfile, err := r.loadDictionary()
 	if err != nil {
 		return fail("%v", err)
@@ -671,6 +682,18 @@ func (s *Server) createCredTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	// 目标策略：弱口令检测会主动发认证包，打错地方不只是越界，还会把别人家的账号打进锁定。
+	// 这道闸原先只挂在 agent 工具与内网执行上，从界面建的任务完全绕过（见 guard_targets.go）。
+	urls, hosts, err := guardProbeTargets(parsed)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	deny, warn := guardCheckTargets(s.targetPolicy(), urls, hosts)
+	if deny != "" {
+		writeErr(w, 400, "目标被平台拒绝，未发起任何连接："+deny)
+		return
+	}
 
 	task, err := pg.CreateCredTask(db.CredTaskInput{
 		Name: req.Name, Targets: targets, Protocols: req.Protocols,
@@ -679,6 +702,9 @@ func (s *Server) createCredTask(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
+	}
+	if warn != "" {
+		_ = pg.AppendCredTaskLog(task.ID, "告警："+warn)
 	}
 	if s.credMgr != nil {
 		s.credMgr.wakeup()

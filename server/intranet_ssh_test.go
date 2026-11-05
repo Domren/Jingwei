@@ -745,6 +745,22 @@ func TestIntranetHeartbeatSkipsBusySession(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	// 「脚本已被 shell 收到」不等于「那一轮已经持住会话锁」。机器忙的时候心跳会
+	// 抢在持锁之前跑完，于是测到的是探测失败而不是跳过——用例在负载下就是红在这里。
+	// 挂起的命令跑满 3 秒，等锁就位是快的；等不到就是前提不成立，直说。
+	busy := false
+	for time.Now().Before(deadline) {
+		mu := intranetTurnLock(sess.ID)
+		if !mu.TryLock() {
+			busy = true
+			break
+		}
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !busy {
+		t.Fatal("没等到「上一条命令仍在执行」的锁位，用例前提不成立")
+	}
 
 	alive, out, _ := s.intranetHeartbeatCheck(context.Background(), pg, sess, false)
 	if alive {

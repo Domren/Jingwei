@@ -22,6 +22,10 @@ const (
 	maxWeakPassTargets    = 8
 	weakPassPerURLSeconds = 90
 	weakPassDelayMS       = 50
+	// weakPassMinScore 是兜底候选的门槛：路径或标题得真的带登录/后台特征。
+	// 0 分条目一并收下，在纯前端站上等于把同一份 HTML 壳的每个路由都当成登录页
+	// （实测 8 个候选），对真实目标就是无依据地反复发认证尝试——那是账号锁定的来源。
+	weakPassMinScore = 50
 )
 
 // weakPassCandidate is one login-page URL offered to the weak credential check.
@@ -32,8 +36,10 @@ type weakPassCandidate struct {
 
 // weakPassCandidates ranks web services and app-layer systems by how much they
 // look like a login page: an explicit login path first, then a login-titled
-// page, then admin consoles, then everything else. The ranking keeps the run
-// bounded: a scan only spends its budget on the most promising pages.
+// page, then admin consoles. Bare service roots stay in the list regardless of
+// score (a login form often sits on "/" and WebCrack skips pages with no form),
+// but nothing else below the threshold does — a scan only spends its budget on
+// pages with an actual reason to be login entries.
 func weakPassCandidates(services []scanner.WebService, apps []scanner.AppSystem) []weakPassCandidate {
 	seen := map[string]bool{}
 	out := []weakPassCandidate{}
@@ -45,12 +51,16 @@ func weakPassCandidates(services []scanner.WebService, apps []scanner.AppSystem)
 		seen[rawURL] = true
 		out = append(out, weakPassCandidate{URL: rawURL, Score: weakPassScore(path, title)})
 	}
+	roots := map[string]bool{}
 	for _, svc := range services {
 		p := ""
 		if u, err := url.Parse(svc.URL); err == nil {
 			p = u.Path
 		}
 		add(svc.URL, p, svc.Title)
+		if p == "" || p == "/" {
+			roots[strings.TrimSpace(svc.URL)] = true
+		}
 	}
 	for _, app := range apps {
 		add(app.URL, app.Path, app.Title)
@@ -61,10 +71,37 @@ func weakPassCandidates(services []scanner.WebService, apps []scanner.AppSystem)
 		}
 		return len(out[i].URL) < len(out[j].URL)
 	})
-	if len(out) > maxWeakPassTargets {
-		out = out[:maxWeakPassTargets]
+	// 门槛之外的只留服务根地址：登录表单常直接挂在 / 上，而 WebCrack 认不出表单会自己跳过，
+	// 保留它不会凭空发认证包；丢掉它则会在「登录页就是根路径」的站上漏测。
+	kept := make([]weakPassCandidate, 0, len(out))
+	for _, c := range out {
+		if c.Score >= weakPassMinScore || roots[c.URL] {
+			kept = append(kept, c)
+		}
 	}
-	return out
+	if len(kept) > maxWeakPassTargets {
+		kept = kept[:maxWeakPassTargets]
+	}
+	return kept
+}
+
+// weakPassBasis 把候选按依据归类，只用于日志：操作员得能看出这些 URL 凭什么算登录页。
+// 过滤之后分数为 0 的只可能是服务根地址（其余都要求带登录/后台特征）。
+func weakPassBasis(candidates []weakPassCandidate) string {
+	var form, name, admin, root int
+	for _, c := range candidates {
+		switch {
+		case c.Score >= 100:
+			form++
+		case c.Score >= 80:
+			name++
+		case c.Score >= weakPassMinScore:
+			admin++
+		default:
+			root++
+		}
+	}
+	return fmt.Sprintf("登录表单或登录路径 %d · 登录标题 %d · 后台路径/标题 %d · 服务根 %d", form, name, admin, root)
 }
 
 func weakPassScore(path, title string) int {
@@ -112,7 +149,13 @@ func (r *scanRun) runWeakPassBaseline(services []scanner.WebService, apps []scan
 			if parsed, err := url.Parse(u); err == nil {
 				p = parsed.Path
 			}
-			forms = append(forms, weakPassCandidate{URL: u, Score: weakPassScore(p, "")})
+			// 表单是抓下来亲眼见过的，比任何名字启发式都可信，直接进最高档；
+			// 同档内仍按路径像不像登录页排序。
+			score := weakPassScore(p, "")
+			if score < 100 {
+				score = 100
+			}
+			forms = append(forms, weakPassCandidate{URL: u, Score: score})
 		}
 		sort.SliceStable(forms, func(i, j int) bool { return forms[i].Score > forms[j].Score })
 		if len(forms) > maxWeakPassTargets {
@@ -123,6 +166,7 @@ func (r *scanRun) runWeakPassBaseline(services []scanner.WebService, apps []scan
 	}
 	summary["weak_pass_targets"] = len(candidates)
 	if len(candidates) == 0 {
+		r.logf("weakpass", "没有登录入口候选：没抓到登录表单，也没有带登录/后台特征的路径或服务根，跳过 Web 弱口令基线")
 		return 0
 	}
 	if !scanner.WebCrackAvailable() {
@@ -133,7 +177,8 @@ func (r *scanRun) runWeakPassBaseline(services []scanner.WebService, apps []scan
 	for _, c := range candidates {
 		urls = append(urls, c.URL)
 	}
-	r.logf("weakpass", "固定基线：对 %d 个登录页候选执行 Web 弱口令/万能密码检测（每个最多 %ds）", len(urls), weakPassPerURLSeconds)
+	r.logf("weakpass", "固定基线：对 %d 个登录页候选执行 Web 弱口令/万能密码检测（依据：%s；每个最多 %ds）",
+		len(urls), weakPassBasis(candidates), weakPassPerURLSeconds)
 	r.setProgress("weakpass", map[string]any{"targets": len(urls)})
 
 	run := scanner.RunWebCrack(r.ctx, scanner.WebCrackOptions{

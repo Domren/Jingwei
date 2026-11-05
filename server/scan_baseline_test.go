@@ -32,12 +32,20 @@ func TestWeakPassCandidatesRanksAndCaps(t *testing.T) {
 	services := []scanner.WebService{
 		{URL: "http://10.0.0.1:80/", Title: "Welcome"},
 	}
-	apps := make([]scanner.AppSystem, 0, maxWeakPassTargets+4)
+	apps := make([]scanner.AppSystem, 0, maxWeakPassTargets+6)
+	// 一堆不像登录页的子系统：旧口径会把它们塞满候选位，新口径一个都不收。
 	for i := 0; i < maxWeakPassTargets+3; i++ {
 		apps = append(apps, scanner.AppSystem{
 			URL:   "http://10.0.0.1:80/docs" + string(rune('a'+i)),
 			Path:  "/docs" + string(rune('a'+i)),
 			Title: "Docs",
+		})
+	}
+	for i := 0; i < 8; i++ { // 与 login/admin/根 合计超过上限，逼出截断
+		apps = append(apps, scanner.AppSystem{
+			URL:   "http://10.0.0.1:80/signin" + string(rune('a'+i)),
+			Path:  "/signin" + string(rune('a'+i)),
+			Title: "登录",
 		})
 	}
 	apps = append(apps,
@@ -49,17 +57,18 @@ func TestWeakPassCandidatesRanksAndCaps(t *testing.T) {
 
 	got := weakPassCandidates(services, apps)
 	if len(got) != maxWeakPassTargets {
-		t.Fatalf("candidate count: %d want %d", len(got), maxWeakPassTargets)
+		t.Fatalf("candidate count: %d want %d（%+v）", len(got), maxWeakPassTargets, got)
+	}
+	for _, c := range got {
+		if strings.Contains(c.URL, "/docs") {
+			t.Fatalf("低分页面不该进兜底候选：%+v", got)
+		}
+		if c.Score < weakPassMinScore && c.URL != "http://10.0.0.1:80/" {
+			t.Fatalf("除服务根外不该有低于门槛的候选：%+v", got)
+		}
 	}
 	if got[0].URL != "http://10.0.0.1:80/login" || got[0].Score != 100 {
 		t.Fatalf("first candidate should be the login page: %+v", got[0])
-	}
-	// /admin (score 60) must outrank the score-10 docs pages, even though it
-	// was appended after them.
-	for i, c := range got {
-		if c.URL == "http://10.0.0.1:80/admin" && i > 1 {
-			t.Fatalf("admin console ranked too low at %d: %+v", i, got)
-		}
 	}
 	seen := map[string]bool{}
 	for _, c := range got {
@@ -68,11 +77,31 @@ func TestWeakPassCandidatesRanksAndCaps(t *testing.T) {
 		}
 		seen[c.URL] = true
 	}
-	// scores must be non-increasing
 	for i := 1; i < len(got); i++ {
 		if got[i].Score > got[i-1].Score {
 			t.Fatalf("candidates not sorted by score: %+v", got)
 		}
+	}
+	if got[0].Score < weakPassMinScore {
+		t.Fatalf("截断后首位不该是低分候选：%+v", got[0])
+	}
+}
+
+// 纯前端站：每个路由都返回同一份 HTML 壳，路径名也各不相同。旧口径交出
+// maxWeakPassTargets 个「登录页候选」，等于对着一堆同一份页面反复发认证尝试。
+func TestWeakPassCandidatesSkipsUnrelatedPages(t *testing.T) {
+	services := []scanner.WebService{{URL: "http://10.0.0.1:3006/", Title: "Jingwei"}}
+	apps := []scanner.AppSystem{
+		{URL: "http://10.0.0.1:3006/home", Path: "/home", Title: "首页"},
+		{URL: "http://10.0.0.1:3006/function/scans", Path: "/function/scans", Title: "自动化漏扫"},
+		{URL: "http://10.0.0.1:3006/help", Path: "/help", Title: "通知设置"},
+	}
+	got := weakPassCandidates(services, apps)
+	if len(got) != 1 || got[0].URL != "http://10.0.0.1:3006/" {
+		t.Fatalf("SPA 上只该留下服务根一个候选，得到：%+v", got)
+	}
+	if basis := weakPassBasis(got); !strings.Contains(basis, "服务根 1") {
+		t.Fatalf("依据统计没体现服务根：%q", basis)
 	}
 }
 
