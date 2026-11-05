@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,7 +15,7 @@ func TestWorkerControlRoutes(t *testing.T) {
 	defer m.Close()
 
 	td := t.TempDir()
-	s := New(context.Background(), m, td, td, td)
+	s := newTestServer(t, m, td, td, td)
 	h := s.Handler()
 	token, err := testAuthToken(t, s)
 	if err != nil {

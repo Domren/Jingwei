@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -21,7 +20,7 @@ func TestTaskTemplateHTTPCRUD(t *testing.T) {
 	}
 	// 关闭必须晚于所有 t.Cleanup（LIFO 中它最先注册 → 最后执行），否则夹具删除会打到已关闭的连接池上静默失败。
 	t.Cleanup(func() { _ = m.Close() })
-	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
+	s := newTestServer(t, m, t.TempDir(), t.TempDir(), t.TempDir())
 	h := s.Handler()
 	token, err := testAuthToken(t, s)
 	if err != nil {
@@ -92,7 +91,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 	}
 	// 关闭必须晚于所有 t.Cleanup（LIFO 中它最先注册 → 最后执行），否则夹具删除会打到已关闭的连接池上静默失败。
 	t.Cleanup(func() { _ = m.Close() })
-	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
+	s := newTestServer(t, m, t.TempDir(), t.TempDir(), t.TempDir())
 	conversation, err := m.pg.CreateConversation("mainagent", "pin through http", nil)
 	if err != nil {
 		t.Fatal(err)

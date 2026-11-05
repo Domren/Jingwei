@@ -49,10 +49,11 @@ func newNotifyFixture(t *testing.T) *notifyFixture {
 	// （防 SSRF 打到同机服务与云元数据）。测试显式打开这个开关；
 	// 守卫「默认拒绝」的行为由 notify 包的 ssrf_test.go 覆盖。
 	t.Setenv(notify.AllowLocalTargetsEnv, "1")
-	// 投递循环必须关掉：step() 会遍历所有启用渠道，和本用例逐渠道调用的
-	// stepRealtime/stepDigest 抢同一批投递行。抢输的一侧一条都发不出去，
-	// 于是断言变成「看机器心情」——串行跑时这条用例就是这么红的。
-	t.Setenv(notifyLoopDisableEnv, "1")
+	// 本装置假设「这个进程里只有我在投递」：Notifier.Run 的 step() 会遍历库里所有
+	// 启用渠道并领走到期投递。任何用 New(context.Background(), …) 造的 Server 都把
+	// 那个循环带进整个测试进程，它会抢走本用例刚分派出的投递行，失败长这样：
+	// 「假接收端没有收到任何请求」——红不红取决于前面跑过哪些用例。Server 因此
+	// 一律用 newTestServer 造（ctx 随用例取消）。
 	s, _, request := trafficEvidenceServer(t)
 	pg := s.m.pg
 

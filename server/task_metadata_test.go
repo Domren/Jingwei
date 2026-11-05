@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -24,7 +23,7 @@ func TestTaskMetadataPatchReturnsRenameAndPin(t *testing.T) {
 	}
 	taskID, _ := strconv.ParseInt(task.ID, 10, 64)
 	defer purgeTaskNow(t, m.pg, taskID)
-	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
+	s := newTestServer(t, m, t.TempDir(), t.TempDir(), t.TempDir())
 	token, err := testAuthToken(t, s)
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +65,7 @@ func TestConversationBatchDeleteReportsMissing(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
 	defer m.Close()
-	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
+	s := newTestServer(t, m, t.TempDir(), t.TempDir(), t.TempDir())
 	first, err := m.pg.CreateConversation("mainagent", "batch-http-first", nil)
 	if err != nil {
 		t.Fatal(err)

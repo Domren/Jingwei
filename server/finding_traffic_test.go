@@ -20,6 +20,19 @@ import (
 	"github.com/Autumn-27/jingwei/traffic"
 )
 
+// newTestServer 造一个只活到用例结束的 Server（参数次序与 New 一致）。
+//
+// New 会起通知投递循环、证据 GC、任务归档 worker 等后台协程，它们都跟着 ctx 结束。
+// 直接传 context.Background() 等于让这些协程活到整个测试进程退出：通知循环每个 tick
+// 遍历库里**所有**启用渠道并领走到期投递，于是会抢走别的作用例刚分派出来的投递行，
+// 失败表现为「假接收端一条都没收到」，而红不红取决于前面跑过哪些用例、机器快不快。
+func newTestServer(t *testing.T, m *Manager, skillDir, dataDir, keyDir string) *Server {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return New(ctx, m, skillDir, dataDir, keyDir)
+}
+
 func trafficEvidenceServer(t *testing.T) (*Server, *db.RecordedFinding, func(string, string, string) *httptest.ResponseRecorder) {
 	t.Helper()
 	m, err := NewManager(t.TempDir(), "")

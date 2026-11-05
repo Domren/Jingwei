@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -53,7 +52,7 @@ func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
+	s := newTestServer(t, m, t.TempDir(), t.TempDir(), t.TempDir())
 	token, err := testAuthToken(t, s)
 	if err != nil {
 		t.Fatal(err)

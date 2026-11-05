@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"os"
 	"strings"
 	"testing"
@@ -22,7 +21,7 @@ func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
 	// delete would fail against a closed DB, leaving its fixtures in the schema.
 	t.Cleanup(func() { _ = m.Close() })
 	td := t.TempDir()
-	s := New(context.Background(), m, td, td, td)
+	s := newTestServer(t, m, td, td, td)
 
 	// The "nothing configured" branch needs an empty llm_profiles, but on a shared
 	// dev database that table holds the operator's live credentials — wiping it to
@@ -79,7 +78,7 @@ func TestResolveChatAgentHonoursConversationProfile(t *testing.T) {
 	// the pool only after that delete has run.
 	t.Cleanup(func() { _ = m.Close() })
 	td := t.TempDir()
-	s := New(context.Background(), m, td, td, td)
+	s := newTestServer(t, m, td, td, td)
 
 	// Force the global fallback to nil so a non-nil result can ONLY come from the
 	// conversation's own profile — this is exactly the situation the user hit
