@@ -52,7 +52,12 @@ type AppDiscoverOptions struct {
 	// MaxCandidates caps probes per service (dictionary + enumerated entries).
 	MaxCandidates int
 	// MaxJSFiles caps same-origin scripts fetched for route extraction.
-	MaxJSFiles  int
+	MaxJSFiles int
+	// URLDeep 开启 JS/URL 提取的「深入」模式：在单层（种子页 + 其 JS）之上，
+	// 再跟进页面链接一层，用于把 API 清单摸全。默认关闭——每多一层就是成倍的请求。
+	URLDeep bool
+	// URLMaxDepth 是深入模式的最大层级（含种子页），<=0 用 2。
+	URLMaxDepth int
 	Concurrency int
 	Timeout     time.Duration
 	Proxy       string
@@ -350,7 +355,31 @@ func appEnumerateEntries(ctx context.Context, prober *Prober, base string, svc W
 				for _, m := range reJSRouteString.FindAllStringSubmatch(string(jr.body), -1) {
 					add(strings.Trim(m[0], "\"'`"), "js")
 				}
+				// C2：更完整的 URL/接口提取（绝对 URL、查询串、模板插值归一化），
+				// 与上面那条保守的旧正则并存——旧正则负责高置信度路径，新提取器
+				// 负责把接口清单摸全，两者都会经过 add() 去重。
+				for _, it := range ExtractURLsFromText(string(jr.body), u, "js", 2, true) {
+					add(it.Path, "urlfinder")
+				}
 			}
+		}
+	}
+	// 深入模式：跟进页面链接一层，把「首页 → 子页」里才出现的接口也收进来。
+	// 预算故意小（8 页）：这是发现阶段的补充，不是目录爆破。
+	if opts.URLDeep {
+		items := FindURLs(ctx, base, URLFinderOptions{
+			Deep: true, MaxDepth: opts.URLMaxDepth, MaxPages: 8, MaxJSFiles: 8, SameHost: true,
+			Fetch: func(_ context.Context, raw string) (int, []byte, error) {
+				r := appRawFetch(ctx, prober, raw, svc.IP)
+				if r == nil {
+					return 0, nil, fmt.Errorf("fetch failed")
+				}
+				return r.status, r.body, nil
+			},
+			Logf: opts.Logf,
+		})
+		for _, it := range items {
+			add(it.Path, "urlfinder-deep")
 		}
 	}
 	return out, root

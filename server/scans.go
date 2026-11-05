@@ -256,6 +256,11 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 	if len(appSystems) > 0 {
 		summary["app_systems_linked"] = appLinked
 	}
+	// C1：目录枚举只在全量模式下跑（默认字典 + 少量扩展名，预算 90s/服务），
+	// 结果按「目录/文件」行写进 scan_task_results，每行带请求与响应字节。
+	if n := r.runDirEnum(res.Services); n > 0 {
+		summary["dir_entries"] = n
+	}
 
 	// 固定基线：Web 登录弱口令。放在 POC 匹配之前，模板命中与否都要跑。
 	weakFound := r.runWeakPassBaseline(res.Services, appSystems, assets, summary)
@@ -888,6 +893,7 @@ func (r *scanRun) runAppDiscovery(res *scanner.DiscoverResult, assets *scanAsset
 	systems, err := scanner.AppDiscover(r.ctx, services, scanner.AppDiscoverOptions{
 		MaxCandidates: 240,
 		MaxJSFiles:    20,
+		URLDeep:       r.task.Mode == "full",
 		Concurrency:   8,
 		Timeout:       8 * time.Second,
 		Proxy:         r.task.Proxy,
@@ -951,6 +957,61 @@ func (r *scanRun) runAppDiscovery(res *scanner.DiscoverResult, assets *scanAsset
 		r.logf("app", "应用层发现完成：子路径系统 %d 个（入库 %d 个）", len(systems), linked)
 	}
 	return systems, linked
+}
+
+// runDirEnum 在 Web 服务上做一轮有预算的目录枚举。只跑前 5 个服务：
+// 这是入口发现，不是全站爆破；全量模式也不该被一个字典拖成几小时。
+func (r *scanRun) runDirEnum(services []scanner.WebService) int {
+	if r.task.Mode != "full" || len(services) == 0 {
+		return 0
+	}
+	limit := len(services)
+	if limit > 5 {
+		limit = 5
+	}
+	r.setProgress("dir", map[string]any{"services": limit})
+	total := 0
+	for _, svc := range services[:limit] {
+		if r.ctx.Err() != nil {
+			break
+		}
+		entries, err := scanner.DirFuzz(r.ctx, svc.URL, scanner.DirFuzzOptions{
+			Extensions:  []string{"php", "bak", "zip", "txt"},
+			Concurrency: 10,
+			RateLimit:   20,
+			Budget:      90 * time.Second,
+			MaxRequests: 800,
+			Proxy:       r.task.Proxy,
+			Logf:        func(format string, args ...any) { r.logf("dir", format, args...) },
+		})
+		if err != nil {
+			r.logf("dir", "%s 目录枚举失败：%v", svc.URL, err)
+			continue
+		}
+		for _, e := range entries {
+			if _, err := r.pg.AddScanTaskResult(r.task.ID, 0, db.ScanTaskResult{
+				TemplateID: "dir-enum:" + e.Source,
+				Name:       "目录/文件：" + e.Path,
+				Severity:   "info",
+				Host:       svc.Host,
+				MatchedAt:  e.URL,
+				Type:       "dir",
+				Extracted:  []string{fmt.Sprintf("%d / %d bytes", e.Status, e.Length)},
+				Raw: map[string]any{
+					"status": e.Status, "length": e.Length, "location": e.Location,
+					"request": string(e.Request), "response": string(e.Response),
+				},
+			}); err != nil {
+				r.logf("dir", "保存目录枚举结果失败 %s: %v", e.URL, err)
+				continue
+			}
+			total++
+		}
+	}
+	if total > 0 {
+		r.logf("dir", "目录枚举完成：%d 条有效入口（写入扫描结果）", total)
+	}
+	return total
 }
 
 func appSourceLabel(source string) string {
