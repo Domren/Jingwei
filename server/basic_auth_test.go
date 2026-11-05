@@ -405,19 +405,42 @@ func TestBasicAuthExpiredCookieAndSecureFlag(t *testing.T) {
 	}
 }
 
+// 跨源通道现在默认关闭，只有 JINGWEI_DEV_CORS=1（本机 next dev 那套）才对回环来源放行。
+// 预检本身始终 204 且不落到 handler 上；放不放行只看响应头。
 func TestBasicAuthCORS(t *testing.T) {
+	preflight := func(t *testing.T, origin string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest("OPTIONS", "http://127.0.0.1:8787/api/settings/basic-auth", nil)
+		r.Header.Set("Origin", origin)
+		w := httptest.NewRecorder()
+		cors(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("preflight reached handler") })).ServeHTTP(w, r)
+		if w.Code != 204 {
+			t.Fatalf("preflight %s: %d", origin, w.Code)
+		}
+		return w
+	}
+
+	// 默认：连回环来源也不放行。
+	if w := preflight(t, "http://127.0.0.1:3000"); w.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("默认不该放行任何跨源：%v", w.Header())
+	}
+
+	t.Setenv("JINGWEI_DEV_CORS", "1")
 	for _, tc := range []struct {
 		origin      string
 		credentials bool
 	}{
 		{"http://127.0.0.1:3000", true}, {"https://evil.test", false}, {"http://127.0.0.1.evil.test:3000", false},
 	} {
-		r := httptest.NewRequest("OPTIONS", "http://127.0.0.1:8787/api/settings/basic-auth", nil)
-		r.Header.Set("Origin", tc.origin)
-		w := httptest.NewRecorder()
-		cors(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("preflight reached handler") })).ServeHTTP(w, r)
-		if w.Code != 204 || (w.Header().Get("Access-Control-Allow-Credentials") == "true") != tc.credentials {
+		w := preflight(t, tc.origin)
+		if (w.Header().Get("Access-Control-Allow-Credentials") == "true") != tc.credentials {
 			t.Fatalf("unexpected CORS for %s: %v", tc.origin, w.Header())
+		}
+		if tc.credentials && w.Header().Get("Access-Control-Allow-Origin") != tc.origin {
+			t.Fatalf("回环来源应被回显：%v", w.Header())
+		}
+		if !tc.credentials && w.Header().Get("Access-Control-Allow-Origin") != "" {
+			t.Fatalf("非回环来源不该拿到 ACAO：%v", w.Header())
 		}
 	}
 }

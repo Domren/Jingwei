@@ -4577,24 +4577,26 @@ func (s *Server) gc(w http.ResponseWriter, r *http.Request) {
 
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		// Next dev and the Go SSE endpoint use different ports on the same
-		// loopback host. Allow the gate cookie only for that local pairing.
+		// 默认不向任何来源发跨源许可。管理 API 的读接口能拿到漏洞、凭据、内网会话，
+		// 一旦对任意站点开口子，同机或同网段上的一个恶意页面就能借用户的会话读数据。
+		// 唯一的历史场景是「本机跑 next dev、前端在另一个端口」——那需要显式
+		// JINGWEI_DEV_CORS=1 打开，而且只对回环来源回许可。
 		origin := r.Header.Get("Origin")
 		u, err := url.Parse(origin)
 		host, _, hostErr := net.SplitHostPort(r.Host)
 		if hostErr != nil {
 			host = r.Host
 		}
-		if err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() == host &&
+		devCORS := strings.TrimSpace(os.Getenv("JINGWEI_DEV_CORS")) == "1"
+		if devCORS && err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() == host &&
 			(host == "localhost" || host == "127.0.0.1" || host == "::1") {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Add("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+			w.Header().Set("Access-Control-Expose-Headers", "Content-Disposition, X-Workspace-Path")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		}
-		w.Header().Add("Vary", "Origin")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Expose-Headers", "Content-Disposition, X-Workspace-Path")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(204)
 			return
