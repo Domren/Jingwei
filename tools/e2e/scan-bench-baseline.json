@@ -1,0 +1,759 @@
+{
+  "cells": {
+    "n1000-t1-c10": {
+      "median_seconds": 1.474610342993401,
+      "samples": [
+        {
+          "request_count": 1000,
+          "returncode": 0,
+          "seconds": 1.4727375589718577,
+          "unique_pairs": 1000,
+          "validated": true
+        },
+        {
+          "request_count": 1000,
+          "returncode": 0,
+          "seconds": 1.474610342993401,
+          "unique_pairs": 1000,
+          "validated": true
+        },
+        {
+          "request_count": 1000,
+          "returncode": 0,
+          "seconds": 1.4786115430179052,
+          "unique_pairs": 1000,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 10,
+        "rate": 500,
+        "targets": 1,
+        "templates": 1000
+      }
+    },
+    "n1000-t1-c20": {
+      "median_seconds": 1.4751724930247292,
+      "samples": [
+        {
+          "request_count": 1000,
+          "returncode": 0,
+          "seconds": 1.496013871015748,
+          "unique_pairs": 1000,
+          "validated": true
+        },
+        {
+          "request_count": 1000,
+          "returncode": 0,
+          "seconds": 1.4741286239877809,
+          "unique_pairs": 1000,
+          "validated": true
+        },
+        {
+          "request_count": 1000,
+          "returncode": 0,
+          "seconds": 1.4751724930247292,
+          "unique_pairs": 1000,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 20,
+        "rate": 500,
+        "targets": 1,
+        "templates": 1000
+      }
+    },
+    "n1000-t1-c50": {
+      "median_seconds": 1.48190570101724,
+      "samples": [
+        {
+          "request_count": 1000,
+          "returncode": 0,
+          "seconds": 1.4330404519860167,
+          "unique_pairs": 1000,
+          "validated": true
+        },
+        {
+          "request_count": 1000,
+          "returncode": 0,
+          "seconds": 1.48190570101724,
+          "unique_pairs": 1000,
+          "validated": true
+        },
+        {
+          "request_count": 1000,
+          "returncode": 0,
+          "seconds": 2.032695992005756,
+          "unique_pairs": 1000,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 50,
+        "rate": 500,
+        "targets": 1,
+        "templates": 1000
+      }
+    },
+    "n1000-t4-c10": {
+      "median_seconds": 7.543811573996209,
+      "samples": [
+        {
+          "request_count": 4000,
+          "returncode": 0,
+          "seconds": 7.543811573996209,
+          "unique_pairs": 4000,
+          "validated": true
+        },
+        {
+          "request_count": 4000,
+          "returncode": 0,
+          "seconds": 7.5340839920099825,
+          "unique_pairs": 4000,
+          "validated": true
+        },
+        {
+          "request_count": 4000,
+          "returncode": 0,
+          "seconds": 8.183541013975628,
+          "unique_pairs": 4000,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 10,
+        "rate": 500,
+        "targets": 4,
+        "templates": 1000
+      }
+    },
+    "n1000-t4-c20": {
+      "median_seconds": 7.4977363029902335,
+      "samples": [
+        {
+          "request_count": 4000,
+          "returncode": 0,
+          "seconds": 7.4977363029902335,
+          "unique_pairs": 4000,
+          "validated": true
+        },
+        {
+          "request_count": 4000,
+          "returncode": 0,
+          "seconds": 7.493993768992368,
+          "unique_pairs": 4000,
+          "validated": true
+        },
+        {
+          "request_count": 4000,
+          "returncode": 0,
+          "seconds": 7.543269604997477,
+          "unique_pairs": 4000,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 20,
+        "rate": 500,
+        "targets": 4,
+        "templates": 1000
+      }
+    },
+    "n1000-t4-c50": {
+      "median_seconds": 7.505292276997352,
+      "samples": [
+        {
+          "request_count": 4000,
+          "returncode": 0,
+          "seconds": 7.467955047992291,
+          "unique_pairs": 4000,
+          "validated": true
+        },
+        {
+          "request_count": 4000,
+          "returncode": 0,
+          "seconds": 7.505292276997352,
+          "unique_pairs": 4000,
+          "validated": true
+        },
+        {
+          "request_count": 4000,
+          "returncode": 0,
+          "seconds": 7.531104284978937,
+          "unique_pairs": 4000,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 50,
+        "rate": 500,
+        "targets": 4,
+        "templates": 1000
+      }
+    },
+    "n200-t1-c10": {
+      "median_seconds": 0.27996865700697526,
+      "samples": [
+        {
+          "request_count": 200,
+          "returncode": 0,
+          "seconds": 0.3411246619943995,
+          "unique_pairs": 200,
+          "validated": true
+        },
+        {
+          "request_count": 200,
+          "returncode": 0,
+          "seconds": 0.27996865700697526,
+          "unique_pairs": 200,
+          "validated": true
+        },
+        {
+          "request_count": 200,
+          "returncode": 0,
+          "seconds": 0.264785346982535,
+          "unique_pairs": 200,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 10,
+        "rate": 500,
+        "targets": 1,
+        "templates": 200
+      }
+    },
+    "n200-t1-c20": {
+      "median_seconds": 0.2714848759933375,
+      "samples": [
+        {
+          "request_count": 200,
+          "returncode": 0,
+          "seconds": 0.3155487480107695,
+          "unique_pairs": 200,
+          "validated": true
+        },
+        {
+          "request_count": 200,
+          "returncode": 0,
+          "seconds": 0.2714848759933375,
+          "unique_pairs": 200,
+          "validated": true
+        },
+        {
+          "request_count": 200,
+          "returncode": 0,
+          "seconds": 0.26550033802050166,
+          "unique_pairs": 200,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 20,
+        "rate": 500,
+        "targets": 1,
+        "templates": 200
+      }
+    },
+    "n200-t1-c50": {
+      "median_seconds": 0.2648593299963977,
+      "samples": [
+        {
+          "request_count": 200,
+          "returncode": 0,
+          "seconds": 0.2647364909935277,
+          "unique_pairs": 200,
+          "validated": true
+        },
+        {
+          "request_count": 200,
+          "returncode": 0,
+          "seconds": 0.31553261398221366,
+          "unique_pairs": 200,
+          "validated": true
+        },
+        {
+          "request_count": 200,
+          "returncode": 0,
+          "seconds": 0.2648593299963977,
+          "unique_pairs": 200,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 50,
+        "rate": 500,
+        "targets": 1,
+        "templates": 200
+      }
+    },
+    "n200-t4-c10": {
+      "median_seconds": 1.3456874739786144,
+      "samples": [
+        {
+          "request_count": 800,
+          "returncode": 0,
+          "seconds": 1.3456874739786144,
+          "unique_pairs": 800,
+          "validated": true
+        },
+        {
+          "request_count": 800,
+          "returncode": 0,
+          "seconds": 1.3557541649788618,
+          "unique_pairs": 800,
+          "validated": true
+        },
+        {
+          "request_count": 800,
+          "returncode": 0,
+          "seconds": 1.3451632049982436,
+          "unique_pairs": 800,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 10,
+        "rate": 500,
+        "targets": 4,
+        "templates": 200
+      }
+    },
+    "n200-t4-c20": {
+      "median_seconds": 1.3765498569991905,
+      "samples": [
+        {
+          "request_count": 800,
+          "returncode": 0,
+          "seconds": 1.3509069959982298,
+          "unique_pairs": 800,
+          "validated": true
+        },
+        {
+          "request_count": 800,
+          "returncode": 0,
+          "seconds": 1.3765498569991905,
+          "unique_pairs": 800,
+          "validated": true
+        },
+        {
+          "request_count": 800,
+          "returncode": 0,
+          "seconds": 1.377731312008109,
+          "unique_pairs": 800,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 20,
+        "rate": 500,
+        "targets": 4,
+        "templates": 200
+      }
+    },
+    "n200-t4-c50": {
+      "median_seconds": 1.346844579995377,
+      "samples": [
+        {
+          "request_count": 800,
+          "returncode": 0,
+          "seconds": 1.346844579995377,
+          "unique_pairs": 800,
+          "validated": true
+        },
+        {
+          "request_count": 800,
+          "returncode": 0,
+          "seconds": 1.3505456960119773,
+          "unique_pairs": 800,
+          "validated": true
+        },
+        {
+          "request_count": 800,
+          "returncode": 0,
+          "seconds": 1.332236043002922,
+          "unique_pairs": 800,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 50,
+        "rate": 500,
+        "targets": 4,
+        "templates": 200
+      }
+    },
+    "n3000-t1-c10": {
+      "median_seconds": 5.524179872008972,
+      "samples": [
+        {
+          "request_count": 3000,
+          "returncode": 0,
+          "seconds": 5.471450693003135,
+          "unique_pairs": 3000,
+          "validated": true
+        },
+        {
+          "request_count": 3000,
+          "returncode": 0,
+          "seconds": 5.524179872008972,
+          "unique_pairs": 3000,
+          "validated": true
+        },
+        {
+          "request_count": 3000,
+          "returncode": 0,
+          "seconds": 5.546463676000712,
+          "unique_pairs": 3000,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 10,
+        "rate": 500,
+        "targets": 1,
+        "templates": 3000
+      }
+    },
+    "n3000-t1-c20": {
+      "median_seconds": 5.453448568005115,
+      "samples": [
+        {
+          "request_count": 3000,
+          "returncode": 0,
+          "seconds": 5.4710121100069955,
+          "unique_pairs": 3000,
+          "validated": true
+        },
+        {
+          "request_count": 3000,
+          "returncode": 0,
+          "seconds": 5.451348911999958,
+          "unique_pairs": 3000,
+          "validated": true
+        },
+        {
+          "request_count": 3000,
+          "returncode": 0,
+          "seconds": 5.453448568005115,
+          "unique_pairs": 3000,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 20,
+        "rate": 500,
+        "targets": 1,
+        "templates": 3000
+      }
+    },
+    "n3000-t1-c50": {
+      "median_seconds": 5.48004469301668,
+      "samples": [
+        {
+          "request_count": 3000,
+          "returncode": 0,
+          "seconds": 5.473152902995935,
+          "unique_pairs": 3000,
+          "validated": true
+        },
+        {
+          "request_count": 3000,
+          "returncode": 0,
+          "seconds": 5.48004469301668,
+          "unique_pairs": 3000,
+          "validated": true
+        },
+        {
+          "request_count": 3000,
+          "returncode": 0,
+          "seconds": 5.556881527008954,
+          "unique_pairs": 3000,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 50,
+        "rate": 500,
+        "targets": 1,
+        "templates": 3000
+      }
+    },
+    "n3000-t4-c10": {
+      "median_seconds": 24.251656169013586,
+      "samples": [
+        {
+          "request_count": 12000,
+          "returncode": 0,
+          "seconds": 24.251656169013586,
+          "unique_pairs": 12000,
+          "validated": true
+        },
+        {
+          "request_count": 12000,
+          "returncode": 0,
+          "seconds": 23.498040410981048,
+          "unique_pairs": 12000,
+          "validated": true
+        },
+        {
+          "request_count": 12000,
+          "returncode": 0,
+          "seconds": 24.261610335001023,
+          "unique_pairs": 12000,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 10,
+        "rate": 500,
+        "targets": 4,
+        "templates": 3000
+      }
+    },
+    "n3000-t4-c20": {
+      "median_seconds": 23.61390427002334,
+      "samples": [
+        {
+          "request_count": 12000,
+          "returncode": 0,
+          "seconds": 23.616927472990938,
+          "unique_pairs": 12000,
+          "validated": true
+        },
+        {
+          "request_count": 12000,
+          "returncode": 0,
+          "seconds": 23.551634143979754,
+          "unique_pairs": 12000,
+          "validated": true
+        },
+        {
+          "request_count": 12000,
+          "returncode": 0,
+          "seconds": 23.61390427002334,
+          "unique_pairs": 12000,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 20,
+        "rate": 500,
+        "targets": 4,
+        "templates": 3000
+      }
+    },
+    "n3000-t4-c50": {
+      "median_seconds": 23.494821559026605,
+      "samples": [
+        {
+          "request_count": 12000,
+          "returncode": 0,
+          "seconds": 23.494821559026605,
+          "unique_pairs": 12000,
+          "validated": true
+        },
+        {
+          "request_count": 12000,
+          "returncode": 0,
+          "seconds": 23.484353892999934,
+          "unique_pairs": 12000,
+          "validated": true
+        },
+        {
+          "request_count": 12000,
+          "returncode": 0,
+          "seconds": 23.596519115002593,
+          "unique_pairs": 12000,
+          "validated": true
+        }
+      ],
+      "workload": {
+        "concurrency": 50,
+        "rate": 500,
+        "targets": 4,
+        "templates": 3000
+      }
+    }
+  },
+  "created_at": "2026-11-06T01:26:49.538405+00:00",
+  "metadata": {
+    "flags": [
+      "-silent",
+      "-no-color",
+      "-jsonl",
+      "-omit-raw",
+      "-omit-template",
+      "-disable-clustering",
+      "-disable-update-check",
+      "-no-interactsh",
+      "-disable-redirects",
+      "-retries",
+      "0",
+      "-timeout",
+      "5",
+      "-no-httpx",
+      "-no-stdin",
+      "-bulk-size",
+      "4",
+      "-scan-strategy",
+      "template-spray",
+      "-rate-limit",
+      "500",
+      "-auth=false",
+      "-dashboard=false",
+      "-cloud-upload=false",
+      "-config",
+      "{private_config}",
+      "-templates",
+      "{templates}",
+      "-list",
+      "{targets}",
+      "-concurrency",
+      "{concurrency}"
+    ],
+    "hardware": {
+      "architecture": "x86_64",
+      "cpu_models": [
+        "Intel(R) Core(TM) Ultra 5 125H"
+      ],
+      "host_logical_cpus": 18,
+      "kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "limits": {
+        "cpus": 2,
+        "memory_bytes": 1073741824,
+        "pids": 128
+      }
+    },
+    "harness_sha256": "4db5f2940d7e27686463984e92d86aedc1f5422cb417121e6dbabb4c659c8586",
+    "image_id": "sha256:085ce1402517870db6a6652e8a6187e735120737fc9c9c0eca119e2bf6f2ecbc",
+    "nuclei": {
+      "sha256": "c49588140f357cbdddd5436dec11201953a4c5390faeec90777f9ee2cfd70251",
+      "version": "v3.11.1"
+    },
+    "python_version": "3.12.15",
+    "workload": {
+      "cell_timeout_seconds": 120,
+      "connection": "close",
+      "fixture_threads": 32,
+      "fixture_version": 2,
+      "http_version": "1.0",
+      "matrix": [
+        {
+          "concurrency": 10,
+          "rate": 500,
+          "targets": 1,
+          "templates": 200
+        },
+        {
+          "concurrency": 20,
+          "rate": 500,
+          "targets": 1,
+          "templates": 200
+        },
+        {
+          "concurrency": 50,
+          "rate": 500,
+          "targets": 1,
+          "templates": 200
+        },
+        {
+          "concurrency": 10,
+          "rate": 500,
+          "targets": 4,
+          "templates": 200
+        },
+        {
+          "concurrency": 20,
+          "rate": 500,
+          "targets": 4,
+          "templates": 200
+        },
+        {
+          "concurrency": 50,
+          "rate": 500,
+          "targets": 4,
+          "templates": 200
+        },
+        {
+          "concurrency": 10,
+          "rate": 500,
+          "targets": 1,
+          "templates": 1000
+        },
+        {
+          "concurrency": 20,
+          "rate": 500,
+          "targets": 1,
+          "templates": 1000
+        },
+        {
+          "concurrency": 50,
+          "rate": 500,
+          "targets": 1,
+          "templates": 1000
+        },
+        {
+          "concurrency": 10,
+          "rate": 500,
+          "targets": 4,
+          "templates": 1000
+        },
+        {
+          "concurrency": 20,
+          "rate": 500,
+          "targets": 4,
+          "templates": 1000
+        },
+        {
+          "concurrency": 50,
+          "rate": 500,
+          "targets": 4,
+          "templates": 1000
+        },
+        {
+          "concurrency": 10,
+          "rate": 500,
+          "targets": 1,
+          "templates": 3000
+        },
+        {
+          "concurrency": 20,
+          "rate": 500,
+          "targets": 1,
+          "templates": 3000
+        },
+        {
+          "concurrency": 50,
+          "rate": 500,
+          "targets": 1,
+          "templates": 3000
+        },
+        {
+          "concurrency": 10,
+          "rate": 500,
+          "targets": 4,
+          "templates": 3000
+        },
+        {
+          "concurrency": 20,
+          "rate": 500,
+          "targets": 4,
+          "templates": 3000
+        },
+        {
+          "concurrency": 50,
+          "rate": 500,
+          "targets": 4,
+          "templates": 3000
+        }
+      ],
+      "samples": 3,
+      "suite_timeout_seconds": 1200,
+      "timing": "monotonic end-to-end nuclei process; fresh HOME per sample; no warmup"
+    },
+    "workload_sha256": "aabd303d944d0b2079ffa2372f9c2dfb4f0aa3945a1e48c141ec85feeb8d65cd"
+  },
+  "schema_version": 2
+}
