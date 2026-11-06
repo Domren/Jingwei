@@ -143,6 +143,7 @@ func (s *Server) createAuthorization(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	s.invalidateGuardAuthorizations()
 	writeJSON(w, 200, authz)
 }
 
@@ -165,5 +166,6 @@ func (s *Server) deleteAuthorization(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "授权不存在")
 		return
 	}
+	s.invalidateGuardAuthorizations()
 	writeJSON(w, 200, map[string]any{"deleted": true})
 }

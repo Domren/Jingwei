@@ -19,6 +19,14 @@ import (
 // let two test binaries write the same tables and deadlock each other. The lock
 // stays on one pinned connection because a session-level advisory lock returns
 // to PostgreSQL with the session it was taken on.
+//
+// The isolated schema is only half of the isolation: more than half of this
+// package builds its server through NewManager, which resolves the DSN from the
+// environment and would otherwise land in `public`, sharing tables with the db
+// and agent suites — including four `DELETE FROM authorizations` cleanups that
+// would wipe rows another suite is asserting on. JINGWEI_PG_DSN is therefore
+// re-exported pinned to the same schema, so both construction paths land on
+// jingwei_test_server and the suite lock covers every write this package does.
 func TestMain(m *testing.M) {
 	dsn, _, err := db.DSN()
 	if err != nil {
@@ -30,6 +38,17 @@ func TestMain(m *testing.M) {
 		// isolated schema and without the lock means sharing tables with db/agent —
 		// the deadlock this lock exists to keep apart.
 		fmt.Fprintf(os.Stderr, "server suite: 打不开隔离 schema，拒绝在共享表上跑：%v\n", err)
+		os.Exit(1)
+	}
+	pinned, err := db.SchemaDSN(dsn, "jingwei_test_server")
+	if err != nil {
+		_ = pg.Close()
+		fmt.Fprintf(os.Stderr, "server suite: 拼不出隔离 schema 的 DSN，拒绝让 NewManager 系用例写共享表：%v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Setenv("JINGWEI_PG_DSN", pinned); err != nil {
+		_ = pg.Close()
+		fmt.Fprintf(os.Stderr, "server suite: 无法把 DSN 指到隔离 schema：%v\n", err)
 		os.Exit(1)
 	}
 	conn, err := pg.Conn(context.Background())

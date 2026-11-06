@@ -5,13 +5,18 @@ import (
 	"time"
 )
 
+// authorizationTestSchema 隔离本用例的授权夹具。10.0.0.0/8 一类的宽范围一旦落在共享
+// schema 里，别的包判断「这个目标在不在授权范围内」就会读到它——该拒的目标被放行了，
+// 而两边的日志都「没错」。密封值与弱口令的用例同理各占一个 schema。
+const authorizationTestSchema = "jingwei_authorization_test"
+
 // TestAuthorizationRoundTrip 钉住授权清单的存储层本身。
 //
 // 为什么单独写：F4 原先只有「匹配语义」的单测（纯函数），一次都没真的往库里写过，
 // 于是两个只有走数据库才会暴露的错误一路活到了浏览器验证阶段——LIMIT 的占位符没传参、
 // 数组列读不回来。纯函数测得再多，也不等于这个功能能跑。
 func TestAuthorizationRoundTrip(t *testing.T) {
-	d, err := Open(testDSN(t))
+	d, err := OpenTestSchema(testDSN(t), authorizationTestSchema)
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}

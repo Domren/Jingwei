@@ -156,7 +156,7 @@ func (r *credRun) execute() (status, errMsg string, summary map[string]any) {
 	if gerr != nil {
 		return fail("%v", gerr)
 	}
-	if deny, warn := guardCheckTargets(r.s.targetPolicy(), urls, hosts); deny != "" {
+	if deny, warn := guardCheckTargets(r.s.admissionPolicy(), urls, hosts); deny != "" {
 		return fail("目标被平台拒绝，未发起任何连接：%s", deny)
 	} else if warn != "" {
 		_ = r.pg.AppendCredTaskLog(r.task.ID, "告警："+warn)
@@ -689,7 +689,7 @@ func (s *Server) createCredTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	deny, warn := guardCheckTargets(s.targetPolicy(), urls, hosts)
+	deny, warn := guardCheckTargets(s.admissionPolicy(), urls, hosts)
 	if deny != "" {
 		writeErr(w, 400, "目标被平台拒绝，未发起任何连接："+deny)
 		return

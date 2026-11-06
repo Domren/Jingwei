@@ -55,7 +55,37 @@ func TestWithSearchPathKeepsBothDSNDialectsParsable(t *testing.T) {
 		t.Fatalf("合并后的 options = %q", got)
 	}
 
-	if _, err := withSearchPath("host=h options=-cfoo=1", schema); err == nil {
-		t.Fatal("libpq DSN 已有 options 时必须拒绝，否则会写出两个 options 参数")
+	libpqMerged, err := withSearchPath("host=h options=-cfoo=1", schema)
+	if err != nil {
+		t.Fatalf("libpq DSN 已有 options 时应当合并，不该拒绝: %v", err)
+	}
+	if libpqMerged != "host=h options=-cfoo=1 -csearch_path="+schema {
+		t.Fatalf("libpq DSN 合并结果 = %q", libpqMerged)
+	}
+	if n := strings.Count(libpqMerged, "options="); n != 1 {
+		t.Fatalf("libpq DSN 出现了 %d 个 options 参数：%q", n, libpqMerged)
+	}
+
+	// Re-pinning is the shape a suite hits when TestMain pins JINGWEI_PG_DSN and a
+	// per-test helper pins the same DSN again: the old search_path must be dropped,
+	// not appended after, or the last one silently wins for some spellings and the
+	// helper reads a schema nobody created.
+	for _, dsn := range []string{
+		"host=h options=-csearch_path=other_schema",
+		"host=h options='-c quoted'", // 带引号的值改不动，必须拒绝而不是拼坏
+	} {
+		got, err := withSearchPath(dsn, schema)
+		if strings.Contains(dsn, "'") {
+			if err == nil {
+				t.Fatalf("带引号的 options 值应当拒绝改写，得到 %q", got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("重写 search_path: %v", err)
+		}
+		if got != "host=h options=-csearch_path="+schema {
+			t.Fatalf("重写后的 DSN 还留着旧 schema：%q", got)
+		}
 	}
 }

@@ -73,29 +73,44 @@ func guardProbeTargets(targets []scanner.Target) (urls, hosts []string, err erro
 	return urls, hosts, nil
 }
 
-// targetPolicy 取进程级目标策略。没有策略源（未接数据库的构造路径）时返回 nil，
-// 调用方据此放行——与 guard 自己的「没有策略就没有这一层」保持一致。
-func (s *Server) targetPolicy() guard.TargetPolicy {
+// admissionPolicy 取准入检查用的目标策略：现场新建，不用进程级那个。
+//
+// 进程级策略把授权清单缓存 30 秒，图的是高频目标检查不必每条都查库。准入检查恰好是
+// 缓存最不该出现的地方：它低频，却总发生在「授权清单刚刚改过」的那一刻——补完授权就
+// 点新建、改完范围就重跑任务。更危险的是空清单也会被缓存：平台刚起来还没有任何授权时
+// 按老语义放行过一次，随后操作员补上授权，接下来 30 秒内对着范围外主机照样不拦，
+// 而认证包一旦发出去就收不回来。没有数据库时仍退回进程级策略（可能为 nil），
+// 保持「没有策略就没有这一层」的老语义。
+func (s *Server) admissionPolicy() guard.TargetPolicy {
 	if s == nil || s.m == nil {
 		return nil
+	}
+	if s.m.pg != nil {
+		return newGuardTargetPolicy(s.m.pg)
 	}
 	return s.m.guardPolicy
 }
 
+// invalidateGuardAuthorizations 让进程级目标策略立刻重读授权清单。
+//
+// 准入检查（创建任务、执行前复核）本来就是现场新建策略源，不看这份缓存；这里管的是
+// 另一批消费者——agent 工具与资产禁令那几路共用进程级策略，它们要等 30 秒才看见
+// 操作员刚补的授权。
+func (s *Server) invalidateGuardAuthorizations() {
+	if s == nil || s.m == nil {
+		return
+	}
+	if pol, ok := s.m.guardPolicy.(*guardTargetPolicy); ok {
+		pol.invalidateAuthorizations()
+	}
+}
+
 // guardInputTargets 把用户输入的目标摊开、过一遍平台策略。创建任务与续扫准入共用
 // 同一段判断，两条路径给出不同的准入条件就等于没有准入条件。
-//
-// 这里现场新建一个策略源，不用进程级那个：它的授权清单有 30 秒缓存，而「刚补完授权
-// 就点新建/续扫」是最常见的动作，低频的准入检查不值得为缓存冒误拒的险。没有数据库时
-// 仍退回进程级策略（可能为 nil），保持「没有策略就没有这一层」的老语义。
 func (s *Server) guardInputTargets(targets []scanner.Target) (deny, warn string) {
 	urls, hosts, err := guardProbeTargets(targets)
 	if err != nil {
 		return err.Error(), ""
 	}
-	pol := s.targetPolicy()
-	if s != nil && s.m != nil && s.m.pg != nil {
-		pol = newGuardTargetPolicy(s.m.pg)
-	}
-	return guardCheckTargets(pol, urls, hosts)
+	return guardCheckTargets(s.admissionPolicy(), urls, hosts)
 }

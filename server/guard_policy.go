@@ -218,6 +218,17 @@ func (p *guardTargetPolicy) activeAuthorizations() ([]*pgdb.Authorization, error
 	return list, nil
 }
 
+// invalidateAuthorizations 丢掉这份缓存，下一次检查重读库。
+//
+// 缓存连「一条授权都没有」这个结果一起缓存，而平台刚起来时那正是常态：操作员补完第一条
+// 授权，进程级策略还要拿着空的清单最多 30 秒——这段时间里对着范围外主机的认证包照发不误，
+// 发出去的包收不回。写入只发生在授权的建/删两处，所以改完就作废，比让读侧猜缓存新旧靠谱。
+func (p *guardTargetPolicy) invalidateAuthorizations() {
+	p.authzMu.Lock()
+	p.authz, p.authzAt = nil, time.Time{}
+	p.authzMu.Unlock()
+}
+
 // scopeRules converts task_scope rows into host-matchable rules. ICP/keyword
 // rows carry no host constraint and are deliberately skipped; company rows are
 // expanded to the company's assets (cached).

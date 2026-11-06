@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -137,13 +138,17 @@ func TestScanCreateRejectsTargetOutsideAuthorization(t *testing.T) {
 
 // 授权可能在任务入队之后才加、才改、才到期，所以执行器自己还要再问一次。
 // 这里直接跑执行器：拒绝必须发生在任何连接之前，结果行一条都不该有。
+//
+// 目标用 TEST-NET 地址，不用 10.0.0.1：这道断言一旦失效，用例就会真的朝那台主机发
+// 认证包——10.0.0.1 在很多环境里是活的网关，而认证包能把别人的账号打进锁定且收不回。
+// 失败的用例不该顺手变成一次越界攻击。
 func TestCredRunRefusesDeniedTargetBeforeAnyPacket(t *testing.T) {
 	s, _ := newCredTestServer(t)
 	pg := s.m.pg
 	defer func() { _, _ = pg.Exec(`DELETE FROM authorizations`) }()
 
 	task, err := pg.CreateCredTask(db.CredTaskInput{
-		Name: "先建后加授权", Targets: []string{"10.0.0.1:22"}, Protocols: []string{"ssh"},
+		Name: "先建后加授权", Targets: []string{"192.0.2.20:22"}, Protocols: []string{"ssh"},
 		DictProfile: "builtin",
 	})
 	if err != nil {
@@ -151,6 +156,12 @@ func TestCredRunRefusesDeniedTargetBeforeAnyPacket(t *testing.T) {
 	}
 	restore := settingGuardMode(t, pg, "strict")
 	defer restore()
+	// 引信：先让进程级策略查一次授权清单，把「平台上还没有任何授权」这份结果缓存住
+	// （它缓存 30 秒）。执行期检查一旦退回那个共享策略，下面补的授权就看不见，
+	// 越界目标会被放行——先建后加授权这条路看着通过了，其实只是缓存恰好是冷的。
+	if deny, _ := guardCheckTargets(s.m.guardPolicy, nil, []string{"203.0.113.10"}); deny != "" {
+		t.Fatalf("预热用的授权内目标不该被拒：%s", deny)
+	}
 	if _, err := pg.CreateAuthorization(db.AuthorizationInput{
 		Name: "统一测试-执行期", Targets: []string{"203.0.113.0/24"}, Enabled: true,
 	}); err != nil {
@@ -189,6 +200,49 @@ func TestGuardProbeTargetsExpandsCIDR(t *testing.T) {
 	}
 	if len(urls) == 0 || !strings.Contains(urls[0], "shop.example.com") {
 		t.Fatalf("URL 目标应作为 url 交出去，得到 %v", urls)
+	}
+}
+
+// 进程级策略缓存授权清单 30 秒。补授权的人下一步就是重跑任务，删授权的人下一步就是
+// 确认「这台机器现在应该被拦住」——两边都不该等缓存过期。这里两头都钉：
+// 建完授权，原本因为没有授权而放行的目标必须立刻被拒；删掉授权，必须立刻回到放行。
+func TestGuardAuthorizationWriteInvalidatesCache(t *testing.T) {
+	s, _ := newCredTestServer(t)
+	pg := s.m.pg
+	defer func() { _, _ = pg.Exec(`DELETE FROM authorizations`) }()
+	restore := settingGuardMode(t, pg, "strict")
+	defer restore()
+
+	// 引信：先把「平台上还没有任何授权」这份结果缓存住。
+	if deny, _ := guardCheckTargets(s.m.guardPolicy, nil, []string{"192.0.2.10"}); deny != "" {
+		t.Fatalf("没有任何授权时按老语义放行，得到 %q", deny)
+	}
+
+	rec := credPost(t, s.createAuthorization, map[string]any{
+		"name": "统一测试-写入即生效", "targets": []string{"203.0.113.0/24"}, "enabled": true,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("建授权失败：%d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if deny, _ := guardCheckTargets(s.m.guardPolicy, nil, []string{"192.0.2.10"}); deny == "" {
+		t.Fatal("新登记的授权没被执行：范围外目标仍被放行（缓存里那份空清单没作废）")
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/authorizations/1", nil)
+	req.SetPathValue("id", strconv.FormatInt(created.ID, 10))
+	del := httptest.NewRecorder()
+	s.deleteAuthorization(del, req)
+	if del.Code != http.StatusOK {
+		t.Fatalf("删授权失败：%d %s", del.Code, del.Body.String())
+	}
+	if deny, _ := guardCheckTargets(s.m.guardPolicy, nil, []string{"192.0.2.10"}); deny != "" {
+		t.Fatalf("授权已删除，仍按旧清单拦人：%s", deny)
 	}
 }
 
