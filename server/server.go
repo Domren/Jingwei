@@ -46,6 +46,7 @@ type Server struct {
 	ctx         context.Context
 	scanMgr     *scanManager
 	credMgr     *credManager
+	subMgr      *subdomainManager
 	deepMgr     *deepManager
 	resourceMgr *resourceManager
 	// tunnels 记着「哪条隧道上现在有几个重任务在跑」，是 F6 并发预算的占用表。
@@ -317,6 +318,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		s.scanMgr.start(ctx)
 		s.credMgr = newCredManager(s)
 		s.credMgr.start(ctx)
+		s.subMgr = newSubdomainManager(s)
+		s.subMgr.start(ctx)
 		s.deepMgr = newDeepManager(s)
 		s.deepMgr.start(ctx)
 		s.resourceMgr.start(ctx)
@@ -967,6 +970,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/credscan/tasks/{id}/cancel", s.cancelCredTask)
 	mux.HandleFunc("GET /api/credscan/tasks/{id}/results", s.listCredTaskResults)
 	mux.HandleFunc("GET /api/credscan/tasks/{id}/report", s.credTaskReport)
+
+	// 子域名枚举（独立模块）：任务、结果、口径与报告
+	mux.HandleFunc("GET /api/subdomain/options", s.subdomainOptions)
+	mux.HandleFunc("GET /api/subdomain/tasks", s.listSubdomainTasks)
+	mux.HandleFunc("POST /api/subdomain/tasks", s.createSubdomainTask)
+	mux.HandleFunc("POST /api/subdomain/tasks/batch-delete", s.batchDeleteSubdomainTasks)
+	mux.HandleFunc("GET /api/subdomain/tasks/{id}", s.getSubdomainTask)
+	mux.HandleFunc("POST /api/subdomain/tasks/{id}/cancel", s.cancelSubdomainTask)
+	mux.HandleFunc("GET /api/subdomain/tasks/{id}/results", s.listSubdomainResults)
+	mux.HandleFunc("GET /api/subdomain/tasks/{id}/report", s.subdomainReportMarkdown)
 
 	// 深度利用：漏洞验证 / 漏洞利用 / WAF 绕过 / Webshell 注入 / Webshell 管理
 	mux.HandleFunc("GET /api/deep/tasks", s.listDeepTasks)

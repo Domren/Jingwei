@@ -2914,3 +2914,58 @@ export interface CredTaskInput {
   options?: Record<string, unknown>;
   dict_profile?: string;
 }
+
+// ── 子域名枚举（C3）──────────────────────────────────────────────────────────
+export type SubdomainTaskStatus = "queued" | "running" | "done" | "failed" | "canceled";
+
+export interface SubdomainTask {
+  id: number;
+  name: string;
+  targets: string[];
+  options: Record<string, unknown>;
+  status: SubdomainTaskStatus;
+  stage: string;
+  progress: Record<string, unknown>;
+  summary: Record<string, unknown>;
+  log?: string;
+  error?: string;
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+}
+
+export interface SubdomainRecordEntry {
+  type: string;
+  values: string[];
+}
+
+export interface SubdomainResult {
+  id: number;
+  task_id: number;
+  name: string;
+  root: string;
+  /** 来源：input（直接给出）、dict（字典命中）、public（公开接口）。 */
+  source: string;
+  records: SubdomainRecordEntry[];
+  ips: string[];
+  /** 与泛解析基线一致：不是这个域名自己的子域名，而是 `*` 的答复。 */
+  wildcard: boolean;
+  /** 写进资产台账后的编号；为空表示这条没进资产图。 */
+  asset_id?: number | null;
+  created_at: string;
+}
+
+export interface SubdomainTaskInput {
+  name?: string;
+  targets: string[];
+  options?: Record<string, unknown>;
+}
+
+export interface SubdomainOptionsInfo {
+  builtin_words?: number;
+  public_sources?: string[];
+  default_ports?: string;
+  default_timeout?: number;
+  max_queries?: number;
+  note?: string;
+}

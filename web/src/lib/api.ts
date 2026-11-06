@@ -145,6 +145,10 @@ import type {
   SkillCall,
   SkillItem,
   Stats,
+  SubdomainOptionsInfo,
+  SubdomainResult,
+  SubdomainTask,
+  SubdomainTaskInput,
   Task,
   TaskArchive,
   TaskArchivePage,
@@ -1607,6 +1611,22 @@ export const api = {
     sp.set("limit", String(params?.limit ?? 500));
     return get<{ results: CredResult[]; total: number }>(`/credscan/tasks/${id}/results?${sp}`);
   },
+
+  // ---- 子域名枚举（C3）----
+  subdomainOptions: () => get<SubdomainOptionsInfo>("/subdomain/options"),
+  subdomainTasks: (limit = 50) => get<{ tasks?: SubdomainTask[] }>(`/subdomain/tasks?limit=${limit}`),
+  subdomainTask: (id: number) => get<{ task: SubdomainTask; result_count?: number }>(`/subdomain/tasks/${id}`),
+  createSubdomainTask: (input: SubdomainTaskInput) => post<SubdomainTask>("/subdomain/tasks", input),
+  cancelSubdomainTask: (id: number) => post<{ canceled: boolean }>(`/subdomain/tasks/${id}/cancel`, {}),
+  deleteSubdomainTasks: (ids: number[]) => post<{ deleted: number }>("/subdomain/tasks/batch-delete", { ids }),
+  subdomainResults: (id: number, params?: { root?: string; source?: string; limit?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.root) sp.set("root", params.root);
+    if (params?.source) sp.set("source", params.source);
+    sp.set("limit", String(params?.limit ?? 2000));
+    return get<{ results?: SubdomainResult[]; total?: number }>(`/subdomain/tasks/${id}/results?${sp}`);
+  },
+  subdomainReport: (id: number) => get<{ markdown?: string }>(`/subdomain/tasks/${id}/report`),
 
   // ---- Deep exploitation ----
   deepTasks: (params?: { kind?: string; limit?: number; offset?: number }) => {

@@ -2211,3 +2211,45 @@ DO $$ BEGIN
         EXECUTE 'ALTER TABLE authorizations ALTER COLUMN exclusions SET DEFAULT ''[]''::jsonb';
     END IF;
 END $$;
+
+-- C3：子域名枚举的任务与结果。
+--
+-- 结果表只回答「这一轮枚举出了什么」，资产的真相仍在 assets 里（子域名行 + 由 A/AAAA
+-- 顺带登记的 IP 行）。两处分开是有意的：把发现直接写成资产、不给任务台账，用户就
+-- 无法回答「这些子域名是哪一轮、用什么方式得到的」；只留台账不写资产，拓扑图与端口
+-- 探测就拿不到东西，等于让人手工搬运。
+CREATE TABLE IF NOT EXISTS subdomain_tasks (
+    id           BIGSERIAL PRIMARY KEY,
+    name         TEXT NOT NULL DEFAULT '',
+    targets      JSONB NOT NULL DEFAULT '[]',
+    options      JSONB NOT NULL DEFAULT '{}',
+    status       TEXT NOT NULL DEFAULT 'queued',
+    stage        TEXT NOT NULL DEFAULT 'queued',
+    progress     JSONB NOT NULL DEFAULT '{}',
+    summary      JSONB NOT NULL DEFAULT '{}',
+    log          TEXT NOT NULL DEFAULT '',
+    error        TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at   TIMESTAMPTZ,
+    finished_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_subdomain_tasks_created ON subdomain_tasks(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_subdomain_tasks_status ON subdomain_tasks(status, id);
+
+CREATE TABLE IF NOT EXISTS subdomain_results (
+    id         BIGSERIAL PRIMARY KEY,
+    task_id    BIGINT NOT NULL REFERENCES subdomain_tasks(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    root       TEXT NOT NULL DEFAULT '',
+    source     TEXT NOT NULL DEFAULT '',
+    records    JSONB NOT NULL DEFAULT '[]',
+    ips        JSONB NOT NULL DEFAULT '[]',
+    -- 与泛解析基线一致的命中（只在操作员选择保留时入库）：标出来，别和真子域名混为一谈。
+    wildcard   BOOLEAN NOT NULL DEFAULT false,
+    -- 写入资产台账后的子域名资产编号；写失败时为 NULL，报告要能说「这条没进资产」。
+    asset_id   BIGINT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_subdomain_results_task ON subdomain_results(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_subdomain_results_asset ON subdomain_results(asset_id);

@@ -60,6 +60,14 @@ func TestUIEndpointsAreRouted(t *testing.T) {
 		{"GET", "/api/credscan/tasks/1/report"},
 		{"GET", "/api/scans/1/diff"},
 		{"POST", "/api/deep/exec-form"},
+		{"GET", "/api/subdomain/options"},
+		{"GET", "/api/subdomain/tasks"},
+		{"POST", "/api/subdomain/tasks"},
+		{"POST", "/api/subdomain/tasks/batch-delete"},
+		{"GET", "/api/subdomain/tasks/1"},
+		{"POST", "/api/subdomain/tasks/1/cancel"},
+		{"GET", "/api/subdomain/tasks/1/results"},
+		{"GET", "/api/subdomain/tasks/1/report"},
 	}
 	for _, c := range named {
 		r := httptest.NewRequest(c.method, c.path, nil)
