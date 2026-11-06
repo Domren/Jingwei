@@ -12,6 +12,7 @@ import (
 
 	"github.com/Autumn-27/jingwei/db"
 	"github.com/Autumn-27/jingwei/notify"
+	"github.com/Autumn-27/jingwei/report"
 	"github.com/Autumn-27/jingwei/scanner"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -75,7 +76,124 @@ type intranetEvacuationReport struct {
 	// 公钥、近期落地文件里，既不属于本次任务的任何落地物、也没有精卫标记的条目。
 	// 它们可能是目标原有配置，也可能是台账之外的残留——按内容人工判断。
 	LedgerExternal []string `json:"ledger_external,omitempty"`
-	Summary        string   `json:"summary"`
+	// Traces / TraceMatrix 是痕迹矩阵（G4）：按手段汇总「本次留下什么、怎么验证、清掉之后
+	// 还剩什么」，以及账外残留。矩阵是撤离报告的一部分，不是界面现编的文案。
+	Traces      []report.TraceMatrixRow `json:"traces,omitempty"`
+	TraceMatrix string                  `json:"trace_matrix,omitempty"`
+	Summary     string                  `json:"summary"`
+}
+
+// intranetBuildTraceMatrix 把本轮撤离的逐项结果汇总成痕迹矩阵。
+//
+// 结论只认两种证据：有独立验证命令且验证通过，才算「已验证清除」；只跑了撤销命令、
+// 或验证输出判不出来的，一律写成「无法复核」——这一栏宁可难看，也不能好看。
+func intranetBuildTraceMatrix(rep *intranetEvacuationReport, verifyKnown map[int64]bool) {
+	type key struct{ kind, host string }
+	order := []key{}
+	rows := map[key]*report.TraceMatrixRow{}
+	unknown := make([]string, 0, len(rep.Residual))
+	for _, line := range rep.Residual {
+		if strings.Contains(line, "无法复核") || strings.Contains(line, "无法判定") {
+			unknown = append(unknown, line)
+		}
+	}
+	for _, it := range rep.Items {
+		kind, name := it.Kind, it.Name
+		switch it.Type {
+		case "artifact":
+			if _, ok := db.ArtifactTraceProfileFor(kind); !ok {
+				name = kind + "（kind 未登记痕迹档案）"
+			}
+		case "tunnel":
+			kind, name = db.ArtifactTraceTunnel, it.Name
+		case "memshell":
+			kind, name = db.ArtifactTraceMemshell, it.Name
+		case "webshell":
+			kind = db.IntranetArtifactFile
+			if strings.TrimSpace(name) == "" {
+				name = "webshell 载荷文件"
+			}
+		default:
+			// 会话与受管资源不是目标上的维持手段，不进矩阵。
+			continue
+		}
+		profile, ok := db.ArtifactTraceProfileFor(kind)
+		k := key{kind: kind, host: it.Host}
+		row, exists := rows[k]
+		if !exists {
+			row = &report.TraceMatrixRow{Kind: kind, Host: it.Host}
+			if ok {
+				row.Name, row.Traces, row.Residue, row.Verify = profile.Name, profile.Traces, profile.Residue, profile.Verify
+			} else {
+				row.Name = kind
+				row.Verify = "没有痕迹档案：kind " + kind + " 未在 db/intranet_artifact_traces.go 登记"
+			}
+			rows[k] = row
+			order = append(order, k)
+		}
+		if strings.TrimSpace(row.Name) == "" || !ok {
+			row.Name = firstNonEmpty(name, kind)
+		}
+		landed := firstNonEmpty(name, "#"+strconv.FormatInt(it.ID, 10))
+		if it.Type == "artifact" {
+			landed += "（#" + strconv.FormatInt(it.ID, 10) + "）"
+		}
+		verdict, detail := intranetTraceVerdict(it, kind, verifyKnown)
+		// 同一手段多条：落地点都记下来，结论取最差的那一个——一条已清除不能盖掉另一条失败。
+		row.Landed = append(row.Landed, landed)
+		if intranetVerdictRank(verdict) < intranetVerdictRank(row.Verdict) || len(row.Verdict) == 0 {
+			row.Verdict, row.Detail = verdict, detail
+		}
+	}
+	out := make([]report.TraceMatrixRow, 0, len(order))
+	for _, k := range order {
+		out = append(out, *rows[k])
+	}
+	rep.Traces = out
+	rep.TraceMatrix = report.TraceMatrixMarkdown(report.TraceMatrixInput{
+		Rows: out, LedgerExternal: rep.LedgerExternal, Unknown: unknown,
+		GeneratedAt: rep.FinishedAt,
+	})
+}
+
+// intranetTraceVerdict 把逐项状态映射成矩阵结论。
+func intranetTraceVerdict(it intranetEvacuationItem, kind string, verifyKnown map[int64]bool) (string, string) {
+	switch it.Status {
+	case "planned":
+		return report.TraceVerdictNotAttempted, "预览模式，没有执行撤销"
+	case "skipped":
+		return report.TraceVerdictActive, traceDetailLine(it.Detail)
+	case "failed":
+		return report.TraceVerdictFailed, traceDetailLine(it.Detail)
+	}
+	if it.Type == "artifact" && !verifyKnown[it.ID] {
+		return report.TraceVerdictUnverified, "台账里没有独立的验证命令，只执行了撤销命令"
+	}
+	return report.TraceVerdictCleared, traceDetailLine(it.Detail)
+}
+
+// intranetVerdictRank 给结论排序：数值越小越差，合并同类行时保留最差结论。
+func intranetVerdictRank(v string) int {
+	switch v {
+	case report.TraceVerdictFailed:
+		return 0
+	case report.TraceVerdictUnverified, report.TraceVerdictNoProfile:
+		return 1
+	case report.TraceVerdictActive:
+		return 2
+	case report.TraceVerdictNotAttempted:
+		return 3
+	}
+	return 4
+}
+
+// traceDetailLine 取复核原文的第一行并截断：矩阵单元格里放不下整段输出。
+func traceDetailLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i > 0 {
+		s = s[:i]
+	}
+	return truncateIntranetOutput(s, 160)
 }
 
 func intranetEvacuationDetail(out intranetExecOutcome) string {
@@ -140,6 +258,11 @@ func (s *Server) intranetEvacuate(ctx context.Context, pg *db.DB, opts intranetE
 		rep.Residual = append(rep.Residual, "读取落地物台账失败："+err.Error())
 	}
 	rep.Artifacts.Total = len(artifacts)
+	// 矩阵要知道每条有没有独立的验证命令：只有撤销命令的退出码时，结论不能写成「已清除」。
+	traceVerified := map[int64]bool{}
+	for _, art := range artifacts {
+		traceVerified[art.ID] = strings.TrimSpace(art.VerifyCommand) != ""
+	}
 	revokedThisRun := make([]*db.IntranetArtifact, 0, len(artifacts))
 	for _, art := range artifacts {
 		item := intranetEvacuationItem{
@@ -360,6 +483,8 @@ func (s *Server) intranetEvacuate(ctx context.Context, pg *db.DB, opts intranetE
 	s.intranetEvacuateWebshells(ctx, pg, opts.TaskID, rep, opts.DryRun, opts.DeleteWebshells, blockedShells)
 
 	rep.finish(opts.DryRun)
+	// G4：把上面逐项结果汇总成痕迹矩阵，撤离报告自带这一节（JSON 与 Markdown 同一来源）。
+	intranetBuildTraceMatrix(rep, traceVerified)
 	// H3：撤离有残留是运维事件，走通知渠道；dry-run 只是预览，不发。
 	if !opts.DryRun && len(rep.Residual) > 0 {
 		if _, err := pg.AddNotificationEvent(ctx, notify.EventEvacuationFailed, 0, notify.Snapshot{

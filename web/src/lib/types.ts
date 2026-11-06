@@ -2335,7 +2335,22 @@ export interface IntranetEvacuationReport {
   residual: string[];
   /** 不在台账内的目标侧痕迹（G1）：可能是原有运维配置，也可能是残留，按内容人工判断。 */
   ledger_external?: string[];
+  /** 痕迹矩阵（G4）：按手段汇总「留下什么 / 怎么验证 / 撤销后还剩什么 / 本次结论」。 */
+  traces?: TraceMatrixRow[];
+  trace_matrix?: string;
   summary: string;
+}
+
+export interface TraceMatrixRow {
+  kind: string;
+  name: string;
+  host: string;
+  landed: string[];
+  traces: string[];
+  residue: string[];
+  verify: string;
+  verdict: string;
+  detail?: string;
 }
 
 export interface IntranetEvacuationInput {

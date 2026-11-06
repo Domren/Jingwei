@@ -272,6 +272,14 @@ function artifactStatusMeta(status: string) {
   }
 }
 
+// 判据用前缀而不是全等：服务端改措辞（「未配置验证命令，无法复核」这类）时，
+// 不能让一个没验证过的结论显示成绿色。
+function traceVerdictClass(verdict: string) {
+  if (verdict.startsWith("已验证")) return "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400";
+  if (verdict.startsWith("撤销失败")) return "bg-red-500/15 text-red-700 dark:text-red-400";
+  return "bg-amber-500/15 text-amber-700 dark:text-amber-400";
+}
+
 function credentialStatusMeta(status: string) {
   switch (status) {
     case "valid":
@@ -3198,6 +3206,65 @@ export default function DeepIntranetPage() {
                         <li key={item}>{item}</li>
                       ))}
                     </ul>
+                  </div>
+                ) : null}
+                {(evacuateReport.traces?.length ?? 0) > 0 ? (
+                  <div className="rounded-md border bg-muted/20 p-2">
+                    <div className="mb-1 flex flex-wrap items-center gap-2 text-xs">
+                      <span className="font-medium">痕迹矩阵（本次留下什么、验证到什么程度）</span>
+                      <span className="text-muted-foreground">
+                        结论只有「已验证清除」代表验证命令确认痕迹消失；「无法复核」不是已清理
+                      </span>
+                      {(evacuateReport.trace_matrix ?? "") !== "" ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-6"
+                          onClick={() => {
+                            navigator.clipboard
+                              .writeText(evacuateReport.trace_matrix ?? "")
+                              .then(() => toast.success("痕迹矩阵 Markdown 已复制（可直接贴进报告）"))
+                              .catch(() => toast.error("复制失败"));
+                          }}
+                        >
+                          复制 Markdown
+                        </Button>
+                      ) : null}
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-[11px]">
+                        <thead>
+                          <tr className="border-b text-left text-muted-foreground">
+                            <th className="py-1 pr-2 font-medium">手段</th>
+                            <th className="py-1 pr-2 font-medium">本次落地点</th>
+                            <th className="py-1 pr-2 font-medium">部署后留下的痕迹</th>
+                            <th className="py-1 pr-2 font-medium">清除验证</th>
+                            <th className="py-1 pr-2 font-medium">结论</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(evacuateReport.traces ?? []).map((row) => (
+                            <tr key={`${row.kind}-${row.host}`} className="border-b border-dashed align-top">
+                              <td className="py-1 pr-2 whitespace-nowrap">{row.name || row.kind}</td>
+                              <td className="py-1 pr-2 font-mono break-all">{(row.landed ?? []).join("；")}</td>
+                              <td className="py-1 pr-2 text-muted-foreground">{(row.traces ?? []).join("；")}</td>
+                              <td className="py-1 pr-2 text-muted-foreground">{row.verify}</td>
+                              <td className="py-1 pr-2 whitespace-nowrap">
+                                <Badge variant="outline" className={traceVerdictClass(row.verdict)}>
+                                  {row.verdict}
+                                  {row.detail ? `：${row.detail}` : ""}
+                                </Badge>
+                                {(row.residue ?? []).length > 0 ? (
+                                  <div className="mt-1 max-w-[22rem] text-muted-foreground">
+                                    撤销后仍存在：{(row.residue ?? []).join("；")}
+                                  </div>
+                                ) : null}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
                 ) : null}
                 {(evacuateReport.ledger_external?.length ?? 0) > 0 ? (
