@@ -31,6 +31,9 @@ const (
 	EventArtifactExpiring = "artifact_expiring"
 	EventRetestVerdict    = "retest_verdict"
 	EventEvacuationFailed = "evacuation_residual"
+	// EventSecretRotation 是签名密钥轮换后的补救结果：哪些已经由平台重发、哪些还等人补。
+	// 它和另外三条一样发生在平台自己身上——漏推一条的代价是操作员以为轮换已经过去了。
+	EventSecretRotation = "secret_rotation"
 )
 
 // InitKind 是 config 里为空的 kind 的兜底值。

@@ -73,7 +73,7 @@ func (f Filter) Validate() error {
 // IsSystemKind 报告事件是否属于运维事件：它们不按漏洞过滤条件裁剪。
 func IsSystemKind(kind string) bool {
 	switch kind {
-	case EventArtifactExpiring, EventRetestVerdict, EventEvacuationFailed:
+	case EventArtifactExpiring, EventRetestVerdict, EventEvacuationFailed, EventSecretRotation:
 		return true
 	}
 	return false

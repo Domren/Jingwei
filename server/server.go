@@ -1039,6 +1039,10 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("GET /api/settings", s.getSettings)
 	mux.HandleFunc("PUT /api/settings", s.putSettings)
+	// 签名密钥轮换后的自检与补救（G3）：自检只读；补救接口默认按 dry_run 演练，
+	// 真执行要显式 dry_run=false。
+	mux.HandleFunc("GET /api/system/seal-audit", s.sealAuditHandler)
+	mux.HandleFunc("POST /api/system/seal-remediation", s.sealRemediationHandler)
 	// 漏洞 IM 推送。渠道是「多实例 + 各自过滤规则」的资源，因此独立成一组
 	// REST 接口，而不是塞进扁平的 /api/settings 键值里。
 	mux.HandleFunc("GET /api/notify/meta", s.notifyMeta)

@@ -146,7 +146,7 @@ func TestMatchStatusChangeRequiresOptIn(t *testing.T) {
 // 也要收到「落地物到期 / 撤离残留」这类系统事件。
 func TestSystemEventsBypassVulnFilters(t *testing.T) {
 	f := Filter{MinSeverity: "critical", TaskIDs: []int64{42}, VulnClassInclude: []string{"sqli"}}
-	for _, kind := range []string{EventArtifactExpiring, EventRetestVerdict, EventEvacuationFailed} {
+	for _, kind := range []string{EventArtifactExpiring, EventRetestVerdict, EventEvacuationFailed, EventSecretRotation} {
 		if !Match(f, Snapshot{Kind: kind, Severity: "high", TaskID: 7, VulnClass: "system"}) {
 			t.Fatalf("%s 被漏洞过滤条件拦掉了", kind)
 		}

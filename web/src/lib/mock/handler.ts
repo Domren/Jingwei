@@ -2353,6 +2353,25 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/settings" && m === "GET") return D.settings;
   if (path === "/settings" && m === "PUT") return { ...D.settings, ...b };
   if (path === "/settings/basic-auth" && m === "GET") return { enabled: false, username: "", password_set: false };
+
+  // 签名密钥自检与补救（G3）。演示模式给的是「一切正常」这个真实形状：四类都在、条数为 0。
+  // 不在这里编造失效条目——编出来的数字会让演示看起来像出过事故，而界面真正的分支要靠真实例演练。
+  if (path === "/system/seal-audit" && m === "GET") {
+    return { audit: mockSealAudit(), summary: "没有用当前签名密钥解不开的值。" };
+  }
+  if (path === "/system/seal-remediation" && m === "POST") {
+    const dryRun = b.dry_run !== false;
+    const audit = mockSealAudit();
+    return {
+      dry_run: dryRun,
+      audit,
+      items: [],
+      reissued: 0,
+      remaining: 0,
+      note: dryRun ? "演练：以上是计划，库里一个字节都没改。" : "没有用当前签名密钥解不开的值，无需补救。",
+      finished_at: new Date().toISOString(),
+    };
+  }
   if (path === "/settings/basic-auth" && m === "PUT")
     throw new Error("演示模式不支持修改 HTTP Basic Auth，请在实际部署中配置");
   if (path === "/settings/web-search/test") return { ok: true, count: 5, backend: D.settings.web_search_backend };
@@ -2692,4 +2711,30 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   )
     ? []
     : {};
+}
+
+// mockSealAudit 是自检响应的形状：四类密封值，演示模式里都读得开。
+function mockSealAudit() {
+  const now = new Date().toISOString();
+  const cat = (key: string, name: string, fix: string, automatable: boolean) => ({
+    key,
+    name,
+    fix,
+    automatable,
+    total: 0,
+    unreadable: 0,
+    ids: [],
+    rows: [],
+  });
+  return {
+    checked_at: now,
+    seal_enabled: true,
+    unreadable_total: 0,
+    categories: [
+      cat("webshell", "webshell 密钥", "重新投放载荷", true),
+      cat("memshell", "内存马密钥", "经父壳重新注入内存马", false),
+      cat("credential", "内网凭据口令", "重新登记凭据（平台读不出旧口令，只能重填）", false),
+      cat("llm_key", "模型 API 密钥", "在系统设置里重新填写", false),
+    ],
+  };
 }

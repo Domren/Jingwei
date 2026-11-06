@@ -135,6 +135,8 @@ import type {
   ShellExecInput,
   ShellExecResult,
   ShellExecForm,
+  SealAudit,
+  SealRemediation,
   ShellFileAction,
   ShellFileChunk,
   ShellFileList,
@@ -1637,6 +1639,10 @@ export const api = {
   // exec() 语境的命令编码换算：贴给 Java exec(String) / ProcessBuilder 之前问一次。
   execForm: (command: string, osKind?: string) =>
     post<ShellExecForm>("/deep/exec-form", { command, os_kind: osKind ?? "" }),
+  // 签名密钥轮换后的自检与补救（G3）：自检只读；补救默认演练，真执行要显式传 dryRun=false。
+  sealAudit: () => get<{ audit: SealAudit; summary: string }>("/system/seal-audit"),
+  sealRemediation: (dryRun: boolean) =>
+    post<SealRemediation>("/system/seal-remediation", { dry_run: dryRun }),
   webshellInfo: (id: number, cwd?: string) =>
     get<ShellInfoResult>(`/deep/webshells/${id}/info${cwd ? `?cwd=${encodeURIComponent(cwd)}` : ""}`),
   webshellPayload: (id: number) =>

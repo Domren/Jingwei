@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log"
 	"strings"
+	"time"
 )
 
 // 落盘密封内核：值用 AES-256-GCM 加密后再入库，密钥由平台签名根密钥
@@ -336,49 +337,130 @@ func (d *DB) migrateLLMAPIKeys() (sealed, failed int, err error) {
 	return sealed, failed, nil
 }
 
-// auditSealedSecrets counts stored values that this signing root cannot open and
-// says so once, at startup. Discovering it one command at a time is how an
-// operator loses an afternoon: every shell looks alive (the check passes) and
-// every command fails to unseal, which reads like a target problem.
-func (d *DB) auditSealedSecrets() (unreadableTotal int) {
+// 密封自检的分类。key 是给补救流程与界面用的稳定标识，Name 是给人看的那一句。
+const (
+	SealCategoryWebshell   = "webshell"
+	SealCategoryMemshell   = "memshell"
+	SealCategoryCredential = "credential"
+	SealCategoryLLMKey     = "llm_key"
+)
+
+// SealRow 是一条解不开的记录：id 给补救流程按条办事，label 给界面说清是哪一条。
+type SealRow struct {
+	ID    int64  `json:"id"`
+	Label string `json:"label"`
+}
+
+// SealCategoryAudit 是一类值的自检结果：一共多少条密封着、其中多少条当前密钥解不开、
+// 以及解不开的那些是哪几条（补救流程要按条办事，只给条数就只能靠人挨个试）。
+type SealCategoryAudit struct {
+	Key         string    `json:"key"`
+	Name        string    `json:"name"`
+	Fix         string    `json:"fix"`
+	Automatable bool      `json:"automatable"`
+	Total       int       `json:"total"`
+	Unreadable  int       `json:"unreadable"`
+	IDs         []int64   `json:"ids"`
+	Rows        []SealRow `json:"rows"`
+}
+
+// SealAudit 是一次完整自检的结果。
+type SealAudit struct {
+	CheckedAt       time.Time           `json:"checked_at"`
+	SealEnabled     bool                `json:"seal_enabled"`
+	Categories      []SealCategoryAudit `json:"categories"`
+	UnreadableTotal int                 `json:"unreadable_total"`
+	QueryErrors     []string            `json:"query_errors,omitempty"`
+}
+
+// UnreadableIDs 按分类给出解不开的行 id，供补救流程直接按条处理。
+func (a SealAudit) UnreadableIDs(category string) []int64 {
+	for _, c := range a.Categories {
+		if c.Key == category {
+			return c.IDs
+		}
+	}
+	return nil
+}
+
+// AuditSealedSecrets 逐类查出「库里密封着、但当前签名根密钥解不开」的值。
+//
+// 为什么要有这件事：换过平台签名根密钥之后，每一条 shell 看起来都是活的（check 只问它
+// 答不答话），而每一条命令都在解封那一步失败——读起来完全像目标出了问题。逐条试能试
+// 一整个下午。
+//
+// Automatable 说的是「平台能不能自己做完那一半」：webshell 可以（重新发密钥、重出载荷，
+// 剩下的投放动作由人做一次）；内存马不行（要靠父壳重新注入，而父壳自己可能也解不开）；
+// 凭据与模型密钥更不行——平台无法凭空知道一个它已经读不出来的口令。
+func (d *DB) AuditSealedSecrets() SealAudit {
+	out := SealAudit{CheckedAt: time.Now(), SealEnabled: len(d.sealKey) > 0,
+		Categories: []SealCategoryAudit{}}
 	if len(d.sealKey) == 0 {
-		return 0
+		return out
 	}
 	checks := []struct {
-		what    string
-		query   string
-		purpose SealPurpose
-		fix     string
+		key         string
+		what        string
+		query       string
+		purpose     SealPurpose
+		fix         string
+		automatable bool
 	}{
-		{"webshell 密钥", `SELECT secret FROM webshells WHERE left(COALESCE(secret, ''), 3) = '` + SealPrefix + `'`, SealPurposeShell, "重新投放载荷"},
-		{"内存马密钥", `SELECT secret FROM java_memshells WHERE left(COALESCE(secret, ''), 3) = '` + SealPrefix + `'`, SealPurposeShell, "重新注入内存马"},
-		{"内网凭据口令", `SELECT password FROM intranet_credentials WHERE left(password, 3) = '` + SealPrefix + `'`, SealPurposeCredential, "重新登记凭据"},
-		{"模型 API 密钥", `SELECT api_key FROM llm_profiles WHERE left(COALESCE(api_key, ''), 3) = '` + SealPrefix + `'`, SealPurposeLLMKey, "在系统设置里重新填写"},
+		{SealCategoryWebshell, "webshell 密钥",
+			`SELECT id, COALESCE(secret, ''), CONCAT_WS(' · ', NULLIF(TRIM(name), ''), url)
+			   FROM webshells WHERE left(COALESCE(secret, ''), 3) = '` + SealPrefix + `'`,
+			SealPurposeShell, "重新投放载荷", true},
+		{SealCategoryMemshell, "内存马密钥",
+			`SELECT id, COALESCE(secret, ''), CONCAT_WS(' · ', NULLIF(TRIM(type), ''), NULLIF(TRIM(path), ''), NULLIF(url, ''))
+			   FROM java_memshells WHERE left(COALESCE(secret, ''), 3) = '` + SealPrefix + `'`,
+			SealPurposeShell, "经父壳重新注入内存马", false},
+		{SealCategoryCredential, "内网凭据口令",
+			`SELECT id, password, CONCAT_WS(' @ ', username, NULLIF(host, ''))
+			   FROM intranet_credentials WHERE left(password, 3) = '` + SealPrefix + `'`,
+			SealPurposeCredential, "重新登记凭据（平台读不出旧口令，只能重填）", false},
+		{SealCategoryLLMKey, "模型 API 密钥",
+			`SELECT id, COALESCE(api_key, ''), CONCAT_WS(' · ', NULLIF(TRIM(name), ''), NULLIF(TRIM(model), ''))
+			   FROM llm_profiles WHERE left(COALESCE(api_key, ''), 3) = '` + SealPrefix + `'`,
+			SealPurposeLLMKey, "在系统设置里重新填写", false},
 	}
 	for _, c := range checks {
+		row := SealCategoryAudit{Key: c.key, Name: c.what, Fix: c.fix, Automatable: c.automatable,
+			IDs: []int64{}, Rows: []SealRow{}}
 		rows, err := d.Query(c.query)
 		if err != nil {
-			log.Printf("[seal] %s 自检查询失败：%v", c.what, err)
+			// 查询失败与「一条都没有」是两件事：前者不能让自检报告说一切正常。
+			out.QueryErrors = append(out.QueryErrors, c.what+" 自检查询失败: "+err.Error())
+			log.Printf("[seal] %s", out.QueryErrors[len(out.QueryErrors)-1])
+			out.Categories = append(out.Categories, row)
 			continue
 		}
-		var unreadable int
 		for rows.Next() {
-			var v string
-			if err := rows.Scan(&v); err != nil {
+			var id int64
+			var v, label string
+			if err := rows.Scan(&id, &v, &label); err != nil {
 				continue
 			}
+			row.Total++
 			if _, oerr := OpenSealed(d.sealKey, c.purpose, v); oerr != nil {
-				unreadable++
+				row.Unreadable++
+				row.IDs = append(row.IDs, id)
+				row.Rows = append(row.Rows, SealRow{ID: id, Label: strings.TrimSpace(label)})
 			}
 		}
 		rows.Close()
-		// Per-kind counts are what make the fix actionable: a webshell is re-planted
-		// by pushing a payload, a model key is re-entered in settings, and only the
-		// operator knows which of the two they are looking at.
-		if unreadable > 0 {
-			log.Printf("[seal] %d 条%s用当前签名密钥解不开，需%s", unreadable, c.what, c.fix)
-		}
-		unreadableTotal += unreadable
+		out.UnreadableTotal += row.Unreadable
+		out.Categories = append(out.Categories, row)
 	}
-	return unreadableTotal
+	return out
+}
+
+// auditSealedSecrets 在启动时把自检结果写进日志（分类条数才是可行动的那句话）。
+func (d *DB) auditSealedSecrets() int {
+	audit := d.AuditSealedSecrets()
+	for _, c := range audit.Categories {
+		if c.Unreadable > 0 {
+			log.Printf("[seal] %d 条%s用当前签名密钥解不开，需%s", c.Unreadable, c.Name, c.Fix)
+		}
+	}
+	return audit.UnreadableTotal
 }

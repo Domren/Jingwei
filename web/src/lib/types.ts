@@ -1861,6 +1861,56 @@ export interface ShellExecForm {
   typed_tokens: string[];
 }
 
+// 签名密钥轮换后的自检与补救（G3）。automatable=false 的那几类，平台只能列出人工步骤：
+// 内存马要经父壳重注入，凭据与模型密钥的旧值已经读不出来，只能重填。
+export interface SealRow {
+  id: number;
+  label: string;
+}
+
+export interface SealCategoryAudit {
+  key: string;
+  name: string;
+  fix: string;
+  automatable: boolean;
+  total: number;
+  unreadable: number;
+  ids: number[];
+  rows: SealRow[];
+}
+
+export interface SealAudit {
+  checked_at: string;
+  seal_enabled: boolean;
+  categories: SealCategoryAudit[];
+  unreadable_total: number;
+  query_errors?: string[];
+}
+
+export interface SealRemediationItem {
+  category: string;
+  id: number;
+  label: string;
+  action: string;
+  done: boolean;
+  error: string;
+  key_version?: number;
+  payload_filename?: string;
+  payload_sha256?: string;
+  payload?: string;
+  next: string;
+}
+
+export interface SealRemediation {
+  dry_run: boolean;
+  audit: SealAudit;
+  items: SealRemediationItem[];
+  reissued: number;
+  remaining: number;
+  note: string;
+  finished_at: string;
+}
+
 export interface ShellInfoSection {
   label: string;
   output: string;

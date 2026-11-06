@@ -25,6 +25,7 @@ import { CHAT_SEND_MODE_OPTIONS, type ChatSendMode, setChatSendMode, useChatSend
 import type { Settings } from "@/lib/types";
 
 import { BasicAuthCard } from "./_components/basic-auth-card";
+import { SealRemediationCard } from "./_components/seal-remediation-card";
 import { UpdateCard } from "./_components/update-card";
 
 export default function SystemSettingsPage() {
@@ -306,6 +307,7 @@ export default function SystemSettingsPage() {
       <div className="columns-1 gap-4 md:gap-6 lg:columns-2">
         <UpdateCard />
         <BasicAuthCard />
+        <SealRemediationCard />
 
         <Card className="mb-4 break-inside-avoid md:mb-6">
           <CardHeader>
