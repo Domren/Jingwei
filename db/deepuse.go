@@ -209,21 +209,55 @@ func (d *DB) GetDeepTask(id int64) (*DeepTask, error) {
 	return t, err
 }
 
-// ClaimNextDeepTask atomically claims the oldest queued deep task.
-func (d *DB) ClaimNextDeepTask() (*DeepTask, error) {
-	t, err := deepOneTask(d.QueryRow(`UPDATE deep_tasks
-SET status='running', stage='start', started_at=now(), finished_at=NULL, error='', progress='{}'::jsonb
-WHERE id=(SELECT id FROM deep_tasks WHERE status='queued' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
-RETURNING ` + deepTaskCols))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+// QueuedDeepProxies 按 FIFO 列出排队的深挖任务与它们各自的出站代理（存在 params 里）。
+// 深挖任务（sqlmap/dalfox）与漏扫共用一条隧道时，两者会互相把对方挤成超时，
+// 所以并发预算必须同时看得见这两类任务。
+func (d *DB) QueuedDeepProxies(limit int) ([]QueuedProxyTask, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 200
 	}
+	rows, err := d.Query(`SELECT id, COALESCE(params->>'proxy','') FROM deep_tasks WHERE status='queued' ORDER BY id LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
-	return t, nil
+	defer rows.Close()
+	out := []QueuedProxyTask{}
+	for rows.Next() {
+		var q QueuedProxyTask
+		if err := rows.Scan(&q.ID, &q.Proxy); err != nil {
+			return nil, err
+		}
+		out = append(out, q)
+	}
+	return out, rows.Err()
 }
 
+// SetDeepTaskQueueNote 写明深挖任务为什么还在排队；认领时 progress 会整体重置。
+func (d *DB) SetDeepTaskQueueNote(id int64, note string) error {
+	_, err := d.Exec(`UPDATE deep_tasks
+SET progress = CASE WHEN $2='' THEN progress - 'queue_note'
+                    ELSE progress || jsonb_build_object('queue_note', $2) END
+WHERE id=$1 AND status='queued'
+      AND (progress->>'queue_note') IS DISTINCT FROM $2`, id, strings.TrimSpace(note))
+	return err
+}
+
+// ClaimDeepTask 按 ID 认领一条排队任务。False 表示已被别的执行者抢走或状态已变，
+// 调用方要放弃这一格名额去看下一个候选。
+func (d *DB) ClaimDeepTask(id int64) (bool, error) {
+	res, err := d.Exec(`UPDATE deep_tasks
+SET status='running', stage='start', started_at=now(), finished_at=NULL, error='', progress='{}'::jsonb
+WHERE id=$1 AND status='queued'`, id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// 排队深挖任务的认领只有一条路：QueuedDeepProxies 按 FIFO 取候选 + ClaimDeepTask 按 ID
+// 抢占。跳过隧道并发预算的「直接认领最老的排队任务」已经被删掉——留一条近路，预算就会
+// 在某个不明显的时刻被绕过。
 // UpdateDeepTaskProgress persists the current stage/counters and appends a log line.
 func (d *DB) UpdateDeepTaskProgress(id int64, stage string, progress map[string]any, logLine string) error {
 	line := strings.TrimSpace(logLine)

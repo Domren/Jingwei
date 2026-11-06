@@ -37,10 +37,7 @@ func TestDeepTaskLifecycle(t *testing.T) {
 		t.Error("params not persisted")
 	}
 
-	claimed, err := d.ClaimNextDeepTask()
-	if err != nil {
-		t.Fatal(err)
-	}
+	claimed := claimOneQueuedDeep(t, d)
 	if claimed == nil || claimed.ID != task.ID {
 		t.Fatalf("expected to claim task %d, got %v", task.ID, claimed)
 	}
@@ -74,11 +71,7 @@ func TestDeepTaskLifecycle(t *testing.T) {
 	}
 
 	// A finished task is not claimable again.
-	claimed, err = d.ClaimNextDeepTask()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if claimed != nil {
+	if claimed := claimOneQueuedDeep(t, d); claimed != nil {
 		t.Errorf("finished task was reclaimed: %+v", claimed)
 	}
 
@@ -126,11 +119,7 @@ func TestDeepTaskCancelAndRecover(t *testing.T) {
 	}
 
 	// A canceled task must not be claimable.
-	claimed, err := d.ClaimNextDeepTask()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if claimed != nil {
+	if claimed := claimOneQueuedDeep(t, d); claimed != nil {
 		t.Errorf("canceled task was claimed: %+v", claimed)
 	}
 
@@ -475,4 +464,29 @@ func TestWebshellCRUD(t *testing.T) {
 	if _, err := d.GetWebshell(shell.ID); err == nil {
 		t.Error("deleted webshell still readable")
 	}
+}
+
+// claimOneQueuedDeep 按生产路径认领第一个排队任务（候选来自 QueuedDeepProxies，
+// 隧道预算在 server 侧决定谁能开工，这里只验「认领本身是原子的、终态不可再认领」）。
+func claimOneQueuedDeep(t *testing.T, d *DB) *DeepTask {
+	t.Helper()
+	queued, err := d.QueuedDeepProxies(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range queued {
+		ok, err := d.ClaimDeepTask(q.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			continue
+		}
+		task, err := d.GetDeepTask(q.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return task
+	}
+	return nil
 }

@@ -64,7 +64,7 @@ func (m *deepManager) loop(ctx context.Context) {
 			return
 		}
 		for {
-			task, err := m.s.m.pg.ClaimNextDeepTask()
+			task, budget, err := m.claimNext()
 			if err != nil {
 				log.Printf("[deep] claim queued task: %v", err)
 				break
@@ -72,7 +72,7 @@ func (m *deepManager) loop(ctx context.Context) {
 			if task == nil {
 				break
 			}
-			m.run(ctx, task)
+			m.run(ctx, task, budget)
 		}
 		select {
 		case <-ctx.Done():
@@ -83,7 +83,45 @@ func (m *deepManager) loop(ctx context.Context) {
 	}
 }
 
-func (m *deepManager) run(parent context.Context, task *db.DeepTask) {
+// claimNext 与漏扫共用同一张隧道占用表：自动深挖任务就是漏扫排下去的，
+// 两边各数各的名额等于没有预算——一条隧道上「1 个扫描 + 1 个深挖」同时全速跑，
+// 塞爆之后两边的结论都不可信。
+func (m *deepManager) claimNext() (*db.DeepTask, proxyBudget, error) {
+	queued, err := m.s.m.pg.QueuedDeepProxies(0)
+	if err != nil {
+		return nil, proxyBudget{}, err
+	}
+	for _, q := range queued {
+		budget := m.s.budget(q.Proxy)
+		if !m.s.tunnels.acquire(budget) {
+			note := queueNote(budget, m.s.tunnels.occupancy(budget.endpoint))
+			if err := m.s.m.pg.SetDeepTaskQueueNote(q.ID, note); err != nil {
+				log.Printf("[deep] 记录排队原因失败 %d: %v", q.ID, err)
+			}
+			continue
+		}
+		claimed, err := m.s.m.pg.ClaimDeepTask(q.ID)
+		if err != nil {
+			m.s.tunnels.release(budget)
+			return nil, proxyBudget{}, err
+		}
+		if !claimed {
+			m.s.tunnels.release(budget)
+			continue
+		}
+		task, err := m.s.m.pg.GetDeepTask(q.ID)
+		if err != nil {
+			m.s.tunnels.release(budget)
+			log.Printf("[deep] 认领后读取任务失败 %d: %v", q.ID, err)
+			return nil, proxyBudget{}, err
+		}
+		return task, budget, nil
+	}
+	return nil, proxyBudget{}, nil
+}
+
+func (m *deepManager) run(parent context.Context, task *db.DeepTask, budget proxyBudget) {
+	defer m.s.tunnels.release(budget)
 	timeout := 15 * time.Minute
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()

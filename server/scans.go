@@ -97,7 +97,7 @@ func (m *scanManager) loop(ctx context.Context) {
 			return
 		}
 		for {
-			task, err := m.s.m.pg.ClaimNextScanTask()
+			task, budget, err := m.claimNext()
 			if err != nil {
 				log.Printf("[scan] claim queued task: %v", err)
 				break
@@ -105,7 +105,7 @@ func (m *scanManager) loop(ctx context.Context) {
 			if task == nil {
 				break
 			}
-			m.run(ctx, task)
+			m.run(ctx, task, budget)
 		}
 		select {
 		case <-ctx.Done():
@@ -116,7 +116,48 @@ func (m *scanManager) loop(ctx context.Context) {
 	}
 }
 
-func (m *scanManager) run(parent context.Context, task *db.ScanTask) {
+// claimNext 按 FIFO 取下一个「现在能跑」的扫描。走隧道/代理的还要看那条通道有没有
+// 剩余名额：满了就把它留在队列里并写明原因，而不是失败的、也不是把整条队列堵住
+// ——后面排着的直连任务照样开工。
+func (m *scanManager) claimNext() (*db.ScanTask, proxyBudget, error) {
+	queued, err := m.s.m.pg.QueuedScanProxies(0)
+	if err != nil {
+		return nil, proxyBudget{}, err
+	}
+	for _, q := range queued {
+		budget := m.s.budget(q.Proxy)
+		if !m.s.tunnels.acquire(budget) {
+			note := queueNote(budget, m.s.tunnels.occupancy(budget.endpoint))
+			if err := m.s.m.pg.SetScanTaskQueueNote(q.ID, note); err != nil {
+				log.Printf("[scan] 记录排队原因失败 %d: %v", q.ID, err)
+			}
+			continue
+		}
+		claimed, err := m.s.m.pg.ClaimScanTask(q.ID)
+		if err != nil {
+			m.s.tunnels.release(budget)
+			return nil, proxyBudget{}, err
+		}
+		if !claimed {
+			// 别的执行者已经抢走这一格（或任务刚被取消），名额还回去看下一个候选。
+			m.s.tunnels.release(budget)
+			continue
+		}
+		task, err := m.s.m.pg.GetScanTask(q.ID)
+		if err != nil {
+			m.s.tunnels.release(budget)
+			log.Printf("[scan] 认领后读取任务失败 %d: %v", q.ID, err)
+			return nil, proxyBudget{}, err
+		}
+		return task, budget, nil
+	}
+	return nil, proxyBudget{}, nil
+}
+
+func (m *scanManager) run(parent context.Context, task *db.ScanTask, budget proxyBudget) {
+	// 名额在整个任务期间占着：隧道被塞爆不是某一瞬间的事，从探测到 POC 到深挖
+	// 全程都算这一条通道上的负载。
+	defer m.s.tunnels.release(budget)
 	timeout := time.Duration(task.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
@@ -133,7 +174,7 @@ func (m *scanManager) run(parent context.Context, task *db.ScanTask) {
 		m.mu.Unlock()
 	}()
 
-	run := &scanRun{s: m.s, pg: m.s.m.pg, task: task, ctx: ctx, progress: map[string]any{}}
+	run := &scanRun{s: m.s, pg: m.s.m.pg, task: task, ctx: ctx, progress: map[string]any{}, budget: budget}
 	status, stage, errMsg, summary := run.execute()
 	if summary == nil {
 		summary = map[string]any{}
@@ -161,6 +202,9 @@ type scanRun struct {
 	pg   *db.DB
 	task *db.ScanTask
 	ctx  context.Context
+
+	// budget 是这一轮在隧道/代理上的并发口径（F6）。零值表示不受约束。
+	budget proxyBudget
 
 	mu       sync.Mutex
 	progress map[string]any
@@ -236,10 +280,14 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 		return r.executeResume(summary)
 	}
 
-	r.logf("discover", "开始资产发现：%d 个目标，端口策略 %s", len(targets), r.task.Ports)
+	if line := r.budget.logLine(); line != "" {
+		r.logf("budget", "%s", line)
+	}
+	probeConcurrency := r.budget.clampProbes(200)
+	r.logf("discover", "开始资产发现：%d 个目标，端口策略 %s（探测并发 %d）", len(targets), r.task.Ports, probeConcurrency)
 	res, err := scanner.Discover(r.ctx, targets, scanner.DiscoverOptions{
 		Ports:         r.task.Ports,
-		Concurrency:   200,
+		Concurrency:   probeConcurrency,
 		Timeout:       900 * time.Millisecond,
 		MaxProbes:     3000,
 		MaxPortChecks: maxScanPortChecks,
@@ -326,8 +374,13 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 		return "failed", "failed", "建立续扫检查点失败，未发起 POC 扫描：" + err.Error(), summary
 	}
 
+	nucConc, nucRate := r.budget.clampNuclei(r.task.Concurrency, r.task.RateLimit)
 	r.logf("scan", "开始 nuclei 扫描：%d 个 POC × %d 个目标（并发 %d，限速 %d/s），切成 %d 个分片",
-		len(templates), len(scanTargets), r.task.Concurrency, r.task.RateLimit, len(runs))
+		len(templates), len(scanTargets), nucConc, nucRate, len(runs))
+	if nucConc != r.task.Concurrency || nucRate != r.task.RateLimit {
+		r.logf("scan", "并发与限速已从任务设定的 %d / %d 收敛到 %d / %d：这一轮走的是受预算约束的隧道/代理通道",
+			r.task.Concurrency, r.task.RateLimit, nucConc, nucRate)
+	}
 	r.setProgress("scan", map[string]any{
 		"templates": len(templates), "targets": len(scanTargets), "shards": shardCounters(shards),
 	})
@@ -548,7 +601,8 @@ func (r *scanRun) runNucleiStaged(runs []scanShardRun, shards []db.ScanShard, as
 	for _, s := range shards {
 		byOrdinal[s.Ordinal] = s
 	}
-	opts := scanner.NucleiOptions{RateLimit: r.task.RateLimit, Concurrency: r.task.Concurrency, Proxy: r.task.Proxy}
+	concurrency, rateLimit := r.budget.clampNuclei(r.task.Concurrency, r.task.RateLimit)
+	opts := scanner.NucleiOptions{RateLimit: rateLimit, Concurrency: concurrency, Proxy: r.task.Proxy}
 
 	for i, sr := range runs {
 		if sh := byOrdinal[sr.ordinal]; sh.Status == "done" {

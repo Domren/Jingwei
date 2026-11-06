@@ -636,6 +636,9 @@ export default function ScansPage() {
                         {active && <Loader2Icon className="size-3 animate-spin" />}
                         {meta.label}
                       </Badge>
+                      {task.status === "queued" && typeof task.progress.queue_note === "string" && (
+                        <div className="mt-1 max-w-44 text-[11px] text-amber-600">{task.progress.queue_note}</div>
+                      )}
                       {task.error && (
                         <div className="mt-1 max-w-32 truncate text-[11px] text-destructive">{task.error}</div>
                       )}

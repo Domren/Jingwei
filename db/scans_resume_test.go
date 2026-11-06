@@ -361,3 +361,61 @@ func TestScanRecoveryMessages(t *testing.T) {
 		}
 	}
 }
+
+// 排队原因只能写在还在排队的任务上：正在跑的任务的 progress 由执行器整体覆盖，
+// 从旁边往里塞一个键会被下一次进度刷新无声吃掉，看起来像「写了但没生效」。
+func TestQueueNoteOnlyOnQueued(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	queued, err := d.CreateScanTask(ScanTaskInput{Name: "f6-note-queued", Targets: []string{"http://10.0.0.1/"}, Mode: "auto", Ports: "80", Proxy: "socks5://10.0.0.9:1080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, err := d.CreateScanTask(ScanTaskInput{Name: "f6-note-running", Targets: []string{"http://10.0.0.1/"}, Mode: "auto", Ports: "80", Proxy: "socks5://10.0.0.9:1080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM scan_tasks WHERE id IN ($1,$2)`, queued.ID, running.ID)
+	})
+	if _, err := d.Exec(`UPDATE scan_tasks SET status='running', stage='scan' WHERE id=$1`, running.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	note := "隧道/代理 10.0.0.9:1080 上已有 1 个任务在跑（预算 1），排队等待"
+	for _, id := range []int64{queued.ID, running.ID} {
+		if err := d.SetScanTaskQueueNote(id, note); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, _ := d.GetScanTask(queued.ID); got.Progress["queue_note"] != note {
+		t.Fatalf("排队任务没记下原因：%v", got.Progress)
+	}
+	if got, _ := d.GetScanTask(running.ID); got.Progress["queue_note"] != nil {
+		t.Fatalf("运行中的任务被写进了排队原因：%v", got.Progress)
+	}
+
+	// 同一句话重复写不产生新写入（认领循环每 30 秒跑一次，不能每次都摸一遍行）。
+	if err := d.SetScanTaskQueueNote(queued.ID, note); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetScanTaskQueueNote(queued.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := d.GetScanTask(queued.ID); got.Progress["queue_note"] != nil {
+		t.Fatalf("清空排队原因没生效：%v", got.Progress)
+	}
+
+	// 候选列表按 FIFO，并原样带上代理串（端点归一化在 server 侧只做一次）。
+	candidates, err := d.QueuedScanProxies(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) == 0 || candidates[0].ID != queued.ID || candidates[0].Proxy != "socks5://10.0.0.9:1080" {
+		t.Fatalf("排队候选不对：%+v", candidates)
+	}
+}

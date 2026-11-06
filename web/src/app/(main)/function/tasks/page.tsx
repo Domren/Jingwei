@@ -105,6 +105,7 @@ import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
 import {
   Sheet,
   SheetClose,
@@ -1062,6 +1063,10 @@ function ConcurrencySettingsDialog() {
   const [open, setOpen] = React.useState(false);
   const [enabled, setEnabled] = React.useState(false);
   const [limit, setLimit] = React.useState("5");
+  const [tunnelOn, setTunnelOn] = React.useState(true);
+  const [tunnelTasks, setTunnelTasks] = React.useState("1");
+  const [tunnelRequests, setTunnelRequests] = React.useState("4");
+  const [tunnelBusy, setTunnelBusy] = React.useState<{ endpoint: string; used: number }[]>([]);
   const [loading, setLoading] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
 
@@ -1073,6 +1078,10 @@ function ConcurrencySettingsDialog() {
       .then((settings) => {
         setEnabled(!!settings.task_concurrency_enabled);
         setLimit(String(settings.task_concurrency_limit ?? 5));
+        setTunnelOn(settings.tunnel_concurrency_enabled !== false);
+        setTunnelTasks(String(settings.tunnel_concurrency_limit ?? 1));
+        setTunnelRequests(String(settings.tunnel_request_concurrency_limit ?? 4));
+        setTunnelBusy(settings.tunnel_busy ?? []);
       })
       .catch(() => {
         // Keep the dialog usable with defaults; reopening retries the request.
@@ -1082,10 +1091,22 @@ function ConcurrencySettingsDialog() {
 
   async function save() {
     const nextLimit = Math.max(1, Math.floor(Number(limit) || 5));
+    const nextTasks = Math.max(1, Math.floor(Number(tunnelTasks) || 1));
+    const nextRequests = Math.max(1, Math.floor(Number(tunnelRequests) || 4));
     setSaving(true);
     try {
-      await api.setSettings({ task_concurrency_enabled: enabled, task_concurrency_limit: nextLimit });
-      toast.success(enabled ? `已开启并发限制：最多同时运行 ${nextLimit} 个任务` : "已关闭任务并发限制");
+      await api.setSettings({
+        task_concurrency_enabled: enabled,
+        task_concurrency_limit: nextLimit,
+        tunnel_concurrency_enabled: tunnelOn,
+        tunnel_concurrency_limit: nextTasks,
+        tunnel_request_concurrency_limit: nextRequests,
+      });
+      toast.success(
+        enabled
+          ? `已开启并发限制：最多同时运行 ${nextLimit} 个任务；同一条隧道 ${nextTasks} 个，隧道内并发 ${nextRequests}`
+          : "已关闭任务并发限制",
+      );
       setOpen(false);
     } catch (error) {
       toast.error(`保存失败：${(error as Error).message}`);
@@ -1129,6 +1150,66 @@ function ConcurrencySettingsDialog() {
                 disabled={loading}
               />
             </div>
+          )}
+          <Separator />
+          <div className="flex items-center justify-between gap-4">
+            <div className="grid gap-1">
+              <Label htmlFor="tunnel-concurrency-enabled">隧道并发预算</Label>
+              <span className="text-muted-foreground text-xs">
+                一条 chisel/ssh 隧道是单通道转发。塞爆之后的现象不是慢，是超时潮：探测报「连不上」、
+                POC 大面积不命中，报告于是把一个被自己挤死的通道说成「没问题」。默认开启。
+              </span>
+            </div>
+            <Switch
+              id="tunnel-concurrency-enabled"
+              checked={tunnelOn}
+              onCheckedChange={setTunnelOn}
+              disabled={loading}
+            />
+          </div>
+          {tunnelOn && (
+            <>
+              <div className="grid gap-2">
+                <Label htmlFor="tunnel-concurrency-limit">同一条隧道上同时运行的任务数</Label>
+                <Input
+                  id="tunnel-concurrency-limit"
+                  type="number"
+                  min={1}
+                  className="w-32"
+                  value={tunnelTasks}
+                  onChange={(event) => setTunnelTasks(event.target.value)}
+                  disabled={loading}
+                />
+                <span className="text-muted-foreground text-xs">
+                  超出的任务留在队列里等待并写明原因，不判失败；后面的直连任务照常开工。
+                </span>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="tunnel-request-concurrency-limit">隧道内单次运行的并发</Label>
+                <Input
+                  id="tunnel-request-concurrency-limit"
+                  type="number"
+                  min={1}
+                  className="w-32"
+                  value={tunnelRequests}
+                  onChange={(event) => setTunnelRequests(event.target.value)}
+                  disabled={loading}
+                />
+                <span className="text-muted-foreground text-xs">
+                  nuclei 的 -concurrency 与限速、以及端口探测并发都按这个数收敛（探测 = 该数 × 4）。
+                </span>
+              </div>
+              {tunnelBusy.length > 0 && (
+                <div className="text-muted-foreground text-xs">
+                  当前占用：
+                  {tunnelBusy.map((b) => (
+                    <span key={b.endpoint} className="ml-2 font-mono">
+                      {b.endpoint} ×{b.used}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </div>
         <DialogFooter>

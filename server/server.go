@@ -48,6 +48,8 @@ type Server struct {
 	credMgr     *credManager
 	deepMgr     *deepManager
 	resourceMgr *resourceManager
+	// tunnels 记着「哪条隧道上现在有几个重任务在跑」，是 F6 并发预算的占用表。
+	tunnels *tunnelBudget
 
 	skillDir  string // root directory for skill subdirectories
 	jwtKey    []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
@@ -186,7 +188,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
-		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1),
+		tunnels: newTunnelBudget()}
 	s.resourceMgr = newResourceManager(s)
 	s.initSideQuestions()
 	if m.pg != nil {
@@ -3931,6 +3934,7 @@ func (s *Server) settingsPayload() map[string]any {
 	if concLimit == 0 {
 		concLimit = defaultConcurrencyLimit // 关闭时也回显一个合理默认值给 UI
 	}
+	tunnelOn, tunnelTaskLimit, tunnelReqLimit, tunnelAnyProxy := s.tunnelSettings()
 	return map[string]any{
 		"traffic_capture":           s.m.TrafficEnabled(),
 		"agent_traffic_binding":     s.m.pg.GetBool(settingAgentTrafficBinding, true),
@@ -3951,6 +3955,14 @@ func (s *Server) settingsPayload() map[string]any {
 		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
 		"task_concurrency_enabled": concOn,                      // 任务并发上限开关(默认关)
 		"task_concurrency_limit":   concLimit,                   // 同时运行任务上限(开启后默认5)
+		// 隧道/代理并发预算(F6)：同一条隧道上同时允许几个重任务，以及隧道内单次运行的
+		// 并发上限。默认开——一条 chisel/ssh 通道被 200 个并发拨号塞爆之后，报出来的
+		// 「端口不开 / POC 不命中」已经不是目标的结论，而是通道的结论。
+		"tunnel_concurrency_enabled":       tunnelOn,
+		"tunnel_concurrency_limit":         tunnelTaskLimit,
+		"tunnel_request_concurrency_limit": tunnelReqLimit,
+		"tunnel_budget_any_proxy":          tunnelAnyProxy,
+		"tunnel_busy":                      s.tunnels.snapshot(), // 现在哪条隧道上占了几个名额
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
 		// 自动切到下一个配置。bind_fallback 仅在轮询开启时有意义(默认关)。
 		"llm_pool_enabled":       s.m.LLMPoolEnabled(),
@@ -4040,6 +4052,12 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		// 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
 		ConcurrencyEnabled *bool `json:"task_concurrency_enabled"`
 		ConcurrencyLimit   *int  `json:"task_concurrency_limit"`
+		// 隧道/代理并发预算(F6)：同一条隧道上同时允许几个重任务、隧道内单次运行的并发上限。
+		// 超限的任务留在队列里等待并写明原因，不失败。
+		TunnelConcurrencyEnabled *bool `json:"tunnel_concurrency_enabled"`
+		TunnelTaskLimit          *int  `json:"tunnel_concurrency_limit"`
+		TunnelRequestLimit       *int  `json:"tunnel_request_concurrency_limit"`
+		TunnelBudgetForAnyProxy  *bool `json:"tunnel_budget_any_proxy"`
 		// LLM 轮询(故障转移)开关 + 「绑定配置失败也兜底回轮询链」开关。两者都需要
 		// 重建 provider 链才生效，走下面的 changed → applyLLM 路径。
 		LLMPoolEnabled      *bool `json:"llm_pool_enabled"`
@@ -4147,6 +4165,14 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		// 立即协调一次:关闭时放行全部排队,调高上限时补位启动,不必等下一个 tick。
 		go s.reconcileConcurrency()
+	}
+	if req.TunnelConcurrencyEnabled != nil || req.TunnelTaskLimit != nil ||
+		req.TunnelRequestLimit != nil || req.TunnelBudgetForAnyProxy != nil {
+		if err := s.SetTunnelConcurrency(req.TunnelConcurrencyEnabled, req.TunnelTaskLimit,
+			req.TunnelRequestLimit, req.TunnelBudgetForAnyProxy); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
 	}
 	if req.PythonInterp != nil {
 		if err := s.m.pg.SetSetting(settingPythonInterp, strings.TrimSpace(*req.PythonInterp)); err != nil {

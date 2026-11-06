@@ -231,20 +231,47 @@ func (d *DB) GetScanTask(id int64) (*ScanTask, error) {
 	return t, err
 }
 
-// ClaimNextScanTask atomically claims the oldest queued task for execution.
-// It returns (nil, nil) when the queue is empty.
-func (d *DB) ClaimNextScanTask() (*ScanTask, error) {
-	t, err := scanOneScanTask(d.QueryRow(`UPDATE scan_tasks
-SET status='running', stage='discover', started_at=now(), finished_at=NULL, error='', progress='{}'::jsonb
-WHERE id=(SELECT id FROM scan_tasks WHERE status='queued' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
-RETURNING ` + scanTaskCols))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+// 排队任务的认领只有一条路：QueuedScanProxies 按 FIFO 取候选，ClaimScanTask 按 ID 抢占。
+// 没有「直接认领最老的排队任务」那种便捷写法了——要不要开工现在取决于隧道并发预算，
+// 留一个跳过预算的认领方式等于给它一条近路。
+//
+// QueuedScanProxies 列出排队任务与各自要走的代理串。代理原样返回、只用于算端点：
+// 它可能带凭据，因此绝不写进日志或接口（见 server.proxyEndpoint）。
+type QueuedProxyTask struct {
+	ID    int64
+	Proxy string
+}
+
+func (d *DB) QueuedScanProxies(limit int) ([]QueuedProxyTask, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 200
 	}
+	rows, err := d.Query(`SELECT id, proxy FROM scan_tasks WHERE status='queued' ORDER BY id LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
-	return t, nil
+	defer rows.Close()
+	out := []QueuedProxyTask{}
+	for rows.Next() {
+		var q QueuedProxyTask
+		if err := rows.Scan(&q.ID, &q.Proxy); err != nil {
+			return nil, err
+		}
+		out = append(out, q)
+	}
+	return out, rows.Err()
+}
+
+// SetScanTaskQueueNote 把「为什么还在排队」写进进度里。排队不动的原因是隧道忙，
+// 不是任务坏了——不写出来，运维只能猜，而猜的方向通常是「平台卡死了」。
+// note 为空表示清除（任务被认领时 progress 也会整体重置）。
+func (d *DB) SetScanTaskQueueNote(id int64, note string) error {
+	_, err := d.Exec(`UPDATE scan_tasks
+SET progress = CASE WHEN $2='' THEN progress - 'queue_note'
+                    ELSE progress || jsonb_build_object('queue_note', $2) END
+WHERE id=$1 AND status='queued'
+      AND (progress->>'queue_note') IS DISTINCT FROM $2`, id, strings.TrimSpace(note))
+	return err
 }
 
 // ClaimScanTask atomically moves a queued task to running. False means another
