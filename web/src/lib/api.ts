@@ -134,6 +134,7 @@ import type {
   Severity,
   ShellExecInput,
   ShellExecResult,
+  ShellExecForm,
   ShellFileAction,
   ShellFileChunk,
   ShellFileList,
@@ -1633,6 +1634,9 @@ export const api = {
   checkWebshell: (id: number) =>
     post<{ alive: boolean; status: string; note: string }>(`/deep/webshells/${id}/check`, {}),
   execWebshell: (id: number, input: ShellExecInput) => post<ShellExecResult>(`/deep/webshells/${id}/exec`, input),
+  // exec() 语境的命令编码换算：贴给 Java exec(String) / ProcessBuilder 之前问一次。
+  execForm: (command: string, osKind?: string) =>
+    post<ShellExecForm>("/deep/exec-form", { command, os_kind: osKind ?? "" }),
   webshellInfo: (id: number, cwd?: string) =>
     get<ShellInfoResult>(`/deep/webshells/${id}/info${cwd ? `?cwd=${encodeURIComponent(cwd)}` : ""}`),
   webshellPayload: (id: number) =>

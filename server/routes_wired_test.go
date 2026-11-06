@@ -59,6 +59,7 @@ func TestUIEndpointsAreRouted(t *testing.T) {
 		{"GET", "/api/credscan/tasks/1/results"},
 		{"GET", "/api/credscan/tasks/1/report"},
 		{"GET", "/api/scans/1/diff"},
+		{"POST", "/api/deep/exec-form"},
 	}
 	for _, c := range named {
 		r := httptest.NewRequest(c.method, c.path, nil)

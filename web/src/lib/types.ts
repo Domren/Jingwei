@@ -1846,6 +1846,21 @@ export interface ShellExecResult {
   note?: string;
 }
 
+// exec() 语境下的一条命令该长成什么样（E4）。single 为空时 reason 说明为什么这条路走不通，
+// needs_bash 表示单串形式用了只有 bash 认的写法。typed_tokens 是原命令被 exec(String)
+// 按空白切碎的结果——缺陷本身。
+export interface ShellExecForm {
+  command: string;
+  os: string;
+  needs_shell: boolean;
+  constructs: string[];
+  argv: string[];
+  single: string;
+  needs_bash: boolean;
+  reason: string;
+  typed_tokens: string[];
+}
+
 export interface ShellInfoSection {
   label: string;
   output: string;

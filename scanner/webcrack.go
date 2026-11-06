@@ -83,7 +83,7 @@ type webCrackBridgeOutput struct {
 
 var (
 	webCrackLookOnce sync.Once
-	webCrackBin      string // "python3 <bridge>"
+	webCrackArgv     []string // ["python3", "<bridge>"]
 	webCrackLookErr  error
 	webCrackLookEnv  string
 )
@@ -94,7 +94,7 @@ func WebCrackAvailable() bool {
 	return err == nil
 }
 
-func webCrackBinary() (string, error) {
+func webCrackBinary() ([]string, error) {
 	key := os.Getenv("JINGWEI_WEBCRACK_BRIDGE") + "|" + os.Getenv("JINGWEI_WEBCRACK_PYTHON")
 	webCrackLookOnce.Do(func() {
 		webCrackLookEnv = key
@@ -106,11 +106,11 @@ func webCrackBinary() (string, error) {
 		webCrackLookOnce = sync.Once{}
 		return webCrackBinary()
 	}
-	return webCrackBin, webCrackLookErr
+	return webCrackArgv, webCrackLookErr
 }
 
 func webCrackResolve() {
-	webCrackBin, webCrackLookErr = "", nil
+	webCrackArgv, webCrackLookErr = nil, nil
 	py := strings.TrimSpace(os.Getenv("JINGWEI_WEBCRACK_PYTHON"))
 	if py == "" {
 		var err error
@@ -130,13 +130,14 @@ func webCrackResolve() {
 		webCrackLookErr = err
 		return
 	}
-	if strings.ContainsAny(py, " \t\n") || strings.ContainsAny(script, " \t\n") {
-		// webCrackBin is split on whitespace by the caller: refuse paths that
-		// would not survive that, rather than silently mangling the command.
-		webCrackLookErr = errors.New("webcrack：python 或脚本路径含空白字符，请改用引号安全的路径")
+	// 解释器那一段是配置项，允许写成「python3 -E -s」这样的命令行。按空白切会让带空格的
+	// 路径变成两个参数（E4），所以走命令行切分：引号与转义都算数，需要 shell 构件时报错。
+	pyArgv, err := SplitCommandLine(py)
+	if err != nil {
+		webCrackLookErr = fmt.Errorf("webcrack：JINGWEI_WEBCRACK_PYTHON 不是一个可用的参数列表（%v）", err)
 		return
 	}
-	webCrackBin = py + " " + script
+	webCrackArgv = append(pyArgv, script)
 }
 
 func webCrackBridgeScript() (string, error) {
@@ -165,21 +166,23 @@ func webCrackBridgeScript() (string, error) {
 func RunWebCrack(ctx context.Context, opts WebCrackOptions) WebCrackRun {
 	run := WebCrackRun{}
 	start := time.Now()
-	bin, err := webCrackBinary()
-	if err != nil {
+	argv, err := webCrackBinary()
+	if err != nil || len(argv) == 0 {
 		run.Missing = true
+		if err == nil {
+			err = errors.New("未解析出可执行参数")
+		}
 		run.Err = errors.New("webcrack 未安装：" + err.Error())
 		return run
 	}
-	parts := strings.Fields(bin)
 	args := make([]string, 0, 8+2*len(opts.URLs))
-	args = append(args, parts[1:]...)
+	args = append(args, argv[1:]...)
 	for _, u := range opts.URLs {
 		if u = strings.TrimSpace(u); u != "" {
 			args = append(args, "--url", u)
 		}
 	}
-	if len(args) <= len(parts)-1 {
+	if len(args) == len(argv)-1 {
 		run.Err = errors.New("webcrack：没有可测试的 URL")
 		return run
 	}
@@ -233,7 +236,7 @@ func RunWebCrack(ctx context.Context, opts WebCrackOptions) WebCrackRun {
 	}
 	var out limitedBuffer
 	out.limit = 8 << 20
-	cmd := exec.CommandContext(runCtx, parts[0], args...)
+	cmd := exec.CommandContext(runCtx, argv[0], args...)
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if pairsJSON != "" {
 		// Credentials are handed over on stdin so they never appear in the

@@ -12,6 +12,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import type { ShellExecResult } from "@/lib/types";
 
+import { ExecFormDialog } from "./exec-form-dialog";
+
 /**
  * One terminal turn, delivered by the caller.
  *
@@ -118,6 +120,8 @@ export function ShellTerminal({
   const [follow, setFollow] = React.useState(true);
   const [history, setHistory] = React.useState<string[]>([]);
   const [histIdx, setHistIdx] = React.useState<number | null>(null);
+  // 非空表示正在看这条命令的 exec() 语境形式（E4）。
+  const [formCmd, setFormCmd] = React.useState("");
 
   const nextId = React.useRef(1);
   const boxRef = React.useRef<HTMLDivElement | null>(null);
@@ -384,6 +388,17 @@ export function ShellTerminal({
           <CopyIcon className="size-3.5" />
           复制会话
         </Button>
+        {/* 贴给 Java exec(String) / 内存马命令口之前先问一句：这条命令在那个语境里会被切成什么、
+            该写成什么形式。换算在这里做是因为只有平台知道命令通道的解释器族。 */}
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-6"
+          disabled={!input.trim()}
+          onClick={() => setFormCmd(input.trim())}
+        >
+          exec() 语境形式
+        </Button>
         <Button
           variant="ghost"
           size="sm"
@@ -399,6 +414,10 @@ export function ShellTerminal({
         </Button>
         <span>超时只停止本地等待，目标上的命令可能仍在继续。</span>
       </div>
+
+      {formCmd ? (
+        <ExecFormDialog command={formCmd} osKind={osKind} onOpenChange={(open) => !open && setFormCmd("")} />
+      ) : null}
     </div>
   );
 }

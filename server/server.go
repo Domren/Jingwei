@@ -991,6 +991,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/deep/credentials", s.listGlobalCredentials)
 	mux.HandleFunc("POST /api/deep/webshells/{id}/exec", s.execWebshellCommand)
 	mux.HandleFunc("GET /api/deep/webshells/{id}/info", s.webshellInfo)
+	// exec() 语境的命令编码助手：纯静态换算，不接触目标。
+	mux.HandleFunc("POST /api/deep/exec-form", s.execForm)
 	// Java 内存马：由 v2 JSP webshell 注入 filter/servlet/listener/valve/agent
 	mux.HandleFunc("GET /api/deep/memshells", s.listJavaMemshells)
 	mux.HandleFunc("GET /api/deep/memshells/{id}", s.getJavaMemshell)
