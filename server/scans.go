@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -213,11 +215,7 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 	}
 	// 资产禁令之外还要过客户授权清单（F4）：这一层此前只挂在 agent 工具与内网执行上，
 	// 从漏扫页建的任务绕过它（见 guard_targets.go）。
-	gURLs, gHosts, gerr := guardProbeTargets(targets)
-	if gerr != nil {
-		return "failed", "failed", gerr.Error(), summary
-	}
-	if deny, warn := guardCheckTargets(r.s.targetPolicy(), gURLs, gHosts); deny != "" {
+	if deny, warn := r.s.guardInputTargets(targets); deny != "" {
 		r.logf("guard", "目标被平台拒绝，未发起扫描：%s", deny)
 		return "failed", "failed", "目标被平台拒绝，未发起扫描：" + deny, summary
 	} else if warn != "" {
@@ -232,6 +230,10 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 		r.logf("discover", "出站代理：%s（资产发现/弱口令/深度利用子任务均经此代理）", redactProxyURL(normalized))
 	} else {
 		r.task.Proxy = ""
+	}
+
+	if r.task.ResumeRequested {
+		return r.executeResume(summary)
 	}
 
 	r.logf("discover", "开始资产发现：%d 个目标，端口策略 %s", len(targets), r.task.Ports)
@@ -287,7 +289,7 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 			Technologies: app.Technologies, ContentLength: app.ContentLength,
 		})
 	}
-	templates, err := r.selectTemplates(services)
+	templates, templateIDs, err := r.selectTemplates(services)
 	if err != nil {
 		return "failed", "failed", err.Error(), summary
 	}
@@ -314,79 +316,653 @@ func (r *scanRun) execute() (status, stage, errMsg string, summary map[string]an
 		return "done", "done", "", summary
 	}
 
-	r.logf("scan", "开始 nuclei 扫描：%d 个 POC × %d 个目标（并发 %d，限速 %d/s）",
-		len(templates), len(scanTargets), r.task.Concurrency, r.task.RateLimit)
-	r.setProgress("scan", map[string]any{"templates": len(templates), "targets": len(scanTargets)})
-	nrun := scanner.RunNuclei(r.ctx, templates, scanTargets, scanner.NucleiOptions{
-		RateLimit:   r.task.RateLimit,
-		Concurrency: r.task.Concurrency,
-		Proxy:       r.task.Proxy,
+	// D5：把「这一轮扫什么、切成哪些片」在一个事务里钉死。计划钉住模板 ID 与内容摘要、
+	// 目标顺序与分片参数，之后中断/重启都能凭它重建，不必重跑资产发现。写不进去就失败：
+	// 没有检查点的半途扫描会留下「扫过了」的假象，续扫时无从判断哪些片是空的。
+	plan := newScanPlan(scanTargets, templates, templateIDs, res.Services, appSystems)
+	runs := scanShardRuns(plan, templates)
+	shards, err := r.saveScanPlan(plan, runs)
+	if err != nil {
+		return "failed", "failed", "建立续扫检查点失败，未发起 POC 扫描：" + err.Error(), summary
+	}
+
+	r.logf("scan", "开始 nuclei 扫描：%d 个 POC × %d 个目标（并发 %d，限速 %d/s），切成 %d 个分片",
+		len(templates), len(scanTargets), r.task.Concurrency, r.task.RateLimit, len(runs))
+	r.setProgress("scan", map[string]any{
+		"templates": len(templates), "targets": len(scanTargets), "shards": shardCounters(shards),
 	})
-	summary["nuclei_elapsed_ms"] = nrun.Elapsed.Milliseconds()
-	if nrun.Chains > 0 {
+	st := r.runNucleiStaged(runs, shards, assets)
+	return r.finishStaged(plan, st, summary, exposureFindings)
+}
+
+// scanShardTemplates 是一片最多带多少条模板：太大则中断时白跑得多，太小则 nuclei 的
+// 启动与模板编译成本占比高。400 在 1 万条的库上是 25 片。
+const scanShardTemplates = 400
+
+// scanShardUnits 是一片最多多少「模板 × 目标」请求单元。目标多时按目标再切，单片的
+// 中断代价才有上界，授权/禁令检查也才有办法落到具体目标上（被打断的片重跑才不会牵连
+// 整段模板）。
+const scanShardUnits = 4000
+
+// 续扫计划的阶段。只有 poc 阶段可续：postprocess 已经在库里排队了深挖任务，重放会
+// 把同一批漏洞再深挖一遍。
+const (
+	scanPhasePOC         = "poc"
+	scanPhasePostprocess = "postprocess"
+	scanPhaseDone        = "done"
+)
+
+// scanPlan 是续扫所需的全部上下文：目标、被钉住的模板（ID + 内容摘要 + nuclei 模板名）、
+// 分片参数与发现阶段的结果。发现阶段的服务/应用系统一并存下，续扫后的专项基线与深挖
+// 才有输入。
+type scanPlan struct {
+	Phase         string               `json:"phase"`
+	TemplateChunk int                  `json:"template_chunk"`
+	UnitBudget    int                  `json:"unit_budget"`
+	Targets       []string             `json:"targets"`
+	TemplateIDs   []int64              `json:"template_ids"`
+	TemplateKeys  []string             `json:"template_keys"`
+	Digests       []string             `json:"digests"`
+	Services      []scanner.WebService `json:"services"`
+	Apps          []scanner.AppSystem  `json:"apps"`
+}
+
+func newScanPlan(targets []string, templates []scanner.NucleiTemplate, ids []int64, services []scanner.WebService, apps []scanner.AppSystem) scanPlan {
+	p := scanPlan{
+		Phase: scanPhasePOC, TemplateChunk: scanShardTemplates, UnitBudget: scanShardUnits,
+		Targets: append([]string{}, targets...), TemplateIDs: append([]int64{}, ids...),
+		TemplateKeys: make([]string, 0, len(templates)), Digests: make([]string, 0, len(templates)),
+		Services: services, Apps: apps,
+	}
+	// 模板内容与 nuclei 模板名按同一条目写入，计划里的三个平行数组（ID / 模板名 / 摘要）
+	// 因此天然对齐；selectTemplates 是一边走一边 append 的。
+	for _, t := range templates {
+		p.TemplateKeys = append(p.TemplateKeys, t.ID)
+		sum := sha256.Sum256([]byte(t.Content))
+		p.Digests = append(p.Digests, hex.EncodeToString(sum[:]))
+	}
+	return p
+}
+
+func (p scanPlan) JSON() string {
+	raw, err := json.Marshal(p)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+func parseScanPlan(raw string) (scanPlan, error) {
+	var p scanPlan
+	if strings.TrimSpace(raw) == "" {
+		return p, fmt.Errorf("没有续扫计划（中断发生在 POC 分片阶段之前），请用「重跑」重新开始")
+	}
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		return p, fmt.Errorf("续扫计划已损坏，无法解析：%v", err)
+	}
+	if p.Phase != scanPhasePOC {
+		return p, fmt.Errorf("续扫计划停在 %q 阶段，只有 POC 分片阶段可以续跑；请用「重跑」重新开始", p.Phase)
+	}
+	if len(p.Targets) == 0 || len(p.TemplateIDs) == 0 || len(p.TemplateIDs) != len(p.TemplateKeys) || len(p.Digests) != len(p.TemplateIDs) {
+		return p, fmt.Errorf("续扫计划不完整（目标 %d 个 / 模板 %d 个 / 摘要 %d 个），请用「重跑」重新开始",
+			len(p.Targets), len(p.TemplateIDs), len(p.Digests))
+	}
+	if p.TemplateChunk <= 0 {
+		p.TemplateChunk = scanShardTemplates
+	}
+	if p.UnitBudget <= 0 {
+		p.UnitBudget = scanShardUnits
+	}
+	return p, nil
+}
+
+// scanShardRun 是一次 nuclei 调用的输入：第几段的哪几条模板、打哪几个目标。
+type scanShardRun struct {
+	ordinal   int
+	chunk     int
+	templates []scanner.NucleiTemplate
+	targets   []string
+}
+
+// spec 是分片行的稳定身份。布局完全由「模板顺序 × 目标顺序 × 分片参数」决定，续扫时
+// 重算一遍再与库内比对，就能发现中途有人改了 POC 库或目标清单。
+func (s scanShardRun) spec() db.ScanShardSpec {
+	return db.ScanShardSpec{Ordinal: s.ordinal, Chunk: s.chunk, Target: strings.Join(s.targets, ","), Templates: len(s.templates)}
+}
+
+// scanShardRuns 先按模板切段，再按「一段模板打多少目标」分组，使单片工作量不超过
+// scanShardUnits。段在前、目标在后：模板是按危险等级排的，先让高危模板覆盖所有目标。
+func scanShardRuns(p scanPlan, templates []scanner.NucleiTemplate) []scanShardRun {
+	chunkSize := max(p.TemplateChunk, 1)
+	units := max(p.UnitBudget, 1)
+	runs := []scanShardRun{}
+	ordinal := 0
+	for off := 0; off < len(templates); off += chunkSize {
+		end := min(off+chunkSize, len(templates))
+		chunk := templates[off:end]
+		group := max(units/len(chunk), 1)
+		for toff := 0; toff < len(p.Targets); toff += group {
+			targets := p.Targets[toff:min(toff+group, len(p.Targets))]
+			runs = append(runs, scanShardRun{
+				ordinal: ordinal, chunk: off / chunkSize,
+				templates: chunk, targets: targets,
+			})
+			ordinal++
+		}
+	}
+	return runs
+}
+
+// stagedScan 是分片阶段跑完后的账：聚合的 nuclei 输出、各状态片数与途中攒下的错误。
+type stagedScan struct {
+	run        scanner.NucleiRun
+	findingIDs map[string]int64
+	done       int
+	failed     int
+	skipped    int
+	pending    int
+	total      int
+	retried    int
+	denied     []string
+	timedOut   bool
+	canceled   bool
+	err        error
+}
+
+// shardCounters 是界面要看的分片账：总数与四种状态各多少。形状在整轮里保持一致（一直是
+// 个对象），页面上的「分片 x/n」才不会一会儿是数字、一会儿是对象。
+func shardCounters(shards []db.ScanShard) map[string]any {
+	out := map[string]any{"total": len(shards), "done": 0, "failed": 0, "skipped": 0, "pending": 0}
+	for _, s := range shards {
+		key := "pending"
+		switch s.Status {
+		case "done":
+			key = "done"
+		case "failed":
+			key = "failed"
+		case "skipped":
+			key = "skipped"
+		}
+		out[key] = out[key].(int) + 1
+	}
+	return out
+}
+
+// counters 用的是执行器内存里的账（跑到哪算哪），finishStaged 用库里的进度行重算。
+func (s *stagedScan) counters() map[string]any {
+	return map[string]any{
+		"total": s.total, "done": s.done, "failed": s.failed,
+		"skipped": s.skipped, "pending": s.pending,
+	}
+}
+
+func (s *stagedScan) absorb(part scanner.NucleiRun) {
+	s.run.Results = append(s.run.Results, part.Results...)
+	s.run.Chains += part.Chains
+	s.run.Singles += part.Singles
+	s.run.HeadlessSkipped += part.HeadlessSkipped
+	s.run.Elapsed += part.Elapsed
+	s.run.TemplateCount += part.TemplateCount
+	s.run.RawTemplates += part.RawTemplates
+	s.run.RawTargets += part.RawTargets
+	s.run.TargetCount += part.TargetCount
+}
+
+// saveScanPlan 把计划与分片布局一次写进库，并返回当前进度行。
+func (r *scanRun) saveScanPlan(p scanPlan, runs []scanShardRun) ([]db.ScanShard, error) {
+	specs := make([]db.ScanShardSpec, 0, len(runs))
+	for _, sr := range runs {
+		specs = append(specs, sr.spec())
+	}
+	return r.pg.SaveScanPlan(r.task.ID, p.JSON(), specs)
+}
+
+// shardGuard 在执行一片之前重新问一遍平台策略。授权清单与资产禁令都是随时可改的，
+// 一轮扫描（尤其是续扫）不能拿建任务时的旧答案去打已经被移出的目标；读不到策略时
+// 按拒绝处理，与 guard 其它地方一致。
+func (r *scanRun) shardGuard(targets []string) (deny, warn string) {
+	pt, err := scanner.ParseTargets(targets)
+	if err != nil {
+		return "目标解析失败：" + err.Error(), ""
+	}
+	rules, err := r.pg.ListAssetInterceptRules()
+	if err != nil {
+		return "加载资产拦截规则失败：" + err.Error(), ""
+	}
+	if reason, blocked := scanTargetBlockReason(rules, pt); blocked {
+		return "目标命中资产拦截规则：" + reason, ""
+	}
+	// 走进程级同一个判断（同样是现场读清单），续扫与新建任务不会给出两种答案。
+	return r.s.guardInputTargets(pt)
+}
+
+// runNucleiStaged 按布局逐片执行 nuclei，并把每片的结果当场落库、当场记进度：
+//   - done 的片在续扫时跳过；
+//   - 片内出错先原地重试一次，仍失败记 failed 并停手，留待续扫；
+//   - 超时/取消不给当前片记 done（这一片没跑完，续扫整片重来，结果由唯一键去重）；
+//   - 结果没写进库就不算片完成，检查点写库失败同样立刻停手；
+//   - 目标被平台拒绝的片记 skipped，不连接、不假装扫过。
+func (r *scanRun) runNucleiStaged(runs []scanShardRun, shards []db.ScanShard, assets *scanAssetIndex) *stagedScan {
+	st := &stagedScan{run: scanner.NucleiRun{Results: []scanner.NucleiResult{}}, findingIDs: map[string]int64{}, total: len(runs)}
+	byOrdinal := make(map[int]db.ScanShard, len(shards))
+	for _, s := range shards {
+		byOrdinal[s.Ordinal] = s
+	}
+	opts := scanner.NucleiOptions{RateLimit: r.task.RateLimit, Concurrency: r.task.Concurrency, Proxy: r.task.Proxy}
+
+	for i, sr := range runs {
+		if sh := byOrdinal[sr.ordinal]; sh.Status == "done" {
+			st.done++
+			r.logf("scan", "分片 %d/%d 已完成（模板 %d × 目标 %d，上次落库 %d 条），跳过",
+				i+1, st.total, len(sr.templates), len(sr.targets), sh.Results)
+			continue
+		}
+		if deny, warn := r.shardGuard(sr.targets); deny != "" {
+			st.skipped++
+			st.denied = append(st.denied, fmt.Sprintf("%s（分片 %d/%d）", deny, i+1, st.total))
+			if err := r.pg.FinishScanShard(r.task.ID, sr.ordinal, "skipped", 0, deny); err != nil {
+				st.err = errors.Join(st.err, fmt.Errorf("记录分片 %d 被拒失败: %w", i+1, err))
+				return st
+			}
+			r.setProgress("scan", map[string]any{"shards": st.counters()})
+			r.logf("guard", "分片 %d/%d 的目标被平台拒绝，未发起连接：%s", i+1, st.total, deny)
+			continue
+		} else if warn != "" {
+			r.logf("guard", "%s", warn)
+		}
+		if err := r.pg.StartScanShard(r.task.ID, sr.ordinal); err != nil {
+			st.err = errors.Join(st.err, fmt.Errorf("记录分片 %d 开始失败: %w", i+1, err))
+			return st
+		}
+
+		outcome := r.executeShard(sr, opts, assets)
+		st.absorb(outcome.part)
+		r.mergeFindingIDs(st.findingIDs, outcome.findingIDs)
+		if outcome.persistErr != nil {
+			st.failed++
+			st.err = errors.Join(st.err, outcome.persistErr)
+			r.markShardFailed(sr.ordinal, i+1, st.total, outcome.persistErr.Error())
+			return st
+		}
+		if outcome.part.Err != nil && r.ctx.Err() == nil && !outcome.part.TimedOut {
+			// 单片失败先原地重试一次：临时文件、目标抖动不值得让整轮退回去重跑。
+			r.logf("scan", "分片 %d/%d 失败（%v），重试一次", i+1, st.total, outcome.part.Err)
+			st.retried++
+			outcome = r.executeShard(sr, opts, assets)
+			st.absorb(outcome.part)
+			r.mergeFindingIDs(st.findingIDs, outcome.findingIDs)
+			if outcome.persistErr != nil {
+				st.failed++
+				st.err = errors.Join(st.err, outcome.persistErr)
+				r.markShardFailed(sr.ordinal, i+1, st.total, outcome.persistErr.Error())
+				return st
+			}
+		}
+		if outcome.part.TimedOut || r.ctx.Err() != nil {
+			// 超时或取消：这一片没跑完，进度留在 pending，续扫时整片重来。
+			st.pending++
+			st.timedOut = st.timedOut || outcome.part.TimedOut
+			st.canceled = r.ctx.Err() != nil
+			return st
+		}
+		if outcome.part.Err != nil {
+			st.failed++
+			st.err = errors.Join(st.err, fmt.Errorf("分片 %d/%d：%s", i+1, st.total, nucleiErrorMessage(outcome.part)))
+			r.markShardFailed(sr.ordinal, i+1, st.total, nucleiErrorMessage(outcome.part))
+			return st
+		}
+		// done 只描述「 nuclei 跑完 + 结果落库 + 进度写库」三件事都成了；
+		// 写进度失败也必须停手，否则下一片会踩在一个谎报的检查点上。
+		if err := r.pg.FinishScanShard(r.task.ID, sr.ordinal, "done", outcome.stored, ""); err != nil {
+			st.failed++
+			st.err = errors.Join(st.err, fmt.Errorf("记录分片 %d 完成失败: %w", i+1, err))
+			r.markShardFailed(sr.ordinal, i+1, st.total, err.Error())
+			return st
+		}
+		st.done++
+		r.setProgress("scan", map[string]any{"shards": st.counters()})
+		r.logf("scan", "分片 %d/%d 完成：模板 %d × 目标 %d，新增结果 %d 条",
+			i+1, st.total, len(sr.templates), len(sr.targets), outcome.stored)
+	}
+	return st
+}
+
+// shardOutcome 是一片跑完一次的结果。nuclei 的错误与落库的错误必须分开：前者可以让
+// 上层重试一次，后者说明进度已经不可信，重试同一只会写坏库的路径没有意义。
+type shardOutcome struct {
+	part       scanner.NucleiRun
+	stored     int
+	findings   int
+	findingIDs map[string]int64
+	persistErr error
+}
+
+func (r *scanRun) executeShard(sr scanShardRun, opts scanner.NucleiOptions, assets *scanAssetIndex) shardOutcome {
+	part := scanner.RunNuclei(r.ctx, sr.templates, sr.targets, opts)
+	st, fd, ids, err := r.salvageResults(part.Results, assets)
+	return shardOutcome{part: part, stored: st, findings: fd, findingIDs: ids, persistErr: err}
+}
+
+func (r *scanRun) markShardFailed(ordinal, index, total int, msg string) {
+	if err := r.pg.FinishScanShard(r.task.ID, ordinal, "failed", 0, msg); err != nil {
+		r.logf("scan", "记录分片 %d/%d 失败状态时又出错（不影响本轮结论）：%v", index, total, err)
+	}
+}
+
+func (r *scanRun) mergeFindingIDs(dst, src map[string]int64) {
+	for k, v := range src {
+		dst[k] = v
+	}
+}
+
+// shardProgressFromDB 给 summary 用：分片账以库内进度行为准，
+// 执行器内存里的计数在中断时是不可信的。
+func (r *scanRun) shardProgressFromDB() map[string]any {
+	shards, err := r.pg.ListScanShards(r.task.ID)
+	if err != nil {
+		r.logf("scan", "读取分片进度失败（汇总里暂不显示分片数）：%v", err)
+		return map[string]any{}
+	}
+	return shardCounters(shards)
+}
+
+// finishStaged 把分片阶段的结果换算成任务终态。首轮与续扫走同一段代码：两条路径给出
+// 不同的「完成」定义，是断点续扫最容易骗人的地方。
+func (r *scanRun) finishStaged(p scanPlan, st *stagedScan, summary map[string]any, exposureFindings int) (string, string, string, map[string]any) {
+	summary["nuclei_elapsed_ms"] = st.run.Elapsed.Milliseconds()
+	summary["shards"] = r.shardProgressFromDB()
+	if st.run.Chains > 0 {
 		r.logf("scan", "链式模板 %d 条降为并发 %d 执行（多步 POC 会改写会话/上传目录，全并发会互相覆盖结果），单发模板 %d 条按并发 %d 执行",
-			nrun.Chains, scanner.StatefulChainConcurrency, nrun.Singles, r.task.Concurrency)
+			st.run.Chains, scanner.StatefulChainConcurrency, st.run.Singles, r.task.Concurrency)
 	}
-	if nrun.RawTargets > 0 {
+	if st.run.RawTargets > 0 {
 		r.logf("scan", "非 Web 端口目标 %d 个仅用 network/javascript/ssl 类 POC 直接探测（%d 条模板），HTTP POC 不再包装原始端口",
-			nrun.RawTargets, nrun.RawTemplates)
+			st.run.RawTargets, st.run.RawTemplates)
 	}
-	if nrun.HeadlessSkipped > 0 {
-		r.logf("scan", "跳过 %d 条 headless 浏览器模板（需 -headless 与浏览器，扫描镜像未提供，不影响其余 POC）", nrun.HeadlessSkipped)
+	if st.run.HeadlessSkipped > 0 {
+		r.logf("scan", "跳过 %d 条 headless 浏览器模板（需 -headless 与浏览器，扫描镜像未提供，不影响其余 POC）", st.run.HeadlessSkipped)
 	}
 
-	stored, findings, findingIDs := r.persistResults(nrun.Results, assets)
+	// 结果/发现数一律按库内实际行数重算：分片被中断后整片重跑，重复行会被唯一键吃掉，
+	// 用「本轮 persistResults 返回值」累加会少算，报出来的数字就对不上台账。
+	stored, pocFindings, cerr := r.pg.ScanPOCResultCounts(r.task.ID, p.TemplateKeys)
+	if cerr != nil {
+		r.logf("scan", "按库内行数重算结果统计失败，改用本轮累加值：%v", cerr)
+		stored, pocFindings = len(st.run.Results), len(st.findingIDs)
+	}
 	summary["results"] = stored
-	summary["findings"] = findings + exposureFindings
-	r.setProgress("scan", map[string]any{"results": stored, "findings": findings + exposureFindings})
+	summary["findings"] = pocFindings + exposureFindings
+	r.setProgress("scan", map[string]any{"results": stored, "findings": pocFindings + exposureFindings, "shards": summary["shards"]})
 
-	if nrun.TimedOut {
+	// 顺序有讲究：超时是「有期限的中断」，文案要带上分片进度，放在通用中断之前。
+	if st.timedOut {
 		r.logf("scan", "nuclei 执行超时（%ds），保留已产出的结果", r.task.TimeoutSeconds)
-		// 超时要分开报「POC 结果 / 发现」和「这一轮已经入库的其它产出」。只写前两者
-		// 的数字（超时轮常常是 0），会让人以为连应用层探测和目录枚举也没做，
-		// 而那些行确实已经在库里、可以直接接着看。
+		// 超时要分开报「POC 结果 / 发现」和「这一轮已经入库的其它产出」。只写前两者的
+		// 数字（超时轮常常是 0），会让人以为连应用层探测和目录枚举也没做，而那些行
+		// 确实已经在库里、可以直接接着看。
 		return "failed", "failed", fmt.Sprintf(
-			"扫描超时（%ds）：POC 结果 %d 条、发现 %d 条；本轮已入库的还有应用层系统 %d 个、目录入口 %d 条",
-			r.task.TimeoutSeconds, stored, findings+exposureFindings,
-			summaryInt(summary, "app_systems"), summaryInt(summary, "dir_entries")), summary
+			"扫描超时（%ds）：POC 结果 %d 条、发现 %d 条；本轮已入库的还有应用层系统 %d 个、目录入口 %d 条。"+
+				"分片进度已保留（完成 %d/%d），可「续扫」只跑剩余分片",
+			r.task.TimeoutSeconds, stored, pocFindings+exposureFindings,
+			summaryInt(summary, "app_systems"), summaryInt(summary, "dir_entries"),
+			summaryValue(summary, "shards", "done"), summaryValue(summary, "shards", "total")), summary
 	}
-	if r.ctx.Err() != nil {
+	if st.canceled {
 		return r.aborted("扫描已中断", summary)
 	}
-	if nrun.Err != nil {
-		msg := nucleiErrorMessage(nrun)
-		r.logf("scan", "nuclei 执行出错：%s", msg)
-		if stored == 0 {
-			return "failed", "failed", msg, summary
+	// 只要还有片没跑完（失败、或因任何原因没得出结论），一律不算完成：done 的含义是
+	// 「计划里的每片都对每个目标都跑过了」，缺一票就不是。
+	if st.err != nil || st.failed > 0 || st.pending > 0 {
+		msg := st.err
+		if msg == nil {
+			msg = fmt.Errorf("有 %d 个分片执行失败", st.failed)
 		}
-		covered := r.autoExploit(nrun.Results, findingIDs, summary)
-		r.runInjectionBaseline(res.Services, appSystems, summary, covered)
-		return "done", "done", msg, summary
+		return "failed", "failed", fmt.Sprintf(
+			"POC 分片未全部完成（完成 %d / 失败 %d / 未跑完 %d / 共 %d）：%v；已完成分片的进度已保留，可「续扫」只跑剩余分片",
+			st.done, st.failed, st.pending, st.total, msg), summary
 	}
-	r.logf("scan", "扫描完成：%d 条结果，%d 条写入发现", stored, findings)
-	covered := r.autoExploit(nrun.Results, findingIDs, summary)
+
+	// 全部片跑完：先切阶段，再做只该做一次的收尾。中途失败时 phase 停在 postprocess，
+	// 续扫条件不再成立——重放这段会把同一批漏洞再深挖一遍。
+	if err := r.postProcess(p, summary); err != nil {
+		return "failed", "failed", err.Error(), summary
+	}
+	warnings := []string{}
+	if st.skipped > 0 {
+		r.logf("guard", "%d 个分片的目标被平台拒绝，本轮未对其发起连接", st.skipped)
+		warnings = append(warnings, fmt.Sprintf("有 %d 个分片因平台策略未执行（目标被拒绝）：%s",
+			st.skipped, truncateText(strings.Join(st.denied, "；"), 300)))
+	}
+	if st.retried > 0 {
+		r.logf("scan", "其中 %d 个分片首次执行失败、重试后完成", st.retried)
+		warnings = append(warnings, fmt.Sprintf("%d 个分片首次执行失败、重试后完成", st.retried))
+	}
+	r.logf("scan", "扫描完成：%d 条结果（库内实际），%d 条写入发现", stored, pocFindings)
+	return "done", "done", strings.Join(warnings, "；"), summary
+}
+
+// postProcess 在全部 POC 分片跑完后执行自动深挖与 SQL/XSS 专项基线。命中从库里恢复
+// 而不是用内存里的结果：续扫时前面若干片是上一次跑的，内存里根本没有那些命中，只数本轮
+// 新命中的话，首轮中断前扫出来的高危漏洞就永远不会被深挖。
+func (r *scanRun) postProcess(p scanPlan, summary map[string]any) error {
+	if err := r.pg.SetScanPlanPhase(r.task.ID, scanPhasePostprocess); err != nil {
+		return fmt.Errorf("记录扫描阶段失败（为避免重复排队深挖已停手）: %w", err)
+	}
+	if r.ctx.Err() != nil {
+		return fmt.Errorf("扫描已中断，POC 已全部跑完但深挖与专项基线未执行；请用「重跑」重新开始")
+	}
+	hits, findingIDs, err := r.restorePOCHits(p)
+	if err != nil {
+		return fmt.Errorf("恢复 POC 命中失败（无法安排深挖）: %w", err)
+	}
+	covered := r.autoExploit(hits, findingIDs, summary)
 	// 固定基线：SQL/XSS 参数位置由页面枚举得出，nuclei 有没有命中都要交给工具判定。
-	r.runInjectionBaseline(res.Services, appSystems, summary, covered)
-	return "done", "done", "", summary
+	r.runInjectionBaseline(p.Services, p.Apps, summary, covered)
+	if err := r.pg.SetScanPlanPhase(r.task.ID, scanPhaseDone); err != nil {
+		return fmt.Errorf("收尾阶段写回扫描计划失败: %w", err)
+	}
+	return nil
+}
+
+// restorePOCHits 把本轮 POC 阶段写进库的命中还原成执行器要用的类型化结果，并按同样的
+// 键恢复「命中 → 发现编号」索引。
+//
+// 还原不出完整报文：结果行的 raw 有意丢掉 request/response（正文挂在发现条目上），
+// 所以注入点走 nuclei 一直在给的 curl 命令还原——这与「nuclei 只对部分命中打印 raw」
+// 时的现场行为是同一条路径，不是续扫特有的降级。
+func (r *scanRun) restorePOCHits(p scanPlan) ([]scanner.NucleiResult, map[string]int64, error) {
+	rows, err := r.pg.ListScanTaskPOCHits(r.task.ID, p.TemplateKeys)
+	if err != nil {
+		return nil, nil, err
+	}
+	findingIDs := map[string]int64{}
+	out := make([]scanner.NucleiResult, 0, len(rows))
+	for _, row := range rows {
+		res := scanner.NucleiResultFromEvent(row.Raw)
+		if res.TemplateID == "" {
+			res.TemplateID = row.TemplateID
+		}
+		if res.Name == "" {
+			res.Name = row.Name
+		}
+		if res.Severity == "" {
+			res.Severity = strings.ToLower(row.Severity)
+		}
+		if res.Host == "" {
+			res.Host = row.Host
+		}
+		if res.MatchedAt == "" {
+			res.MatchedAt = row.MatchedAt
+		}
+		if res.Type == "" {
+			res.Type = row.Type
+		}
+		if res.Curl == "" {
+			res.Curl = row.Curl
+		}
+		if len(res.Extracted) == 0 {
+			res.Extracted = row.Extracted
+		}
+		key := scanResultKey(res)
+		if row.FindingID != nil && *row.FindingID > 0 {
+			findingIDs[key] = *row.FindingID
+		}
+		out = append(out, res)
+	}
+	r.logf("auto", "从台账恢复 %d 条 POC 命中（含续扫前已完成的分片），据此安排深挖与专项验证", len(out))
+	return out, findingIDs, nil
+}
+
+// executeResume 从分片断点继续：不重跑资产发现、应用层发现与目录枚举（那些行已在台账
+// 里），只补未完成的 POC 分片，然后照常做一次收尾。
+func (r *scanRun) executeResume(summary map[string]any) (status, stage, errMsg string, out map[string]any) {
+	fail := func(format string, args ...any) (string, string, string, map[string]any) {
+		msg := fmt.Sprintf(format, args...)
+		r.logf("scan", "续扫失败：%s", msg)
+		return "failed", "failed", msg, summary
+	}
+	// 发现阶段的产出全部保留：续扫只补 POC，那些行仍然代表这一轮的资产与应用层结论。
+	for k, v := range r.task.Summary {
+		if _, ok := summary[k]; !ok {
+			summary[k] = v
+		}
+	}
+	plan, err := parseScanPlan(r.task.Plan)
+	if err != nil {
+		return fail("%v", err)
+	}
+	templates, err := r.pinnedTemplates(plan)
+	if err != nil {
+		return fail("%v", err)
+	}
+	// 续扫前重新问一遍策略：中断期间授权清单可能被改过，整批目标都不再允许时一条连接也不该发。
+	if deny, warn := r.shardGuard(plan.Targets); deny != "" {
+		return fail("目标被平台拒绝，未发起续扫：%s", deny)
+	} else if warn != "" {
+		r.logf("guard", "%s", warn)
+	}
+	assets, err := r.resumeAssetIndex()
+	if err != nil {
+		return fail("重建资产索引失败：%v", err)
+	}
+	runs := scanShardRuns(plan, templates)
+	shards, err := r.saveScanPlan(plan, runs)
+	if err != nil {
+		if errors.Is(err, db.ErrScanLayoutChanged) {
+			return fail("%v", err)
+		}
+		return fail("校验续扫检查点失败：%v", err)
+	}
+	counters := shardCounters(shards)
+	toBeRun := len(shards) - counters["done"].(int)
+	r.logf("scan", "续扫：目标 %d 个 · 模板 %d 个 · 分片 %d 个（已完成 %d 个 · 待跑 %d 个）",
+		len(plan.Targets), len(templates), len(shards), counters["done"].(int), toBeRun)
+	r.setProgress("scan", map[string]any{"templates": len(templates), "targets": len(plan.Targets), "shards": counters})
+	st := r.runNucleiStaged(runs, shards, assets)
+	exposure := summaryInt(summary, "exposure_findings") + summaryInt(summary, "weak_pass_found")
+	return r.finishStaged(plan, st, summary, exposure)
+}
+
+// pinnedTemplates 按计划里钉住的模板 ID 与内容摘要重建模板。POC 被删除、停用或改过内容
+// 都直接拒绝续扫：布局是按上一轮的模板清单算的，模板一变「哪些片扫过了」就不再成立，
+// 把旧进度和新模板拼起来会谎报覆盖面。
+func (r *scanRun) pinnedTemplates(p scanPlan) ([]scanner.NucleiTemplate, error) {
+	pocs, err := r.pg.POCTemplatesByIDs(p.TemplateIDs)
+	if err != nil {
+		return nil, fmt.Errorf("读取续扫模板失败：%v", err)
+	}
+	byID := make(map[int64]db.POCTemplate, len(pocs))
+	for _, item := range pocs {
+		byID[item.ID] = item
+	}
+	changed, missing := 0, 0
+	templates := make([]scanner.NucleiTemplate, 0, len(p.TemplateIDs))
+	for i, id := range p.TemplateIDs {
+		item, ok := byID[id]
+		if !ok || strings.TrimSpace(item.Content) == "" {
+			missing++
+			continue
+		}
+		sum := sha256.Sum256([]byte(item.Content))
+		if item.TemplateID != p.TemplateKeys[i] || hex.EncodeToString(sum[:]) != p.Digests[i] {
+			changed++
+			continue
+		}
+		templates = append(templates, scanner.NucleiTemplate{ID: item.TemplateID, Content: item.Content})
+	}
+	if missing > 0 || changed > 0 {
+		return nil, fmt.Errorf("续扫计划里的 POC 已不可用：%d 条被删除或停用、%d 条内容已改动。"+
+			"半旧半新的进度拼不成一次可信的扫描，请用「重跑」重新开始", missing, changed)
+	}
+	if len(templates) == 0 {
+		return nil, fmt.Errorf("续扫计划里没有可执行的 POC")
+	}
+	return templates, nil
+}
+
+// resumeAssetIndex 用本轮台账重建「URL → 资产」索引，命中写发现时才能挂回正确资产。
+// 读不到就失败：把发现挂到空资产上比不写发现更难追查。
+func (r *scanRun) resumeAssetIndex() (*scanAssetIndex, error) {
+	assets := newScanAssetIndex()
+	rows, err := r.pg.ListScanTaskAssets(r.task.ID, 2000)
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range rows {
+		if strings.TrimSpace(a.URL) != "" {
+			assets.addService(a.URL, a.AssetID)
+		} else {
+			assets.addOtherService(a.Host, 0, a.AssetID)
+		}
+	}
+	return assets, nil
 }
 
 func (r *scanRun) aborted(errMsg string, summary map[string]any) (string, string, string, map[string]any) {
-	if st, err := r.pg.GetScanTask(r.task.ID); err == nil && st.Status == "canceled" {
-		return "canceled", "canceled", "已手动停止", summary
+	// 能不能续扫不靠猜：以库里的检查点为准（CanResume 由计划的 phase 算出）。给一条
+	// 「可以续扫」的提示而实际没有检查点，比不给提示更坏。
+	st, err := r.pg.GetScanTask(r.task.ID)
+	resumeHint := ""
+	if err == nil && st.CanResume {
+		resumeHint = "；POC 分片进度已保留，可「续扫」只跑剩余分片"
+	}
+	if err == nil && st.Status == "canceled" {
+		return "canceled", "canceled", "已手动停止" + resumeHint, summary
 	}
 	if errors.Is(r.ctx.Err(), context.DeadlineExceeded) {
 		// 中断可能发生在探测阶段之后：这一轮已经入库的结果与发现要照 summary 报出来，
 		// 否则超时文案只说「扫描超时」，看不出还有东西可查。
-		return "failed", "failed", fmt.Sprintf("扫描超时（%ds）：结果 %d 条、发现 %d 条；应用层系统 %d 个、目录入口 %d 条已入库",
+		return "failed", "failed", fmt.Sprintf("扫描超时（%ds）：结果 %d 条、发现 %d 条；应用层系统 %d 个、目录入口 %d 条已入库%s",
 			r.task.TimeoutSeconds, summaryInt(summary, "results"), summaryInt(summary, "findings"),
-			summaryInt(summary, "app_systems"), summaryInt(summary, "dir_entries")), summary
+			summaryInt(summary, "app_systems"), summaryInt(summary, "dir_entries"), resumeHint), summary
 	}
-	return "failed", "failed", errMsg, summary
+	return "failed", "failed", errMsg + resumeHint, summary
 }
 
 // summaryInt reads a counter out of the run summary; absent means zero.
 func summaryInt(summary map[string]any, key string) int {
 	switch v := summary[key].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	}
+	return 0
+}
+
+// summaryValue 从 summary 的嵌套 map（分片进度就是）里取一个计数。
+func summaryValue(summary map[string]any, path ...string) int {
+	var cur any = summary
+	for _, key := range path {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return 0
+		}
+		cur = m[key]
+	}
+	switch v := cur.(type) {
 	case int:
 		return v
 	case int64:
@@ -1158,11 +1734,11 @@ func (r *scanRun) recordExposedService(pf scanner.PortFinding, service string, a
 	return findingID > 0
 }
 
-func (r *scanRun) selectTemplates(services []scanner.WebService) ([]scanner.NucleiTemplate, error) {
+func (r *scanRun) selectTemplates(services []scanner.WebService) ([]scanner.NucleiTemplate, []int64, error) {
 	task := r.task
 	minRank := severityRank(task.MinSeverity)
 	if task.MinSeverity != "" && minRank < 0 {
-		return nil, fmt.Errorf("无效的最低危险等级: %s", task.MinSeverity)
+		return nil, nil, fmt.Errorf("无效的最低危险等级: %s", task.MinSeverity)
 	}
 	var pocs []db.POCTemplate
 	var err error
@@ -1170,7 +1746,7 @@ func (r *scanRun) selectTemplates(services []scanner.WebService) ([]scanner.Nucl
 	case "auto":
 		if !task.Fingerprint {
 			r.logf("match", "自动匹配已关闭（fingerprint=false），不加载 POC")
-			return nil, nil
+			return nil, nil, nil
 		}
 		techSet := map[string]bool{}
 		for _, svc := range services {
@@ -1188,7 +1764,7 @@ func (r *scanRun) selectTemplates(services []scanner.WebService) ([]scanner.Nucl
 		// 让这类无需特定指纹的探测仍能对目标执行。
 		metas, err := r.pg.ListEnabledPOCMetadata()
 		if err != nil {
-			return nil, fmt.Errorf("加载 POC 元数据失败: %w", err)
+			return nil, nil, fmt.Errorf("加载 POC 元数据失败: %w", err)
 		}
 		rankByID := make(map[int64]int, len(metas))
 		smeta := make([]scanner.TemplateMeta, 0, len(metas))
@@ -1211,7 +1787,7 @@ func (r *scanRun) selectTemplates(services []scanner.WebService) ([]scanner.Nucl
 		}
 		if matched == 0 {
 			r.logf("match", "指纹未命中任何 POC")
-			return nil, nil
+			return nil, nil, nil
 		}
 		r.logf("match", "指纹命中 %d 个 POC，按危险等级优先选取 %d 个（最低等级：%s）",
 			matched, len(ids), severityLabel(task.MinSeverity))
@@ -1227,12 +1803,13 @@ func (r *scanRun) selectTemplates(services []scanner.WebService) ([]scanner.Nucl
 		}
 		r.logf("match", "全量模式加载 %d 个启用的 POC（按危险等级优先）", len(pocs))
 	default:
-		return nil, fmt.Errorf("未知扫描模式: %s", task.Mode)
+		return nil, nil, fmt.Errorf("未知扫描模式: %s", task.Mode)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("加载 POC 失败: %w", err)
+		return nil, nil, fmt.Errorf("加载 POC 失败: %w", err)
 	}
 	out := make([]scanner.NucleiTemplate, 0, len(pocs))
+	ids := make([]int64, 0, len(pocs))
 	seen := map[string]bool{}
 	for _, p := range pocs {
 		if p.Protocol == "workflow" || strings.TrimSpace(p.Content) == "" {
@@ -1246,9 +1823,10 @@ func (r *scanRun) selectTemplates(services []scanner.WebService) ([]scanner.Nucl
 		}
 		seen[p.TemplateID] = true
 		out = append(out, scanner.NucleiTemplate{ID: p.TemplateID, Content: p.Content})
+		ids = append(ids, p.ID)
 	}
 	r.logf("match", "准备执行 %d 个 POC（最低等级：%s）", len(out), severityLabel(task.MinSeverity))
-	return out, nil
+	return out, ids, nil
 }
 
 // prioritizeAutoTemplates sorts matched IDs by severity (critical first) so the
@@ -1369,12 +1947,35 @@ func (r *scanRun) nucleiTargets(res *scanner.DiscoverResult, raw []scanner.Targe
 	return out
 }
 
-func (r *scanRun) persistResults(results []scanner.NucleiResult, assets *scanAssetIndex) (int, int, map[string]int64) {
+// scanSalvageTimeout bounds how long a canceled or timed-out run may keep writing
+// to the database after its own context is gone. nuclei 亲眼产出的命中是证据：进程要
+// 停止不该让它们消失，但也不能无限期挂住关闭流程。
+const scanSalvageTimeout = 30 * time.Second
+
+// salvageResults 决定用哪个上下文落库一片命中：任务上下文还在就用它（取消时及早收手），
+// 已经中断就换一个不带取消、最多 scanSalvageTimeout 的新上下文，把已产出的命中救回来。
+func (r *scanRun) salvageResults(results []scanner.NucleiResult, assets *scanAssetIndex) (int, int, map[string]int64, error) {
+	if r.ctx.Err() == nil {
+		return r.persistResultsCtx(r.ctx, results, assets)
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.ctx), scanSalvageTimeout)
+	defer cancel()
+	stored, findings, ids, err := r.persistResultsCtx(ctx, results, assets)
+	if ctx.Err() != nil && !errors.Is(ctx.Err(), context.Canceled) {
+		r.logf("scan", "抢救已产出的命中时超时（%s），其余结果已保留", scanSalvageTimeout)
+	}
+	return stored, findings, ids, err
+}
+
+// persistResultsCtx 落库 nuclei 命中。返回第一个写库错误：结果或发现没进库的分片不能
+// 被记成完成，否则续扫会跳过一片其实什么都没留下的进度。
+func (r *scanRun) persistResultsCtx(ctx context.Context, results []scanner.NucleiResult, assets *scanAssetIndex) (int, int, map[string]int64, error) {
 	stored, findingCount, createdCount, merged := 0, 0, 0, 0
 	findingIDs := map[string]int64{}
 	seen := map[string]bool{}
+	var persistErr error
 	for i, res := range results {
-		if r.ctx.Err() != nil {
+		if ctx.Err() != nil {
 			break
 		}
 		key := scanResultKey(res)
@@ -1395,6 +1996,9 @@ func (r *scanRun) persistResults(results []scanner.NucleiResult, assets *scanAss
 				fmt.Sprintf("scan:%d", r.task.ID), assets.idsFor(res.MatchedAt, res.Host), dedupeKey)
 			if err != nil {
 				r.logf("finalize", "写入发现失败 %s: %v", res.TemplateID, err)
+				if persistErr == nil {
+					persistErr = fmt.Errorf("写入发现失败 %s: %w", res.TemplateID, err)
+				}
 			} else {
 				findingID = id
 				findingIDs[key] = id
@@ -1426,8 +2030,13 @@ func (r *scanRun) persistResults(results []scanner.NucleiResult, assets *scanAss
 				})
 				if err := r.pg.SetFindingHTTPArtifactsAndAutoReport(id, httpReq, httpResp, autoReport); err != nil {
 					r.logf("finalize", "保存原始 HTTP/报告失败 %s: %v", res.TemplateID, err)
+					if persistErr == nil {
+						persistErr = fmt.Errorf("保存 %s 的原始报文/报告失败: %w", res.TemplateID, err)
+					}
 				}
-				r.attachReproductionSequence(res, id)
+				if err := r.attachReproductionSequence(ctx, res, id); err != nil && persistErr == nil {
+					persistErr = fmt.Errorf("保存 %s 的复现报文序列失败: %w", res.TemplateID, err)
+				}
 			}
 		}
 		raw := sanitizeNucleiRaw(res.Raw)
@@ -1444,6 +2053,9 @@ func (r *scanRun) persistResults(results []scanner.NucleiResult, assets *scanAss
 		})
 		if err != nil {
 			r.logf("finalize", "保存扫描结果失败 %s: %v", res.TemplateID, err)
+			if persistErr == nil {
+				persistErr = fmt.Errorf("保存扫描结果失败 %s: %w", res.TemplateID, err)
+			}
 			continue
 		}
 		if id > 0 {
@@ -1456,15 +2068,15 @@ func (r *scanRun) persistResults(results []scanner.NucleiResult, assets *scanAss
 	if merged > 0 {
 		r.logf("finalize", "%d 条命中合并到既有发现（按模板+主机+路径去重），新增 %d 条", merged, createdCount)
 	}
-	return stored, findingCount, findingIDs
+	return stored, findingCount, findingIDs, persistErr
 }
 
 // attachReproductionSequence stores every request/response nuclei recorded for
 // a hit as finding evidence. Reports can then show the exploit request in
 // addition to the matched proof request instead of only the final check.
-func (r *scanRun) attachReproductionSequence(res scanner.NucleiResult, findingID int64) {
+func (r *scanRun) attachReproductionSequence(ctx context.Context, res scanner.NucleiResult, findingID int64) error {
 	if findingID <= 0 || len(res.Exchanges) == 0 {
-		return
+		return nil
 	}
 	raws := make([]evidence.RawExchange, 0, len(res.Exchanges))
 	for _, ex := range res.Exchanges {
@@ -1479,9 +2091,11 @@ func (r *scanRun) attachReproductionSequence(res scanner.NucleiResult, findingID
 		}
 		raws = append(raws, evidence.RawExchange{Request: req, Response: resp, Role: role, Note: note})
 	}
-	if err := r.s.evidenceStore().SaveRawExchanges(r.ctx, findingID, raws); err != nil {
+	if err := r.s.evidenceStore().SaveRawExchanges(ctx, findingID, raws); err != nil {
 		r.logf("finalize", "保存复现报文序列失败 %s: %v", res.TemplateID, err)
+		return err
 	}
+	return nil
 }
 
 // scanResultKey identifies one hit within a scan run. It matches the key used
@@ -1659,12 +2273,7 @@ func (s *Server) createScanTask(w http.ResponseWriter, r *http.Request) {
 	}
 	// 客户授权清单在创建阶段就拒（与弱口令检测一致）：拒绝原因要点名是哪条授权不管用，
 	// 让人去补授权，而不是建一个跑一半失败的任务。
-	gURLs, gHosts, gerr := guardProbeTargets(targets)
-	if gerr != nil {
-		writeErr(w, 400, gerr.Error())
-		return
-	}
-	if deny, _ := guardCheckTargets(s.targetPolicy(), gURLs, gHosts); deny != "" {
+	if deny, _ := s.guardInputTargets(targets); deny != "" {
 		writeErr(w, 400, "目标被平台拒绝，未创建任务："+deny)
 		return
 	}
@@ -1983,6 +2592,67 @@ func (s *Server) cancelScanTask(w http.ResponseWriter, r *http.Request) {
 		s.scanMgr.cancelTask(id)
 	}
 	writeJSON(w, 200, map[string]any{"canceled": true})
+}
+
+// POST /api/scans/{id}/resume — 续扫：只跑未完成/失败的分片，已完成的跳过。
+// 与「重跑」的区别：重跑从头再扫一遍（结果清空）；续扫沿用同一任务与台账，接着跑。
+func (s *Server) resumeScanTask(w http.ResponseWriter, r *http.Request) {
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	id, ok := pathInt(r, "id")
+	if !ok {
+		writeErr(w, 400, "无效的扫描任务 ID")
+		return
+	}
+	task, err := pg.GetScanTask(id)
+	if errors.Is(err, db.ErrScanTaskNotFound) {
+		writeErr(w, 404, "扫描任务不存在")
+		return
+	}
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	switch task.Status {
+	case "queued", "running":
+		writeErr(w, 409, "任务正在进行中，不需要续扫")
+		return
+	case "done":
+		writeErr(w, 409, "任务已完成，没有待续扫的分片；要重测请用「重跑」")
+		return
+	}
+	if !task.CanResume {
+		writeErr(w, 409, "这条任务不可续扫：中断不在 POC 分片阶段（没有可接着跑的分片检查点），请用「重跑」重新开始")
+		return
+	}
+	// 准入时现场再问一次平台策略：中断期间授权清单可能被改过，被移出的目标应该在
+	// 这里就被拒，而不是排进队列后再失败一次、还占着一轮超时预算。
+	targets, err := scanner.ParseTargets(task.Targets)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if deny, warn := s.guardInputTargets(targets); deny != "" {
+		writeErr(w, 400, "目标被平台拒绝，未发起续扫："+deny)
+		return
+	} else if warn != "" {
+		log.Printf("[scan %d] 续扫准入（告警模式）：%s", id, warn)
+	}
+	resumed, err := pg.RequestScanResume(id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if !resumed {
+		writeErr(w, 409, "续扫条件在检查后变了（任务被改动或分片进度已丢失），请刷新后重试")
+		return
+	}
+	if s.scanMgr != nil {
+		s.scanMgr.wakeup()
+	}
+	writeJSON(w, 200, map[string]any{"resumed": true})
 }
 
 func (s *Server) rerunScanTask(w http.ResponseWriter, r *http.Request) {

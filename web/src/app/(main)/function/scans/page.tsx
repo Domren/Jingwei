@@ -450,6 +450,19 @@ export default function ScansPage() {
     }
   }
 
+  async function resumeTask(task: ScanTask) {
+    setBusyId(task.id);
+    try {
+      await api.resumeScan(task.id);
+      toast.success("已续扫：跳过已完成的分片，只跑剩下的");
+      setRefreshKey((k) => k + 1);
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   async function rerunTask(task: ScanTask) {
     setBusyId(task.id);
     try {
@@ -592,6 +605,9 @@ export default function ScansPage() {
               scans.map((task) => {
                 const meta = statusMeta(task);
                 const active = task.status === "running" || task.status === "queued";
+                const shards = (task.progress.shards ?? task.summary.shards) as
+                  | { total: number; done: number; failed: number; skipped?: number }
+                  | undefined;
                 return (
                   <TableRow key={task.id}>
                     <TableCell>
@@ -633,6 +649,14 @@ export default function ScansPage() {
                       {num(task.summary.findings) > 0 && (
                         <span className="ml-1 text-orange-600">发现 {num(task.summary.findings)}</span>
                       )}
+                      {shards && shards.total > 0 && (
+                        <span
+                          className="ml-1"
+                          title={`分片进度：完成 ${shards.done} · 失败 ${shards.failed} · 被平台拒绝 ${shards.skipped ?? 0}`}
+                        >
+                          分片 {shards.done}/{shards.total}
+                        </span>
+                      )}
                       {num(task.summary.auto_tasks) > 0 && (
                         <span className="ml-1 text-sky-600">
                           深挖 {num(task.summary.auto_done)}/{num(task.summary.auto_tasks)}
@@ -651,6 +675,18 @@ export default function ScansPage() {
                         {task.status === "done" && (
                           <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => void openDiff(task.id)}>
                             对比
+                          </Button>
+                        )}
+                        {task.can_resume && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 px-2"
+                            disabled={busyId === task.id}
+                            onClick={() => void resumeTask(task)}
+                            title="续扫：跳过已完成的分片，只跑剩下的；完成后照常做深挖与专项基线"
+                          >
+                            续扫
                           </Button>
                         )}
                         {active ? (

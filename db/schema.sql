@@ -1730,6 +1730,31 @@ CREATE INDEX IF NOT EXISTS idx_scan_task_results_finding ON scan_task_results(fi
 -- 运行中的任务在进程重启后不会自动续跑：启动时标记为 failed，避免半截状态卡住。
 ALTER TABLE scan_tasks ADD COLUMN IF NOT EXISTS log TEXT NOT NULL DEFAULT '';
 
+-- D5 断点续扫：把「这一轮要扫什么」和「哪一片扫完了」落库。
+-- plan 钉住目标、模板 ID 与其内容摘要、分片参数与发现阶段上下文（服务/应用系统），
+-- 并带一个 phase（poc → postprocess → done）标出中断发生在哪一段；
+-- shards 每行是「一段模板 × 一组目标」，done 的不再执行，failed/未开始的在续扫时重试。
+-- 布局与 plan 不一致（POC 被改动、目标变了）时续扫直接拒，绝不把半旧半新的结果拼成一片。
+ALTER TABLE scan_tasks ADD COLUMN IF NOT EXISTS plan JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE scan_tasks ADD COLUMN IF NOT EXISTS resume_requested BOOLEAN NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS scan_task_shards (
+    id           BIGSERIAL PRIMARY KEY,
+    scan_task_id BIGINT NOT NULL REFERENCES scan_tasks(id) ON DELETE CASCADE,
+    ordinal      INT NOT NULL,
+    chunk        INT NOT NULL DEFAULT 0,         -- 模板分片编号
+    target       TEXT NOT NULL DEFAULT '',       -- 本片的目标（多个以逗号连接）
+    templates    INT NOT NULL DEFAULT 0,
+    status       TEXT NOT NULL DEFAULT 'pending',  -- pending | done | failed | skipped
+    results      INT NOT NULL DEFAULT 0,
+    error        TEXT NOT NULL DEFAULT '',
+    started_at   TIMESTAMPTZ,
+    finished_at  TIMESTAMPTZ,
+    UNIQUE (scan_task_id, ordinal)
+);
+-- 1.6.0 开发期间建过分片表但没有 chunk/target 两列（布局校验需要它们），补齐。
+ALTER TABLE scan_task_shards ADD COLUMN IF NOT EXISTS chunk INT NOT NULL DEFAULT 0;
+ALTER TABLE scan_task_shards ADD COLUMN IF NOT EXISTS target TEXT NOT NULL DEFAULT '';
+
 -- =====================================================================
 -- Jingwei additions: 深度利用（漏洞验证 / 漏洞利用 / WAF 绕过 / Webshell）
 -- 全部走异步任务模型，任务与产物分表存储，页面按任务维度回看。

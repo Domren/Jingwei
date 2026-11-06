@@ -945,6 +945,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/scans/{id}", s.deleteScanTask)
 	mux.HandleFunc("POST /api/scans/{id}/cancel", s.cancelScanTask)
 	mux.HandleFunc("POST /api/scans/{id}/rerun", s.rerunScanTask)
+	mux.HandleFunc("POST /api/scans/{id}/resume", s.resumeScanTask)
 	mux.HandleFunc("GET /api/scans/{id}/assets", s.listScanTaskAssets)
 	mux.HandleFunc("GET /api/scans/{id}/results", s.listScanTaskResults)
 	mux.HandleFunc("GET /api/scans/{id}/auto", s.getScanAuto)

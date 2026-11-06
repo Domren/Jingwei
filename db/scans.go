@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -31,11 +32,16 @@ type ScanTask struct {
 	Stage          string         `json:"stage"`  // queued | discover | fingerprint | match | scan | done | failed | canceled
 	Progress       map[string]any `json:"progress"`
 	Summary        map[string]any `json:"summary"`
-	Log            string         `json:"log,omitempty"`
-	Error          string         `json:"error,omitempty"`
-	CreatedAt      time.Time      `json:"created_at"`
-	StartedAt      *time.Time     `json:"started_at,omitempty"`
-	FinishedAt     *time.Time     `json:"finished_at,omitempty"`
+	// Plan 是续扫计划（JSON 原文）：目标、模板 ID 与发现阶段上下文。只在服务端解析。
+	Plan string `json:"-"`
+	// ResumeRequested 表示这条任务是被「续扫」重新入队的，执行器会跳过已完成的阶段。
+	ResumeRequested bool       `json:"resume_requested,omitempty"`
+	CanResume       bool       `json:"can_resume"`
+	Log             string     `json:"log,omitempty"`
+	Error           string     `json:"error,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	StartedAt       *time.Time `json:"started_at,omitempty"`
+	FinishedAt      *time.Time `json:"finished_at,omitempty"`
 }
 
 // ScanTaskInput is the create payload for a scan task.
@@ -91,16 +97,16 @@ const scanTaskCols = `id, name, targets::text, mode, poc_ids::text, ports, min_s
        fingerprint, create_findings, webshell_inject, webshell_params::text, proxy,
        rate_limit, concurrency, timeout_seconds,
        status, stage, progress::text, summary::text, log, error,
-       created_at, started_at, finished_at`
+       plan::text, resume_requested, created_at, started_at, finished_at`
 
 func scanOneScanTask(row interface{ Scan(...any) error }) (*ScanTask, error) {
 	var t ScanTask
-	var targetsRaw, pocRaw, webshellRaw, progressRaw, summaryRaw string
+	var targetsRaw, pocRaw, webshellRaw, progressRaw, summaryRaw, planRaw string
 	if err := row.Scan(&t.ID, &t.Name, &targetsRaw, &t.Mode, &pocRaw, &t.Ports, &t.MinSeverity,
 		&t.Fingerprint, &t.CreateFindings, &t.WebshellInject, &webshellRaw, &t.Proxy,
 		&t.RateLimit, &t.Concurrency, &t.TimeoutSeconds,
 		&t.Status, &t.Stage, &progressRaw, &summaryRaw, &t.Log, &t.Error,
-		&t.CreatedAt, &t.StartedAt, &t.FinishedAt); err != nil {
+		&planRaw, &t.ResumeRequested, &t.CreatedAt, &t.StartedAt, &t.FinishedAt); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(targetsRaw), &t.Targets)
@@ -108,6 +114,17 @@ func scanOneScanTask(row interface{ Scan(...any) error }) (*ScanTask, error) {
 	_ = json.Unmarshal([]byte(webshellRaw), &t.WebshellParams)
 	_ = json.Unmarshal([]byte(progressRaw), &t.Progress)
 	_ = json.Unmarshal([]byte(summaryRaw), &t.Summary)
+	if planRaw != "" && planRaw != "{}" {
+		t.Plan = planRaw
+	}
+	var plan struct {
+		Phase string `json:"phase"`
+	}
+	// CanResume 只是给界面上的「续扫」按钮做参考；能不能真续，以 RequestScanResume
+	// 的 SQL 条件为准（它额外要求分片行还在）。
+	if json.Unmarshal([]byte(planRaw), &plan) == nil {
+		t.CanResume = (t.Status == "failed" || t.Status == "canceled") && plan.Phase == "poc"
+	}
 	if t.WebshellParams == nil {
 		t.WebshellParams = map[string]any{}
 	}
@@ -301,9 +318,20 @@ WHERE id=$1 AND status IN ('queued','running')`, id)
 }
 
 // RecoverInterruptedScanTasks fails tasks left running by a process restart.
+// The message must not promise more than the checkpoint can deliver: only a run
+// interrupted inside the sharded POC stage can be resumed, so the wording is
+// picked from the plan's phase instead of being asserted for every task.
 func (d *DB) RecoverInterruptedScanTasks() (int64, error) {
 	res, err := d.Exec(`UPDATE scan_tasks
-SET status='failed', stage='failed', error='服务重启，扫描中断', finished_at=now()
+SET status='failed', stage='failed',
+    error=CASE
+        WHEN plan->>'phase'='poc' AND EXISTS (SELECT 1 FROM scan_task_shards s WHERE s.scan_task_id=scan_tasks.id)
+            THEN '服务重启，POC 分片扫描中断：已完成分片已记录，可用「续扫」只跑未完成分片'
+        WHEN plan->>'phase' IN ('postprocess','done')
+            THEN '服务重启，POC 已全部扫完、中断发生在深挖/基线阶段：该阶段不支持续跑，请用「重跑」重新开始'
+        ELSE '服务重启，扫描中断（中断时尚未建立 POC 分片检查点），请用「重跑」重新开始'
+    END,
+    finished_at=now()
 WHERE status='running'`)
 	if err != nil {
 		return 0, err
@@ -321,31 +349,43 @@ func (d *DB) DeleteScanTask(id int64) (bool, error) {
 	return n > 0, nil
 }
 
-// QueueScanTask resets a finished task for another run, clearing prior
-// asset links and results in the same transaction so a fast worker can never
-// pick it up before the old output is gone.
+// QueueScanTask resets a finished task for another run. The row is locked and
+// checked first: deleting output before knowing the task is actually eligible
+// would leave a running executor writing results into a task whose rows are
+// already gone. Plan and shards are reset too, otherwise a rerun would inherit
+// the previous run's checkpoint and skip half of its own POC stage.
 func (d *DB) QueueScanTask(id int64) (bool, error) {
 	tx, err := d.Begin()
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
+	var eligible bool
+	err = tx.QueryRow(`SELECT COALESCE(status IN ('done','failed','canceled'), false)
+FROM scan_tasks WHERE id=$1 FOR UPDATE`, id).Scan(&eligible)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !eligible {
+		return false, nil
+	}
 	if _, err := tx.Exec(`DELETE FROM scan_task_results WHERE scan_task_id=$1`, id); err != nil {
 		return false, err
 	}
 	if _, err := tx.Exec(`DELETE FROM scan_task_assets WHERE scan_task_id=$1`, id); err != nil {
 		return false, err
 	}
-	res, err := tx.Exec(`UPDATE scan_tasks
-SET status='queued', stage='queued', progress='{}'::jsonb, summary='{}'::jsonb,
-    log='', error='', started_at=NULL, finished_at=NULL
-WHERE id=$1 AND status IN ('done','failed','canceled')`, id)
-	if err != nil {
+	if _, err := tx.Exec(`DELETE FROM scan_task_shards WHERE scan_task_id=$1`, id); err != nil {
 		return false, err
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return false, nil
+	if _, err := tx.Exec(`UPDATE scan_tasks
+SET status='queued', stage='queued', progress='{}'::jsonb, summary='{}'::jsonb,
+    log='', error='', plan='{}'::jsonb, resume_requested=false, started_at=NULL, finished_at=NULL
+WHERE id=$1`, id); err != nil {
+		return false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
@@ -585,4 +625,220 @@ WHERE id < $1 AND status = 'done' ORDER BY id DESC LIMIT 1`, id))
 		return nil, nil
 	}
 	return t, err
+}
+
+// ScanShardSpec 是分片布局里的一格：槽位号、模板分片编号、这一片打哪个目标、几
+// 条模板。布局完全由计划里的「模板顺序 × 目标顺序 × 分片参数」算出来，所以续扫时
+// 可以重算一遍再与库内比对，对不上就是中途有人改了 POC 库或目标清单。
+type ScanShardSpec struct {
+	Ordinal   int
+	Chunk     int
+	Target    string
+	Templates int
+}
+
+// ScanShard 是一格分片的布局加进度。done 的不再执行；failed / pending 在续扫时
+// 重试，skipped 是策略拒绝（目标被移出授权），不算失败但结果不完整。
+type ScanShard struct {
+	ScanShardSpec
+	Status  string
+	Results int
+	Error   string
+}
+
+// ErrScanLayoutChanged 表示库里的分片行与计划算出的布局不一致。续扫遇到它只能拒绝：
+// 半旧半新的「已完成」拼起来会谎报覆盖面。
+var ErrScanLayoutChanged = errors.New("分片布局与续扫计划不一致")
+
+type shardQuerier interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+func scanShardRows(q shardQuerier, taskID int64, lock bool) ([]ScanShard, error) {
+	// 普通读不能加 FOR UPDATE，锁读只在校验/补齐时用一个事务内的行锁。
+	stmt := `SELECT ordinal, chunk, target, templates, status, results, error
+FROM scan_task_shards WHERE scan_task_id=$1 ORDER BY ordinal`
+	if lock {
+		stmt += " FOR UPDATE"
+	}
+	rows, err := q.Query(stmt, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ScanShard{}
+	for rows.Next() {
+		var s ScanShard
+		if err := rows.Scan(&s.Ordinal, &s.Chunk, &s.Target, &s.Templates, &s.Status, &s.Results, &s.Error); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// SaveScanPlan 在一个事务里写入续扫计划并对齐分片行：已有行必须逐格与布局一致
+// （不一致就报错，绝不就地压缩或改写历史进度），缺的补上。
+// POC 阶段开始前写一次，续扫时再写一次当作校验。
+func (d *DB) SaveScanPlan(taskID int64, plan string, layout []ScanShardSpec) ([]ScanShard, error) {
+	if len(layout) == 0 {
+		return nil, fmt.Errorf("分片布局为空，无法建立续扫检查点")
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var one int
+	if err := tx.QueryRow(`SELECT 1 FROM scan_tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("扫描任务 %d 不存在", taskID)
+		}
+		return nil, err
+	}
+	if _, err := tx.Exec(`UPDATE scan_tasks SET plan=$2::jsonb WHERE id=$1`, taskID, plan); err != nil {
+		return nil, err
+	}
+	existing, err := scanShardRows(tx, taskID, true)
+	if err != nil {
+		return nil, err
+	}
+	byOrdinal := make(map[int]ScanShard, len(existing))
+	for _, s := range existing {
+		byOrdinal[s.Ordinal] = s
+	}
+	if len(existing) > 0 {
+		if len(existing) != len(layout) {
+			return nil, fmt.Errorf("%w：计划 %d 片，库内 %d 片（目标数或模板数变了），请用「重跑」重新开始",
+				ErrScanLayoutChanged, len(layout), len(existing))
+		}
+		for _, want := range layout {
+			got, ok := byOrdinal[want.Ordinal]
+			if !ok {
+				return nil, fmt.Errorf("%w：库内缺少第 %d 片（应为 目标 %q × 模板 %d），分片进度被人为动过，请用「重跑」重新开始",
+					ErrScanLayoutChanged, want.Ordinal+1, want.Target, want.Templates)
+			}
+			if got.Chunk != want.Chunk || got.Target != want.Target || got.Templates != want.Templates {
+				return nil, fmt.Errorf("%w：第 %d 片应为 目标 %q × 模板 %d，库内记的是 目标 %q × 模板 %d，请用「重跑」重新开始",
+					ErrScanLayoutChanged, want.Ordinal+1, want.Target, want.Templates, got.Target, got.Templates)
+			}
+		}
+	}
+	for _, want := range layout {
+		if _, ok := byOrdinal[want.Ordinal]; ok {
+			continue
+		}
+		if _, err := tx.Exec(`INSERT INTO scan_task_shards(scan_task_id, ordinal, chunk, target, templates, status)
+VALUES ($1,$2,$3,$4,$5,'pending')`, taskID, want.Ordinal, want.Chunk, want.Target, want.Templates); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	// 返回值用布局 + 已读到的状态拼，省掉提交后再查一遍（期间无人能改这些行，
+	// 行锁一直在事务里拿着）。
+	out := make([]ScanShard, 0, len(layout))
+	for _, want := range layout {
+		s := ScanShard{ScanShardSpec: want, Status: "pending"}
+		if got, ok := byOrdinal[want.Ordinal]; ok {
+			s.Status, s.Results, s.Error = got.Status, got.Results, got.Error
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+func (d *DB) ListScanShards(taskID int64) ([]ScanShard, error) {
+	return scanShardRows(d, taskID, false)
+}
+
+func (d *DB) StartScanShard(taskID int64, ordinal int) error {
+	_, err := d.Exec(`UPDATE scan_task_shards SET started_at=now() WHERE scan_task_id=$1 AND ordinal=$2`, taskID, ordinal)
+	return err
+}
+
+// FinishScanShard 记录分片终态（done / failed / skipped）。done 只在「这一片真的
+// 跑完且结果已落库」之后由调用方写入，失败与中断都必须留下可重跑的痕迹。
+func (d *DB) FinishScanShard(taskID int64, ordinal int, status string, results int, errMsg string) error {
+	_, err := d.Exec(`UPDATE scan_task_shards
+SET status=$3, results=$4, error=$5, finished_at=now() WHERE scan_task_id=$1 AND ordinal=$2`,
+		taskID, ordinal, status, results, errMsg)
+	return err
+}
+
+// SetScanPlanPhase 推进续扫计划的 phase（poc → postprocess → done）。phase 是续扫
+// 的唯一判据：只有停在 poc 的任务可以续，跑到 postprocess 说明深挖/基线已经动过，
+// 重放会重复排队深挖任务。到 done 时顺带清掉续扫标记——标记只在确认成功时清。
+func (d *DB) SetScanPlanPhase(taskID int64, phase string) error {
+	_, err := d.Exec(`UPDATE scan_tasks
+SET plan = jsonb_set(plan, '{phase}', to_jsonb($2::text)),
+    resume_requested = CASE WHEN $2='done' THEN false ELSE resume_requested END
+WHERE id=$1`, taskID, phase)
+	return err
+}
+
+// ScanPOCResultCounts 按库内实际行数统计 POC 阶段的结果与发现：分片重跑时唯一键会
+// 吃掉重复行，用「本轮 persistResults 的返回值」累加会少算，只有数库才对得上。
+// 两个过滤条件都不能省：template_id 把目录枚举（dir-enum:…）等同样写这张表的功能排除，
+// raw 里有没有 template-id 把深挖任务回填的行（source=deep）排除——它们不是 POC 命中，
+// 算进覆盖率就是谎报。
+func (d *DB) ScanPOCResultCounts(taskID int64, templateIDs []string) (results, findings int, err error) {
+	if len(templateIDs) == 0 {
+		return 0, 0, nil
+	}
+	err = d.QueryRow(`SELECT count(*), count(*) FILTER (WHERE finding_id IS NOT NULL)
+FROM scan_task_results
+WHERE scan_task_id=$1 AND template_id = ANY($2) AND raw ? 'template-id'`, taskID, templateIDs).
+		Scan(&results, &findings)
+	return results, findings, err
+}
+
+// ListScanTaskPOCHits 取 POC 阶段写入的命中（带原始 nuclei 事件），供续扫之后的深挖
+// 与专项基线重建结果集。过滤条件与 ScanPOCResultCounts 完全一致，两处数字才对得上。
+// 不分页：漏掉尾部等于漏掉高危命中，深挖任务就不会被排上。
+func (d *DB) ListScanTaskPOCHits(taskID int64, templateIDs []string) ([]ScanTaskResult, error) {
+	if len(templateIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := d.Query(`SELECT id, finding_id, template_id, name, severity, host, matched_at, type,
+	       curl_command, extracted::text, raw::text, created_at
+FROM scan_task_results
+WHERE scan_task_id=$1 AND template_id = ANY($2) AND raw ? 'template-id' ORDER BY id`, taskID, templateIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ScanTaskResult{}
+	for rows.Next() {
+		var r ScanTaskResult
+		var extractedRaw, rawRaw string
+		if err := rows.Scan(&r.ID, &r.FindingID, &r.TemplateID, &r.Name, &r.Severity, &r.Host,
+			&r.MatchedAt, &r.Type, &r.Curl, &extractedRaw, &rawRaw, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(extractedRaw), &r.Extracted)
+		_ = json.Unmarshal([]byte(rawRaw), &r.Raw)
+		if r.Extracted == nil {
+			r.Extracted = []string{}
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RequestScanResume 把一条停在 POC 分片阶段的失败/已取消任务重新排队。条件比旧版
+// 严格：必须有 poc 阶段的计划和对应分片行，否则执行器只会拿着一个无法续跑的计划
+// 起来再失败一次。
+func (d *DB) RequestScanResume(taskID int64) (bool, error) {
+	res, err := d.Exec(`UPDATE scan_tasks
+SET status='queued', stage='queued', error='', resume_requested=true, started_at=NULL, finished_at=NULL
+WHERE id=$1 AND status IN ('failed','canceled')
+  AND plan->>'phase'='poc'
+  AND EXISTS (SELECT 1 FROM scan_task_shards s WHERE s.scan_task_id=scan_tasks.id)`, taskID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }

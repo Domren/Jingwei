@@ -81,3 +81,21 @@ func (s *Server) targetPolicy() guard.TargetPolicy {
 	}
 	return s.m.guardPolicy
 }
+
+// guardInputTargets 把用户输入的目标摊开、过一遍平台策略。创建任务与续扫准入共用
+// 同一段判断，两条路径给出不同的准入条件就等于没有准入条件。
+//
+// 这里现场新建一个策略源，不用进程级那个：它的授权清单有 30 秒缓存，而「刚补完授权
+// 就点新建/续扫」是最常见的动作，低频的准入检查不值得为缓存冒误拒的险。没有数据库时
+// 仍退回进程级策略（可能为 nil），保持「没有策略就没有这一层」的老语义。
+func (s *Server) guardInputTargets(targets []scanner.Target) (deny, warn string) {
+	urls, hosts, err := guardProbeTargets(targets)
+	if err != nil {
+		return err.Error(), ""
+	}
+	pol := s.targetPolicy()
+	if s != nil && s.m != nil && s.m.pg != nil {
+		pol = newGuardTargetPolicy(s.m.pg)
+	}
+	return guardCheckTargets(pol, urls, hosts)
+}

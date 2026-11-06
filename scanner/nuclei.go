@@ -923,33 +923,46 @@ func ParseNucleiJSONL(raw string) []NucleiResult {
 		if json.Unmarshal([]byte(line), &m) != nil {
 			continue
 		}
-		r := NucleiResult{
-			TemplateID: asString(m["template-id"]),
-			Host:       asString(m["host"]),
-			MatchedAt:  asString(m["matched-at"]),
-			Type:       asString(m["type"]),
-			Timestamp:  asString(m["timestamp"]),
-			Curl:       asString(m["curl-command"]),
-			Request:    asText(m["request"]),
-			Response:   asText(m["response"]),
-			Raw:        m,
-		}
-		if info, ok := m["info"].(map[string]any); ok {
-			r.Name = asString(info["name"])
-			r.Severity = strings.ToLower(asString(info["severity"]))
-			r.Tags = tagsFromInfo(info["tags"])
-		}
-		if extracted, ok := m["extracted-results"].([]any); ok {
-			for _, v := range extracted {
-				r.Extracted = append(r.Extracted, asString(v))
-			}
-		}
-		if r.Extracted == nil {
-			r.Extracted = []string{}
-		}
-		out = append(out, r)
+		out = append(out, NucleiResultFromEvent(m))
 	}
 	return out
+}
+
+// NucleiResultFromEvent turns one nuclei JSONL event into a typed result. It is
+// exported because a resumed scan rebuilds its POC hits from the events stored
+// in scan_task_results.raw, and guessing the shape a second time would drift
+// from the parser the scan itself used (tags are what route a hit to sqlmap or
+// dalfox, so a missed field silently drops the deep-dive).
+//
+// Request/Response are only present in the live event: the stored copy has them
+// stripped (they live with the finding's artifacts), so a rebuilt result falls
+// back to the curl command, which is retained.
+func NucleiResultFromEvent(m map[string]any) NucleiResult {
+	r := NucleiResult{
+		TemplateID: asString(m["template-id"]),
+		Host:       asString(m["host"]),
+		MatchedAt:  asString(m["matched-at"]),
+		Type:       asString(m["type"]),
+		Timestamp:  asString(m["timestamp"]),
+		Curl:       asString(m["curl-command"]),
+		Request:    asText(m["request"]),
+		Response:   asText(m["response"]),
+		Raw:        m,
+	}
+	if info, ok := m["info"].(map[string]any); ok {
+		r.Name = asString(info["name"])
+		r.Severity = strings.ToLower(asString(info["severity"]))
+		r.Tags = tagsFromInfo(info["tags"])
+	}
+	if extracted, ok := m["extracted-results"].([]any); ok {
+		for _, v := range extracted {
+			r.Extracted = append(r.Extracted, asString(v))
+		}
+	}
+	if r.Extracted == nil {
+		r.Extracted = []string{}
+	}
+	return r
 }
 
 // tagsFromInfo reads a template's tags in whatever shape nuclei printed them:

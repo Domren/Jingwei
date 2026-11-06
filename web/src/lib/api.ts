@@ -1558,6 +1558,8 @@ export const api = {
   createScan: (input: ScanTaskInput) => post<ScanTask>("/scans", input),
   cancelScan: (id: number) => post<{ canceled: boolean }>(`/scans/${id}/cancel`, {}),
   rerunScan: (id: number) => post<ScanTask>(`/scans/${id}/rerun`, {}),
+  /** 续扫：只跑未完成/失败的分片（失败或已取消、且留有分片计划的任务可用）。 */
+  resumeScan: (id: number) => post<{ resumed: boolean }>(`/scans/${id}/resume`, {}),
   deleteScan: (id: number) => del<{ deleted: number }>(`/scans/${id}`),
   scanAssets: (id: number) => get<{ assets: ScanAsset[] }>(`/scans/${id}/assets`),
   scanResults: (id: number) => get<{ results: ScanResult[] }>(`/scans/${id}/results`),

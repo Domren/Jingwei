@@ -1622,7 +1622,8 @@ export interface ScanTask {
   timeout_seconds: number;
   status: ScanStatus;
   stage: ScanStage;
-  progress: Record<string, number>;
+  can_resume: boolean;
+  progress: Record<string, unknown>;
   summary: Record<string, unknown>;
   log?: string;
   error?: string;
