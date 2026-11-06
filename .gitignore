@@ -73,3 +73,7 @@ Thumbs.db
 # tools/e2e 的截图与本地依赖
 tools/e2e/shots/
 tools/e2e/node_modules/
+# I4 视觉验证与平台自检的产物目录（CI 里上传成 artifact，本地跑也别落进版本库）
+/ui-shots/
+/selfcheck/
+ui-visual.md

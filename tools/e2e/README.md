@@ -60,20 +60,59 @@ curl -s -X POST -H "Cookie: jingwei_token=$(cat /tmp/jw.token)" -H 'Content-Type
 脚本里的默认值对应本机 WSL 的 Ubuntu-1 边界靶机（Apache :8080 / Tomcat9 :8081 / sshd :2201，
 从容器内经桥网关 `172.23.0.1` 访问）。换靶机时用上面的环境变量覆盖即可。
 
-## i2-mock-crawl.js — 演示站逐页巡检
+## i2-mock-crawl.js — 逐页巡检 + 每页截图（I4 的 CI 门禁就是它）
 
-这个脚本不打真实例：它遍历**静态导出的每一个页面**（默认 `web/out`），逐页打开，记录脚本错误
-与正文长度。演示模式的接口是本地假路由，漏一个路径就表现为「页面空白」或 `undefined.length`
-崩溃，而这类崩溃在真实实例上不会出现——所以它是独立的一道检查，不依赖靶机。
+这个脚本不打真实例：它遍历**静态导出的每一个页面**（默认 `web/out`），逐页用真 Chromium 打开，
+记下脚本错误与正文长度，并给每个页面留一张截图。演示模式的接口是本地假路由，漏一个路径就表现为
+「页面空白」或 `undefined.length` 崩溃，而这类崩溃在真实实例上不会出现——所以它是独立的一道检查，
+不依赖靶机。
 
 ```bash
-cd web && NEXT_PUBLIC_MOCK=1 NEXT_EXPORT=1 npx next build   # 产出带假数据的 web/out
-python3 -m http.server 3006 --directory out                 # 或在别处起静态服务，用 MOCK_BASE 指过去
-MOCK_BASE=http://127.0.0.1:3006 OUT_DIR=out node ../tools/e2e/i2-mock-crawl.js
+cd web && NEXT_PUBLIC_MOCK=1 npx next build        # 产出带假数据的 web/out（build:static 加 NEXT_PUBLIC_MOCK=1）
+python3 -m http.server 3006 --bind 127.0.0.1 --directory out &
+MOCK_BASE=http://127.0.0.1:3006 OUT_DIR=out \
+JW_SHOTS=shots UI_REPORT=ui-visual.md \
+NODE_PATH=/root/browser-check/node_modules node ../tools/e2e/i2-mock-crawl.js
 ```
 
-期望输出：`有脚本错误的页面=0`、`正文过短的页面` 只包含 `/404/`。跑完记得把 `web/out` 用正式
-构建覆盖回去——`server/webui/dist` 是从它拷进二进制的。
+判据三条，任一不满足就**非零退出**（发版流水线据此拦下发版）：
+
+1. 页面有未捕获异常或 `console.error`；
+2. 正文短于 `MIN_TEXT`（默认 12 字）且没登记在 `ALLOW_EMPTY` 里；
+3. 页面渲染出 Next 的错误块（`Application error` / `Unhandled Runtime Error`）——这种页面正文很长，
+   只按字数判会被放过去。
+
+量正文时优先量 `<main>`；外壳之外的页面（`/404/`）没有 `main`，退到量整页并在表格里标「量整页」——
+不把这类页面当成「需要豁免的空页面」，那是测量口径的问题，不是页面的问题。
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `MOCK_BASE` | `http://127.0.0.1:3006` | 静态服务地址 |
+| `OUT_DIR` | `out` | 静态导出目录（路由表从它的 `index.html` 推出来） |
+| `JW_SHOTS` | `shots` | 截图目录，路由名摊平成 `function-deep-intranet.png` |
+| `UI_REPORT` | 空 | 额外写一份 Markdown 台账（页面 / 字数 / 截图 / 问题） |
+| `ALLOW_EMPTY` | 空 | 逗号分隔的路由前缀，登记过才允许正文为空 |
+| `MIN_TEXT` | `12` | 低于这个字数算空页面 |
+
+它证明的是「每个页面能渲染、控制台不报错」，**不证明业务数据正确**：跑的是 mock 构建，没有后端、
+没有靶机，也不点任何真会发包的按钮。真数据的界面核验仍是 `verify-*.js` 那一套（要实例与靶机）。
+
+## CI 里的两道自动检查（I4）
+
+`.github/workflows/release.yml` 里：
+
+- **`ui-visual` 作业**：构建 mock 静态导出 → 起本地静态服务 → 跑 `i2-mock-crawl.js` →
+  把每个页面一张截图与台账表格作为 `ui-visual-<tag>` 产物上传。**`release` 作业依赖它**，
+  有问题的页面直接让发版失败（镜像已经推出去了，但 Release 不会建）。
+  装的是钉住的 `PLAYWRIGHT_VERSION`，浏览器版本跟着它走，避免上游换版把发版卡住。
+- **`docker` 作业里的 `selfcheck.sh`**：对**刚构建出的那个镜像**跑平台自身安全回归，
+  位置在「推镜像」之前——自检不过的镜像不该变成发布物。报告作为 `selfcheck-<arch>-<tag>` 上传。
+
+两道检查都 `if: always()` 上传产物：失败时那份截图与报告正是要看的东西。
+
+`web/out` 是构建产物目录：mock 构建覆盖过它之后，**记得用正式构建再跑一次**
+（`cd web && npm run build:static`），`server/webui/dist` 是从它拷进二进制的——把带假数据的
+导出打进镜像，界面就停在演示态。
 
 ## selfcheck.sh — 平台自身安全回归（发版前必跑）
 

@@ -68,6 +68,58 @@ jobs:
           path: web/out
           retention-days: 3
 
+  # I4：界面视觉验证纳入 CI 产物，并把「每个页面能渲染、控制台不报错」变成发版必过项。
+  # 这一层跑的是 **mock 静态导出**（无后端、无靶机、不发一个包）：`next build` 通过和用户点开
+  # 是白屏之间，别的自动化都区分不了——路由参数少了、客户端组件拿不到 props、mock 数据形状
+  # 对不上，构建全都照过。跑真实例的那部分（真数据、真交互）仍在 tools/e2e 的人工核验里，
+  # 这里不冒充它。
+  ui-visual:
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      # 与本地那一轮验证对齐的版本；Chromium 修订号跟着 playwright 走，不单独钉。
+      PLAYWRIGHT_VERSION: "1.64.1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build mock static export
+        run: |
+          npm ci
+          NEXT_PUBLIC_MOCK=1 npm run build:static
+        working-directory: web
+      - name: Install headless Chromium
+        run: |
+          mkdir -p /tmp/pw
+          printf '{"name":"jingwei-e2e-runner","private":true}\n' > /tmp/pw/package.json
+          npm install --prefix /tmp/pw --no-audit --no-fund playwright@${PLAYWRIGHT_VERSION}
+          npx --yes playwright@${PLAYWRIGHT_VERSION} install --with-deps chromium
+      - name: Crawl every exported page and capture screenshots
+        run: |
+          python3 -m http.server 3006 --bind 127.0.0.1 --directory web/out > /tmp/http.log 2>&1 &
+          HTTP_PID=$!
+          trap 'kill $HTTP_PID 2>/dev/null || true' EXIT
+          curl --fail --retry 20 --retry-connrefused --retry-delay 1 --max-time 2 -o /dev/null http://127.0.0.1:3006/
+          MOCK_BASE=http://127.0.0.1:3006 \
+          OUT_DIR=web/out \
+          JW_SHOTS=ui-shots \
+          UI_REPORT=ui-visual.md \
+          NODE_PATH=/tmp/pw/node_modules \
+            node tools/e2e/i2-mock-crawl.js
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-visual-${{ needs.prepare.outputs.tag }}
+          path: |
+            ui-shots
+            ui-visual.md
+          retention-days: 14
+
   binaries:
     needs: [prepare, frontend]
     runs-on: ubuntu-latest
@@ -165,6 +217,16 @@ jobs:
           jq -e --arg version "$VERSION" \
             '.ok == true and .service == "jingwei" and .version == $version' /tmp/health.json
           curl --fail http://127.0.0.1:8787/ | grep -qi '<!doctype html'
+          # I3：对**这个刚构建出来的镜像**跑平台自身安全回归（只读探测：不发认证尝试、
+          # 不改配置）。放在推送之前——自检不过的这个镜像不该变成发布物。
+          BASE=http://127.0.0.1:8787 REPORT_DIR=selfcheck bash tools/e2e/selfcheck.sh
+      - name: Upload self-check report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfcheck-${{ matrix.arch }}-${{ needs.prepare.outputs.tag }}
+          path: selfcheck/
+          retention-days: 14
       - name: Push tested architecture image
         uses: docker/build-push-action@v6
         with:
@@ -222,7 +284,7 @@ jobs:
           retention-days: 3
 
   release:
-    needs: [prepare, docker-publish]
+    needs: [prepare, docker-publish, ui-visual]
     runs-on: ubuntu-latest
     permissions:
       contents: write
