@@ -547,9 +547,18 @@ export default function CredscanPage() {
                 ))}
               </div>
               {unsupported.length > 0 && (
-                <p className="text-[11px] text-muted-foreground">
-                  暂不支持：{unsupported.map((p) => p.name).join("、")}（选中会在创建时被拒绝，不会发起连接）
-                </p>
+                <div className="rounded-md border border-dashed px-3 py-2 text-[11px] text-muted-foreground">
+                  <p>暂不支持以下协议（创建时会被拒绝，不会发起连接）：</p>
+                  <ul className="mt-1 space-y-0.5">
+                    {unsupported.map((p) => (
+                      <li key={p.name}>
+                        <span className="font-mono">{p.name}</span>
+                        {p.default_port > 0 && <span> :{p.default_port}</span>}
+                        {p.note ? <span> —— {p.note}</span> : null}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               )}
             </div>
 

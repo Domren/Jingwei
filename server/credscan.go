@@ -663,7 +663,11 @@ func (s *Server) createCredTask(w http.ResponseWriter, r *http.Request) {
 		if !scanner.CredProtocolSupported(name) || scanner.CredAdapterFor(name) == nil {
 			// B5：不支持的协议在创建阶段就拒掉，一条连接都不发。比「建一个全是
 			// unsupported 行的任务」更干净——后者会被误读成「测过了但没实现」。
-			writeErr(w, 400, "该协议暂不支持："+name)
+			msg := "该协议暂不支持：" + name
+			if r := scanner.CredUnsupportedReason(name); r != "" {
+				msg += "（" + r + "）"
+			}
+			writeErr(w, 400, msg)
 			return
 		}
 	}

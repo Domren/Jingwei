@@ -2702,6 +2702,29 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     return { deliveries: mockNotifyDeliveries, total: mockNotifyDeliveries.length, page: 1, page_size: 50 };
   }
 
+  // ── 弱口令检测：协议目录（镜像 scanner/credscan.go 的口径；demo 只列代表性子集）──
+  if (path === "/credscan/protocols" && m === "GET") {
+    return {
+      protocols: [
+        { name: "ssh", default_port: 22, supported: true },
+        { name: "mysql", default_port: 3306, supported: true },
+        { name: "redis", default_port: 6379, supported: true },
+        { name: "ftp", default_port: 21, supported: true },
+        { name: "http-basic", default_port: 80, supported: true },
+        { name: "tomcat-console", default_port: 8080, supported: true },
+        { name: "rdp", default_port: 0, supported: false, note: "CredSSP/NLA 握手不透明，未对真服务验证" },
+        { name: "mssql", default_port: 1433, supported: false, note: "TDS 登录握手（含 NTLM 变体）未对真服务验证" },
+        { name: "smb", default_port: 445, supported: false, note: "SMB/NTLMSSP 握手需域控或 Samba 对照，本版未验证" },
+        { name: "winrm", default_port: 5985, supported: false, note: "WinRM/WMI 走 SOAP + NTLM/Kerberos，厂商差异大，未验证" },
+        { name: "oracle", default_port: 1521, supported: false, note: "Oracle Listener 私有握手，无可复现验证环境" },
+        { name: "jenkins", default_port: 8080, supported: false, note: "表单 + crumb 流程未对真服务验证" },
+      ],
+      dictionaries: ["builtin"],
+      dicts: [],
+      outcomes: ["hit", "deny", "unreachable", "locked", "inconclusive", "unsupported"],
+    };
+  }
+
   // ── 写操作兜底：成功但不落库 ──
   if (["POST", "PUT", "PATCH", "DELETE"].includes(m)) return { ok: true };
 

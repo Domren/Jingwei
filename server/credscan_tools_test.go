@@ -41,8 +41,9 @@ func TestCredscanToolsStartAndStatus(t *testing.T) {
 	raw := workflowCall(t, ctx, start, map[string]any{
 		"targets": []string{"10.0.0.1"}, "protocols": []string{"rdp"},
 	}, true)
-	if !strings.Contains(raw, "该协议暂不支持") {
-		t.Fatalf("不支持协议的错误说明不足: %s", raw)
+	if !strings.Contains(raw, "该协议暂不支持") || !strings.Contains(raw, "CredSSP/NLA") ||
+		!strings.Contains(raw, "未发起任何连接") {
+		t.Fatalf("不支持协议的错误说明要带降级原因与未连接声明: %s", raw)
 	}
 
 	// 工具产出的命中同样不带任何自动动作：凭据仍是 untested。

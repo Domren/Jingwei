@@ -11,6 +11,7 @@ type CredProtocolInfo struct {
 	Name        string `json:"name"`
 	DefaultPort int    `json:"default_port"`
 	Supported   bool   `json:"supported"`
+	Note        string `json:"note,omitempty"`
 }
 
 // CredProtocolCatalog 列出所有出现在默认端口表或适配器注册表里的协议，并把
@@ -27,7 +28,8 @@ func CredProtocolCatalog() []CredProtocolInfo {
 		out = append(out, CredProtocolInfo{
 			Name:        name,
 			DefaultPort: credDefaultPorts[name],
-			Supported:   CredAdapterFor(name) != nil,
+			Supported:   CredAdapterFor(name) != nil && CredProtocolSupported(name),
+			Note:        credUnsupportedProtocols[name],
 		})
 	}
 	for name := range credDefaultPorts {

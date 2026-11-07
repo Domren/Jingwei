@@ -76,7 +76,11 @@ func (s *Server) toolCredscanStart() actool.CoreTool {
 			for _, p := range a.Protocols {
 				name := strings.ToLower(strings.TrimSpace(p))
 				if !scanner.CredProtocolSupported(name) || scanner.CredAdapterFor(name) == nil {
-					return actool.Errorf("该协议暂不支持：" + name + "（未发起任何连接）"), nil
+					msg := "该协议暂不支持：" + name
+					if r := scanner.CredUnsupportedReason(name); r != "" {
+						msg += "（" + r + "）"
+					}
+					return actool.Errorf(msg + "（未发起任何连接）"), nil
 				}
 			}
 			if err := s.credDictExists(pg, a.DictProfile); err != nil {

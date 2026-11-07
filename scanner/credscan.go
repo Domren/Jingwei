@@ -106,12 +106,28 @@ var credDefaultPorts = map[string]int{
 	"vnc": 5900, "zookeeper": 2181, "smtp": 25, "pop3": 110, "imap": 143,
 	"smtp-ssl": 465, "pop3-ssl": 995, "imap-ssl": 993, "ldap": 389, "ldaps": 636,
 	"snmp": 161, "http-basic": 80, "webdav": 80, "tomcat-console": 8080,
+	// 二档协议的端口只供目录展示：它们在创建阶段就被拒，引擎永远不会走到这里。
+	"mssql": 1433, "smb": 445, "winrm": 5985, "oracle": 1521,
+	"routeros": 8728, "cobaltstrike": 50050, "jenkins": 8080, "svn": 3690,
 }
 
-// credUnsupportedProtocols 是三档：握手不透明或版本差异太大，第一版显式报「不支持」。
+// credUnsupportedProtocols 是三档：握手不透明或版本差异太大，显式报「不支持」，value 是原因。
 // 报不支持比给一个不可信的结果好——后者会进报告、进资产页、进人的决策。
-var credUnsupportedProtocols = map[string]bool{
-	"rdp": true, "weblogic-console": true, "jboss-console": true,
+// B4 的二档八项按规划表口径降级：每种握手都要真服务对照（NTLM 要域控或 NTLM 代理、
+// SOAP 要看厂商 WSDL、私有握手没有标准），本交付周期拿不到可复现的验证环境，
+// 宁可逐项写明「暂不支持」，也不写一个没验过的适配器。后续先在 credscan-lab 摆服务再实现。
+var credUnsupportedProtocols = map[string]string{
+	"rdp":              "CredSSP/NLA 握手不透明，未对真服务验证",
+	"weblogic-console": "控制台登录形态版本差异大，未验证",
+	"jboss-console":    "管理接口认证形态不统一，未验证",
+	"mssql":            "TDS 登录握手（含 NTLM 变体）未对真服务验证",
+	"smb":              "SMB/NTLMSSP 握手需域控或 Samba 对照，本版未验证",
+	"winrm":            "WinRM/WMI 走 SOAP + NTLM/Kerberos，厂商差异大，未验证",
+	"oracle":           "Oracle Listener 私有握手，无可复现验证环境",
+	"routeros":         "RouterOS API 私有握手，未验证",
+	"cobaltstrike":     "面板私有协议、无标准，未验证",
+	"jenkins":          "表单 + crumb 流程未对真服务验证",
+	"svn":              "svnserve 私有握手与 HTTP SVN 认证形态未验证",
 }
 
 // CredDefaultPort 返回协议的常见端口（0 表示没有默认端口，例如纯 HTTP 形态）。
@@ -133,7 +149,13 @@ func CredProtocolKnown(protocol string) bool {
 
 // CredProtocolSupported 区分「认识但不实现」与「认识且能测」。
 func CredProtocolSupported(protocol string) bool {
-	return !credUnsupportedProtocols[strings.ToLower(strings.TrimSpace(protocol))]
+	_, unsupported := credUnsupportedProtocols[strings.ToLower(strings.TrimSpace(protocol))]
+	return !unsupported
+}
+
+// CredUnsupportedReason 返回目录里登记的降级原因；未登记的协议返回空串。
+func CredUnsupportedReason(protocol string) string {
+	return credUnsupportedProtocols[strings.ToLower(strings.TrimSpace(protocol))]
 }
 
 // CredAttempt 是一次尝试的完整记录，含证据字节。
@@ -529,9 +551,13 @@ func runCredEndpoint(ctx, runCtx context.Context, endpoint CredEndpoint, creds [
 	// 不支持的协议：一个包都不发。前端与报告据此写「该协议暂不支持」，
 	// 而不是留一个空结果让人以为测过了。
 	if !CredProtocolSupported(endpoint.Protocol) {
+		reason := "该协议的握手形态本平台不实现，未发起连接"
+		if r := CredUnsupportedReason(endpoint.Protocol); r != "" {
+			reason = "暂不支持：" + r + "；未发起连接"
+		}
 		for _, c := range creds {
 			emit(CredAttempt{Host: endpoint.Host, Port: endpoint.Port, Protocol: endpoint.Protocol,
-				Cred: c, Outcome: CredUnsupported, Reason: "该协议的握手形态本平台不实现，未发起连接"})
+				Cred: c, Outcome: CredUnsupported, Reason: reason})
 		}
 		return
 	}

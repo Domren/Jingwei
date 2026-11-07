@@ -147,6 +147,12 @@
   不必先猜再去查。
 ### 变更
 
+- **弱口令检测二档协议显式降级（B4）**：MSSQL、SMB、WinRM/WMI、Oracle Listener、RouterOS、
+  CobaltStrike 面板、Jenkins、SVN 这 8 个二档协议本版不做适配器——每种握手都要真服务对照
+  （NTLM 要域控或 Samba 对照、SOAP 要看厂商 WSDL、私有握手没有标准），本周期拿不到可复现的
+  验证环境。与其写没验过的适配器，不如在协议目录里逐项登记「暂不支持」：每项带降级原因与
+  展示端口，前端选择器逐项列出原因；创建请求与 agent 工具当场带原因拒绝（不发起任何连接）；
+  引擎若收到这类端点，登记的原因原样写进结果行。后续先在 `credscan-lab` 摆服务再实现。
 - 数据库自动迁移新增 `subdomain_tasks` / `subdomain_results` 两张表（启动时 `IF NOT EXISTS` 建好，无需手工步骤）；
   新增接口 `POST/GET /api/subdomain/tasks`、`GET /api/subdomain/tasks/{id}`、`.../results`、`.../report`、
   `POST .../{id}/cancel`、`POST .../batch-delete`、`GET /api/subdomain/options`。

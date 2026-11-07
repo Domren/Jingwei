@@ -2899,6 +2899,7 @@ export interface CredProtocolInfo {
   name: string;
   default_port: number;
   supported: boolean;
+  note?: string;
 }
 
 export interface CredDict {
