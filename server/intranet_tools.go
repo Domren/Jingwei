@@ -153,6 +153,12 @@ func (s *Server) toolIntranetExec() actool.CoreTool {
 			// returns" apart from "this shell is dead" — without them a stopped
 			// wait reads as a transport failure and the next tool call gives up on
 			// a session that is still working.
+			// F5：把这台主机上已识别的终端防护随命令结果一起交回去。worker 做下一个动作前
+			// 就该知道「这里有没有东西在看着」，而不是先猜、撞了再回头查。
+			// 只回看已入库的收集结果，不额外发命令。
+			if epNote := sessionEndpointNote(pg, sess.ID); epNote != "" {
+				return jsonResult(map[string]any{"session_id": sess.ID, "cwd": out.Cwd, "output": out.Output, "exit_code": out.ExitCode, "is_error": out.IsError, "timed_out": out.TimedOut, "marker_ok": out.MarkerOK, "note": out.Note, "endpoint_security": epNote})
+			}
 			return jsonResult(map[string]any{"session_id": sess.ID, "cwd": out.Cwd, "output": out.Output, "exit_code": out.ExitCode, "is_error": out.IsError, "timed_out": out.TimedOut, "marker_ok": out.MarkerOK, "note": out.Note})
 		})
 }

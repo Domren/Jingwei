@@ -2238,6 +2238,13 @@ export default function DeepIntranetPage() {
                     <div className="mt-1 text-[11px] text-muted-foreground">
                       结构化条目 {String(run.parsed?.count ?? 0)} 条
                     </div>
+                    {/* 结论一句（F5：终端防护与补丁基线都靠它把「没读到」与「没有」分开说清） */}
+                    {typeof run.parsed?.summary === "string" && run.parsed.summary ? (
+                      <div className="mt-1 rounded border bg-muted/20 p-1.5 text-[11px]">{run.parsed.summary}</div>
+                    ) : null}
+                    {typeof run.parsed?.finding_note === "string" && run.parsed.finding_note ? (
+                      <div className="mt-1 text-[11px] text-muted-foreground">{run.parsed.finding_note}</div>
+                    ) : null}
                     {Array.isArray(run.parsed?.items) && run.parsed.items.length > 0 && (
                       <pre className="mt-1 max-h-40 overflow-auto rounded bg-muted/30 p-2 font-mono text-[11px] whitespace-pre-wrap">
                         {run.parsed.items

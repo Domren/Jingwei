@@ -255,3 +255,29 @@ func TestStripCurlArtifactsKeepsRawPackets(t *testing.T) {
 		t.Fatal("placeholder must not appear when nothing was removed")
 	}
 }
+
+// F5 的两类条目在 guidanceFor 里必须落到专门的分支：
+// 终端防护是环境事实（不给规避建议），补丁基线未命中是待确认（不直接当漏洞）。
+// 用服务层真实生成的标题来测，避免「分支写了但被前面的泛化分支截走」。
+func TestGuidanceForEndpointFindings(t *testing.T) {
+	g := guidanceFor("endpoint_security 目标存在终端防护：Microsoft Defender 防病毒")
+	if !strings.Contains(g.Impact, "不是漏洞") {
+		t.Fatalf("影响评估要把环境事实与漏洞分开：%s", g.Impact)
+	}
+	if !strings.Contains(g.Remediation, "不提供任何规避") {
+		t.Fatalf("修复建议不能留规避空间：%s", g.Remediation)
+	}
+	for _, bad := range []string{"关闭", "禁用 Defender", "绕过", "卸载"} {
+		if strings.Contains(g.Remediation, bad) || strings.Contains(g.Impact, bad) {
+			t.Fatalf("出现了规避性措辞 %q", bad)
+		}
+	}
+
+	p := guidanceFor("missing_patch 补丁基线未命中：CVE-2019-0708（远程桌面服务远程执行代码（BlueKeep），待确认）")
+	if !strings.Contains(p.Impact, "尚未验证") {
+		t.Fatalf("未命中的基线必须写明未验证：%s", p.Impact)
+	}
+	if !strings.Contains(p.Remediation, "WSUS") || !strings.Contains(p.Remediation, "不要以") {
+		t.Fatalf("修复建议要先核实再动手：%s", p.Remediation)
+	}
+}

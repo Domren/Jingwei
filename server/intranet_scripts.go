@@ -52,9 +52,9 @@ var intranetScriptCatalog = []intranetScriptDef{
 	{ID: "linux-containers", Name: "容器", OS: "linux", Parser: "containers",
 		Command: `docker ps --format '{{.Names}}|{{.Image}}|{{.Ports}}' 2>/dev/null; podman ps 2>/dev/null | head -50`,
 		Note:    "运行中的容器与端口映射"},
-	{ID: "win-systeminfo", Name: "系统信息", OS: "windows", Parser: "windows_systeminfo",
+	{ID: "win-systeminfo", Name: "系统信息与补丁基线", OS: "windows", Parser: "patches",
 		Command: `systeminfo`,
-		Note:    "OS 版本/补丁概况"},
+		Note:    "OS 版本与 build + 已安装补丁与基线比对（systeminfo 慢，约 30–60 秒）"},
 	{ID: "win-users", Name: "本地用户", OS: "windows", Parser: "lines",
 		Command: `net user`,
 		Note:    "本机账号列表"},
@@ -64,15 +64,32 @@ var intranetScriptCatalog = []intranetScriptDef{
 	{ID: "win-ports", Name: "监听端口", OS: "windows", Parser: "windows_ports",
 		Command: `netstat -ano`,
 		Note:    "监听地址/端口/PID"},
-	{ID: "win-patches", Name: "补丁", OS: "windows", Parser: "windows_patches",
+	{ID: "win-patches", Name: "补丁（wmic）", OS: "windows", Parser: "patches",
 		Command: `wmic qfe list brief`,
-		Note:    "已安装补丁（缺失补丁需自行比对）"},
+		Note:    "已安装补丁与基线比对；wmic 在新版本上可能已移除，取不到就换 PowerShell 那条"},
+	{ID: "win-hotfixes", Name: "补丁（PowerShell）", OS: "windows", Parser: "patches",
+		Command: `powershell -NoProfile -Command "Get-HotFix | Select-Object HotFixID,InstalledOn | ConvertTo-Csv -NoTypeInformation"`,
+		Note:    "已安装补丁与基线比对（wmic 被移除时用这条）"},
+	{ID: "win-endpoint", Name: "终端防护进程与服务", OS: "windows", Parser: "endpoint",
+		Command: `tasklist /fo csv /nh 2>nul & sc query type= service state= all 2>nul | findstr /i "SERVICE_NAME"`,
+		Note:    "按进程名/服务名识别杀软与 EDR；只登记有公开文档支撑的条目，认不出的列入待确认"},
+	{ID: "linux-endpoint", Name: "终端防护进程", OS: "linux", Parser: "endpoint",
+		Command: `ps -eo pid=,comm=,args= 2>/dev/null | head -200`,
+		Note:    "同上，Linux 侧；主机上通常没有终端防护，读不到列表时不做判断"},
 	{ID: "win-tasks", Name: "计划任务", OS: "windows", Parser: "windows_tasks",
 		Command: `schtasks /query /fo LIST`,
 		Note:    "任务名与状态"},
 	{ID: "win-priv", Name: "令牌特权", OS: "windows", Parser: "lines",
 		Command: `whoami /priv`,
 		Note:    "当前令牌特权"},
+}
+
+// endpointOSKind 把脚本侧的 linux/windows 归到识别函数认的说法。
+func endpointOSKind(os string) string {
+	if strings.EqualFold(strings.TrimSpace(os), "windows") {
+		return "windows"
+	}
+	return "linux"
 }
 
 func intranetScriptByID_(id string) (intranetScriptDef, bool) {
@@ -96,7 +113,13 @@ func scriptLines(output string) []string {
 	return out
 }
 
-func parseIntranetScriptOutput(parser, output string) map[string]any {
+func parseIntranetScriptOutput(parser, osKind, output string) map[string]any {
+	switch parser {
+	case "endpoint":
+		return parseEndpointScript(endpointOSKind(osKind), output)
+	case "patches":
+		return parsePatchScript(output)
+	}
 	lines := scriptLines(output)
 	items := []any{}
 	switch parser {
@@ -184,24 +207,10 @@ func parseIntranetScriptOutput(parser, output string) map[string]any {
 				items = append(items, map[string]any{"name": parts[0], "image": parts[1], "ports": parts[2]})
 			}
 		}
-	case "windows_systeminfo":
-		for _, l := range lines {
-			lower := strings.ToLower(l)
-			if strings.Contains(lower, "os name") || strings.Contains(lower, "os version") ||
-				strings.Contains(lower, "hotfix") || strings.Contains(lower, "system type") {
-				items = append(items, strings.TrimSpace(l))
-			}
-		}
 	case "windows_ports":
 		for _, l := range lines {
 			lower := strings.ToLower(l)
 			if strings.Contains(lower, "listen") || strings.Contains(lower, "udp") {
-				items = append(items, strings.Join(strings.Fields(l), " "))
-			}
-		}
-	case "windows_patches":
-		for _, l := range lines {
-			if strings.Contains(strings.ToLower(l), "kb") {
 				items = append(items, strings.Join(strings.Fields(l), " "))
 			}
 		}
@@ -296,7 +305,7 @@ func (s *Server) runIntranetScript(w http.ResponseWriter, r *http.Request) {
 		SessionID: sess.ID, TaskID: taskID, ScriptID: script.ID, Name: script.Name,
 		OS: script.OS, Command: script.Command, ExitCode: &code, Status: status,
 		Output: truncateIntranetOutput(out.Output, 64<<10),
-		Parsed: parseIntranetScriptOutput(script.Parser, out.Output),
+		Parsed: parseIntranetScriptOutput(script.Parser, script.OS, out.Output),
 	})
 	if err != nil {
 		writeErr(w, 500, "保存脚本结果失败："+err.Error())
@@ -304,6 +313,11 @@ func (s *Server) runIntranetScript(w http.ResponseWriter, r *http.Request) {
 	}
 	if out.Note != "" {
 		run.Parsed["note"] = out.Note
+	}
+	// 终端侧识别不只留在运行记录里：它要进发现台账（可筛选、可交付），
+	// 也要在后续动作前被看见。读不到列表时这里只会给一句「不做判断」。
+	if note := s.recordEndpointFindings(pg, sess, taskID, script.ID, run.Parsed); note != "" {
+		run.Parsed["finding_note"] = note
 	}
 	writeJSON(w, 200, map[string]any{"run": run, "session": sess})
 }
