@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -375,20 +376,24 @@ func normalizeProbeURL(target string) string {
 
 // ---------------------------------------------------------------- 绕过变体
 
-// BypassVariant is one request shape tried against a WAF.
+// BypassVariant is one request shape tried against a WAF. Category drives the
+// feature-aware reordering after the first block: baseline always goes first,
+// the rest are reordered by what the WAF appears to be blocking on.
 type BypassVariant struct {
-	Name    string
-	Desc    string
-	Method  string
-	Path    string
-	Headers map[string]string
-	Body    string
+	Name     string
+	Desc     string
+	Category string // baseline | encoding | header | path | method
+	Method   string
+	Path     string
+	Headers  map[string]string
+	Body     string
 }
 
 // BypassProbe is the outcome of one bypass attempt.
 type BypassProbe struct {
 	Name       string `json:"name"`
 	Desc       string `json:"desc"`
+	Category   string `json:"category"`
 	Method     string `json:"method"`
 	Path       string `json:"path"`
 	StatusCode int    `json:"status_code"`
@@ -398,10 +403,13 @@ type BypassProbe struct {
 	Verdict    string `json:"verdict"`
 	Note       string `json:"note"`
 	ElapsedMs  int64  `json:"elapsed_ms"`
+	Attempt    int    `json:"attempt"`
+	StopReason string `json:"stop_reason"`
 }
 
 // BuildBypassVariants returns the request shapes tried against a protected
-// endpoint. The first entry is the untouched baseline.
+// endpoint. The first entry is the untouched baseline; every other variant is
+// tagged with the category used by the feature-aware reordering.
 func BuildBypassVariants(path, param, payload string) []BypassVariant {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -420,21 +428,21 @@ func BuildBypassVariants(path, param, payload string) []BypassVariant {
 		base = path + "?" + param + "=" + enc
 	}
 	out := []BypassVariant{
-		{Name: "baseline", Desc: "原始请求", Method: http.MethodGet, Path: base},
-		{Name: "case", Desc: "参数大小写变形", Method: http.MethodGet, Path: swapCase(base)},
-		{Name: "urlencode", Desc: "单次 URL 编码", Method: http.MethodGet, Path: path + "?" + param + "=" + singleEncode(payload)},
-		{Name: "doubleencode", Desc: "双重 URL 编码", Method: http.MethodGet, Path: path + "?" + param + "=" + doubleEncode(payload)},
-		{Name: "unicode", Desc: "Unicode 百分号编码", Method: http.MethodGet, Path: path + "?" + param + "=" + unicodeEncode(payload)},
-		{Name: "nullbyte", Desc: "空字节截断", Method: http.MethodGet, Path: path + "?" + param + "=" + enc + "%00"},
-		{Name: "paramname", Desc: "参数名变形", Method: http.MethodGet, Path: path + "?" + param + "%20=" + enc},
-		{Name: "semicolon", Desc: "分号路径变形", Method: http.MethodGet, Path: "/;/" + strings.TrimPrefix(path, "/") + "?" + param + "=" + enc},
-		{Name: "doubleslash", Desc: "重复斜杠", Method: http.MethodGet, Path: "//" + strings.TrimPrefix(path, "/") + "?" + param + "=" + enc},
-		{Name: "trailslash", Desc: "追加尾斜杠", Method: http.MethodGet, Path: path + "/?" + param + "=" + enc},
-		{Name: "ext", Desc: "追加静态后缀", Method: http.MethodGet, Path: path + ".json?" + param + "=" + enc},
-		{Name: "xff", Desc: "X-Forwarded-For 伪造", Method: http.MethodGet, Path: base, Headers: map[string]string{"X-Forwarded-For": "127.0.0.1"}},
-		{Name: "xoriginal", Desc: "X-Original-URL 头改写", Method: http.MethodGet, Path: path, Headers: map[string]string{"X-Original-URL": path + "?" + param + "=" + enc}},
-		{Name: "xrewrite", Desc: "X-Rewrite-URL 头改写", Method: http.MethodGet, Path: path, Headers: map[string]string{"X-Rewrite-URL": path + "?" + param + "=" + enc}},
-		{Name: "post", Desc: "改用 POST 提交", Method: http.MethodPost, Path: path, Body: param + "=" + enc, Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"}},
+		{Name: "baseline", Desc: "原始请求", Category: "baseline", Method: http.MethodGet, Path: base},
+		{Name: "case", Desc: "参数大小写变形", Category: "encoding", Method: http.MethodGet, Path: swapCase(base)},
+		{Name: "urlencode", Desc: "单次 URL 编码", Category: "encoding", Method: http.MethodGet, Path: path + "?" + param + "=" + singleEncode(payload)},
+		{Name: "doubleencode", Desc: "双重 URL 编码", Category: "encoding", Method: http.MethodGet, Path: path + "?" + param + "=" + doubleEncode(payload)},
+		{Name: "unicode", Desc: "Unicode 百分号编码", Category: "encoding", Method: http.MethodGet, Path: path + "?" + param + "=" + unicodeEncode(payload)},
+		{Name: "nullbyte", Desc: "空字节截断", Category: "encoding", Method: http.MethodGet, Path: path + "?" + param + "=" + enc + "%00"},
+		{Name: "paramname", Desc: "参数名变形", Category: "path", Method: http.MethodGet, Path: path + "?" + param + "%20=" + enc},
+		{Name: "semicolon", Desc: "分号路径变形", Category: "path", Method: http.MethodGet, Path: "/;/" + strings.TrimPrefix(path, "/") + "?" + param + "=" + enc},
+		{Name: "doubleslash", Desc: "重复斜杠", Category: "path", Method: http.MethodGet, Path: "//" + strings.TrimPrefix(path, "/") + "?" + param + "=" + enc},
+		{Name: "trailslash", Desc: "追加尾斜杠", Category: "path", Method: http.MethodGet, Path: path + "/?" + param + "=" + enc},
+		{Name: "ext", Desc: "追加静态后缀", Category: "path", Method: http.MethodGet, Path: path + ".json?" + param + "=" + enc},
+		{Name: "xff", Desc: "X-Forwarded-For 伪造", Category: "header", Method: http.MethodGet, Path: base, Headers: map[string]string{"X-Forwarded-For": "127.0.0.1"}},
+		{Name: "xoriginal", Desc: "X-Original-URL 头改写", Category: "header", Method: http.MethodGet, Path: path, Headers: map[string]string{"X-Original-URL": path + "?" + param + "=" + enc}},
+		{Name: "xrewrite", Desc: "X-Rewrite-URL 头改写", Category: "header", Method: http.MethodGet, Path: path, Headers: map[string]string{"X-Rewrite-URL": path + "?" + param + "=" + enc}},
+		{Name: "post", Desc: "改用 POST 提交", Category: "method", Method: http.MethodPost, Path: path, Body: param + "=" + enc, Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"}},
 	}
 	return out
 }
@@ -480,43 +488,295 @@ func unicodeEncode(s string) string {
 	return b.String()
 }
 
-// RunBypassProbes sends every variant and classifies the outcome. A variant
-// counts as a bypass when it is not blocked and the injected payload shows up
-// in the response while the baseline stayed blocked.
-func RunBypassProbes(ctx context.Context, c *DeepClient, baseURL string, variants []BypassVariant, keywords []string) []BypassProbe {
+// BlockFeature is the shape of interception inferred from a blocked response. It
+// is used only to pick which variant family to try next; it never asserts a
+// conclusion about the WAF product or version.
+type BlockFeature int
+
+const (
+	// BlockUnknown means the block could not be classified; the natural variant
+	// order is kept.
+	BlockUnknown BlockFeature = iota
+	// BlockRateLimit is a captcha, rate limit or retry-after gate.
+	BlockRateLimit
+	// BlockVendor is a recognizable WAF product signature in the body.
+	BlockVendor
+	// BlockRule is a path/parameter rule (a bare 401/403/405/406 with no marker).
+	BlockRule
+)
+
+func (f BlockFeature) String() string {
+	switch f {
+	case BlockRateLimit:
+		return "rate_limit_or_captcha"
+	case BlockVendor:
+		return "vendor_feature"
+	case BlockRule:
+		return "path_or_param_rule"
+	default:
+		return "unknown"
+	}
+}
+
+// captchaRateMarker flags a rate limit or human-verification gate.
+var captchaRateMarker = regexp.MustCompile(`(?i)(验证码|滑块|人机验证|captcha|retry-after|rate.?limit|访问频率|频率限制|too many requests|请求过于频繁|操作频繁)`)
+
+// vendorBlockMarker flags a recognizable WAF product in the body. Generic words
+// like "拦截" are deliberately excluded so a bare 403 is read as a rule, not a
+// named product.
+var vendorBlockMarker = regexp.MustCompile(`(?i)(安全狗|知道创宇|云防护|网站防火墙|web application firewall|云锁|网盾|云盾|waf\s*blocked)`)
+
+// classifyBlockFeature infers the block shape from a blocked response. It only
+// distinguishes routing priorities, so an uncertain body falls back to the rule
+// category rather than guessing a product.
+func classifyBlockFeature(resp DeepResponse) BlockFeature {
+	if resp.StatusCode == 429 {
+		return BlockRateLimit
+	}
+	if resp.StatusCode == 503 && hasRetryAfter(resp.Headers) {
+		return BlockRateLimit
+	}
+	if captchaRateMarker.MatchString(resp.Body) {
+		return BlockRateLimit
+	}
+	if vendorBlockMarker.MatchString(resp.Body) {
+		return BlockVendor
+	}
+	return BlockRule
+}
+
+func hasRetryAfter(h http.Header) bool {
+	if h == nil {
+		return false
+	}
+	_, ok := h["Retry-After"]
+	return ok
+}
+
+// categoryPriority returns the variant-category order to try for a block shape.
+// A rate-limit/captcha gate is beaten by header tweaks first; a named-WAF
+// feature block by encoding first; a path/param rule by path变形 first. The
+// order is fixed, so the probe sequence is reproducible.
+func categoryPriority(feature BlockFeature) []string {
+	switch feature {
+	case BlockRateLimit:
+		return []string{"header", "encoding", "path", "method"}
+	case BlockVendor:
+		return []string{"encoding", "header", "path", "method"}
+	case BlockRule:
+		return []string{"path", "header", "encoding", "method"}
+	default:
+		return nil // natural order
+	}
+}
+
+// reorderByFeature keeps order[0:from+1] (baseline + already-sent variants) in
+// place and stably sorts the remainder by category priority. Unknown categories
+// sort last, and within a category the build order is preserved.
+func reorderByFeature(order []BypassVariant, from int, feature BlockFeature) []BypassVariant {
+	prio := categoryPriority(feature)
+	if prio == nil {
+		return order
+	}
+	head := make([]BypassVariant, from+1)
+	copy(head, order[:from+1])
+	tail := make([]BypassVariant, len(order)-from-1)
+	copy(tail, order[from+1:])
+	rankOf := func(cat string) int {
+		for i, p := range prio {
+			if p == cat {
+				return i
+			}
+		}
+		return len(prio)
+	}
+	sort.SliceStable(tail, func(a, b int) bool {
+		return rankOf(tail[a].Category) < rankOf(tail[b].Category)
+	})
+	return append(head, tail...)
+}
+
+// BypassConfig bounds how many requests RunBypassProbes will send.
+type BypassConfig struct {
+	// MaxAttempts is the cap on total requests, including the baseline. It is
+	// clamped to bypassHardCap so a large caller value can never loop forever.
+	MaxAttempts int
+	// MaxConsecutiveBlocked stops after this many blocked responses in a row.
+	MaxConsecutiveBlocked int
+	// MaxConsecutiveErrors stops after this many transport errors in a row.
+	MaxConsecutiveErrors int
+}
+
+// DefaultBypassConfig returns the production defaults.
+func DefaultBypassConfig() BypassConfig {
+	return BypassConfig{
+		MaxAttempts:           8,
+		MaxConsecutiveBlocked: 5,
+		MaxConsecutiveErrors:  3,
+	}
+}
+
+// bypassHardCap is the absolute ceiling on MaxAttempts.
+const bypassHardCap = 64
+
+func (c BypassConfig) clamp() BypassConfig {
+	if c.MaxAttempts <= 0 {
+		c.MaxAttempts = DefaultBypassConfig().MaxAttempts
+	}
+	if c.MaxAttempts > bypassHardCap {
+		c.MaxAttempts = bypassHardCap
+	}
+	if c.MaxConsecutiveBlocked <= 0 {
+		c.MaxConsecutiveBlocked = DefaultBypassConfig().MaxConsecutiveBlocked
+	}
+	if c.MaxConsecutiveErrors <= 0 {
+		c.MaxConsecutiveErrors = DefaultBypassConfig().MaxConsecutiveErrors
+	}
+	return c
+}
+
+// BypassRun is the outcome of a full bypass campaign against one endpoint.
+type BypassRun struct {
+	// BaselineBlocked is whether the untouched baseline request was blocked.
+	BaselineBlocked bool `json:"baseline_blocked"`
+	// BlockFeature is the inferred block shape (empty when the baseline passed).
+	BlockFeature string `json:"block_feature"`
+	// Attempts is how many probes were actually sent.
+	Attempts int `json:"attempts"`
+	// StopReason explains why sending stopped.
+	StopReason string `json:"stop_reason"`
+	// FinalVerdict is "bypassed" when any variant reached the target, else
+	// "no_bypass".
+	FinalVerdict string `json:"final_verdict"`
+	// Probes are the individual attempts, in send order.
+	Probes []BypassProbe `json:"probes"`
+}
+
+// RunBypassProbes sends variants against a protected endpoint. The baseline is
+// always first. Once a probe is blocked, the remaining variants are reordered by
+// the inferred block shape and the campaign stops on the first bypass, on budget
+// exhaustion, or on a consecutive-block / consecutive-error stop-loss. It never
+// loops unboundedly.
+func RunBypassProbes(ctx context.Context, c *DeepClient, baseURL string, variants []BypassVariant, keywords []string, cfg BypassConfig) BypassRun {
+	cfg = cfg.clamp()
+	run := BypassRun{}
 	base := normalizeProbeURL(baseURL)
-	probes := make([]BypassProbe, 0, len(variants))
-	for _, v := range variants {
+	if len(variants) == 0 {
+		run.StopReason = "no_variants"
+		run.FinalVerdict = "no_bypass"
+		return run
+	}
+	order := make([]BypassVariant, len(variants))
+	copy(order, variants)
+	reordered := false
+	feature := BlockUnknown
+	consecutiveBlocked := 0
+	consecutiveErrors := 0
+	bypassed := false
+
+	for i := 0; i < len(order); i++ {
+		if run.Attempts >= cfg.MaxAttempts {
+			run.StopReason = "budget_exhausted"
+			break
+		}
+		if ctx.Err() != nil {
+			if run.StopReason == "" {
+				run.StopReason = "context_canceled"
+			}
+			break
+		}
+		v := order[i]
 		full := joinProbeURL(base, v.Path)
-		probe := BypassProbe{Name: v.Name, Desc: v.Desc, Method: v.Method, Path: v.Path}
+		probe := BypassProbe{
+			Name:     v.Name,
+			Desc:     v.Desc,
+			Category: v.Category,
+			Method:   v.Method,
+			Path:     v.Path,
+			Attempt:  run.Attempts + 1,
+		}
 		req := DeepRequest{Method: v.Method, URL: full, Headers: v.Headers, Body: v.Body, Timeout: 12 * time.Second}
 		resp := c.Do(ctx, req)
 		probe.ElapsedMs = resp.Elapsed.Milliseconds()
+
 		if resp.Error != "" {
 			probe.Verdict = "error"
 			probe.Note = resp.Error
-			probes = append(probes, probe)
+			consecutiveErrors++
+			consecutiveBlocked = 0
+			run.Attempts++
+			probesAppend(&run, probe)
+			if consecutiveErrors >= cfg.MaxConsecutiveErrors {
+				run.StopReason = "consecutive_errors"
+				setLastStopReason(&run, run.StopReason)
+				break
+			}
 			continue
 		}
+		consecutiveErrors = 0
 		probe.StatusCode = resp.StatusCode
 		probe.Length = resp.Length
-		probe.Blocked = resp.StatusCode == 403 || resp.StatusCode == 406 || resp.StatusCode == 405 ||
-			wafBlockMarker.MatchString(resp.Body)
-		probe.Matched = responseContains(resp.Body, keywords)
+		blocked := resp.StatusCode == 403 || resp.StatusCode == 406 || resp.StatusCode == 405 ||
+			resp.StatusCode == 401 || wafBlockMarker.MatchString(resp.Body)
+		matched := responseContains(resp.Body, keywords)
 		switch {
-		case probe.Blocked:
+		case blocked:
 			probe.Verdict = "blocked"
 			probe.Note = fmt.Sprintf("HTTP %d 被拦截", resp.StatusCode)
-		case probe.Matched:
+			consecutiveBlocked++
+			if !reordered {
+				feature = classifyBlockFeature(resp)
+				run.BlockFeature = feature.String()
+				order = reorderByFeature(order, i, feature)
+			}
+		case matched:
 			probe.Verdict = "bypassed"
 			probe.Note = "未被拦截且命中目标特征"
+			bypassed = true
 		default:
 			probe.Verdict = "passed"
 			probe.Note = fmt.Sprintf("HTTP %d 未命中目标特征", resp.StatusCode)
+			consecutiveBlocked = 0
 		}
-		probes = append(probes, probe)
+		run.Attempts++
+		probesAppend(&run, probe)
+		if bypassed {
+			run.StopReason = "bypass_found"
+			setLastStopReason(&run, run.StopReason)
+			break
+		}
+		if consecutiveBlocked >= cfg.MaxConsecutiveBlocked {
+			run.StopReason = "consecutive_blocked"
+			setLastStopReason(&run, run.StopReason)
+			break
+		}
 	}
-	return probes
+
+	if len(run.Probes) > 0 && run.Probes[0].Verdict == "blocked" {
+		run.BaselineBlocked = true
+	}
+	if run.StopReason == "" {
+		run.StopReason = "completed"
+	}
+	if bypassed {
+		run.FinalVerdict = "bypassed"
+	} else {
+		run.FinalVerdict = "no_bypass"
+	}
+	return run
+}
+
+// probesAppend appends a probe to the run; it exists only to keep the inline
+// loop readable.
+func probesAppend(run *BypassRun, p BypassProbe) {
+	run.Probes = append(run.Probes, p)
+}
+
+// setLastStopReason tags the final probe so the stop cause travels with it.
+func setLastStopReason(run *BypassRun, reason string) {
+	if len(run.Probes) > 0 {
+		run.Probes[len(run.Probes)-1].StopReason = reason
+	}
 }
 
 func responseContains(body string, keywords []string) bool {

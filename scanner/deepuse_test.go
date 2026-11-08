@@ -224,9 +224,36 @@ func TestDetectWAF(t *testing.T) {
 	}
 }
 
-func TestRunBypassProbes(t *testing.T) {
+func TestRunBypassProbesFirstShotPasses(t *testing.T) {
+	// 无 WAF：所有请求都返回 200 并带关键词 → 基线即命中，第一发就停。
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.RawQuery, "union") && !strings.Contains(r.URL.RawQuery, "%2525") {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("data: union select ok"))
+	}))
+	defer srv.Close()
+	variants := BuildBypassVariants("/api", "q", "union")
+	run := RunBypassProbes(context.Background(), NewDeepClient(5*time.Second), srv.URL, variants, []string{"union select ok"}, DefaultBypassConfig())
+	if run.FinalVerdict != "bypassed" {
+		t.Fatalf("final verdict: %q", run.FinalVerdict)
+	}
+	if run.Attempts != 1 {
+		t.Fatalf("should stop at baseline when it already bypasses, attempts=%d", run.Attempts)
+	}
+	if run.StopReason != "bypass_found" {
+		t.Fatalf("stop reason: %q", run.StopReason)
+	}
+	if run.BaselineBlocked {
+		t.Fatal("baseline should not be blocked")
+	}
+	if run.Probes[0].Attempt != 1 {
+		t.Fatalf("probe attempt: %d", run.Probes[0].Attempt)
+	}
+}
+
+func TestRunBypassProbesBypassAfterBlocks(t *testing.T) {
+	// 只有基线被拦，其余变形放行 → 被拦后第 n 发命中，不再按构造顺序盲发。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api" && r.URL.RawQuery == "q=union" {
 			w.WriteHeader(403)
 			_, _ = w.Write([]byte("blocked by WAF"))
 			return
@@ -235,22 +262,169 @@ func TestRunBypassProbes(t *testing.T) {
 		_, _ = w.Write([]byte("data: union select ok"))
 	}))
 	defer srv.Close()
-
 	variants := BuildBypassVariants("/api", "q", "union")
-	probes := RunBypassProbes(context.Background(), NewDeepClient(5*time.Second), srv.URL, variants, []string{"union select ok"})
-	var bypassed, blocked int
-	for _, p := range probes {
-		switch p.Verdict {
-		case "bypassed":
-			bypassed++
-		case "blocked":
-			blocked++
+	run := RunBypassProbes(context.Background(), NewDeepClient(5*time.Second), srv.URL, variants, []string{"union select ok"}, DefaultBypassConfig())
+	if run.FinalVerdict != "bypassed" {
+		t.Fatalf("final verdict: %q", run.FinalVerdict)
+	}
+	if !run.BaselineBlocked {
+		t.Fatal("baseline should be blocked")
+	}
+	if run.Attempts < 2 {
+		t.Fatalf("should need at least 2 attempts to bypass after block, got %d", run.Attempts)
+	}
+	if run.StopReason != "bypass_found" {
+		t.Fatalf("stop reason: %q", run.StopReason)
+	}
+	if run.BlockFeature == "" {
+		t.Fatal("block feature should be inferred from baseline")
+	}
+	sawBlockFirst, foundBypass := false, false
+	for _, p := range run.Probes {
+		if p.Attempt == 1 {
+			sawBlockFirst = p.Verdict == "blocked"
+		}
+		if p.Verdict == "bypassed" {
+			foundBypass = true
 		}
 	}
-	if bypassed == 0 {
-		t.Fatalf("no bypass detected: %+v", probes)
+	if !sawBlockFirst || !foundBypass {
+		t.Fatalf("expected block-then-bypass, run=%+v", run)
 	}
-	if blocked == 0 {
-		t.Fatalf("no blocked variant detected: %+v", probes)
+}
+
+func TestRunBypassProbesAllBlocked(t *testing.T) {
+	// 所有变形都被拦 → 连续被拦止损，预算内全部被拦，不无限重发。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(403)
+		_, _ = w.Write([]byte("blocked by WAF"))
+	}))
+	defer srv.Close()
+	cfg := DefaultBypassConfig()
+	variants := BuildBypassVariants("/api", "q", "union")
+	run := RunBypassProbes(context.Background(), NewDeepClient(5*time.Second), srv.URL, variants, []string{"union select ok"}, cfg)
+	if run.FinalVerdict != "no_bypass" {
+		t.Fatalf("final verdict: %q", run.FinalVerdict)
+	}
+	if !run.BaselineBlocked {
+		t.Fatal("baseline should be blocked")
+	}
+	if run.StopReason != "consecutive_blocked" {
+		t.Fatalf("stop reason: %q (attempts=%d)", run.StopReason, run.Attempts)
+	}
+	if run.Attempts != cfg.MaxConsecutiveBlocked {
+		t.Fatalf("should stop at the consecutive-block limit, attempts=%d want %d", run.Attempts, cfg.MaxConsecutiveBlocked)
+	}
+	for _, p := range run.Probes {
+		if p.Verdict == "bypassed" {
+			t.Fatal("no variant should bypass a fully blocking target")
+		}
+	}
+}
+
+func TestRunBypassProbesBudgetCap(t *testing.T) {
+	// 所有请求都放行但不命中关键词（passed）→ 没有绕过也没有被拦，靠预算上限收口。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("hello"))
+	}))
+	defer srv.Close()
+	cfg := DefaultBypassConfig()
+	variants := BuildBypassVariants("/api", "q", "union")
+	if len(variants) <= cfg.MaxAttempts {
+		t.Fatalf("need more variants than budget to test the cap, got %d", len(variants))
+	}
+	run := RunBypassProbes(context.Background(), NewDeepClient(5*time.Second), srv.URL, variants, []string{"union select ok"}, cfg)
+	if run.FinalVerdict != "no_bypass" {
+		t.Fatalf("final verdict: %q", run.FinalVerdict)
+	}
+	if run.Attempts != cfg.MaxAttempts {
+		t.Fatalf("attempts should be capped at MaxAttempts=%d, got %d", cfg.MaxAttempts, run.Attempts)
+	}
+	if run.StopReason != "budget_exhausted" {
+		t.Fatalf("stop reason: %q", run.StopReason)
+	}
+}
+
+func TestRunBypassProbesConsecutiveErrors(t *testing.T) {
+	// 目标不可达（端口拒绝）→ 连续传输错误止损，不无限重发。
+	variants := BuildBypassVariants("/api", "q", "union")
+	cfg := DefaultBypassConfig()
+	run := RunBypassProbes(context.Background(), NewDeepClient(200*time.Millisecond), "http://127.0.0.1:1/", variants, []string{"x"}, cfg)
+	if run.StopReason != "consecutive_errors" {
+		t.Fatalf("stop reason: %q (attempts=%d)", run.StopReason, run.Attempts)
+	}
+	if run.Attempts != cfg.MaxConsecutiveErrors {
+		t.Fatalf("attempts should stop at consecutive-error limit, got %d want %d", run.Attempts, cfg.MaxConsecutiveErrors)
+	}
+}
+
+func TestClassifyBlockFeature(t *testing.T) {
+	cases := []struct {
+		name string
+		resp DeepResponse
+		want BlockFeature
+	}{
+		{"429", DeepResponse{StatusCode: 429}, BlockRateLimit},
+		{"503 retry-after", DeepResponse{StatusCode: 503, Headers: http.Header{"Retry-After": []string{"2"}}}, BlockRateLimit},
+		{"captcha body", DeepResponse{StatusCode: 403, Body: "请输入验证码"}, BlockRateLimit},
+		{"vendor body", DeepResponse{StatusCode: 403, Body: "安全狗拦截"}, BlockVendor},
+		{"bare 403", DeepResponse{StatusCode: 403, Body: "forbidden"}, BlockRule},
+		{"401", DeepResponse{StatusCode: 401}, BlockRule},
+	}
+	for _, c := range cases {
+		if got := classifyBlockFeature(c.resp); got != c.want {
+			t.Errorf("%s: classify = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestReorderByFeature(t *testing.T) {
+	variants := BuildBypassVariants("/api", "q", "union")
+	// 基线恒在第一位；规则类场景里路径变形排到最先。
+	order := reorderByFeature(variants, 0, BlockRule)
+	if order[0].Name != "baseline" {
+		t.Fatalf("baseline must stay first, got %q", order[0].Name)
+	}
+	prio := []string{"path", "header", "encoding", "method"}
+	lastRank := -1
+	seen := map[string]bool{}
+	for _, v := range order[1:] {
+		r := len(prio)
+		for i, p := range prio {
+			if p == v.Category {
+				r = i
+			}
+		}
+		if r < lastRank {
+			t.Fatalf("reorder not monotonic by category: %q after rank %d", v.Category, lastRank)
+		}
+		lastRank = r
+		if seen[v.Name] {
+			t.Fatalf("duplicate variant after reorder: %q", v.Name)
+		}
+		seen[v.Name] = true
+	}
+	if len(seen) != len(variants)-1 {
+		t.Fatalf("reorder dropped or added variants: got %d want %d", len(seen), len(variants)-1)
+	}
+}
+
+func TestBypassConfigClamp(t *testing.T) {
+	// 硬上限：无论调用方传多大，尝试次数都被封顶。
+	got := BypassConfig{MaxAttempts: 9999}.clamp()
+	if got.MaxAttempts != bypassHardCap {
+		t.Fatalf("hard cap not applied: %d", got.MaxAttempts)
+	}
+	// 零/负值回退默认；连续阈值同样有下限。
+	got = BypassConfig{MaxAttempts: 0, MaxConsecutiveBlocked: 0, MaxConsecutiveErrors: 0}.clamp()
+	if got.MaxAttempts != DefaultBypassConfig().MaxAttempts {
+		t.Fatalf("zero MaxAttempts not defaulted: %d", got.MaxAttempts)
+	}
+	if got.MaxConsecutiveBlocked != DefaultBypassConfig().MaxConsecutiveBlocked {
+		t.Fatalf("zero MaxConsecutiveBlocked not defaulted: %d", got.MaxConsecutiveBlocked)
+	}
+	if got.MaxConsecutiveErrors != DefaultBypassConfig().MaxConsecutiveErrors {
+		t.Fatalf("zero MaxConsecutiveErrors not defaulted: %d", got.MaxConsecutiveErrors)
 	}
 }

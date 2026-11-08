@@ -163,3 +163,26 @@ func TestChecklistCopiesDefaults(t *testing.T) {
 		t.Fatal("checklist shares backing array with defaults")
 	}
 }
+
+// BypassReview must never auto-confirm: a "bypassed" WAF probe is only evidence
+// the payload reached the target, not a vulnerability, so the verdict is
+// needs_review and the checklist forces a differential replay.
+func TestBypassReview(t *testing.T) {
+	d := BypassReview()
+	if d.Verdict != NeedsReview {
+		t.Fatalf("bypass verdict = %q, want needs_review", d.Verdict)
+	}
+	if d.Class != ClassWAFBypass {
+		t.Fatalf("class = %q", d.Class)
+	}
+	if len(d.Checks) == 0 {
+		t.Fatal("bypass checks empty")
+	}
+	joined := strings.Join(d.Checks, " ")
+	if !strings.Contains(joined, "拦截") && !strings.Contains(joined, "验证码") {
+		t.Fatalf("bypass checklist should warn about interception/captcha pages: %q", joined)
+	}
+	if !strings.Contains(joined, "重放") && !strings.Contains(joined, "对照") {
+		t.Fatalf("bypass checklist should require differential replay: %q", joined)
+	}
+}

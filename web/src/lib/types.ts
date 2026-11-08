@@ -1745,6 +1745,8 @@ export interface WAFBypassResult {
   resp_length: number;
   verdict: string;
   note: string;
+  attempt?: number;
+  stop_reason?: string;
   created_at: string;
 }
 

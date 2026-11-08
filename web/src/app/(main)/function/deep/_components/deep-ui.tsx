@@ -362,6 +362,7 @@ export function DeepDetailDialog({
   const [task, setTask] = React.useState<DeepTask | null>(null);
   const [records, setRecords] = React.useState<ExploitRecord[]>([]);
   const [wafResults, setWafResults] = React.useState<WAFBypassResult[]>([]);
+  const [wafSummary, setWafSummary] = React.useState<Record<string, unknown> | null>(null);
   const [tab, setTab] = React.useState("records");
 
   React.useEffect(() => {
@@ -376,6 +377,7 @@ export function DeepDetailDialog({
         setTask(r.task);
         setRecords(r.records ?? []);
         setWafResults(r.waf_results ?? []);
+        setWafSummary(r.waf_summary ?? null);
       } catch (e) {
         if (alive) toast.error((e as Error).message);
       }
@@ -476,7 +478,7 @@ export function DeepDetailDialog({
             <ScrollArea className="min-h-0 flex-1">
               <div className="pr-3">
                 {tab === "records" && <ExploitRecordList records={records} />}
-                {tab === "waf" && <WAFResultList results={wafResults} />}
+                {tab === "waf" && <WAFResultList results={wafResults} summary={wafSummary} />}
                 {tab === "log" && (
                   <pre className="whitespace-pre-wrap break-all rounded-md bg-muted/50 p-3 font-mono text-xs">
                     {task?.log?.trim() || "（暂无日志）"}
@@ -598,48 +600,111 @@ function ExploitRecordCard({ record }: { record: ExploitRecord }) {
   );
 }
 
-/** WAFResultList renders the WAF bypass attempts. */
-export function WAFResultList({ results }: { results: WAFBypassResult[] }) {
-  if (results.length === 0) {
+const WAF_STOP_REASON_LABEL: Record<string, string> = {
+  bypass_found: "命中后停止",
+  consecutive_blocked: "连续被拦止损",
+  consecutive_errors: "连续错误止损",
+  budget_exhausted: "预算耗尽",
+  completed: "全部发完",
+  context_canceled: "任务取消",
+  no_variants: "无变形",
+};
+
+const WAF_FEATURE_LABEL: Record<string, string> = {
+  rate_limit_or_captcha: "限速/验证码",
+  vendor_feature: "厂商特征",
+  path_or_param_rule: "路径/参数规则",
+  unknown: "未知",
+};
+
+/** WAFResultList renders the WAF bypass attempts plus the campaign-level
+ * summary (baseline blocked, inferred block shape, attempts, stop reason, final
+ * verdict) so the three outcomes — first-shot pass / bypass-after-blocks /
+ * all-blocked-within-budget — are visible as numbers, not just per-row verdicts. */
+export function WAFResultList({
+  results,
+  summary,
+}: {
+  results: WAFBypassResult[];
+  summary?: Record<string, unknown> | null;
+}) {
+  if (results.length === 0 && !summary) {
     return <p className="py-8 text-center text-sm text-muted-foreground">暂无绕过结果</p>;
   }
+  const baselineBlocked = summary?.baseline_blocked === true;
+  const blockFeature = String(summary?.block_feature ?? "");
+  const attempts = summary?.attempts;
+  const stopReason = String(summary?.stop_reason ?? "");
+  const finalVerdict = String(summary?.final_verdict ?? "");
   return (
-    <Table>
-      <TableHeader>
-        <TableRow>
-          <TableHead>变形</TableHead>
-          <TableHead>方法</TableHead>
-          <TableHead>路径</TableHead>
-          <TableHead className="w-20">状态码</TableHead>
-          <TableHead className="w-24">结论</TableHead>
-          <TableHead className="w-20">长度</TableHead>
-        </TableRow>
-      </TableHeader>
-      <TableBody>
-        {results.map((r) => {
-          const meta = wafVerdictMeta(r.verdict);
-          return (
-            <TableRow key={r.id}>
-              <TableCell>
-                <div className="font-medium">{r.variant_desc || r.variant}</div>
-                <div className="font-mono text-xs text-muted-foreground">{r.variant}</div>
-              </TableCell>
-              <TableCell className="font-mono text-xs">{r.method}</TableCell>
-              <TableCell className="max-w-64 truncate font-mono text-xs" title={r.path}>
-                {r.path}
-              </TableCell>
-              <TableCell className="font-mono text-xs">{r.status_code ?? "—"}</TableCell>
-              <TableCell>
-                <Badge variant="outline" className={meta.className}>
-                  {meta.label}
-                </Badge>
-              </TableCell>
-              <TableCell className="font-mono text-xs text-muted-foreground">{r.resp_length}</TableCell>
+    <div className="flex flex-col gap-3">
+      {summary && (
+        <div className="flex flex-wrap gap-2 text-xs">
+          <Badge variant="outline" className={baselineBlocked ? "border-red-500/30 bg-red-500/10 text-red-600" : "border-sky-500/30 bg-sky-500/10 text-sky-600"}>
+            基线{baselineBlocked ? "被拦截" : "未拦截"}
+          </Badge>
+          {blockFeature && (
+            <Badge variant="outline">拦截特征：{WAF_FEATURE_LABEL[blockFeature] ?? blockFeature}</Badge>
+          )}
+          {attempts !== undefined && attempts !== null && (
+            <Badge variant="outline">尝试 {String(attempts)} 次</Badge>
+          )}
+          {stopReason && (
+            <Badge variant="outline">停止：{WAF_STOP_REASON_LABEL[stopReason] ?? stopReason}</Badge>
+          )}
+          {finalVerdict && (
+            <Badge
+              variant="outline"
+              className={finalVerdict === "bypassed" ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600" : "border-muted-foreground/20"}
+            >
+              结论：{finalVerdict === "bypassed" ? "存在可绕过" : "未绕过"}
+            </Badge>
+          )}
+        </div>
+      )}
+      {results.length === 0 ? (
+        <p className="py-8 text-center text-sm text-muted-foreground">暂无逐条绕过结果</p>
+      ) : (
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-10">#</TableHead>
+              <TableHead>变形</TableHead>
+              <TableHead>方法</TableHead>
+              <TableHead>路径</TableHead>
+              <TableHead className="w-20">状态码</TableHead>
+              <TableHead className="w-24">结论</TableHead>
+              <TableHead className="w-20">长度</TableHead>
             </TableRow>
-          );
-        })}
-      </TableBody>
-    </Table>
+          </TableHeader>
+          <TableBody>
+            {results.map((r) => {
+              const meta = wafVerdictMeta(r.verdict);
+              return (
+                <TableRow key={r.id}>
+                  <TableCell className="font-mono text-xs text-muted-foreground">{r.attempt ?? "—"}</TableCell>
+                  <TableCell>
+                    <div className="font-medium">{r.variant_desc || r.variant}</div>
+                    <div className="font-mono text-xs text-muted-foreground">{r.variant}</div>
+                  </TableCell>
+                  <TableCell className="font-mono text-xs">{r.method}</TableCell>
+                  <TableCell className="max-w-64 truncate font-mono text-xs" title={r.path}>
+                    {r.path}
+                  </TableCell>
+                  <TableCell className="font-mono text-xs">{r.status_code ?? "—"}</TableCell>
+                  <TableCell>
+                    <Badge variant="outline" className={meta.className}>
+                      {meta.label}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground">{r.resp_length}</TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      )}
+    </div>
   );
 }
 

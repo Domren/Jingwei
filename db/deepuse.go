@@ -378,22 +378,31 @@ FROM exploit_records WHERE task_id=$1 ORDER BY id ASC`, taskID)
 	return out, rows.Err()
 }
 
-// WAFBypassResult is one bypass attempt against a protected endpoint.
+// WAFBypassResult is one bypass attempt against a protected endpoint. The
+// attempt/stop_reason/block_feature/final_verdict/baseline_blocked fields make
+// the campaign quantifiable: the same POC against a WAF vs a non-WAF target
+// yields a different Attempts/StopReason/FinalVerdict instead of just a list of
+// per-variant verdicts.
 type WAFBypassResult struct {
-	ID          int64     `json:"id"`
-	TaskID      int64     `json:"task_id"`
-	Target      string    `json:"target"`
-	WAFDetected bool      `json:"waf_detected"`
-	WAFVendor   string    `json:"waf_vendor"`
-	Variant     string    `json:"variant"`
-	VariantDesc string    `json:"variant_desc"`
-	Method      string    `json:"method"`
-	Path        string    `json:"path"`
-	StatusCode  *int      `json:"status_code,omitempty"`
-	RespLength  int       `json:"resp_length"`
-	Verdict     string    `json:"verdict"`
-	Note        string    `json:"note"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID             int64     `json:"id"`
+	TaskID         int64     `json:"task_id"`
+	Target         string    `json:"target"`
+	WAFDetected    bool      `json:"waf_detected"`
+	WAFVendor      string    `json:"waf_vendor"`
+	Variant        string    `json:"variant"`
+	VariantDesc    string    `json:"variant_desc"`
+	Method         string    `json:"method"`
+	Path           string    `json:"path"`
+	StatusCode     *int      `json:"status_code,omitempty"`
+	RespLength     int       `json:"resp_length"`
+	Verdict        string    `json:"verdict"`
+	Note           string    `json:"note"`
+	Attempt        int       `json:"attempt"`
+	StopReason     string    `json:"stop_reason"`
+	BlockFeature   string    `json:"block_feature"`
+	FinalVerdict   string    `json:"final_verdict"`
+	BaselineBlocked bool     `json:"baseline_blocked"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // AddWAFBypassResult stores one bypass attempt.
@@ -401,11 +410,13 @@ func (d *DB) AddWAFBypassResult(rec WAFBypassResult) (int64, error) {
 	var id int64
 	err := d.QueryRow(`
 INSERT INTO waf_bypass_results(task_id, target, waf_detected, waf_vendor, variant, variant_desc,
-                                method, path, status_code, resp_length, verdict, note)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                                method, path, status_code, resp_length, verdict, note,
+                                attempt, stop_reason, block_feature, final_verdict, baseline_blocked)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
 RETURNING id`,
 		rec.TaskID, rec.Target, rec.WAFDetected, rec.WAFVendor, rec.Variant, rec.VariantDesc,
-		rec.Method, rec.Path, rec.StatusCode, rec.RespLength, rec.Verdict, rec.Note).Scan(&id)
+		rec.Method, rec.Path, rec.StatusCode, rec.RespLength, rec.Verdict, rec.Note,
+		rec.Attempt, rec.StopReason, rec.BlockFeature, rec.FinalVerdict, rec.BaselineBlocked).Scan(&id)
 	return id, err
 }
 
@@ -413,7 +424,8 @@ RETURNING id`,
 func (d *DB) ListWAFBypassResults(taskID int64) ([]*WAFBypassResult, error) {
 	rows, err := d.Query(`
 SELECT id, task_id, target, waf_detected, waf_vendor, variant, variant_desc, method, path,
-       status_code, resp_length, verdict, note, created_at
+       status_code, resp_length, verdict, note, attempt, stop_reason, block_feature,
+       final_verdict, baseline_blocked, created_at
 FROM waf_bypass_results WHERE task_id=$1 ORDER BY id ASC`, taskID)
 	if err != nil {
 		return nil, err
@@ -424,6 +436,7 @@ FROM waf_bypass_results WHERE task_id=$1 ORDER BY id ASC`, taskID)
 		var r WAFBypassResult
 		if err := rows.Scan(&r.ID, &r.TaskID, &r.Target, &r.WAFDetected, &r.WAFVendor, &r.Variant,
 			&r.VariantDesc, &r.Method, &r.Path, &r.StatusCode, &r.RespLength, &r.Verdict, &r.Note,
+			&r.Attempt, &r.StopReason, &r.BlockFeature, &r.FinalVerdict, &r.BaselineBlocked,
 			&r.CreatedAt); err != nil {
 			return nil, err
 		}

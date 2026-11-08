@@ -1637,7 +1637,7 @@ export const api = {
     return get<{ tasks: DeepTask[]; total: number }>(`/deep/tasks?${sp}`);
   },
   deepTask: (id: number) =>
-    get<{ task: DeepTask; records?: ExploitRecord[]; waf_results?: WAFBypassResult[] }>(`/deep/tasks/${id}`),
+    get<{ task: DeepTask; records?: ExploitRecord[]; waf_results?: WAFBypassResult[]; waf_summary?: Record<string, unknown> }>(`/deep/tasks/${id}`),
   createDeepTask: (input: DeepTaskInput) => post<DeepTask>("/deep/tasks", input),
   cancelDeepTask: (id: number) => post<{ ok: boolean }>(`/deep/tasks/${id}/cancel`, {}),
   deleteDeepTask: (id: number) => del<{ ok: boolean }>(`/deep/tasks/${id}`),

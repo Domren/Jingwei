@@ -28,6 +28,7 @@ const (
 	ClassAuthBypass      Class = "auth_bypass"
 	ClassInfoLeak        Class = "info_leak"
 	ClassDeserialization Class = "deserialization"
+	ClassWAFBypass       Class = "waf_bypass"
 	ClassGeneric         Class = "generic"
 )
 
@@ -203,6 +204,12 @@ var classChecks = map[Class][]string{
 		"优先寻找模板特征之外的独立证据（唯一 marker、版本页、文件内容）",
 		"若只能依赖状态码或通用关键词，标记为待人工复核",
 	},
+	ClassWAFBypass: {
+		"确认响应不是拦截页/验证码/人机验证页——这类页面可能包含你的关键词，造成假命中",
+		"用未编码的对照请求重放，确认响应差异确实由绕过引起而非缓存或随机 200",
+		"核对请求是否被 WAF 静默改写（路径/参数名被归一化后仍命中并不等于绕过）",
+		"保留原始请求、关键响应片段与可复现 curl 作为证据，平台不自动宣称漏洞成立",
+	},
 }
 
 // Checklist returns the review checklist for a class. The returned slice is a
@@ -212,4 +219,18 @@ func Checklist(class Class) []string {
 	out = append(out, generalChecks...)
 	out = append(out, classChecks[class]...)
 	return out
+}
+
+// BypassReview returns the manual-review decision for a WAF-bypass campaign.
+// A "bypassed" probe only means the injected payload showed up in a response
+// that was not flagged as blocked; it is not proof of a vulnerability, because
+// an interception or captcha page may coincidentally contain the keyword. The
+// verdict is therefore always needs_review and the checklist forces a
+// differential replay before any claim is made.
+func BypassReview() Decision {
+	return Decision{
+		Class:   ClassWAFBypass,
+		Verdict: NeedsReview,
+		Checks:  Checklist(ClassWAFBypass),
+	}
 }

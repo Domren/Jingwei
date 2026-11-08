@@ -1822,6 +1822,14 @@ CREATE TABLE IF NOT EXISTS waf_bypass_results (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_waf_bypass_results_task ON waf_bypass_results(task_id, id);
+-- D3（1.6.0）：WAF 绕过记录补齐「可量化差异」字段——基线是否拦截、识别到的拦截特征、
+-- 第几发、停止原因、整轮最终结论，便于把「第一发就过 / 被拦后第 n 发过 / 预算内全部被拦」
+-- 三种形态跑成数字，而不是只留一堆逐条判定。
+ALTER TABLE waf_bypass_results ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE waf_bypass_results ADD COLUMN IF NOT EXISTS stop_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE waf_bypass_results ADD COLUMN IF NOT EXISTS block_feature TEXT NOT NULL DEFAULT '';
+ALTER TABLE waf_bypass_results ADD COLUMN IF NOT EXISTS final_verdict TEXT NOT NULL DEFAULT '';
+ALTER TABLE waf_bypass_results ADD COLUMN IF NOT EXISTS baseline_blocked BOOLEAN NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS webshells (
     id            BIGSERIAL PRIMARY KEY,

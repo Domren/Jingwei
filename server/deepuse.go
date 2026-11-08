@@ -1153,27 +1153,39 @@ func (r *deepRun) runWAFBypass(summary map[string]any) (string, string, string, 
 
 	variants := scanner.BuildBypassVariants(path, param, payload)
 	r.logf("waf", "开始绕过测试：%d 种变形", len(variants))
-	probes := scanner.RunBypassProbes(r.ctx, client, base, variants, keywords)
+	run := scanner.RunBypassProbes(r.ctx, client, base, variants, keywords, scanner.DefaultBypassConfig())
 	bypassed, blocked := 0, 0
-	for _, p := range probes {
+	for _, p := range run.Probes {
 		if p.Verdict == "bypassed" {
 			bypassed++
 		}
 		if p.Verdict == "blocked" {
 			blocked++
 		}
+		note := p.Note
+		// A "bypassed" probe is only evidence that the payload reached the
+		// target; an interception/captcha page may coincidentally echo the
+		// keyword. Tag it so nobody reads this as a confirmed vulnerability.
+		if p.Verdict == "bypassed" {
+			note = note + "；需对照重放确认非拦截/验证码页假命中"
+		}
 		rec := db.WAFBypassResult{
-			TaskID:      r.task.ID,
-			Target:      base,
-			WAFDetected: det.Detected,
-			WAFVendor:   det.Vendor,
-			Variant:     p.Name,
-			VariantDesc: p.Desc,
-			Method:      p.Method,
-			Path:        p.Path,
-			Verdict:     p.Verdict,
-			Note:        p.Note,
-			RespLength:  p.Length,
+			TaskID:         r.task.ID,
+			Target:         base,
+			WAFDetected:    det.Detected,
+			WAFVendor:      det.Vendor,
+			Variant:        p.Name,
+			VariantDesc:    p.Desc,
+			Method:         p.Method,
+			Path:           p.Path,
+			Verdict:        p.Verdict,
+			Note:           note,
+			RespLength:     p.Length,
+			Attempt:        p.Attempt,
+			StopReason:     p.StopReason,
+			BlockFeature:   run.BlockFeature,
+			FinalVerdict:   run.FinalVerdict,
+			BaselineBlocked: run.BaselineBlocked,
 		}
 		if p.StatusCode > 0 {
 			code := p.StatusCode
@@ -1183,11 +1195,18 @@ func (r *deepRun) runWAFBypass(summary map[string]any) (string, string, string, 
 			r.logf("waf", "写入结果失败 %s: %v", p.Name, err)
 		}
 	}
-	summary["variants"] = len(probes)
+	summary["variants"] = len(run.Probes)
 	summary["bypassed"] = bypassed
 	summary["blocked"] = blocked
+	summary["baseline_blocked"] = run.BaselineBlocked
+	summary["block_feature"] = run.BlockFeature
+	summary["attempts"] = run.Attempts
+	summary["stop_reason"] = run.StopReason
+	summary["final_verdict"] = run.FinalVerdict
+	summary["bypass_review"] = verdict.BypassReview().Checks
 	r.setProgress("waf", map[string]any{"bypassed": bypassed, "blocked": blocked})
-	r.logf("waf", "绕过测试完成：%d 种变形可绕过，%d 种被拦截", bypassed, blocked)
+	r.logf("waf", "绕过测试完成：%d 种变形可绕过，%d 种被拦截；尝试 %d 次，停止原因 %q",
+		bypassed, blocked, run.Attempts, run.StopReason)
 	return "done", "done", "", summary
 }
 
@@ -1496,6 +1515,18 @@ func (s *Server) getDeepTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if results, err := pg.ListWAFBypassResults(id); err == nil {
 		out["waf_results"] = results
+	}
+	if task != nil && task.Summary != nil {
+		wafKeys := []string{"baseline_blocked", "block_feature", "attempts", "stop_reason", "final_verdict", "bypassed", "blocked", "variants"}
+		wafSummary := map[string]any{}
+		for _, k := range wafKeys {
+			if v, ok := task.Summary[k]; ok {
+				wafSummary[k] = v
+			}
+		}
+		if len(wafSummary) > 0 {
+			out["waf_summary"] = wafSummary
+		}
 	}
 	writeJSON(w, 200, out)
 }
