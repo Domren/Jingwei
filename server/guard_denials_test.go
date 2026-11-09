@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -152,5 +153,72 @@ func TestGuardDenialStatsBucketsByTaskAndCategory(t *testing.T) {
 	}
 	if b.Denials != 1 || b.Mode != "warn" {
 		t.Fatalf("task B bucket = %+v", b)
+	}
+}
+
+// 按成因的分布要能把「抖动可重试」与「策略拒绝」分开：这两类在界面上长得一样，
+// 但前者重试就好、后者重试一万次也不会放行。窗口外的行同样不能算进来。
+func TestGuardDenialBreakdownSplitsRetryableCauses(t *testing.T) {
+	pg := prescanTestDB(t)
+	task, err := pg.CreateTask("guard denial breakdown", "10.97.1.0/24", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	purgeTaskFixture(t, pg, task.ID)
+	t.Cleanup(func() {
+		_, _ = pg.Exec(`DELETE FROM guard_denials WHERE task_id=$1`, task.ID)
+	})
+	for i := 0; i < 4; i++ {
+		if err := pg.InsertGuardDenial(task.ID, pgdb.GuardDenialBlockReadFailed, "strict", "读取资产禁令失败"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := pg.InsertGuardDenial(task.ID, pgdb.GuardDenialOutOfScope, "strict", "不在范围内"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.InsertGuardDenial(0, pgdb.GuardDenialOutOfScope, "warn", "无任务上下文"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.InsertGuardDenial(task.ID, pgdb.GuardDenialOutOfScope, "strict", "很久以前"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pg.Exec(`UPDATE guard_denials SET ts = now() - interval '40 days' WHERE task_id=$1 AND reason='很久以前'`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	causes, err := pg.GuardDenialBreakdown(time.Hour * 24 * 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blockRead, outOfScope *pgdb.GuardDenialCause
+	for i := range causes {
+		switch causes[i].Category {
+		case pgdb.GuardDenialBlockReadFailed:
+			blockRead = &causes[i]
+		case pgdb.GuardDenialOutOfScope:
+			outOfScope = &causes[i]
+		}
+	}
+	// 分布是全局的（跨任务、跨用例共享同一张表），所以只断言「自己插的这几条被算进来了」，
+	// 不断言总数等于几——那个数字会被并行用例与历史数据改掉。
+	if blockRead == nil || blockRead.Total < 4 || blockRead.Tasks < 1 {
+		t.Fatalf("block_read_failed = %+v，want 至少 total>=4 tasks>=1", blockRead)
+	}
+	if !blockRead.Retryable || !strings.Contains(blockRead.Advice, "重试") {
+		t.Fatalf("读库抖动应当标为可重试并给出重试建议：%+v", blockRead)
+	}
+	if outOfScope == nil {
+		t.Fatalf("窗口内的 out_of_scope 没统计到：%+v", causes)
+	}
+	// 窗口外那条的措辞是独一份的：它若出现在 LastReason 里，说明回看窗口没生效。
+	if outOfScope.LastReason == "很久以前" {
+		t.Fatalf("40 天前的拒绝被算进了窗口：%+v", outOfScope)
+	}
+	if outOfScope.Retryable || !strings.Contains(outOfScope.Advice, "重试不会放行") {
+		t.Fatalf("策略拒绝不该标可重试，且要写明重试不会放行：%+v", outOfScope)
+	}
+	// 未登记的成因不能被默认当成可重试：默认值定成「不可重试」才安全。
+	if retryable, advice := pgdb.GuardDenialCauseMeta("some_new_cause"); retryable || !strings.Contains(advice, "未登记") {
+		t.Fatalf("未登记成因默认 = retryable=%v advice=%q，want 不可重试且点名未登记", retryable, advice)
 	}
 }

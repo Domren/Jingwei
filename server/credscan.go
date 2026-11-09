@@ -544,6 +544,8 @@ func (s *Server) credProtocols(w http.ResponseWriter, r *http.Request) {
 		"protocols":    scanner.CredProtocolCatalog(),
 		"dictionaries": names,
 		"dicts":        dicts,
+		// 内置字典的版本与分档：界面要能说清「这一版覆盖到哪」，而不是只写「内置精简字典」。
+		"builtin_dict": scanner.CredBuiltinDictionaryInfo(),
 		"outcomes":     db.CredTaskOutcomes,
 	})
 }

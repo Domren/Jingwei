@@ -28,7 +28,7 @@ func TestCredOrderSNMPCommunityFirst(t *testing.T) {
 		}
 	}
 	// SNMP 的凭据就是 community：public / private / community 必须排在最前。
-	wantHead := []string{"public", "private"}
+	wantHead := []string{"public", "private", "community"}
 	for i, pw := range wantHead {
 		if out[i].Username != "" || out[i].Password != pw {
 			t.Fatalf("第 %d 条应为纯口令 %q，实际 %+v", i+1, pw, out[i])
@@ -37,10 +37,10 @@ func TestCredOrderSNMPCommunityFirst(t *testing.T) {
 	// 其余条目的相对顺序保持原样（稳定分区）。
 	seen := 0
 	for _, c := range in {
-		if c.Username == "" && (c.Password == "public" || c.Password == "private") {
+		if snmpCommunityCred(c) {
 			continue
 		}
-		for out[seen].Username == "" && (out[seen].Password == "public" || out[seen].Password == "private") {
+		for snmpCommunityCred(out[seen]) {
 			seen++
 		}
 		if credKey(out[seen]) != credKey(c) {
@@ -48,6 +48,20 @@ func TestCredOrderSNMPCommunityFirst(t *testing.T) {
 		}
 		seen++
 	}
+}
+
+// snmpCommunityCred 判断一条是不是「纯口令」形态的 community。
+// 用集合而不是逐个比较：vendor 档加一条 community 时，这条测试不该跟着改。
+func snmpCommunityCred(c Credential) bool {
+	if c.Username != "" {
+		return false
+	}
+	for _, pw := range credProtocolCommunityFirst["snmp"] {
+		if c.Password == pw {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCredOrderOtherProtocolsUntouched(t *testing.T) {

@@ -76,6 +76,10 @@ type intranetEvacuationReport struct {
 	// 公钥、近期落地文件里，既不属于本次任务的任何落地物、也没有精卫标记的条目。
 	// 它们可能是目标原有配置，也可能是台账之外的残留——按内容人工判断。
 	LedgerExternal []string `json:"ledger_external,omitempty"`
+	// ManualRevoked 是「台账里由人声明已清理、平台没有连上目标验证」的落地物。
+	// 它们不在撤销循环里（status 已是 revoked），但报告不能把它们混进「平台已验证清除」：
+	// 报告读者看到的是结果，而这里的结果是人说的，不是平台验的。
+	ManualRevoked []string `json:"manual_revoked,omitempty"`
 	// Traces / TraceMatrix 是痕迹矩阵（G4）：按手段汇总「本次留下什么、怎么验证、清掉之后
 	// 还剩什么」，以及账外残留。矩阵是撤离报告的一部分，不是界面现编的文案。
 	Traces      []report.TraceMatrixRow `json:"traces,omitempty"`
@@ -218,6 +222,9 @@ func (r *intranetEvacuationReport) finish(dryRun bool) {
 		if r.Scan.Checked > 0 {
 			r.Summary += fmt.Sprintf("；预扫描 %d 项，仍存在 %d 项", r.Scan.Checked, r.Scan.Present)
 		}
+		if len(r.ManualRevoked) > 0 {
+			r.Summary += fmt.Sprintf("；另有 %d 条此前由人工声明已清理（未经平台验证）", len(r.ManualRevoked))
+		}
 		return
 	}
 	r.Summary = fmt.Sprintf("撤离完成：落地物 %d/%d 已撤销并验证，隧道 %d/%d 已拆除，受管资源 %d/%d 已释放，会话关闭 %d/%d",
@@ -237,6 +244,17 @@ func (r *intranetEvacuationReport) finish(dryRun bool) {
 	} else {
 		r.Summary += "；未发现残留"
 	}
+	if len(r.ManualRevoked) > 0 {
+		r.Summary += fmt.Sprintf("；另有 %d 条由人工声明已清理（未经平台验证，见 manual_revoked）", len(r.ManualRevoked))
+	}
+}
+
+// optionalNote 把人工处置说明拼进一行；没有说明就什么都不加，不编「（无说明）」。
+func optionalNote(s string) string {
+	if s == "" {
+		return ""
+	}
+	return "（说明：" + truncateIntranetOutput(s, 200) + "）"
 }
 
 // intranetEvacuate runs the whole evacuation sequence in deployment-reverse
@@ -306,6 +324,25 @@ func (s *Server) intranetEvacuate(ctx context.Context, pg *db.DB, opts intranetE
 			targets = revokedThisRun
 		}
 		s.intranetRescanArtifacts(ctx, pg, targets, rep)
+	}
+
+	// 1b. 人工声明已清理的条目：不进撤销循环（status 已是 revoked，撤销会再跑一遍命令），
+	// 但必须在报告里单列。这些条目的证据是操作员的一句话，不是平台的验证输出；混进
+	// 「已撤销并验证」的计数里，等于替操作员担保他没担保的事。
+	if revokedManually, merr := pg.ListManualRevokedIntranetArtifacts(opts.TaskID); merr != nil {
+		rep.Residual = append(rep.Residual, "读取人工处置记录失败："+merr.Error())
+	} else {
+		for _, art := range revokedManually {
+			note := ""
+			if m, ok := art.Metadata["manual_revoke"].(map[string]any); ok {
+				if v, ok := m["note"].(string); ok {
+					note = strings.TrimSpace(v)
+				}
+			}
+			line := fmt.Sprintf("落地物 #%d（%s %s）由人工声明已清理，平台未验证%s",
+				art.ID, art.Kind, displayOr(art.Name, art.Path), optionalNote(note))
+			rep.ManualRevoked = append(rep.ManualRevoked, line)
+		}
 	}
 
 	// 2. 隧道：先于关闭会话拆除，拆除命令需要会话的 webshell 通道。

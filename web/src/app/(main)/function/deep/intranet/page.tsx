@@ -6,6 +6,7 @@ import {
   ActivityIcon,
   ArrowRightLeftIcon,
   CheckIcon,
+  ClipboardCheckIcon,
   DownloadIcon,
   EraserIcon,
   EyeIcon,
@@ -1137,6 +1138,34 @@ export default function DeepIntranetPage() {
     }
   }
 
+  // ---- 人工确认清理：撤销命令跑不通时的兜底 ----
+  // 这条路径不碰目标，只把操作员的观察记进台账。界面上必须与「撤销」分开摆，
+  // 因为两者的证据强度不同：撤销有 verify_command 的输出，人工确认只有一句话。
+  const [manualArtifact, setManualArtifact] = React.useState<IntranetArtifact | null>(null);
+  const [manualNote, setManualNote] = React.useState("");
+  const [manualSaving, setManualSaving] = React.useState(false);
+
+  async function submitManualRevoke() {
+    if (!manualArtifact) return;
+    const note = manualNote.trim();
+    if (Array.from(note).length < 8) {
+      toast.error("请写清在目标上执行了什么、看到了什么（至少 8 个字）");
+      return;
+    }
+    setManualSaving(true);
+    try {
+      const r = await api.manualRevokeIntranetArtifact(manualArtifact.id, note);
+      toast.success(r.note);
+      setManualArtifact(null);
+      setManualNote("");
+      refresh();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setManualSaving(false);
+    }
+  }
+
   // ---- 凭据台账：口令只写不读，界面里永远看不见明文 ----
   const [credFilter, setCredFilter] = React.useState<"all" | "untested" | "valid" | "invalid">("all");
   const [credOpen, setCredOpen] = React.useState(false);
@@ -1906,22 +1935,49 @@ export default function DeepIntranetPage() {
                       <TableCell className="text-muted-foreground text-xs">{fmtTime(a.created_at)}</TableCell>
                       <TableCell className="text-right">
                         {a.status === "active" ? (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="text-red-600"
-                            disabled={busyId === `artifact-${a.id}`}
-                            onClick={() => void revokeArtifact(a)}
-                          >
-                            {busyId === `artifact-${a.id}` ? (
-                              <Loader2Icon className="size-3.5 animate-spin" />
-                            ) : (
-                              <Trash2Icon className="size-3.5" />
-                            )}
-                            撤销
-                          </Button>
+                          <div className="flex items-center justify-end gap-1">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="text-muted-foreground"
+                              disabled={busyId === `artifact-${a.id}`}
+                              title="会话已死、目标不可达时，在目标上手工清理后用它记账"
+                              onClick={() => {
+                                setManualNote("");
+                                setManualArtifact(a);
+                              }}
+                            >
+                              <ClipboardCheckIcon className="size-3.5" />
+                              人工确认
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="text-red-600"
+                              disabled={busyId === `artifact-${a.id}`}
+                              onClick={() => void revokeArtifact(a)}
+                            >
+                              {busyId === `artifact-${a.id}` ? (
+                                <Loader2Icon className="size-3.5 animate-spin" />
+                              ) : (
+                                <Trash2Icon className="size-3.5" />
+                              )}
+                              撤销
+                            </Button>
+                          </div>
                         ) : (
-                          <span className="text-muted-foreground text-xs">{fmtTime(a.revoked_at)}</span>
+                          <div className="flex flex-col items-end gap-0.5">
+                            <span className="text-muted-foreground text-xs">{fmtTime(a.revoked_at)}</span>
+                            {a.metadata?.manual_revoke ? (
+                              <Badge
+                                variant="outline"
+                                className="border-amber-500/40 text-amber-700 text-[10px] dark:text-amber-400"
+                                title="由人声明已清理，平台没有验证过目标"
+                              >
+                                人工声明
+                              </Badge>
+                            ) : null}
+                          </div>
                         )}
                       </TableCell>
                     </TableRow>
@@ -3230,6 +3286,47 @@ export default function DeepIntranetPage() {
         </DialogContent>
       </Dialog>
 
+      {/* 人工确认清理：撤销命令跑不通时的记账入口 */}
+      <Dialog
+        open={!!manualArtifact}
+        onOpenChange={(open) => {
+          if (!open) setManualArtifact(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>人工确认已清理 #{manualArtifact?.id}</DialogTitle>
+            <DialogDescription>
+              会话已死、目标不可达、撤销命令发不出去时用它：你在目标上手工清掉了痕迹，把做过什么、看到什么记下来。
+              这条路径<strong>不会连接目标</strong>，也不会执行任何命令。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-3 text-sm">
+            <FieldRow label="处置说明" hint="必填；撤离报告与台账都会引用你写的这句">
+              <Textarea
+                value={manualNote}
+                onChange={(e) => setManualNote(e.target.value)}
+                rows={3}
+                placeholder="例：SSH 登录 10.0.0.5，rm -f /etc/cron.d/jw-ab12，ls 确认文件不存在、crontab -l 无该条目"
+              />
+            </FieldRow>
+            <p className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-amber-700 text-xs dark:text-amber-400">
+              这是<strong>人工声明</strong>：平台没有连上目标验证。撤离报告会把它单列在「人工声明已清理」一节，
+              不计入「平台已验证清除」的条数。要让结论变成平台验证过的，仍需恢复一条可用通道再走「撤销」。
+            </p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" size="sm" disabled={manualSaving} onClick={() => setManualArtifact(null)}>
+              取消
+            </Button>
+            <Button size="sm" disabled={manualSaving} onClick={() => void submitManualRevoke()}>
+              {manualSaving ? <Loader2Icon className="size-4 animate-spin" /> : <ClipboardCheckIcon className="size-4" />}
+              记录为已清理
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* 撤离清理 */}
       <Dialog open={evacuateOpen} onOpenChange={setEvacuateOpen}>
         <DialogContent className="sm:max-w-3xl">
@@ -3343,6 +3440,18 @@ export default function DeepIntranetPage() {
                     </div>
                     <ul className="list-disc space-y-1 pl-4 text-xs">
                       {evacuateReport.residual.map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+                {(evacuateReport.manual_revoked?.length ?? 0) > 0 ? (
+                  <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-2">
+                    <div className="mb-1 font-medium text-amber-700 text-xs dark:text-amber-400">
+                      人工声明已清理（{evacuateReport.manual_revoked?.length}）——平台没有验证过目标，不计入已验证清除
+                    </div>
+                    <ul className="list-disc space-y-1 pl-4 text-xs">
+                      {evacuateReport.manual_revoked?.map((item) => (
                         <li key={item}>{item}</li>
                       ))}
                     </ul>

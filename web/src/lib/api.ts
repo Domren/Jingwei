@@ -30,6 +30,7 @@ import type {
   ConvTokenSummary,
   CoverageAssetRefs,
   CoverageGraphData,
+  CredBuiltinDictInfo,
   CredDict,
   CredentialTrafficDetail,
   CredProtocolInfo,
@@ -1577,9 +1578,14 @@ export const api = {
 
   // ---- 弱口令检测（界面名） ----
   credProtocols: () =>
-    get<{ protocols: CredProtocolInfo[]; dictionaries: string[]; dicts?: CredDict[]; outcomes: string[] }>(
-      "/credscan/protocols",
-    ),
+    get<{
+      protocols: CredProtocolInfo[];
+      dictionaries: string[];
+      dicts?: CredDict[];
+      /** 内置字典的版本与分档（core / vendor）；导入档没有版本，不在这里。 */
+      builtin_dict?: CredBuiltinDictInfo;
+      outcomes: string[];
+    }>("/credscan/protocols"),
   saveCredDict: (name: string, content: string) => post<CredDict>("/credscan/dicts", { name, content }),
   deleteCredDict: (name: string) => del<{ deleted: boolean }>(`/credscan/dicts/${encodeURIComponent(name)}`),
   credTasks: (limit = 50) => get<{ tasks: CredTask[] }>(`/credscan/tasks?limit=${limit}`),
@@ -1903,6 +1909,13 @@ export const api = {
     post<{ artifact: IntranetArtifact; revoked: boolean; error?: string }>(`/intranet/artifacts/${id}/revoke`, {
       session_id: sessionId,
     }),
+  // 撤销链路的兜底：会话已死、目标不可达时，把操作员在目标上的观察记进台账。
+  // 返回的 verified 恒为 false——平台没有连上目标，报告里会单列为「人工声明」。
+  manualRevokeIntranetArtifact: (id: number, note: string) =>
+    post<{ artifact: IntranetArtifact; verified: boolean; already_revoked?: boolean; note: string }>(
+      `/intranet/artifacts/${id}/manual-revoke`,
+      { note },
+    ),
   persistIntranetSession: (id: number, input: IntranetPersistInput) =>
     post<{ artifact: IntranetArtifact; deployed: boolean; reused: boolean; error?: string }>(
       `/intranet/sessions/${id}/persist`,

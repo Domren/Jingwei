@@ -1481,10 +1481,26 @@ export interface GuardDenialStat {
   last_at: string;
 }
 
+/**
+ * 按成因汇总的拒绝分布（跨任务）。判断「要不要给这一类加短暂重试」看它：
+ * retryable 为真的成因是读库抖动，可重试；其余是策略拒绝，重试不会放行。
+ */
+export interface GuardDenialCause {
+  category: string;
+  total: number;
+  tasks: number;
+  last_24h: number;
+  last_reason: string;
+  last_at: string;
+  retryable: boolean;
+  advice: string;
+}
+
 export interface GuardDenials {
   window_hours: number;
   mode: string;
   denials: GuardDenialStat[];
+  causes?: GuardDenialCause[];
 }
 
 export interface JudgeConfig {
@@ -2368,6 +2384,11 @@ export interface IntranetEvacuationReport {
   residual: string[];
   /** 不在台账内的目标侧痕迹（G1）：可能是原有运维配置，也可能是残留，按内容人工判断。 */
   ledger_external?: string[];
+  /**
+   * 由人声明已清理、平台没连上目标验证的落地物（A5）。
+   * 它们不在 artifacts 的计数里：报告不能把「操作员说清掉了」写成「平台验证清除」。
+   */
+  manual_revoked?: string[];
   /** 痕迹矩阵（G4）：按手段汇总「留下什么 / 怎么验证 / 撤销后还剩什么 / 本次结论」。 */
   traces?: TraceMatrixRow[];
   trace_matrix?: string;
@@ -2939,6 +2960,23 @@ export interface CredDict {
   name: string;
   entry_count: number;
   created_at: string;
+}
+
+/** 内置字典的一档（core 通用 / vendor 厂商设备）。 */
+export interface CredDictTier {
+  key: string;
+  label: string;
+  count: number;
+  note: string;
+}
+
+/** 内置字典的版本与分档构成，给界面说明「这一版覆盖到哪」。 */
+export interface CredBuiltinDictInfo {
+  profile: string;
+  version: string;
+  total: number;
+  tiers: CredDictTier[];
+  order: string;
 }
 
 export interface CredTaskInput {

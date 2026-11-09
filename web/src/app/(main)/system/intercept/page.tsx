@@ -549,6 +549,35 @@ function GuardDenialCard() {
               <JudgeStat label="涉及任务" value={String(new Set(rows.map((r) => r.task_id)).size)} />
               <JudgeStat label="当前模式" value={data?.mode || "-"} />
             </div>
+            {(data?.causes?.length ?? 0) > 0 ? (
+              <div className="mb-3 rounded border bg-muted/20 p-2">
+                <p className="mb-1 text-xs font-medium">
+                  按成因分布（决定「要不要加重试」看这一栏：可重试=读库抖动，其余=策略拒绝）
+                </p>
+                <ul className="flex flex-col gap-1 text-xs">
+                  {data?.causes?.map((c) => (
+                    <li key={c.category} className="flex flex-wrap items-baseline gap-2">
+                      <Badge
+                        variant="outline"
+                        className={
+                          c.retryable
+                            ? "border-amber-500/40 text-amber-700 text-[10px] dark:text-amber-400"
+                            : "border-slate-400/40 text-[10px]"
+                        }
+                      >
+                        {c.retryable ? "可重试" : "策略拒绝"}
+                      </Badge>
+                      <span className="font-medium">{GUARD_DENIAL_LABELS[c.category] || c.category}</span>
+                      <span className="tabular-nums">{c.total} 次</span>
+                      <span className="text-muted-foreground">
+                        {c.tasks} 个任务 · 近 24h {c.last_24h} 次
+                      </span>
+                      <span className="text-muted-foreground">{c.advice}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs">
                 <thead className="text-[10px] uppercase tracking-wider text-muted-foreground">

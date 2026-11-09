@@ -30,7 +30,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { CredDict, CredProtocolInfo, CredResult, CredTask } from "@/lib/types";
+import type { CredBuiltinDictInfo, CredDict, CredProtocolInfo, CredResult, CredTask } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import { fmtTime } from "../_components/deep-ui";
@@ -97,6 +97,8 @@ export default function CredscanPage() {
   const [protocols, setProtocols] = React.useState<CredProtocolInfo[]>([]);
   const [dictionaries, setDictionaries] = React.useState<string[]>(["builtin"]);
   const [dicts, setDicts] = React.useState<CredDict[]>([]);
+  // 内置字典的版本与分档：让界面能回答「这一版到底试了哪些、覆盖到哪」。
+  const [builtinDict, setBuiltinDict] = React.useState<CredBuiltinDictInfo | null>(null);
   const [dictOpen, setDictOpen] = React.useState(false);
   const [dictName, setDictName] = React.useState("");
   const [dictContent, setDictContent] = React.useState("");
@@ -135,6 +137,7 @@ export default function CredscanPage() {
       const r = await api.credProtocols();
       setProtocols(r.protocols ?? []);
       setDicts(r.dicts ?? []);
+      setBuiltinDict(r.builtin_dict ?? null);
       if (r.dictionaries?.length) {
         setDictionaries(r.dictionaries);
         setDictProfile((prev) => (r.dictionaries.includes(prev) ? prev : r.dictionaries[0]));
@@ -577,6 +580,15 @@ export default function CredscanPage() {
                     ))}
                   </SelectContent>
                 </Select>
+                {builtinDict ? (
+                  // 分档与版本写在选择器下面：操作员要能回答「这次到底试了哪些」，
+                  // 只写「内置精简字典」等于什么都没说。顺序也要写出来——它决定先试出什么。
+                  <p className="text-muted-foreground text-xs">
+                    内置字典 {builtinDict.version} · 共 {builtinDict.total} 组（
+                    {builtinDict.tiers.map((t) => `${t.label} ${t.count}`).join(" / ")}）。尝试顺序：
+                    {builtinDict.order}
+                  </p>
+                ) : null}
               </div>
               <div className="space-y-1.5">
                 <Label>任务预算</Label>

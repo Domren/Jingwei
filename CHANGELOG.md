@@ -194,11 +194,17 @@
 ### 变更
 
 - **弱口令字典扩充 + 协议定向的条目顺序**：内置字典补上各协议最常见的出厂弱口令（MSSQL 的
-  `sa`、Oracle 的 `scott/tiger` 与 `system/oracle`、WebLogic/JBoss/Jenkins 控制台、svnserve、
-  RouterOS）与纯口令条目（`public`/`private`，SNMP 的凭据就是 community）。更要紧的是顺序：
-  SNMP 只有口令字段有意义，按原顺序要空转四十多条（每条静默丢弃、等满应答窗口）才轮到
-  `public`，预算吃紧时最先被牺牲的正是本该先试的那几条。现在按协议做稳定分区把这几个提到
-  最前，**只重排不增删**——少一条就等于报告里声称测过一组其实没测的口令。
+  `sa`、JBoss/Jenkins 控制台、svnserve、RouterOS）与纯口令条目（`public`/`private`/`community`，
+  SNMP 的凭据就是 community）。更要紧的是顺序：SNMP 只有口令字段有意义，按原顺序要空转四十多条
+  （每条静默丢弃、等满应答窗口）才轮到 `public`，预算吃紧时最先被牺牲的正是本该先试的那几条。
+  现在按协议做稳定分区把这几个提到最前，**只重排不增删**——少一条就等于报告里声称测过一组
+  其实没测的口令。
+- **内置字典改为分档维护并带内容版本**：拆成「通用（core）」与「厂商/设备（vendor）」两档，
+  尝试顺序固定为 core 全量 → vendor 全量（与 1.6.0 的实际顺序一致，分档不改变先试出什么）；
+  版本号 `2026.11` 随内容变动，`GET /api/credscan/protocols` 返回 `builtin_dict`（版本、各档条数、
+  顺序说明），界面在选择器下方写明「内置字典 2026.11 · 共 N 组（通用 x / 厂商 y）」。维护口径
+  （加条目的门槛、复核节奏、改完怎么验）落在 `docs/弱口令字典维护口径.md`——此前只有一句
+  「内置精简档」，没人说得清下一次该加什么、加到哪一档。
 - 数据库自动迁移新增 `subdomain_tasks` / `subdomain_results` 两张表（启动时 `IF NOT EXISTS` 建好，无需手工步骤）；
   新增接口 `POST/GET /api/subdomain/tasks`、`GET /api/subdomain/tasks/{id}`、`.../results`、`.../report`、
   `POST .../{id}/cancel`、`POST .../batch-delete`、`GET /api/subdomain/options`。
@@ -241,6 +247,30 @@
   DSN，落在与 `db`/`agent` 共享的表上，还夹着几条无条件的 `DELETE FROM authorizations`；现在整个包的
   两条构造路径都钉在同一个 schema 上，`db` 的授权夹具也各占一个 schema。DSN 改写支持重写已有的
   `search_path`（原来二次改写直接报错），并行/串行 × URI/keyword 四种口径下 `server` 包全绿。
+- **隐式 TLS 的四个适配器没有把通道状态写进结果（smtp-ssl / pop3-ssl / imap-ssl / ldaps）**：
+  结果里 `tls` 恒为 false，于是证据说明写着「以上字节是明文」，复现命令也给成裸 socket——
+  照那条命令连 465/995/993/636 是连不上的，报告读者会把它当成「目标没开 TLS」。这四条
+  此前只有进程内桩，桩不检查这个字段；补上 `smtp-ssl` 的真机用例（aiosmtpd 隐式 TLS）当场
+  撞出来。现在 `Try` 在握手成功后写 `res.TLS = a.tls`。
+- **补上 `smtp-ssl` 的真机用例**（`tools/e2e/credscan-lab/smtps-lab.sh` + `smtps-lab.py`）：
+  31 个协议里唯一没有 lab 用例的一个。服务端是 aiosmtpd 的隐式 TLS（自带 AUTH PLAIN），
+  命中与拒绝两条路径都跑通（`235` / `535 5.7.8`），并断言 `tls=true`——只验 outcome 不验通道，
+  上面那条缺陷就会被漏过去。起服务与写清单一条命令，`up` / `test` / `down` 三段。
+- **失败落地的落地物有了人工处置路径（A5）**：会话已死、目标不可达、撤销命令发不出去时，
+  台账此前只剩「一直挂着 active」一个选择，撤离报告于是永远报「未撤销」。现在可以记录
+  「人工确认已清理」：`POST /api/intranet/artifacts/{id}/manual-revoke`，强制写清在目标上做了
+  什么（至少 8 字），状态置 revoked、原部署证据保留，另在 `metadata.manual_revoke` 落
+  by/at/note。**撤离报告把它单列在 `manual_revoked` 一节，不计入「平台已验证清除」的条数**，
+  summary 与界面都写明「未经平台验证」——把人的一句话写成平台结论，比不写更糟。
+- **目标策略拒绝的分布可以一眼看完（A7 的代码侧）**：`GET /api/intercept/guard/denials` 增加
+  `causes`，按成因给出总数、影响任务数、近 24h 次数与一句处置建议，并区分「可重试（读库抖动）」
+  与「策略拒绝（重试不会放行）」。此前只有 per-(task, category)，回答不了「要不要给这一类加
+  短暂重试」——那需要真实任务量跑一段时间才看得准，数据侧的准备这一版先做完。
+- **CHANGELOG 与 README 的版本一致性有了自动校验（A3）**：新增 `tools/docaudit`，解析
+  `## [x.y.z] - 日期` 与 README 的标题版本、版本历史、下载命令/镜像标签/ldflags 里七类
+  硬编码，检查版本存在性、日期一致、顺序递减、条目非空、硬编码与标题同版本、以及「未发布」
+  标记与 README 的发布状态是否自洽。`go test ./...` 会跑仓库真实文件——发版时漏改一半会在
+  测试里红，而不是等用户拉到 tag 发现文档对不上。
 
 ## [1.5.0] - 2026-11-05（弱口令检测 · 客户授权清单 · 客户交付版报告）
 

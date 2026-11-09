@@ -45,6 +45,19 @@ JW_CRED_LAB=1 JW_CRED_LAB_MANIFEST=/tmp/jw-cred-lab-6/lab.json \
 先失败在「真机清单读不到」上——**这不是回归**，是清单来源不同。`six-pack.sh` 只写清单不起服务；
 SMB / RDP / RouterOS 三条按下面「手动起剩下三条」起。
 
+### smtp-ssl（465 隐式 TLS，一条命令的清单）
+
+```bash
+tools/e2e/credscan-lab/smtps-lab.sh up      # venv 装 aiosmtpd（中科大源）+ 自签证书 + 写清单
+tools/e2e/credscan-lab/smtps-lab.sh test    # JW_CRED_LAB=1 跑 TestCredLabProtocols
+tools/e2e/credscan-lab/smtps-lab.sh down    # 停服务、删清单
+```
+
+没用 postfix：它的 465 要改 `master.cf` 的 `smtpd_tls_wrappermode=yes`、AUTH 还要另配 cyrus-sasl，
+两处配错都是静默不生效；这里要验的是适配器在隐式 TLS 上的 AUTH 判定，aiosmtpd 给的
+220 / 多行 EHLO / 235 / 535 语义是真实的。**这条用例第一次跑就是红的**——红在
+`expect_tls` 上，见 `进度手册` §5.10（四个隐式 TLS 适配器都没标 `TLS`）。
+
 ## 这一台覆盖什么
 
 | 协议 | 覆盖的认证形态 | 位置 |
@@ -66,6 +79,7 @@ SMB / RDP / RouterOS 三条按下面「手动起剩下三条」起。
 | SVN | 真 `svnserve` 的 **CRAM-MD5**（原生机制）：`( step ( <len>:<challenge> ) )` → `HMAC-MD5(口令, challenge)`；拒绝态措辞是 `( failure ( 18:Password incorrect ) )` | 宿主机 3691 |
 | Zookeeper | 四字命令 `ruok` 有应答（3.4 默认放开） | Ubuntu-1:2181 |
 | SMTP | postfix（2525 上的 SASL 入口）+ dovecot auth 套接字；`AUTH PLAIN` 235/535 | Ubuntu-1:2525 |
+| SMTP-SSL | aiosmtpd 1.4.6 **隐式 TLS**（465 形态，握手即 TLS，不是 STARTTLS）：`AUTH PLAIN` 235 / `535 5.7.8`。用例断言 `expect_tls=true`——这一条存在的意义就是验通道，只验 outcome 会把「没升 TLS」放过 | 宿主机 1465（`smtps-lab.sh up`） |
 | POP3 / IMAP | dovecot + passwd-file（文件必须 root:dovecot 0640） | Ubuntu-1:110 / 143 |
 | POP3-SSL / IMAP-SSL | dovecot 隐式 TLS（安装时自签证书） | Ubuntu-1:995 / 993 |
 | LDAP / LDAPS | slapd + `uid=jwcred,ou=people,dc=lab,dc=local` 简单 bind；LDAPS 用自签证书（`SLAPD_SERVICES` 要含 `ldaps:///`） | Ubuntu-1:389 / 636 |

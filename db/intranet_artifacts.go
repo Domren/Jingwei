@@ -338,6 +338,52 @@ ORDER BY id DESC`, id)
 	return out, rows.Err()
 }
 
+// MarkIntranetArtifactManualRevoked 把一条落地物记成「人工确认已清理」。
+//
+// 与 MarkIntranetArtifactRevoked 的差别是证据来源：那条的调用方是平台的撤销流程，手里有
+// verify_command 的输出；这条的调用方是操作员——会话已经死了、目标不可达、撤销命令根本发不
+// 出去，只剩「我在目标上看过，确实没了」。两种证据不能混成同一个 status：撤离报告若把人的一句
+// 话写成「平台已验证清除」，那份报告就在替操作员担保他没担保的事。
+//
+// 所以这里额外落 metadata.manual_revoke = {by, at, note}，报告与界面据此标「人工声明、未经平台
+// 验证」，原部署证据也保留（追加而不是覆盖）。
+func (d *DB) MarkIntranetArtifactManualRevoked(id int64, note, actor string) (*IntranetArtifact, error) {
+	a, err := scanIntranetArtifact(d.QueryRow(`
+UPDATE intranet_artifacts SET status='revoked', revoked_at=now(),
+    evidence = CASE WHEN coalesce(evidence,'')='' THEN $2 ELSE evidence || E'\n' || $2 END,
+    metadata = coalesce(metadata,'{}'::jsonb) || jsonb_build_object('manual_revoke',
+        jsonb_build_object('by',$3::text,'at',now(),'note',$4::text))
+WHERE id=$1
+RETURNING `+intranetArtifactCols, id, strings.TrimSpace(note), strings.TrimSpace(actor), strings.TrimSpace(note)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrIntranetArtifactNotFound
+	}
+	return a, err
+}
+
+// ListManualRevokedIntranetArtifacts 取某任务下「人工声明已清理」的落地物。
+// 撤离报告用它单独列一节：这些条目不在撤销循环里（status 已是 revoked），
+// 但报告读者有权知道它们凭什么被当成清理完了。
+func (d *DB) ListManualRevokedIntranetArtifacts(taskID int64) ([]*IntranetArtifact, error) {
+	rows, err := d.Query(`SELECT `+intranetArtifactCols+`
+FROM intranet_artifacts
+WHERE task_id=$1 AND metadata ? 'manual_revoke'
+ORDER BY id DESC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*IntranetArtifact{}
+	for rows.Next() {
+		a, err := scanIntranetArtifact(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 // MarkIntranetArtifactRevoked settles an artifact after its revoke command ran
 // and the follow-up verification confirmed it is gone.
 func (d *DB) MarkIntranetArtifactRevoked(id int64, evidence string) (*IntranetArtifact, error) {

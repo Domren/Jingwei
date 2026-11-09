@@ -17,53 +17,114 @@ type CredDictionary struct {
 	Credentials []Credential `json:"-"`
 }
 
+// 内置字典的版本与分档（维护口径见 docs/弱口令字典维护口径.md）。
+//
+// 分两档不是为了少测，而是为了让「加一条」有地方放，并且让界面能说清这一版覆盖到哪：
+//   - core：通用服务的出厂/默认口令，与具体厂商无关，几乎所有协议都该先试这几条；
+//   - vendor：厂商与设备相关（MSSQL 的 sa、Jenkins/JBoss 控制台、svnserve、RouterOS、
+//     SNMP 的 community 等），只对特定协议有意义，但对它们必须排在前面。
+//
+// 尝试顺序 = core 全量 → vendor 全量，与 1.6.0 的实际顺序一致：顺序也是「先试出什么」的
+// 决定因素，调档不能悄悄改顺序。版本号随内容变动，格式 YYYY.MM（同一月内多次调整加 .1）。
+const (
+	CredBuiltinDictProfile = "builtin"
+	CredBuiltinDictVersion = "2026.11"
+	CredDictTierCore       = "core"
+	CredDictTierVendor     = "vendor"
+)
+
+// credBuiltinCore 是通用档：空口令与 root/admin 这类几乎所有设备都有的组合。
+var credBuiltinCore = []Credential{
+	// 空口令本身是一组必须测的组合：Redis 未开认证、memcached /
+	// Zookeeper 这类根本没有认证的服务，只有它才会命中。放在最前面，
+	// 无认证目标第一条就能出结论，不必先把几十组口令打一遍。
+	{},
+	{Username: "root", Password: "root"},
+	{Username: "root", Password: "123456"},
+	{Username: "root", Password: "toor"},
+	{Username: "root", Password: "password"},
+	{Username: "root", Password: ""},
+	{Username: "admin", Password: "admin"},
+	{Username: "admin", Password: "123456"},
+	{Username: "admin", Password: "password"},
+	{Username: "admin", Password: "admin123"},
+	{Username: "admin", Password: "passw0rd"},
+	{Username: "admin", Password: ""},
+	{Username: "administrator", Password: "administrator"},
+	{Username: "administrator", Password: "123456"},
+	{Username: "administrator", Password: "password"},
+	{Username: "test", Password: "test"},
+	{Username: "test", Password: "123456"},
+	{Username: "guest", Password: "guest"},
+	{Username: "guest", Password: ""},
+	{Username: "user", Password: "user"},
+	{Username: "postgres", Password: "postgres"},
+	{Username: "mysql", Password: "mysql"},
+	{Username: "redis", Password: "redis"},
+	{Username: "mongo", Password: "mongo"},
+	{Username: "ftp", Password: "ftp"},
+	{Username: "ubuntu", Password: "ubuntu"},
+	{Username: "tomcat", Password: "tomcat"},
+	{Username: "www", Password: "www"},
+	{Username: "elastic", Password: "elastic"},
+}
+
+// credBuiltinVendor 是厂商/设备档：只在对应协议上有意义，但对那些协议必须靠前。
+// 加条目的门槛：能说出「哪个产品、哪个版本、出厂就是这样」，且能在 lab 里复现；
+// 只写「网上见过」的条目进不来（那类东西的误报成本远高于命中收益）。
+var credBuiltinVendor = []Credential{
+	// MSSQL 的 sa、JBoss/Jenkins 控制台、svnserve、RouterOS 的出厂/示例口令。
+	{Username: "sa", Password: "sa"},
+	{Username: "sa", Password: ""},
+	{Username: "sa", Password: "123456"},
+	{Username: "jboss", Password: "jboss"},
+	{Username: "jenkins", Password: "jenkins"},
+	{Username: "svn", Password: "svn"},
+	// SNMP 只把口令字段当 community 用：这几条是纯口令条目（无用户名）。
+	{Password: "public"},
+	{Password: "private"},
+	{Password: "community"},
+}
+
 var credBuiltin = CredDictionary{
-	Profile: "builtin",
-	Credentials: []Credential{
-		// 空口令本身是一组必须测的组合：Redis 未开认证、memcached /
-		// Zookeeper 这类根本没有认证的服务，只有它才会命中。放在最前面，
-		// 无认证目标第一条就能出结论，不必先把几十组口令打一遍。
-		{},
-		{Username: "root", Password: "root"},
-		{Username: "root", Password: "123456"},
-		{Username: "root", Password: "toor"},
-		{Username: "root", Password: "password"},
-		{Username: "root", Password: ""},
-		{Username: "admin", Password: "admin"},
-		{Username: "admin", Password: "123456"},
-		{Username: "admin", Password: "password"},
-		{Username: "admin", Password: "admin123"},
-		{Username: "admin", Password: "passw0rd"},
-		{Username: "admin", Password: ""},
-		{Username: "administrator", Password: "administrator"},
-		{Username: "administrator", Password: "123456"},
-		{Username: "administrator", Password: "password"},
-		{Username: "test", Password: "test"},
-		{Username: "test", Password: "123456"},
-		{Username: "guest", Password: "guest"},
-		{Username: "guest", Password: ""},
-		{Username: "user", Password: "user"},
-		{Username: "postgres", Password: "postgres"},
-		{Username: "mysql", Password: "mysql"},
-		{Username: "redis", Password: "redis"},
-		{Username: "mongo", Password: "mongo"},
-		{Username: "ftp", Password: "ftp"},
-		{Username: "ubuntu", Password: "ubuntu"},
-		{Username: "tomcat", Password: "tomcat"},
-		{Username: "www", Password: "www"},
-		{Username: "elastic", Password: "elastic"},
-		// 下列几组是新增协议最常见的出厂/示例弱口令（MSSQL 的 sa、JBoss/Jenkins 控制台、
-		// svnserve、RouterOS）。刻意只放最典型的，不做穷举；大字典仍归操作员显式导入的档位。
-		{Username: "sa", Password: "sa"},
-		{Username: "sa", Password: ""},
-		{Username: "sa", Password: "123456"},
-		{Username: "jboss", Password: "jboss"},
-		{Username: "jenkins", Password: "jenkins"},
-		{Username: "svn", Password: "svn"},
-		// SNMP 只把口令字段当 community 用：这几条是纯口令条目（无用户名）。
-		{Password: "public"},
-		{Password: "private"},
-	},
+	Profile: CredBuiltinDictProfile,
+	Credentials: append(append(make([]Credential, 0, len(credBuiltinCore)+len(credBuiltinVendor)),
+		credBuiltinCore...), credBuiltinVendor...),
+}
+
+// CredDictionaryTier 是字典的一档，给目录接口与界面用。
+type CredDictionaryTier struct {
+	Key   string `json:"key"`
+	Label string `json:"label"`
+	Count int    `json:"count"`
+	Note  string `json:"note"`
+}
+
+// CredDictionaryInfo 是一份字典档的元信息。内置档的 Version 是内容版本，
+// 导入档没有版本（内容由操作员自己维护），所以这里只描述内置档。
+type CredDictionaryInfo struct {
+	Profile string               `json:"profile"`
+	Version string               `json:"version"`
+	Total   int                  `json:"total"`
+	Tiers   []CredDictionaryTier `json:"tiers"`
+	// Order 写明尝试顺序，避免有人以为分档=分组并发。
+	Order string `json:"order"`
+}
+
+// CredBuiltinDictionaryInfo 返回内置字典的版本与分档构成。
+func CredBuiltinDictionaryInfo() CredDictionaryInfo {
+	return CredDictionaryInfo{
+		Profile: credBuiltin.Profile,
+		Version: CredBuiltinDictVersion,
+		Total:   len(credBuiltin.Credentials),
+		Order:   "core 全量 → vendor 全量（严格按此顺序，命中/锁定即停）",
+		Tiers: []CredDictionaryTier{
+			{Key: CredDictTierCore, Label: "通用", Count: len(credBuiltinCore),
+				Note: "空口令与 root/admin 这类通用出厂口令，任何协议都先试"},
+			{Key: CredDictTierVendor, Label: "厂商/设备", Count: len(credBuiltinVendor),
+				Note: "sa / jboss / jenkins / svn / snmp community 等只在对应协议上有意义"},
+		},
+	}
 }
 
 // CredDictionaryByName 取字典档。空名按内置档处理；未知档报错而不是悄悄回落到内置——

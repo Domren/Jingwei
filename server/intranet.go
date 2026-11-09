@@ -2329,6 +2329,9 @@ func (s *Server) registerIntranet(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/intranet/artifacts", s.listIntranetArtifacts)
 	mux.HandleFunc("POST /api/intranet/artifacts", s.registerIntranetArtifact)
 	mux.HandleFunc("POST /api/intranet/artifacts/{id}/revoke", s.revokeIntranetArtifact)
+	// 撤销链路的兜底：会话已死、目标不可达时，操作员在目标上手工清理过，需要把这句观察记进
+	// 台账。它只改状态与证据，不碰目标，报告里单列为「人工声明」而不是「平台已验证」。
+	mux.HandleFunc("POST /api/intranet/artifacts/{id}/manual-revoke", s.manualRevokeIntranetArtifact)
 	mux.HandleFunc("POST /api/intranet/sessions/{id}/persist", s.persistIntranetSession)
 	mux.HandleFunc("POST /api/intranet/evacuate", s.evacuateIntranetTask)
 

@@ -63,6 +63,10 @@ func (a mailCredAdapter) Try(ctx context.Context, ep CredEndpoint, cred Credenti
 	if err != nil {
 		return res.withErr(err)
 	}
+	// 隐式 TLS 变体必须把通道状态写进结果：不写的话证据说明会说「以上字节是明文」，
+	// 复现命令也会给成裸 socket——照那条命令连 465/995/993 是连不上的。
+	// 这一条是 smtp-ssl 真机验证（aiosmtpd 隐式 TLS）抓出来的，进程内桩看不见。
+	res.TLS = a.tls
 	defer w.close()
 	defer func() { res.syncWire(w) }()
 

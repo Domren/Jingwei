@@ -399,5 +399,18 @@ func (s *Server) guardDenialStats(w http.ResponseWriter, r *http.Request) {
 	if stats == nil {
 		stats = []pgdb.GuardDenialStat{}
 	}
-	writeJSON(w, 200, map[string]any{"window_hours": hours, "mode": s.guardEnforcement(), "denials": stats})
+	// 按成因的分布与 per-task 明细一起返回：判断「要不要加短暂重试」看的是前者，
+	// 定位「哪个任务被拒」看的是后者。两者同一次请求给出，避免界面拼两次数。
+	breakdown, berr := pg.GuardDenialBreakdown(time.Duration(hours) * time.Hour)
+	if berr != nil {
+		writeErr(w, 500, berr.Error())
+		return
+	}
+	if breakdown == nil {
+		breakdown = []pgdb.GuardDenialCause{}
+	}
+	writeJSON(w, 200, map[string]any{
+		"window_hours": hours, "mode": s.guardEnforcement(),
+		"denials": stats, "causes": breakdown,
+	})
 }

@@ -2719,6 +2719,22 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       ],
       dictionaries: ["builtin"],
       dicts: [],
+      // 与 scanner.CredBuiltinDictionaryInfo() 同形状；demo 不跑真实字典，数字仅作界面演示。
+      builtin_dict: {
+        profile: "builtin",
+        version: "2026.11",
+        total: 42,
+        order: "core 全量 → vendor 全量（严格按此顺序，命中/锁定即停）",
+        tiers: [
+          { key: "core", label: "通用", count: 29, note: "空口令与 root/admin 这类通用出厂口令，任何协议都先试" },
+          {
+            key: "vendor",
+            label: "厂商/设备",
+            count: 13,
+            note: "sa / jboss / jenkins / svn / snmp community 等只在对应协议上有意义",
+          },
+        ],
+      },
       outcomes: ["hit", "deny", "unreachable", "locked", "inconclusive", "unsupported"],
     };
   }

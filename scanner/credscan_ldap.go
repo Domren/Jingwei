@@ -63,6 +63,9 @@ func (a ldapCredAdapter) Try(ctx context.Context, ep CredEndpoint, cred Credenti
 	if err != nil {
 		return res.withErr(err)
 	}
+	// ldaps 是隐式 TLS：根 DN 与口令都在 TLS 通道里，证据说明必须写成「TLS 通道内的明文」，
+	// 否则复现命令会让人用裸 socket 连 636（必然连不上，也解释不了为什么读不到响应）。
+	res.TLS = a.tls
 	defer w.close()
 	defer func() { res.syncWire(w) }()
 

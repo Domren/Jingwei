@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/jingwei/db"
 	actool "github.com/Autumn-27/norma/tool"
@@ -1327,6 +1328,64 @@ func (s *Server) revokeIntranetArtifact(w http.ResponseWriter, r *http.Request) 
 		body["error"] = err.Error()
 	}
 	writeJSON(w, code, body)
+}
+
+// manualRevokeIntranetArtifact 记录一次「人工确认已清理」。
+//
+// 这是撤销链路的兜底：会话已死、目标不可达、撤销命令发不出去时，操作员可能已经在目标上手工
+// 清掉了痕迹。此前台账只剩两个选择——一直挂着 active（撤离报告永远报「未撤销」），或者不管它
+// （报告失真）。这里给第三条路：把人的观察记下来，并**明确标注它不是平台验证的结果**。
+//
+// 为什么强制写 note：这条记录之后会被当成「已清理」，报告读者看不到目标。只写「已处理」等于
+// 让人替他担保，所以要求写清在目标上执行了什么、看到了什么。
+func (s *Server) manualRevokeIntranetArtifact(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathInt(r, "id")
+	if !ok {
+		writeErr(w, 400, "无效的落地物 ID")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
+	var req struct {
+		Note string `json:"note"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "请求格式错误")
+		return
+	}
+	note := strings.TrimSpace(req.Note)
+	if utf8.RuneCountInString(note) < 8 {
+		writeErr(w, 400, "请写清在目标上执行了什么、看到了什么（至少 8 个字）；这条记录之后会被当成已清理，"+
+			"平台不会再去验证，报告里也只能引用你写的这句")
+		return
+	}
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	art, err := pg.GetIntranetArtifact(id)
+	if err != nil {
+		writeErr(w, 404, "落地物不存在")
+		return
+	}
+	if art.Status == db.IntranetArtifactRevoked {
+		// 幂等：已经撤销的不再改证据，避免第二次点击把第一次的说明覆盖掉。
+		writeJSON(w, 200, map[string]any{
+			"artifact": art, "already_revoked": true, "verified": false,
+			"note": "这条已经是撤销状态，没有改动。",
+		})
+		return
+	}
+	evidence := "【人工确认清理】" + authUsername + "：" + note
+	updated, err := pg.MarkIntranetArtifactManualRevoked(id, evidence, authUsername)
+	if err != nil {
+		writeErr(w, 500, "写入人工处置记录失败："+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"artifact": updated, "verified": false,
+		"note": "已按人工声明标记为清理。平台没有连上目标验证过；撤离报告会把这条单列为「人工声明」，" +
+			"不会算进平台已验证清除的条目。",
+	})
 }
 
 func (s *Server) persistIntranetSession(w http.ResponseWriter, r *http.Request) {
