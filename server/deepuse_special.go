@@ -72,6 +72,9 @@ type probeResult struct {
 	Baseline baselineExchange
 	Elapsed  time.Duration
 	Err      error
+	// BrowserXSS 是真实浏览器对 dalfox 判定的复核结果（D1）。nil 表示没有跑
+	// 浏览器验证（未安装或载体不是 URL），此时 dalfox 的判定原样保留。
+	BrowserXSS *scanner.BrowserXSSRun
 }
 
 type probeCreds struct {
@@ -277,6 +280,7 @@ func (r *deepRun) runInjectionProbe(class string, summary map[string]any) (strin
 	r.logf(stage, "开始 %s 专项验证：%d 个注入点（版本 %s）", tool, len(points), displayOr(r.probeToolVersion(class), "未知"))
 
 	confirmed, review, notReproduced, skipped, kept := 0, 0, 0, 0, 0
+	browserTested, browserExecuted, browserReflectedOnly, browserUnavailable := 0, 0, 0, 0
 	escalated, dba := 0, 0
 	uncovered := 0
 	reopened := 0
@@ -301,6 +305,15 @@ func (r *deepRun) runInjectionProbe(class string, summary map[string]any) (strin
 		res = sessionBlockedNegative(res)
 		if res.Verdict == "not_reproduced" && probePointReachable(res) {
 			res = r.rejudgeProbeNegative(class, p, res, r.credsForPoint(creds, p))
+		}
+		if res.BrowserXSS != nil {
+			if res.BrowserXSS.Missing {
+				browserUnavailable++
+			} else {
+				browserTested += len(res.BrowserXSS.Results)
+				browserExecuted += res.BrowserXSS.ExecutedCount()
+				browserReflectedOnly += res.BrowserXSS.ReflectedOnly()
+			}
 		}
 		if res.Escalation != nil {
 			escalated++
@@ -360,6 +373,18 @@ func (r *deepRun) runInjectionProbe(class string, summary map[string]any) (strin
 			msg += fmt.Sprintf("，剩余 %d 个点未发送探测", left)
 		}
 		return "failed", stage, msg + "。" + targetWedgedHint, summary
+	}
+	if class == scanner.InjectionXSS {
+		summary["xss_browser"] = map[string]any{
+			"tested": browserTested, "executed": browserExecuted,
+			"reflected_only": browserReflectedOnly, "unavailable": browserUnavailable,
+		}
+		if browserTested > 0 {
+			r.logf(stage, "浏览器真实执行确认：%d 个 URL 中执行 %d 个，仅反射未执行 %d 个", browserTested, browserExecuted, browserReflectedOnly)
+		}
+		if browserUnavailable > 0 {
+			r.logf(stage, "%d 个注入点的浏览器验证不可用（node/playwright 缺失），dalfox 判定保留", browserUnavailable)
+		}
 	}
 	summary["findings_reopened"] = reopened
 	summary["findings_confirmed"] = r.confirmedFindingCount()
@@ -991,7 +1016,92 @@ func (r *deepRun) verifyXSSPoint(p probePoint, creds probeCreds) probeResult {
 	}
 	res.Name = fmt.Sprintf("dalfox 验证 XSS：%d 个可执行点 / %d 个反射点（复放可见 %d 个）", verified, len(run.Findings), proved)
 	res.Detail = dalfoxEvidence(run, p, res.Injections)
+
+	// D1：dalfox 的「可执行」是它自己的检测器说的。把 PoC URL 真的放进
+	// Chromium 跑一遍，看到 JS 执行才算数；只反射不执行的，退回待复核。
+	if verified > 0 {
+		targets, nonURL := r.xssBrowserTargets(p, run.Findings)
+		if len(targets) == 0 {
+			if nonURL > 0 {
+				res.Detail += fmt.Sprintf("\n浏览器未验证：%d 个可执行点的载体不是 URL（POST/Cookie/Header 需要表单提交），dalfox 判定保留。", nonURL)
+			}
+			return res
+		}
+		maxTargets := intParam(r.task.Params, "xss_browser_targets", 3)
+		if maxTargets < 1 {
+			maxTargets = 1
+		}
+		if maxTargets > 8 {
+			maxTargets = 8
+		}
+		timeout := intParam(r.task.Params, "xss_browser_timeout", 15)
+		brun := scanner.RunBrowserXSS(r.ctx, scanner.BrowserXSSOptions{
+			Targets: targets, TimeoutSeconds: timeout, MaxTargets: maxTargets,
+		})
+		res.BrowserXSS = &brun
+		switch {
+		case brun.Missing:
+			res.Detail += "\n浏览器验证不可用：" + brun.Err.Error() + "；dalfox 判定保留，未声称已做浏览器确认。"
+		case brun.Err != nil && len(brun.Results) == 0:
+			res.Detail += "\n浏览器验证失败：" + brun.Err.Error() + "；dalfox 判定保留。"
+		default:
+			executed, reflectedOnly := brun.ExecutedCount(), brun.ReflectedOnly()
+			res.Detail += fmt.Sprintf("\n浏览器验证 %d 个 URL：真实执行 %d 个，仅反射未执行 %d 个。",
+				len(brun.Results), executed, reflectedOnly)
+			if executed == 0 {
+				res.Verdict = verdict.NeedsReview
+				res.Name = fmt.Sprintf("dalfox 报可执行但浏览器未观察到执行（复核 %d 个 URL）", len(brun.Results))
+				res.Detail += " 这些点退回待复核：反射存在不等于 JS 执行。"
+			}
+		}
+		if nonURL > 0 {
+			res.Detail += fmt.Sprintf("\n另有 %d 个可执行点载体不是 URL，未做浏览器验证。", nonURL)
+		}
+	}
 	return res
+}
+
+// xssBrowserTargets builds the PoC URLs a browser can load directly. Only query
+// carriers qualify: a POST body / Cookie / Header payload would need form
+// automation, so those are counted separately and reported as not verified.
+func (r *deepRun) xssBrowserTargets(p probePoint, findings []scanner.DalfoxFinding) ([]scanner.BrowserXSSTarget, int) {
+	out := make([]scanner.BrowserXSSTarget, 0, len(findings))
+	nonURL := 0
+	for _, f := range findings {
+		if f.Verdict() != "verified" {
+			continue
+		}
+		loc := strings.ToLower(strings.TrimSpace(f.Location))
+		if loc != "" && loc != "uri" && loc != "query" && loc != "get" {
+			nonURL++
+			continue
+		}
+		payload := strings.TrimSpace(f.Payload)
+		if payload == "" {
+			nonURL++
+			continue
+		}
+		u := strings.TrimSpace(f.URL)
+		if !strings.Contains(u, payload) {
+			// dalfox 的 data 字段在某些版本里只有参数名，按参数重建一次。
+			base, err := url.Parse(p.URL)
+			param := strings.TrimSpace(f.Param)
+			if err != nil || param == "" {
+				nonURL++
+				continue
+			}
+			q := base.Query()
+			q.Set(param, payload)
+			base.RawQuery = q.Encode()
+			u = base.String()
+		}
+		if !strings.Contains(u, payload) {
+			nonURL++
+			continue
+		}
+		out = append(out, scanner.BrowserXSSTarget{URL: u, Payload: payload})
+	}
+	return out, nonURL
 }
 
 type baselineExchange struct {
