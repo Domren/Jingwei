@@ -15,10 +15,16 @@ done
 [ -f "$LAB_DIR/memcached.pid" ] && kill "$(cat "$LAB_DIR/memcached.pid")" 2>/dev/null && rm -f "$LAB_DIR/memcached.pid"
 [ -f "$LAB_DIR/danted.pid" ] && kill "$(cat "$LAB_DIR/danted.pid")" 2>/dev/null && rm -f "$LAB_DIR/danted.pid"
 [ -f "$LAB_DIR/socks-open.pid" ] && kill "$(cat "$LAB_DIR/socks-open.pid")" 2>/dev/null && rm -f "$LAB_DIR/socks-open.pid"
+[ -f "$LAB_DIR/snmpd.pid" ] && kill "$(cat "$LAB_DIR/snmpd.pid")" 2>/dev/null && rm -f "$LAB_DIR/snmpd.pid"
+[ -f "$LAB_DIR/svnserve.pid" ] && kill "$(cat "$LAB_DIR/svnserve.pid")" 2>/dev/null && rm -f "$LAB_DIR/svnserve.pid"
 pkill -x vsftpd 2>/dev/null
 pkill -f "TCP-LISTEN:23230" 2>/dev/null
 pkill -f "danted -D -f $LAB_DIR/sockd.conf" 2>/dev/null
 pkill -f "ProxyCommand=none -D 127.0.0.1:10801" 2>/dev/null
+# snmpd 以 -f 前台跑在 nohup 下：pid 文件丢了就按命令行特征精确收，不误杀宿主机上的 agent。
+pkill -f "snmpd -f -Lo -u root -C -c $LAB_DIR/snmpd.conf" 2>/dev/null
+pkill -f "svnserve -d --listen-port 3691" 2>/dev/null
+rm -rf "$LAB_DIR/svnroot"
 
 # 恢复被改过的系统配置
 if [ -f "$LAB_DIR/vsftpd.conf.orig" ]; then

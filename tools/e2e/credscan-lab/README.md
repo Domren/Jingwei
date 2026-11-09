@@ -46,6 +46,8 @@ Ubuntu-1 上的软件包只有在本轮新装时才由 `down.sh` 卸载（用 `/
 | Tomcat 管理台 | tomcat9-admin 的 `/manager/html` + manager-gui 角色（验完恢复 tomcat-users 并卸载包） | Ubuntu-1:8081 |
 | Elasticsearch | 8.15 X-Pack Basic（HTTP 层关 TLS，认证语义不变） | 容器 `jw-cred-es`，127.0.0.1:9200 |
 | Memcached | 文本协议、默认无认证（`version` 有应答即命中空凭据） | 宿主机 11212 |
+| SNMP | 真 `snmpd` 的 v2c community 认证（**UDP**）：正确 community 命中；错 community 按 RFC 3412 静默丢弃 → 期望 `inconclusive` | 宿主机 16161/udp |
+| SVN | 真 `svnserve` 的 **CRAM-MD5**（原生机制）：`( step ( <len>:<challenge> ) )` → `HMAC-MD5(口令, challenge)`；拒绝态措辞是 `( failure ( 18:Password incorrect ) )` | 宿主机 3691 |
 | Zookeeper | 四字命令 `ruok` 有应答（3.4 默认放开） | Ubuntu-1:2181 |
 | SMTP | postfix（2525 上的 SASL 入口）+ dovecot auth 套接字；`AUTH PLAIN` 235/535 | Ubuntu-1:2525 |
 | POP3 / IMAP | dovecot + passwd-file（文件必须 root:dovecot 0640） | Ubuntu-1:110 / 143 |
@@ -65,8 +67,44 @@ Ubuntu-1 上的软件包只有在本轮新装时才由 `down.sh` 卸载（用 `/
   `JW_CRED_LAB_HTTP` 指到别处）上，任何一个确认成功都是缺陷。
 - **空凭据不能判成命中**：Redis 未开认证与 PG trust 两类除外——那两条的空口令本身就是结论。
 
+## 本台覆盖不到、且**没有**真机验证的协议
+
+1.6.0 补的二档/三档适配器里有 10 条在这台机器上起不了真服务。这不是「暂时跳过」，
+是**缺口**，写在各自的适配器文件头里，发版台账也不许把它们算成已验证：
+
+| 协议 | 为什么这里跑不了 | 现在验到了哪一步 |
+| :-- | :-- | :-- |
+| MSSQL | 服务端是 Windows/Linux 的 TDS 实现，镜像拉不动（`mcr.microsoft.com` 出网受限）；且 Login7 布局尚未按 [MS-TDS] 逐字段核对、TLS/SSPI 未实现 | 进程内协议桩：LOGINACK(0xAD)→hit、ERROR(0xAA)→deny |
+| SMB | 同上；且 [MS-NLMP] 的 NTOWFv1(MD4)/NTLMv2 未实现，Type3 的 NT 应答是派生占位值——真 Samba 必然拒绝，跑出来的 deny 与适配器无关 | 进程内协议桩：STATUS_SUCCESS→hit、0xC000006D→deny、0xC0000234→locked |
+| RDP | 需要 Windows 终端服务或 xrdp；适配器只到 TPKT/X.224 + 连接确认，安全层（CredSSP/NLA）未实现 | 进程内协议桩 |
+| WinRM | 只在 Windows 上；且本平台不实现 SPNEGO，服务端要 Negotiate 时只能落 inconclusive | 进程内协议桩 + `TestCredWinRMNegotiateIsInconclusive` |
+| Oracle | 没有可用实例；O3LOGON(DES/AUTH_SESSKEY) 与 12c PBKDF2 未实现 | 进程内协议桩：AUTH_OK→hit、ORA-01017→deny |
+| RouterOS | 只能跑在 Mikrotik 设备/CHR 上 | 进程内协议桩 |
+| Cobalt Strike | 商业 Team Server，私协议 | 进程内协议桩 |
+| WebLogic / JBoss | 控制台容器太重且镜像拉不动；JBoss 走 Basic（一轮）、WebLogic 走表单三跳 | 进程内协议桩 |
+| Jenkins | 可装但需要 JDK + 服务；表单三跳（crumb → j_acegi_security_check → whoAmI）已在桩里钉住 | 进程内协议桩 |
+
+「进程内协议桩」指的是 `scanner/credscan_new_adapters_test.go`：桩按协议真实编码回帧
+（Login7/NTLMSSP 的用户名是 UTF-16LE、svnserve 的 PLAIN 是 base64、WinRM 的识别证据是
+`Microsoft-HTTPAPI` 的 Server 头），因此它能抓住实现错误，但**代替不了真服务**——
+这也是把缺口逐条列出来的原因。
+
 ## 已知的环境坑（写下来是为了下次别再踩）
 
+- **svn 的报文没有换行**：svnserve 的 S-expression 以空格分隔、不以 `\n` 结尾。照行读会在
+  每条报文收尾处白等到「首包耐心」（6s），一轮 CRAM-MD5 四条报文直接吃光单次尝试的 20s
+  上限，表现为 `dial tcp: i/o timeout`——其实是前一条读把预算耗完了。适配器里用
+  `svnReadMsg`（按静默期收一条）就是这个原因。
+- **svnserve 的 hello 必须带客户端标识**：`( 2 ( edit-pipeline svndiff1 ) <len>:<url> <len>:<client> ( ) )`
+  少了 `<len>:<client>` 这一项，服务端解析后续项错位，发完 hello 直接断连——看起来像
+  「svnserve 不认这个协议」。客户端标识原样用 `SVN/1.14.5 (x86_64-pc-linux-gnu)`。
+- **svnserve 的 passwd 文件必须有 `[users]` 段**：没有它 svnserve 认为一个用户都没有，
+  表现是口令正确也 `Authentication failed`（并且 `svn` 客户端同样连不上，可以先拿客户端自证配置）。
+- **CRAM-MD5 的 challenge 要原样算**：HMAC 的 msg 是服务端 `( step ( <len>:<challenge> ) )`
+  里那串字节本体（**含尖括号**），去掉 `<>` 或去掉长度前缀算出来的值都对不上。口径是用
+  真 svnserve 抓包 + 已知口令反推确认的。
+- **snmpd 在 WSL 里要 `-u root`**：net-snmp 默认降权到 `Debian-snmp`，在 WSL 的 rootfs 上
+  起不来，日志里只有一句权限错误，端口根本不监听。
 - **vsftpd 用不了自定义配置**：给 `vsftpd /tmp/xxx.conf` 会 rc=2 退出。改发行版自带的
   `/etc/vsftpd.conf`，`up.sh` 先备份到 `/tmp/jw-cred-lab/vsftpd.conf.orig`，`down.sh` 恢复。
 - **danted 1.4 的配置语法**与 1.x 旧教程不同（`client pass` / `socks pass` 两段式），

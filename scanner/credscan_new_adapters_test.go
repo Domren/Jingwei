@@ -2,7 +2,10 @@ package scanner
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/md5"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"strings"
@@ -151,19 +154,31 @@ func TestCredSMBHitDeny(t *testing.T) {
 
 // ── SVN ──────────────────────────────────────────────────────────────────────
 
+// svnTestDigest 在测试里独立算一遍 CRAM-MD5 应答：不调生产代码的 svnCRAMResponse，
+// 否则 key/msg 取错了两边会一起错，测试永远绿。
+func svnTestDigest(password, challenge string) string {
+	m := hmac.New(md5.New, []byte(password))
+	m.Write([]byte(challenge))
+	return hex.EncodeToString(m.Sum(nil))
+}
+
+const svnTestChallenge = "<14177855853207743237.1794188582883675@LAPTOP-JWLAB>"
+
 func TestCredSVNHitDeny(t *testing.T) {
 	ep := newCredTestEndpoint(t, func(c net.Conn) {
-		writeString(c, "( success ( 2 2 ( ) ( edit-pipeline svndiff1 ) ) )\n")
-		_ = readLine(c)                                           // 客户端 hello
-		writeString(c, "( success ( 2 ( PLAIN ANONYMOUS ) ) )\n") // 机制列表
-		creds := readLine(c)
-		// svnserve 的 PLAIN 凭据是 base64("\x00user\x00pass")：用生产代码的同一个
-		// 构造器算出期望值来比，而不是猜某一段明文字串。
-		if strings.TrimSpace(creds) == strings.TrimSpace(svnCreds(Credential{Username: "admin", Password: "p"})) {
-			writeString(c, "( success ( ) )\n")
+		// 1 greeting；2 客户端 hello；3 mech list；4 CRAM-MD5；5 step(challenge)；6 凭据。
+		writeString(c, "( success ( 2 2 ( ) ( edit-pipeline svndiff1 ) ) ) ")
+		_ = readLine(c)
+		writeString(c, "( success ( ( CRAM-MD5 ) 5:jwlab ) ) ")
+		_ = readLine(c)
+		writeString(c, fmt.Sprintf("( step ( %d:%s ) ) ", len(svnTestChallenge), svnTestChallenge))
+		auth := readLine(c)
+		if strings.Contains(auth, "admin ") &&
+			strings.Contains(auth, svnTestDigest("p", svnTestChallenge)) {
+			writeString(c, "( success ( ) ) ")
 			return
 		}
-		writeString(c, "( failure ( ( 210005 \"Authentication failed\" ) ) )\n")
+		writeString(c, `( failure ( ( 215004 "Unspecified error" "Authentication failed" ) ) ) `)
 	})
 	ctx := credCtx(t)
 
@@ -178,6 +193,9 @@ func TestCredSVNHitDeny(t *testing.T) {
 	deny, err := svnCredAdapter{}.Try(ctx, credEP(ep.addr, "svn"), Credential{Username: "bob", Password: "x"})
 	if err != nil || deny.Outcome != CredDeny {
 		t.Fatalf("deny = %+v err=%v", deny, err)
+	}
+	if len(deny.RawReq) == 0 || len(deny.RawResp) == 0 {
+		t.Fatal("deny 也要留 wire 证据")
 	}
 }
 

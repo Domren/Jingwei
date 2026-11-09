@@ -118,6 +118,70 @@ else
   bad "memcached 没起来（没装？apt-get install memcached）"
 fi
 
+# ── SNMP：真 snmpd，community 认证（UDP）────────────────────────────────────
+# 这是本台唯一的数据报协议：community 错时 snmpd 按 RFC 3412 **静默丢弃**，一个字节
+# 都不回。所以「错口令」的期望态是 inconclusive 而不是 deny——把静默丢弃写成「这组
+# community 被拒绝」是伪造结论，报告里那句话站不住。
+#
+# 同时开 community=public：Identify 用协议公开默认值探测（它是协议常量，不是被测凭据），
+# 只开自定义 community 的场景下 Identify 认不出协议，会被引擎整批落 inconclusive。
+P_SNMP=16161
+SNMP_PW=snmp$(genpw)
+pkill -f "snmpd -f -Lo -u root -C -c $LAB_DIR/snmpd.conf" 2>/dev/null
+for _ in $(seq 1 20); do ss -lun 2>/dev/null | grep -q ":$P_SNMP " || break; sleep 0.3; done
+cat > "$LAB_DIR/snmpd.conf" <<EOF
+agentaddress udp:127.0.0.1:$P_SNMP
+rocommunity public 127.0.0.1
+rocommunity $SNMP_PW 127.0.0.1
+syslocation jw-lab
+EOF
+# -f 前台跑 + nohup：拿到 pid 才能在 down.sh 里精确停掉，不误杀宿主机上别的 agent。
+nohup snmpd -f -Lo -u root -C -c "$LAB_DIR/snmpd.conf" >"$LAB_DIR/snmpd.log" 2>&1 &
+echo $! > "$LAB_DIR/snmpd.pid"
+snmp_ok=0
+for _ in $(seq 1 20); do
+  ss -lun 2>/dev/null | grep -q ":$P_SNMP " && { snmp_ok=1; break; }
+  sleep 0.3
+done
+if [ "$snmp_ok" = "1" ]; then
+  add_case snmp "snmpd v2c(community)" 127.0.0.1 $P_SNMP "" "$SNMP_PW" "buhaig-$SNMP_PW" hit inconclusive
+else
+  bad "snmpd 没起来：$(tail -2 "$LAB_DIR/snmpd.log" 2>/dev/null | tr '\n' ' ')"
+fi
+
+# ── SVN：真 svnserve，CRAM-MD5（原生机制，不是 SASL）────────────────────────
+# svnserve 的凭据是「base64(口令) 走 PLAIN」这种想当然实现最容易错的地方：原生
+# svnserve 只宣告 CRAM-MD5，客户端要按 challenge 算 HMAC-MD5 再回 "<user> <hex>"。
+# 仓库路径必须显式给（-r 虚拟根下 /repo 才是被测对象），所以用例带 path 参数。
+P_SVN=3691
+SVN_PW=svn$(genpw)
+if command -v svnadmin >/dev/null 2>&1; then
+  rm -rf "$LAB_DIR/svnroot"; mkdir -p "$LAB_DIR/svnroot"
+  svnadmin create "$LAB_DIR/svnroot/repo" >/dev/null 2>&1 || bad "svnadmin create 失败"
+  cat > "$LAB_DIR/svnroot/repo/conf/svnserve.conf" <<EOF
+[general]
+anon-access = none
+auth-access = write
+password-db = passwd
+realm = jwlab
+EOF
+  # [users] 段不能省：没有它的 passwd 文件 svnserve 会当成一个用户都没有，
+  # 表现为「口令明明对却 Authentication failed」。
+  printf '[users]\njwcred = %s\n' "$SVN_PW" > "$LAB_DIR/svnroot/repo/conf/passwd"
+  chmod 600 "$LAB_DIR/svnroot/repo/conf/passwd"
+  pkill -f "svnserve -d --listen-port $P_SVN" 2>/dev/null
+  for _ in $(seq 1 20); do ss -ltn 2>/dev/null | grep -q ":$P_SVN " || break; sleep 0.3; done
+  svnserve -d --listen-port $P_SVN --listen-host 127.0.0.1 \
+    -r "$LAB_DIR/svnroot" --pid-file "$LAB_DIR/svnserve.pid" 2>/dev/null
+  if wait_port 127.0.0.1 $P_SVN 15; then
+    add_case svn "svnserve CRAM-MD5" 127.0.0.1 $P_SVN jwcred "$SVN_PW" "buhaig-$SVN_PW" hit deny '{"path":"/repo"}'
+  else
+    bad "svnserve 没起来（$P_SVN）"
+  fi
+else
+  note "跳过 SVN：没装 subversion（apt-get install -y subversion）"
+fi
+
 # ── PostgreSQL：一个实例里做出 scram / md5 / trust 三种认证 ──────────────────
 PG_PW=$(genpw)
 if ! docker ps --format '{{.Names}}' | grep -qx jw-cred-pg; then
