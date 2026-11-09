@@ -333,3 +333,131 @@ func TestShellInfoProbesBoundTheirWalks(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// A2 遗留：PowerShell 会话不得再落 cmd 语法脚本。宁可点名拒绝，也不静默成功。
+// 这些用例只用一个假 sender，不需要测试库，验收命令可以直接跑全。
+// ---------------------------------------------------------------------------
+
+// psTrailer renders the marker trailer the PowerShell wrapper prints (exit code
+// first, cwd on the following line).
+func psTrailer(output, cwd string, code int) string {
+	return output + "\n" + intranetEcMarker + strconv.Itoa(code) + "\n" +
+		intranetCwdMarker + "\n" + cwd + "\n"
+}
+
+func TestPowerShellSessionRejectsCmdScriptsWithReason(t *testing.T) {
+	// 平台生成、但仍是 cmd.exe 语法的脚本：上传存在性探测/分块/解码、
+	// 下载大小探测/编码、维持部署与撤销、以及经 cmd 调 powershell.exe。
+	cmdScripts := []string{
+		`if exist "C:\x.txt" (echo JW_FILE_EXISTS) else (echo JW_FILE_NEW)`,
+		`if exist "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" (echo __JW_PS__1) else (echo __JW_PS__0)`,
+		`echo ` + strings.Repeat("A", 64) + `>>C:\Users\lab\x.b64`,
+		`certutil -decode -f "C:\x.b64" "C:\x.bin"`,
+		`certutil -encode -f "C:\x.bin" "C:\x.b64"`,
+		`for %I in ("C:\x.bin") do @echo %~zI`,
+		`del /f /q "C:\x.b64" "C:\x.bin"`,
+		`move /y "C:\x.bin" "C:\x.txt"`,
+		`schtasks /create /f /tn "jw-x" /tr "cmd.exe /c whoami" /sc onlogon 2>&1 && echo JW_ARTIFACT_OK`,
+		`reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v jw-x /t REG_SZ /d "cmd.exe /c whoami" /f 2>&1 && echo JW_ARTIFACT_OK`,
+		`sc create "jw-x" binPath= "cmd.exe /c whoami" start= auto 2>&1 & echo JW_ARTIFACT_OK`,
+		`del /f /q "C:\x.txt" >nul 2>&1 & echo JW_ARTIFACT_OK & cmd /c exit 0`,
+		`"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand AAAABBBB`,
+		`echo __JW_CHUNK__ & "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "$p='C:\x'" & echo __JW_CHUNK_END__`,
+	}
+	for i, cmd := range cmdScripts {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			called := false
+			send := func(_ context.Context, script string, _ time.Duration) (string, error) {
+				called = true
+				return psTrailer("LAB-PS-OUTPUT", `C:\Users\lab`, 0), nil
+			}
+			res := shellExec(context.Background(), send, `C:\Users\lab`,
+				intranetOSWindows, intranetShellPowerShell, cmd, time.Second)
+			if called {
+				t.Fatalf("cmd 语法脚本仍被投递给 PowerShell 会话: %q", cmd)
+			}
+			if !res.IsError || res.MarkerOK {
+				t.Fatalf("拒绝必须是明确失败，不能是假成功: %+v", res)
+			}
+			for _, want := range []string{"PowerShell", "cmd.exe", "未静默成功", "移植"} {
+				if !strings.Contains(res.Note, want) {
+					t.Fatalf("拒绝原因要点名 %q，实得 %q", want, res.Note)
+				}
+			}
+		})
+	}
+}
+
+func TestPowerShellSessionStillRunsNativeCommands(t *testing.T) {
+	native := []string{
+		intranetProbeScriptSSHPowerShell,
+		intranetReconScriptPowerShell,
+		"Get-Process | Select-Object -First 5",
+		"Write-Output $env:COMPUTERNAME",
+		"echo hello",
+	}
+	for i, cmd := range native {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			var got string
+			send := func(_ context.Context, script string, _ time.Duration) (string, error) {
+				got = script
+				return psTrailer("OK", `C:\Users\lab`, 0), nil
+			}
+			res := shellExec(context.Background(), send, `C:\Users\lab`,
+				intranetOSWindows, intranetShellPowerShell, cmd, time.Second)
+			if got == "" || res.IsError || !res.MarkerOK || res.ExitCode != 0 {
+				t.Fatalf("PowerShell 原生命令被误拒: %+v (script=%q)", res, got)
+			}
+			if !strings.Contains(got, "$ErrorActionPreference") {
+				t.Fatalf("没有用 PowerShell 包装: %q", got)
+			}
+		})
+	}
+}
+
+func TestPowerShellCmdGuardDoesNotTouchShOrCmdSessions(t *testing.T) {
+	cmdScript := `if exist "C:\x.txt" (echo JW_FILE_EXISTS) else (echo JW_FILE_NEW)`
+	cases := []struct{ osKind, shell, want string }{
+		{intranetOSPosix, intranetShellSh, "cd "},
+		{intranetOSWindows, intranetShellCmd, "chcp 65001"},
+		{intranetOSWindows, "", "chcp 65001"}, // 未探测解释器时按 OS 回落到 cmd（不回归）
+	}
+	for _, c := range cases {
+		var got string
+		send := func(_ context.Context, script string, _ time.Duration) (string, error) {
+			got = script
+			return markerEcho("ok", "/", 0), nil
+		}
+		_ = shellExec(context.Background(), send, "/", c.osKind, c.shell, cmdScript, time.Second)
+		if got == "" {
+			t.Fatalf("(%s,%s) 非 PowerShell 会话的 cmd 脚本不该被守卫拦下", c.osKind, c.shell)
+		}
+		if !strings.Contains(got, c.want) {
+			t.Fatalf("(%s,%s) 包装被改坏: %q", c.osKind, c.shell, got)
+		}
+	}
+}
+
+func TestPowerShellWrapperAlignmentNotRegressed(t *testing.T) {
+	// cwd 校验、单引号转义、控制字符拒绝、$LASTEXITCODE、退出码回收对齐
+	// 现有 PowerShell 包装；守卫只拦 cmd 脚本，不动这些语义。
+	s := intranetScriptPowerShell(`C:\it's`, "whoami")
+	for _, want := range []string{
+		`Set-Location -LiteralPath 'C:\it''s'`, "$ErrorActionPreference='Continue'",
+		"$LASTEXITCODE", `Write-Output ("__JW_EC__"`, "(Get-Location).Path", "whoami",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("PowerShell 包装丢了 %q: %s", want, s)
+		}
+	}
+	if strings.Contains(intranetScriptPowerShell("C:\\new\nline", "dir"), "Set-Location") {
+		t.Fatal("控制字符路径必须拒绝，不能拼进 Set-Location")
+	}
+	if strings.Contains(intranetScriptPowerShell("/", "dir"), "Set-Location") {
+		t.Fatal("POSIX 风格 cwd 必须忽略，不能 cd 到盘根再当成真实目录")
+	}
+	if !strings.Contains(intranetScriptPowerShell("", "Get-Date"), intranetEcMarker) {
+		t.Fatal("纯 cmdlet 命令也必须写退出码标记，不能留空")
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -159,6 +160,69 @@ func shellSendDeadline(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout())
 }
 
+// powershellCmdScriptReason says why a command must not be delivered to a
+// PowerShell session: it is one of the platform-generated cmd.exe scripts for
+// upload/download/persistence/artifacts that A2 has not ported. An empty string
+// means the command is safe to wrap in PowerShell.
+//
+// Only strong, cmd-only constructs are listed. PowerShell-native commands —
+// probes, recon, and operator input with $variables / cmdlets — never match, so
+// the virtual terminal keeps working on PowerShell sessions. The full list is
+// pinned by TestPowerShellSessionRejectsCmdScriptsWithReason.
+func powershellCmdScriptReason(command string) string {
+	for _, marker := range []string{
+		"if exist ", "if not exist ", // 上传存在性探测、落地物验证
+		"certutil -",             // 上传解码 / 下载编码
+		"del /f /q ", "move /y ", // 临时文件清理 / 覆盖
+		"for %I in (", "@echo %~", // 下载文件大小探测
+		"schtasks /create", "schtasks /delete", "schtasks /query",
+		"reg add ", "reg delete ", "reg query ",
+		"sc create ", "sc stop ", "sc delete ", "sc query ",
+		"cmd /c exit 0", ">nul 2>&1", // 台账撤销/验证的退出码归零
+		"-EncodedCommand ", "-NoProfile -NonInteractive -Command", // 经 cmd 调 powershell.exe
+	} {
+		if strings.Contains(command, marker) {
+			return powershellCmdRejectReason(marker)
+		}
+	}
+	if isCmdBase64Append(command) {
+		return powershellCmdRejectReason("echo <base64>>> 分块写入")
+	}
+	return ""
+}
+
+func powershellCmdRejectReason(marker string) string {
+	return "PowerShell 会话拒绝执行 cmd.exe 语法脚本（命中 " + marker + "）：" +
+		"上传/下载/权限维持/落地物脚本尚未移植为 PowerShell，已停止投递，未静默成功；" +
+		"请改用 cmd.exe 会话，或等待该模块移植"
+}
+
+// isCmdBase64Append matches the platform's chunked upload writer
+// `echo <40+ base64 chars>>>C:\path.b64`. An operator's `echo ... > file` in a
+// PowerShell terminal essentially never looks like this, while every upload
+// chunk is still caught — the guard must not let a chunk slip through after the
+// first `if exist` probe was already rejected.
+func isCmdBase64Append(command string) bool {
+	if !strings.HasPrefix(command, "echo ") {
+		return false
+	}
+	i := strings.Index(command, ">>")
+	if i < 0 {
+		return false
+	}
+	body := strings.TrimSpace(command[len("echo "):i])
+	if len(body) < 40 {
+		return false
+	}
+	for _, r := range body {
+		if !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' ||
+			r >= '0' && r <= '9' || r == '+' || r == '/' || r == '=') {
+			return false
+		}
+	}
+	return strings.Contains(command[i+2:], `:\`)
+}
+
 // shellExec runs one command on any channel and splits the cwd/exit-code
 // trailer back out of the echo, so callers get terminal semantics rather than a
 // bare string. osKind is the cached family ("" = never probed) and the resolved
@@ -179,6 +243,19 @@ func shellExec(ctx context.Context, send shellSender, cwd, osKind, shellKind, co
 	// caller file a guess away as the target's operating system.
 	if confirmed {
 		res.OSKind, res.Shell = kind, shell
+	}
+	// A2 遗留：上传/下载/权限维持/落地物的脚本仍是 cmd.exe 语法。把它们塞进
+	// PowerShell 包装，真实目标只会解析失败，而进程内靶机（只看包装标记）会
+	// 假装成功——两种都比点名拒绝糟。这里在投递前拦下，绝不静默成功。
+	if confirmed && shell == intranetShellPowerShell {
+		if reason := powershellCmdScriptReason(command); reason != "" {
+			// 下载/上传的下游会把 outcome.Note 改写成泛化文案；日志保证点名原因
+			// 仍留在服务端，操作员不会只看到「无法读取文件大小」这种无从复核的话。
+			log.Printf("shellExec: %s", reason)
+			res.IsError = true
+			res.Output, res.Note = reason, reason
+			return res
+		}
 	}
 	// An operator's first command should report where the web server actually put
 	// the process — the script directory — not the filesystem root. "cd ." leaves
