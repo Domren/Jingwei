@@ -2322,6 +2322,9 @@ func (s *Server) registerIntranet(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/intranet/credentials", s.listIntranetCredentials)
 	mux.HandleFunc("POST /api/intranet/credentials", s.registerIntranetCredential)
 	mux.HandleFunc("POST /api/intranet/credentials/reuse", s.reuseIntranetCredential)
+	mux.HandleFunc("GET /api/intranet/credential-reuses", s.listIntranetCredentialReuses)
+	mux.HandleFunc("GET /api/intranet/credential-reuses/{id}", s.getIntranetCredentialReuse)
+	mux.HandleFunc("POST /api/intranet/credential-reuses/{id}/revoke", s.revokeIntranetCredentialReuse)
 
 	mux.HandleFunc("GET /api/intranet/artifacts", s.listIntranetArtifacts)
 	mux.HandleFunc("POST /api/intranet/artifacts", s.registerIntranetArtifact)

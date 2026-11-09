@@ -2130,6 +2130,37 @@ export interface IntranetReuseTarget {
   attempts?: number;
   elapsed_ms?: number;
   error?: string;
+  /** 本次尝试新登记出来的凭据 ID（撤销整批时按它回滚；本来就有则为空）。 */
+  created_credential_id?: number;
+}
+
+/** 一次凭据跨主机复用的批次记录：每一次尝试都在里面，可整体撤销。 */
+export interface IntranetCredentialReuse {
+  id: number;
+  credential_id: number;
+  task_id: number;
+  total: number;
+  valid_count: number;
+  invalid_count: number;
+  skipped_count: number;
+  error_count: number;
+  note: string;
+  revoked_at?: string;
+  created_at: string;
+}
+
+export interface IntranetCredentialReuseAttempt {
+  id: number;
+  reuse_id: number;
+  url: string;
+  host: string;
+  status: string;
+  attempts: number;
+  elapsed_ms: number;
+  error?: string;
+  evidence?: string;
+  created_credential_id?: number;
+  created_at: string;
 }
 
 /**

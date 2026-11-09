@@ -78,6 +78,8 @@ import type {
   IntranetBatchItem,
   IntranetCredential,
   IntranetCredentialInput,
+  IntranetCredentialReuse,
+  IntranetCredentialReuseAttempt,
   IntranetEvacuationInput,
   IntranetEvacuationReport,
   IntranetExecResult,
@@ -1834,9 +1836,28 @@ export const api = {
   registerIntranetCredential: (input: IntranetCredentialInput) =>
     post<IntranetCredential>("/intranet/credentials", input),
   intranetCredentialReuse: (credentialId: number, input?: { urls?: string[]; proxy?: string; task_id?: number }) =>
-    post<{ credential: IntranetCredential; targets: IntranetReuseTarget[]; task_id: number; note?: string }>(
-      "/intranet/credentials/reuse",
-      { credential_id: credentialId, ...input },
+    post<{
+      credential: IntranetCredential;
+      targets: IntranetReuseTarget[];
+      task_id: number;
+      note?: string;
+      reuse_id?: number;
+      reuse_ledger_error?: string;
+    }>("/intranet/credentials/reuse", { credential_id: credentialId, ...input }),
+  intranetCredentialReuses: (params?: { credential_id?: number; limit?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.credential_id) sp.set("credential_id", String(params.credential_id));
+    sp.set("limit", String(params?.limit ?? 50));
+    return get<{ reuses: IntranetCredentialReuse[]; total: number }>(`/intranet/credential-reuses?${sp}`);
+  },
+  intranetCredentialReuseDetail: (id: number) =>
+    get<{ reuse: IntranetCredentialReuse; attempts: IntranetCredentialReuseAttempt[] }>(
+      `/intranet/credential-reuses/${id}`,
+    ),
+  revokeIntranetCredentialReuse: (id: number) =>
+    post<{ reuse_id: number; revoked: boolean; deleted_credentials: number; reuse?: IntranetCredentialReuse }>(
+      `/intranet/credential-reuses/${id}/revoke`,
+      {},
     ),
 
   intranetScopeRequests: (params?: { status?: string; task_id?: number; limit?: number; offset?: number }) => {

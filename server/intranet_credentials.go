@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -46,6 +47,9 @@ type intranetReuseTarget struct {
 	Attempts  int    `json:"attempts,omitempty"`
 	ElapsedMS int64  `json:"elapsed_ms,omitempty"`
 	Error     string `json:"error,omitempty"`
+	// CreatedCredentialID 是这次尝试新登记出来的凭据（本来就存在则为空），
+	// 撤销整批时按它精确回滚。
+	CreatedCredentialID int64 `json:"created_credential_id,omitempty"`
 }
 
 // intranetAgentCredential is a ledger entry as the agent sees it: the API view
@@ -262,13 +266,19 @@ func (s *Server) intranetReuseCredential(ctx context.Context, pg *db.DB, in intr
 		targets[i].Kind = res.Kind
 		targets[i].Cookie = res.Cookie
 		host, port, scheme := intranetTargetParts(targets[i].URL)
-		if _, uerr := pg.UpsertIntranetCredential(db.IntranetCredentialInput{
+		// 先看这条凭据是不是本来就存在：只有本批新登记出来的才记 created_credential_id，
+		// 撤销时不会把批次之前就有的记录一起删掉。
+		_, preexisting := pg.FindIntranetCredentialID(host, cred.Username, cred.Password)
+		rec, uerr := pg.UpsertIntranetCredential(db.IntranetCredentialInput{
 			Host: host, Port: port, Protocol: scheme, URL: targets[i].URL,
 			Username: cred.Username, Password: cred.Password, Source: "reuse",
 			TaskID:   taskID,
 			Evidence: fmt.Sprintf("%s：复用凭据 #%d 登录成功（%s）", targets[i].URL, cred.ID, displayOr(res.Kind, "weak")),
-		}); uerr != nil {
+		})
+		if uerr != nil {
 			targets[i].Error = "登录成功但登记凭据失败: " + uerr.Error()
+		} else if !preexisting && rec != nil {
+			targets[i].CreatedCredentialID = rec.ID
 		}
 	}
 
@@ -320,6 +330,27 @@ func (s *Server) intranetReuseCredential(ctx context.Context, pg *db.DB, in intr
 	}
 	if len(targets) < len(urls) {
 		res["note"] = fmt.Sprintf("目标过多，仅验证前 %d 个", intranetReuseMaxURLs)
+	}
+	// 每一次尝试都落台账（含被跳过、被拒、发不出去的），这一批才能整体复盘与整体撤销。
+	attempts := make([]db.IntranetCredentialReuseAttemptInput, 0, len(targets))
+	for _, t := range targets {
+		attempts = append(attempts, db.IntranetCredentialReuseAttemptInput{
+			URL: t.URL, Host: t.Host, Status: t.Status, Attempts: t.Attempts,
+			ElapsedMS: t.ElapsedMS, Error: t.Error,
+			Evidence:            fmt.Sprintf("kind=%s", displayOr(t.Kind, "-")),
+			CreatedCredentialID: t.CreatedCredentialID,
+		})
+	}
+	batch, berr := pg.CreateIntranetCredentialReuse(db.IntranetCredentialReuseInput{
+		CredentialID: cred.ID, TaskID: taskID,
+		Note:     fmt.Sprintf("复用凭据 #%d 到 %d 个目标", cred.ID, len(targets)),
+		Attempts: attempts,
+	})
+	if berr != nil {
+		res["reuse_ledger_error"] = berr.Error()
+		log.Printf("[intranet][reuse] 凭据 #%d 的复用批次落账失败: %v", cred.ID, berr)
+	} else {
+		res["reuse_id"] = batch.ID
 	}
 	return res, nil
 }
@@ -454,6 +485,75 @@ func (s *Server) reuseIntranetCredential(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, 200, res)
+}
+
+// ---------------------------------------------------------------------------
+// 复用批次台账（F1）：一次复用一个批次，可整体复盘与整体撤销
+// ---------------------------------------------------------------------------
+
+func (s *Server) listIntranetCredentialReuses(w http.ResponseWriter, r *http.Request) {
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	q := r.URL.Query()
+	credID, _ := strconv.ParseInt(strings.TrimSpace(q.Get("credential_id")), 10, 64)
+	rows, err := pg.ListIntranetCredentialReuses(credID, atoiDefault(q.Get("limit"), 50))
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"reuses": rows, "total": len(rows)})
+}
+
+func (s *Server) getIntranetCredentialReuse(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathInt(r, "id")
+	if !ok {
+		writeErr(w, 400, "无效的复用批次 ID")
+		return
+	}
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	batch, err := pg.GetIntranetCredentialReuse(id)
+	if err != nil {
+		writeErr(w, 404, "复用批次不存在")
+		return
+	}
+	attempts, err := pg.ListIntranetCredentialReuseAttempts(id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"reuse": batch, "attempts": attempts})
+}
+
+// revokeIntranetCredentialReuse undoes the credentials a batch added. Attempts
+// are kept as audit; only the ledger rows this batch created are removed.
+func (s *Server) revokeIntranetCredentialReuse(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathInt(r, "id")
+	if !ok {
+		writeErr(w, 400, "无效的复用批次 ID")
+		return
+	}
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	deleted, err := pg.RevokeIntranetCredentialReuse(id)
+	if err != nil {
+		if errors.Is(err, db.ErrIntranetCredentialReuseNotFound) {
+			writeErr(w, 404, "复用批次不存在")
+			return
+		}
+		writeErr(w, 500, "撤销失败: "+err.Error())
+		return
+	}
+	batch, _ := pg.GetIntranetCredentialReuse(id)
+	writeJSON(w, 200, map[string]any{
+		"reuse_id": id, "revoked": true, "deleted_credentials": deleted, "reuse": batch,
+	})
 }
 
 // ---------------------------------------------------------------------------

@@ -54,6 +54,7 @@ import type {
   IntranetArtifact,
   IntranetBatchItem,
   IntranetCredential,
+  IntranetCredentialReuse,
   IntranetEvacuationReport,
   IntranetExecResult,
   IntranetScopeRequest,
@@ -1216,7 +1217,11 @@ export default function DeepIntranetPage() {
       const valid = targets.filter((t) => t.status === "valid");
       const skipped = targets.filter((t) => t.status === "skipped");
       if (valid.length > 0) {
-        toast.success(`凭据 #${cred.id} 在 ${valid.length} 个登录页复用成功`);
+        toast.success(
+          r.reuse_id
+            ? `凭据 #${cred.id} 在 ${valid.length} 个登录页复用成功（批次 #${r.reuse_id}，可在复用记录里整体撤销）`
+            : `凭据 #${cred.id} 在 ${valid.length} 个登录页复用成功`,
+        );
       } else if (skipped.length > 0 && skipped.length === targets.length) {
         toast.error(skipped[0]?.error || "目标不在任务范围内，未发起验证");
       } else if (r.note) {
@@ -1224,11 +1229,57 @@ export default function DeepIntranetPage() {
       } else {
         toast.warning(`凭据 #${cred.id} 未能登录任何目标`);
       }
+      if (r.reuse_ledger_error) {
+        toast.warning(`复用批次落账失败：${r.reuse_ledger_error}`);
+      }
       refresh();
     } catch (e) {
       toast.error((e as Error).message);
     } finally {
       setBusyId(null);
+    }
+  }
+
+  const [reuseLogFor, setReuseLogFor] = React.useState<IntranetCredential | null>(null);
+  const [reuseLog, setReuseLog] = React.useState<IntranetCredentialReuse[]>([]);
+  const [reuseLogBusy, setReuseLogBusy] = React.useState(false);
+
+  async function loadReuseLog(cred: IntranetCredential) {
+    const r = await api.intranetCredentialReuses({ credential_id: cred.id, limit: 50 });
+    setReuseLog(r.reuses ?? []);
+  }
+
+  async function openReuseLog(cred: IntranetCredential) {
+    setReuseLogFor(cred);
+    setReuseLog([]);
+    setReuseLogBusy(true);
+    try {
+      await loadReuseLog(cred);
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setReuseLogBusy(false);
+    }
+  }
+
+  async function revokeReuse(batch: IntranetCredentialReuse) {
+    if (
+      !window.confirm(
+        `撤销复用批次 #${batch.id}？本批新登记出来的凭据会被删除，每次尝试的记录保留作审计。`,
+      )
+    ) {
+      return;
+    }
+    setReuseLogBusy(true);
+    try {
+      const r = await api.revokeIntranetCredentialReuse(batch.id);
+      toast.success(`批次 #${batch.id} 已撤销，删除本批新登记凭据 ${r.deleted_credentials} 条`);
+      if (reuseLogFor) await loadReuseLog(reuseLogFor);
+      refresh();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setReuseLogBusy(false);
     }
   }
 
@@ -1675,20 +1726,31 @@ export default function DeepIntranetPage() {
                         {c.last_used_at ? fmtTime(c.last_used_at) : "—"}
                       </TableCell>
                       <TableCell className="text-right">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          disabled={busyId === `cred-${c.id}`}
-                          title="用这一组账号口令精确验证登记过的登录页（不走字典）"
-                          onClick={() => void reuseCredential(c)}
-                        >
-                          {busyId === `cred-${c.id}` ? (
-                            <Loader2Icon className="size-3.5 animate-spin" />
-                          ) : (
-                            <ShieldCheckIcon className="size-3.5" />
-                          )}
-                          复用验证
-                        </Button>
+                        <div className="flex items-center justify-end gap-1">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            title="查看这条凭据的复用批次记录，可按批次整体撤销"
+                            onClick={() => void openReuseLog(c)}
+                          >
+                            <ActivityIcon className="size-3.5" />
+                            记录
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            disabled={busyId === `cred-${c.id}`}
+                            title="用这一组账号口令精确验证登记过的登录页（不走字典）"
+                            onClick={() => void reuseCredential(c)}
+                          >
+                            {busyId === `cred-${c.id}` ? (
+                              <Loader2Icon className="size-3.5 animate-spin" />
+                            ) : (
+                              <ShieldCheckIcon className="size-3.5" />
+                            )}
+                            复用验证
+                          </Button>
+                        </div>
                       </TableCell>
                     </TableRow>
                   );
@@ -1696,6 +1758,77 @@ export default function DeepIntranetPage() {
               </TableBody>
             </Table>
           )}
+          <Dialog
+            open={reuseLogFor !== null}
+            onOpenChange={(open) => {
+              if (!open) setReuseLogFor(null);
+            }}
+          >
+            <DialogContent className="max-w-3xl">
+              <DialogHeader>
+                <DialogTitle>
+                  复用记录{reuseLogFor ? `：${reuseLogFor.username || "—"}@${reuseLogFor.host}` : ""}
+                </DialogTitle>
+                <DialogDescription>
+                  每次「用这条凭据试那台主机」都是一个批次，跳过/被拒/报错的尝试也在里面。
+                  撤销只删除本批新登记出来的凭据，尝试记录保留作审计；批次之前就存在的凭据不受影响。
+                </DialogDescription>
+              </DialogHeader>
+              {reuseLogBusy ? (
+                <div className="text-muted-foreground flex items-center gap-2 py-6 text-sm">
+                  <Loader2Icon className="size-4 animate-spin" /> 正在加载复用批次…
+                </div>
+              ) : reuseLog.length === 0 ? (
+                <p className="text-muted-foreground py-6 text-sm">这条凭据还没有复用记录。</p>
+              ) : (
+                <ScrollArea className="max-h-[420px]">
+                  <div className="flex flex-col gap-2 pr-3">
+                    {reuseLog.map((b) => (
+                      <div key={b.id} className="rounded-md border p-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center gap-2 text-xs">
+                            <span className="font-mono">批次 #{b.id}</span>
+                            <Badge variant="outline">{fmtTime(b.created_at)}</Badge>
+                            <span className="text-muted-foreground">
+                              共 {b.total} 个目标 · 有效 {b.valid_count} · 无效 {b.invalid_count} · 跳过{" "}
+                              {b.skipped_count} · 异常 {b.error_count}
+                            </span>
+                            {b.revoked_at ? (
+                              <Badge variant="outline" className="text-muted-foreground">
+                                已撤销
+                              </Badge>
+                            ) : null}
+                          </div>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            disabled={reuseLogBusy || !!b.revoked_at}
+                            title={
+                              b.revoked_at
+                                ? "该批次已撤销"
+                                : "删除本批新登记出来的凭据，尝试记录保留"
+                            }
+                            onClick={() => void revokeReuse(b)}
+                          >
+                            <EraserIcon className="size-3.5" />
+                            {b.revoked_at ? "已撤销" : "撤销本批"}
+                          </Button>
+                        </div>
+                        {b.note ? (
+                          <div className="text-muted-foreground mt-1 text-xs">{b.note}</div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                </ScrollArea>
+              )}
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setReuseLogFor(null)}>
+                  关闭
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </TabsContent>
 
         <TabsContent value="artifacts" className="flex min-h-0 flex-1 flex-col gap-3">

@@ -2055,6 +2055,41 @@ DROP TRIGGER IF EXISTS trg_intranet_credentials_upd ON intranet_credentials;
 CREATE TRIGGER trg_intranet_credentials_upd BEFORE UPDATE ON intranet_credentials
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+-- 凭据跨主机复用批次（F1）：一次「拿这条凭据试这几台主机」= 一个批次。
+-- 每一次尝试都落 attempts，跳过/被拒/报错也记：撤销时要能说清这一批碰过什么，
+-- 而不只是「成功了几个」。撤销只删本批新产生的凭据，批次之前就存在的记录不动。
+CREATE TABLE IF NOT EXISTS intranet_credential_reuses (
+    id            BIGSERIAL PRIMARY KEY,
+    credential_id BIGINT NOT NULL,
+    task_id       BIGINT NOT NULL DEFAULT 0,
+    total         INTEGER NOT NULL DEFAULT 0,
+    valid_count   INTEGER NOT NULL DEFAULT 0,
+    invalid_count INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    error_count   INTEGER NOT NULL DEFAULT 0,
+    note          TEXT NOT NULL DEFAULT '',
+    revoked_at    TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_cred_reuses_cred ON intranet_credential_reuses(credential_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_cred_reuses_created ON intranet_credential_reuses(created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS intranet_credential_reuse_attempts (
+    id         BIGSERIAL PRIMARY KEY,
+    reuse_id   BIGINT NOT NULL REFERENCES intranet_credential_reuses(id) ON DELETE CASCADE,
+    url        TEXT NOT NULL DEFAULT '',
+    host       TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT '',
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    elapsed_ms BIGINT NOT NULL DEFAULT 0,
+    error      TEXT NOT NULL DEFAULT '',
+    evidence   TEXT NOT NULL DEFAULT '',
+    -- 这次尝试新登记出来的凭据；撤销时按它精确回滚，NULL 表示没有新建。
+    created_credential_id BIGINT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_cred_reuse_attempts_reuse ON intranet_credential_reuse_attempts(reuse_id, id);
+
 -- 内网落地物台账：目标侧的一切持久化痕迹（上传文件、计划任务、systemd 服务、
 -- SSH 公钥等）。每条记录自带撤销命令与验证命令，撤离时按 id 逆序逐条执行并核验。
 -- task_id 与 intranet_sessions 一致，可能是 tasks 或 scan_tasks 的编号，故不做外键。
