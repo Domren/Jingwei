@@ -44,6 +44,9 @@ type credWire struct {
 	resp     []byte
 	// idle 覆盖静默期判定，慢协议（Telnet 的 IAC 协商）可以适当放宽。
 	idle time.Duration
+	// udp 标记这条连接走数据报通道（SNMP）：读取语义是「一个完整数据报」而非
+	// TCP 字节流，超时还要单独区分「静默丢弃」与「端口不通」。
+	udp bool
 }
 
 // credDial 建连接并把上层的取消与单次上限叠成一个 deadline。
@@ -54,6 +57,24 @@ func credDial(ctx context.Context, addr string) (*credWire, error) {
 		return nil, err
 	}
 	w := &credWire{conn: conn, idle: credReadIdle, deadline: time.Now().Add(credAttemptTimeout)}
+	if dl, ok := ctx.Deadline(); ok && dl.Before(w.deadline) {
+		w.deadline = dl
+	}
+	_ = conn.SetDeadline(w.deadline)
+	return w, nil
+}
+
+// credDialUDP 为 SNMP 这类数据报协议建一条「已连接」的 UDP 通道，复用 credWire
+// 的字节记录与单次尝试上限。DialContext("udp") 不握手，Timeout 只防止 ctx 没带
+// deadline 时拨号卡住；真正等应答的截止仍统一由 w.deadline 封顶。
+func credDialUDP(ctx context.Context, addr string) (*credWire, error) {
+	d := net.Dialer{Timeout: credDialTimeout}
+	conn, err := d.DialContext(ctx, "udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	w := &credWire{conn: conn, idle: credReadIdle, udp: true,
+		deadline: time.Now().Add(credAttemptTimeout)}
 	if dl, ok := ctx.Deadline(); ok && dl.Before(w.deadline) {
 		w.deadline = dl
 	}
@@ -192,6 +213,30 @@ func (w *credWire) read() ([]byte, error) {
 		w.recordRead(nil)
 		return nil, err
 	}
+}
+
+// readDatagram 读一个 UDP 数据报。UDP 不是字节流：一次 Read 就是一个完整报文，
+// 不能套 TCP 的 read()/readLine()（它们靠静默期收尾，会把「没应答」误判成「读完了」）。
+// 返回的 error 由调用方分两类处理：ECONNREFUSED 是端口没人听（ICMP 不可达），
+// 超时是「有人听但不回话」——SNMP community 错正是被静默丢弃，两者必须分开。
+func (w *credWire) readDatagram() ([]byte, error) {
+	return w.readDatagramWithin(credFirstReadWait)
+}
+
+// readDatagramWithin 允许协议给单次数据报等待定一个节奏（SNMP 用较短的应答窗口），
+// 但仍受 w.deadline 这个单次尝试硬上限约束，不构成「适配器自定全局超时」。
+func (w *credWire) readDatagramWithin(wait time.Duration) ([]byte, error) {
+	buf := make([]byte, credReadMax)
+	_ = w.conn.SetReadDeadline(w.readDeadline(wait))
+	n, err := w.conn.Read(buf)
+	if n > 0 {
+		w.recordRead(buf[:n])
+		return buf[:n], nil
+	}
+	if err == nil {
+		err = io.EOF
+	}
+	return nil, err
 }
 
 // readDeadline 把「等多久」换算成绝对时间，并且永远不越过本次尝试的上限。

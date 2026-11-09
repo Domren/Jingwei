@@ -106,29 +106,17 @@ var credDefaultPorts = map[string]int{
 	"vnc": 5900, "zookeeper": 2181, "smtp": 25, "pop3": 110, "imap": 143,
 	"smtp-ssl": 465, "pop3-ssl": 995, "imap-ssl": 993, "ldap": 389, "ldaps": 636,
 	"snmp": 161, "http-basic": 80, "webdav": 80, "tomcat-console": 8080,
-	// 二档协议的端口只供目录展示：它们在创建阶段就被拒，引擎永远不会走到这里。
 	"mssql": 1433, "smb": 445, "winrm": 5985, "oracle": 1521,
 	"routeros": 8728, "cobaltstrike": 50050, "jenkins": 8080, "svn": 3690,
+	"rdp": 3389, "weblogic-console": 7001, "jboss-console": 8080,
 }
 
-// credUnsupportedProtocols 是三档：握手不透明或版本差异太大，显式报「不支持」，value 是原因。
-// 报不支持比给一个不可信的结果好——后者会进报告、进资产页、进人的决策。
-// B4 的二档八项按规划表口径降级：每种握手都要真服务对照（NTLM 要域控或 NTLM 代理、
-// SOAP 要看厂商 WSDL、私有握手没有标准），本交付周期拿不到可复现的验证环境，
-// 宁可逐项写明「暂不支持」，也不写一个没验过的适配器。后续先在 credscan-lab 摆服务再实现。
-var credUnsupportedProtocols = map[string]string{
-	"rdp":              "CredSSP/NLA 握手不透明，未对真服务验证",
-	"weblogic-console": "控制台登录形态版本差异大，未验证",
-	"jboss-console":    "管理接口认证形态不统一，未验证",
-	"mssql":            "TDS 登录握手（含 NTLM 变体）未对真服务验证",
-	"smb":              "SMB/NTLMSSP 握手需域控或 Samba 对照，本版未验证",
-	"winrm":            "WinRM/WMI 走 SOAP + NTLM/Kerberos，厂商差异大，未验证",
-	"oracle":           "Oracle Listener 私有握手，无可复现验证环境",
-	"routeros":         "RouterOS API 私有握手，未验证",
-	"cobaltstrike":     "面板私有协议、无标准，未验证",
-	"jenkins":          "表单 + crumb 流程未对真服务验证",
-	"svn":              "svnserve 私有握手与 HTTP SVN 认证形态未验证",
-}
+// credUnsupportedProtocols 曾登记三档「握手不透明」的降级协议。本版把 12 个降级项
+// 逐一实现了适配器（见各 credscan_*.go），故这里不再保留任何条目：留着会让
+// runCredEndpoint 在发起连接之前就把已实现的协议判成 CredUnsupported。
+// 保留空表是为了保持 CredProtocolSupported / CredUnsupportedReason 的口径不变；
+// 真正未实现（没注册适配器）的协议由 runCredEndpoint 的 adapter==nil 分支落 unsupported。
+var credUnsupportedProtocols = map[string]string{}
 
 // CredDefaultPort 返回协议的常见端口（0 表示没有默认端口，例如纯 HTTP 形态）。
 func CredDefaultPort(protocol string) int {

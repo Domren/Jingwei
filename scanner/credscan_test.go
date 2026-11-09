@@ -306,12 +306,17 @@ func TestCredRunStopLossAndLockout(t *testing.T) {
 	})
 }
 
-// 三档协议：一个包都不发，结果写「不支持」。
+// 登记为「暂不支持」的协议：即使有适配器，也一个包都不发，结果写「不支持」。
+// 这条保护现在没有生产条目（12 个降级项都实现了），但机制必须留着：以后再加
+// 降级项时，靠它保证不会先连上去再报不支持。
 func TestCredRunUnsupportedSendsNothing(t *testing.T) {
-	adapter := &credFakeAdapter{protocol: "rdp", identify: true, outcome: CredHit}
+	const proto = "cred-test-downgraded"
+	credUnsupportedProtocols[proto] = "本版不做适配器（测试条目）"
+	defer delete(credUnsupportedProtocols, proto)
+	adapter := &credFakeAdapter{protocol: proto, identify: true, outcome: CredHit}
 	RegisterCredAdapter(adapter)
-	defer unregisterCredAdapter("rdp")
-	plan := []CredEndpoint{{Host: "10.0.0.40", Port: 3389, Protocol: "rdp", ProtocolConfirmed: true}}
+	defer unregisterCredAdapter(proto)
+	plan := []CredEndpoint{{Host: "10.0.0.40", Port: 3389, Protocol: proto, ProtocolConfirmed: true}}
 	c := &credCollector{}
 	if err := CredRun(context.Background(), plan, []Credential{{Username: "a", Password: "b"}},
 		CredOptions{}, c.emit); err != nil {
@@ -472,9 +477,10 @@ func TestCredAttemptEvidenceCarriesRawBytes(t *testing.T) {
 }
 
 func TestCredProtocolSupportTable(t *testing.T) {
-	for _, p := range []string{"rdp", "weblogic-console", "jboss-console"} {
-		if CredProtocolSupported(p) {
-			t.Fatalf("%q 是三档协议，必须报不支持", p)
+	// 三档（rdp / weblogic-console / jboss-console）本版已实现适配器，必须报支持。
+	for _, p := range []string{"rdp", "weblogic-console", "jboss-console", "snmp"} {
+		if !CredProtocolSupported(p) {
+			t.Fatalf("%q 已实现适配器，应当报支持", p)
 		}
 	}
 	for _, p := range []string{"ssh", "redis", "mysql", "ftp"} {

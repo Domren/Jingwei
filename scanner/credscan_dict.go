@@ -21,21 +21,26 @@ var credBuiltin = CredDictionary{
 	Credentials: []Credential{
 		// 空口令本身是一组必须测的组合：Redis 未开认证、memcached /
 		// Zookeeper 这类根本没有认证的服务，只有它才会命中。放在最前面，
-		// 无认证目标第一条就能出结论，不必先把 25 组口令打一遍。
+		// 无认证目标第一条就能出结论，不必先把几十组口令打一遍。
 		{},
 		{Username: "root", Password: "root"},
 		{Username: "root", Password: "123456"},
 		{Username: "root", Password: "toor"},
 		{Username: "root", Password: "password"},
+		{Username: "root", Password: ""},
 		{Username: "admin", Password: "admin"},
 		{Username: "admin", Password: "123456"},
 		{Username: "admin", Password: "password"},
 		{Username: "admin", Password: "admin123"},
+		{Username: "admin", Password: "passw0rd"},
+		{Username: "admin", Password: ""},
 		{Username: "administrator", Password: "administrator"},
 		{Username: "administrator", Password: "123456"},
+		{Username: "administrator", Password: "password"},
 		{Username: "test", Password: "test"},
 		{Username: "test", Password: "123456"},
 		{Username: "guest", Password: "guest"},
+		{Username: "guest", Password: ""},
 		{Username: "user", Password: "user"},
 		{Username: "postgres", Password: "postgres"},
 		{Username: "mysql", Password: "mysql"},
@@ -47,7 +52,23 @@ var credBuiltin = CredDictionary{
 		{Username: "oracle", Password: "oracle"},
 		{Username: "www", Password: "www"},
 		{Username: "elastic", Password: "elastic"},
-		{Username: "root", Password: ""},
+		// 下列几组是新增协议最常见的出厂/示例弱口令（MSSQL 的 sa、Oracle 的
+		// scott/tiger 与管理账号、WebLogic/JBoss/Jenkins 控制台、svnserve、RouterOS）。
+		// 刻意只放最典型的，不做穷举；大字典仍归操作员显式导入的档位。
+		{Username: "sa", Password: "sa"},
+		{Username: "sa", Password: ""},
+		{Username: "sa", Password: "123456"},
+		{Username: "scott", Password: "tiger"},
+		{Username: "sys", Password: "oracle"},
+		{Username: "system", Password: "oracle"},
+		{Username: "weblogic", Password: "weblogic"},
+		{Username: "weblogic", Password: "welcome1"},
+		{Username: "jboss", Password: "jboss"},
+		{Username: "jenkins", Password: "jenkins"},
+		{Username: "svn", Password: "svn"},
+		// SNMP 只把口令字段当 community 用：这几条是纯口令条目（无用户名）。
+		{Password: "public"},
+		{Password: "private"},
 	},
 }
 

@@ -9,36 +9,65 @@ import (
 
 const bannerCaptureNote = "采集方式: TCP 三次握手后被动读取服务端首发数据，扫描器未发送任何应用层请求字节"
 
+const bannerCaptureNoteUDP = "采集方式: 向 UDP 端口发送数据报后读取服务端应答（数据报通道，无三次握手）"
+
+// udpProtocols 列出走数据报通道的协议。证据渲染据此把标签写成 (UDP)、复现命令
+// 换成 SOCK_DGRAM；照 TCP 版用 create_connection 复现 UDP 端口必然连不上。
+// 用协议名路由而不是给 CredAttempt 加字段，是为了不动引擎那侧的结构与 JSON 形状。
+var udpProtocols = map[string]bool{"snmp": true}
+
+func isUDPProtocol(proto string) bool {
+	return udpProtocols[strings.ToLower(strings.TrimSpace(proto))]
+}
+
 // ProtocolBannerPacket renders the bytes a non-HTTP service actually sent to the
 // scanner, as a hexdump plus (when printable) the verbatim text, with the
 // commands needed to capture the same bytes again. This is what makes a
 // service-exposure finding verifiable without wrapping it in HTTP; when nothing
 // was read it says so instead of inventing a packet.
 func ProtocolBannerPacket(proto, addr string, raw []byte) string {
+	return bannerPacket(proto, addr, raw, false)
+}
+
+// ProtocolBannerPacketUDP 是 UDP 版被动采集证据。SNMP 这类数据报协议也可用它，
+// 复现命令用 SOCK_DGRAM，不能用 create_connection。
+func ProtocolBannerPacketUDP(proto, addr string, raw []byte) string {
+	return bannerPacket(proto, addr, raw, true)
+}
+
+func bannerPacket(proto, addr string, raw []byte, udp bool) string {
 	proto = strings.TrimSpace(proto)
 	if proto == "" {
 		proto = "tcp"
 	}
+	if isUDPProtocol(proto) {
+		udp = true
+	}
+	transport, note := "(TCP)", bannerCaptureNote
+	if udp {
+		transport, note = "(UDP)", bannerCaptureNoteUDP
+	}
 	b := &strings.Builder{}
-	fmt.Fprintf(b, "# 协议: %s (TCP)\n", strings.ToUpper(proto))
+	fmt.Fprintf(b, "# 协议: %s %s\n", strings.ToUpper(proto), transport)
 	fmt.Fprintf(b, "# 端点: %s\n", addr)
-	fmt.Fprintf(b, "# %s\n", bannerCaptureNote)
+	fmt.Fprintf(b, "# %s\n", note)
 	if len(raw) == 0 {
 		b.WriteString("# 复现命令:\n")
-		b.WriteString(bannerReproCommands(addr, 0))
-		b.WriteString("\n\n未采集到服务端首发数据（该端口无 banner），只能确认端口可建立 TCP 连接。\n")
+		b.WriteString(bannerReproCommands(addr, 0, udp))
+		b.WriteString("\n\n未采集到服务端首发数据（该端口无 banner），只能确认端口可达。\n")
 		return strings.TrimRight(b.String(), "\n")
 	}
 	fmt.Fprintf(b, "# 响应字节: %d\n", len(raw))
 	b.WriteString("# 复现命令:\n")
-	b.WriteString(bannerReproCommands(addr, len(raw)))
+	b.WriteString(bannerReproCommands(addr, len(raw), udp))
 	b.WriteString(protocolPayloadSection("响应", raw))
 	return strings.TrimRight(b.String(), "\n")
 }
 
 // bannerReproCommands gives two ways to grab the same bytes: nc for a quick
-// look, python3 for a byte-exact dump where xxd is unavailable.
-func bannerReproCommands(addr string, size int) string {
+// look, python3 for a byte-exact dump where xxd is unavailable. UDP 版只能用
+// SOCK_DGRAM + sendto——数据报通道没有三次握手可读。
+func bannerReproCommands(addr string, size int, udp bool) string {
 	host, port := addr, ""
 	if h, p, err := net.SplitHostPort(addr); err == nil {
 		host, port = h, p
@@ -46,6 +75,13 @@ func bannerReproCommands(addr string, size int) string {
 	quoted := host
 	if strings.Contains(host, ":") {
 		quoted = "[" + host + "]"
+	}
+	if udp {
+		if port == "" {
+			return fmt.Sprintf("#   python3 -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(3);s.sendto(b\"\",(%q, 0));print(repr(s.recv(65535)))'\n", host)
+		}
+		return fmt.Sprintf("#   python3 -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(3);s.sendto(b\"\",(%q, %s));print(repr(s.recv(65535)))'\n",
+			host, port)
 	}
 	if port == "" {
 		return fmt.Sprintf("#   nc -w 2 %s\n", quoted)
@@ -66,18 +102,35 @@ func bannerReproCommands(addr string, size int) string {
 // evidence unreproducible, because the reader would connect and see a different
 // response than the one on file.
 func ProtocolExchangePacket(proto, addr string, req, resp []byte) string {
+	return exchangePacket(proto, addr, req, resp, false)
+}
+
+// ProtocolExchangePacketUDP 是 UDP 版交互证据（SNMP 的 GetRequest/GetResponse）：
+// 标签 (UDP)、复现命令用 SOCK_DGRAM + sendto + recv，绝不能用 create_connection。
+func ProtocolExchangePacketUDP(proto, addr string, req, resp []byte) string {
+	return exchangePacket(proto, addr, req, resp, true)
+}
+
+func exchangePacket(proto, addr string, req, resp []byte, udp bool) string {
 	proto = strings.TrimSpace(proto)
 	if proto == "" {
 		proto = "tcp"
 	}
+	if isUDPProtocol(proto) {
+		udp = true
+	}
+	transport, capture := "(TCP)", "主动发送下列请求字节后读取服务端响应，两侧字节都要一致才能复现"
+	if udp {
+		transport, capture = "(UDP)", "向 UDP 端口发送下列请求数据报后读取应答数据报，两侧字节都要一致才能复现"
+	}
 	b := &strings.Builder{}
-	fmt.Fprintf(b, "# 协议: %s (TCP)\n", strings.ToUpper(proto))
+	fmt.Fprintf(b, "# 协议: %s %s\n", strings.ToUpper(proto), transport)
 	fmt.Fprintf(b, "# 端点: %s\n", addr)
-	fmt.Fprintf(b, "# 采集方式: 主动发送下列请求字节后读取服务端响应，两侧字节都要一致才能复现\n")
+	fmt.Fprintf(b, "# 采集方式: %s\n", capture)
 	fmt.Fprintf(b, "# 请求字节: %d\n", len(req))
 	fmt.Fprintf(b, "# 响应字节: %d\n", len(resp))
 	b.WriteString("# 复现命令:\n")
-	b.WriteString(exchangeReproCommand(addr, req))
+	b.WriteString(exchangeReproCommand(addr, req, udp))
 	b.WriteString(protocolPayloadSection("请求", req))
 	b.WriteString(protocolPayloadSection("响应", resp))
 	return strings.TrimRight(b.String(), "\n")
@@ -102,14 +155,19 @@ func protocolPayloadSection(label string, raw []byte) string {
 
 // exchangeReproCommand sends the exact request bytes and prints the reply. The
 // request goes as hex so that \0, \r\n and non-UTF8 protocol fields survive a
-// copy-paste; a quoted shell string would not.
-func exchangeReproCommand(addr string, req []byte) string {
+// copy-paste; a quoted shell string would not. UDP 版用 SOCK_DGRAM + sendto。
+func exchangeReproCommand(addr string, req []byte, udp bool) string {
 	host, port := addr, ""
 	if h, p, err := net.SplitHostPort(addr); err == nil {
 		host, port = h, p
 	}
 	if port == "" {
 		return "#   （端点缺少端口号，无法给出可执行的复现命令）\n"
+	}
+	if udp {
+		return fmt.Sprintf("#   python3 -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);"+
+			"s.settimeout(3);s.sendto(bytes.fromhex(%q),(%q, %s));print(repr(s.recv(65535)))'\n",
+			hex.EncodeToString(req), host, port)
 	}
 	return fmt.Sprintf("#   python3 -c 'import socket;s=socket.create_connection((%q, %s), 5);"+
 		"s.sendall(bytes.fromhex(%q));print(repr(s.recv(65535)))'\n",
