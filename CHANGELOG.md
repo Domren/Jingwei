@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+（暂无）
+
+## [1.6.0] - 2026-11-09（未发布：代码工作已收口，打 tag 与发版待负责人授权）
+
 ### 新增
 
 - **断点续扫**：漏扫的 POC 阶段按「模板段 × 目标组」分片执行，每片的结果与进度当场落库；被超时、手动停止
@@ -145,14 +149,51 @@
   报告模板对这两类条目的修复建议分别是「验证监控覆盖」与「先按 WSUS/SCCM/DISM 核实再装补丁」。
   识别结果同时作为决策输入：会话里已识别的防护会随后续 `intranet_exec` 命令结果一起交回给 agent，
   不必先猜再去查。
+- **弱口令检测补齐最后 12 个协议（B3 收尾）**：此前登记为「暂不支持」的 12 项全部有适配器，
+  协议目录里 35 个协议名全部可测。各自实现到协议握手层并如实标注缺口：MSSQL（TDS PreLogin /
+  Login7 + LOGINACK 确认，口令按 [MS-TDS] 混淆；TLS/SSPI 未实现）、SMB（SMB2 NEGOTIATE +
+  SESSION_SETUP 的 NTLMSSP 三消息；NTOWFv1/NTLMv2 未实现，NT 应答是派生占位值）、WinRM
+  （`POST /wsman` + SOAP Identify；不实现 SPNEGO，服务端只给 Negotiate 时落 inconclusive）、
+  Oracle（TNS Connect/Accept + 认证回执，拒绝时把服务端原文写进 Reason；O3LOGON 未实现）、
+  RouterOS（API 句子协议）、CobaltStrike（Team Server 登录帧）、**SVN（真 CRAM-MD5）**、
+  **SNMP（v1/v2c community，走 UDP）**、Jenkins（crumb → 表单 → `whoAmI` 三跳）、
+  WebLogic 与 JBoss 控制台。判定口径不变：只有服务端亲口「接受」才算命中；`community` 错时
+  SNMP 按 RFC 3412 静默丢弃，结论是 inconclusive 并写明「静默丢弃，已与端口不通区分」——
+  **不写成 deny**。传输层为此加了 UDP 支持与 UDP 版证据渲染（标签 `(UDP)`、复现命令改用
+  `SOCK_DGRAM` + `sendto`，照 TCP 版写 `create_connection` 的复现命令必然连不上）。
+  **真机验证**：SNMP（真 `snmpd`，正确 community 命中、错 community 静默丢弃）与 SVN
+  （真 `svnserve`，命中 + `( failure ( 18:Password incorrect ) )`）已进 `credscan-lab` 并跑通
+  两条路径；其余 10 个协议在这台机器上起不了真服务（Windows-only、私协议、镜像拉不动），
+  只有进程内协议桩，缺口与原因逐条写在 `tools/e2e/credscan-lab/README.md`，**不算已验证**。
+- **浏览器真实验证 XSS（D1）**：镜像里的 Chromium 原先只用于取证截图，现在用来判定 payload
+  是否**真的执行**——逐条在无头浏览器里打开被测点，执行信号只认对话框弹出、写入标记变量、
+  或页面脚本错误里带标记三种。**反射与执行分开记**：反射以服务端原始 HTML 判定（用渲染后的
+  DOM 会把 `<textarea>` 里的标签转义掉，看起来像「没反射」）。执行不起来（浏览器缺失/超时）
+  时结论落「待复核」，不当成「没执行」。误报因此可量化：反射但未执行的点不再算命中。
+- **凭据跨主机复用落批次台账、可整体撤销（F1）**：操作员主动发起的「用这条凭据试那台主机」
+  每次落一个批次：总数/有效/无效/跳过/错误五类计数，逐次尝试的地址、状态、耗时与证据，以及
+  **本批新建的凭据 id**。撤销只删本批新建的凭据并标记撤销时间，重复撤销幂等，既有凭据与
+  历史尝试记录都保留——「撤销」不等于「抹掉做过的事」。内网页凭据行多了「记录」入口。
+- **内存马自动选型 + PHP 环境探测（E3 A 段）**：注入前先探目标容器/Servlet API/可用内存马类型，
+  操作员不填 type 时按 filter→servlet→listener→valve 自动落定并写回台账，非 Tomcat 回退 agent；
+  一个可用类型都探不到时明确报「拒绝盲选」而不是随便挑。PHP 壳落地后走加密通道探一次运行时
+  （版本、`disable_functions`、`open_basedir`），据此判定执行/文件能力并给出可用性结论；探测
+  失败只记 `probe_error`，不判投放失败。显式指定 type 的能力保留（自动是默认，不是唯一）。
+- **按 JDK 版本选 JNDI/本地链路线（E3 B 段，决策 + 单测）**：按 `java.version` 给出四条路线与
+  警告（6u211/7u201/8u191 起关远程类加载、16+ 转本地链并提示 `--add-opens`），并按路线稳定
+  重排链预设、**不丢弃**任何预设。**无低版本 JDK 靶机，未做真机验证**，这一条不当作「已跑通」。
+- **IPv6 目标支持（C6）**：目标解析接受裸 IPv6 与 `[IPv6]:port`，`host:port` 拨号形态正确
+  （不会拼出 `[[::1]]:port`）；**一条坏目标不再拖垮整批**——原来一个 IPv6 地址会让整批端口探测
+  静默不发生，现在只跳过它自己并写明原因；IPv6 CIDR 明确不支持但点名报错。
+
 ### 变更
 
-- **弱口令检测二档协议显式降级（B4）**：MSSQL、SMB、WinRM/WMI、Oracle Listener、RouterOS、
-  CobaltStrike 面板、Jenkins、SVN 这 8 个二档协议本版不做适配器——每种握手都要真服务对照
-  （NTLM 要域控或 Samba 对照、SOAP 要看厂商 WSDL、私有握手没有标准），本周期拿不到可复现的
-  验证环境。与其写没验过的适配器，不如在协议目录里逐项登记「暂不支持」：每项带降级原因与
-  展示端口，前端选择器逐项列出原因；创建请求与 agent 工具当场带原因拒绝（不发起任何连接）；
-  引擎若收到这类端点，登记的原因原样写进结果行。后续先在 `credscan-lab` 摆服务再实现。
+- **弱口令字典扩充 + 协议定向的条目顺序**：内置字典补上各协议最常见的出厂弱口令（MSSQL 的
+  `sa`、Oracle 的 `scott/tiger` 与 `system/oracle`、WebLogic/JBoss/Jenkins 控制台、svnserve、
+  RouterOS）与纯口令条目（`public`/`private`，SNMP 的凭据就是 community）。更要紧的是顺序：
+  SNMP 只有口令字段有意义，按原顺序要空转四十多条（每条静默丢弃、等满应答窗口）才轮到
+  `public`，预算吃紧时最先被牺牲的正是本该先试的那几条。现在按协议做稳定分区把这几个提到
+  最前，**只重排不增删**——少一条就等于报告里声称测过一组其实没测的口令。
 - 数据库自动迁移新增 `subdomain_tasks` / `subdomain_results` 两张表（启动时 `IF NOT EXISTS` 建好，无需手工步骤）；
   新增接口 `POST/GET /api/subdomain/tasks`、`GET /api/subdomain/tasks/{id}`、`.../results`、`.../report`、
   `POST .../{id}/cancel`、`POST .../batch-delete`、`GET /api/subdomain/options`。
@@ -173,6 +214,16 @@
 
 ### 修复
 
+- **PowerShell 会话不再「假成功」地投递 cmd.exe 脚本（A2）**：上传/下载/权限维持/落地物这三组
+  脚本仍是 cmd.exe 语法（`if exist` / `certutil` / `schtasks` / `reg` / `sc`）。塞进 PowerShell
+  包装后目标只会解析失败，而进程内靶机会因为「包装标记对上了」而判成功——两种结果都比点名拒绝糟。
+  现在投递前先判定：命中强 cmd-only 构造就明确报失败并写清原因（同时进服务端日志，因为下游会把
+  结论改写成「无法读取文件大小」这类无从复核的文案），Windows 维持模块在 PowerShell 会话下不生成、
+  不投递、不落库。守卫只列强 cmd-only 构造，PowerShell 原生命令与运算符输入照常可用（有两条反向
+  用例防止把终端写废）。**未做 Windows 真机验证**，脚本移植另行排期。
+- **`JW_PLAYWRIGHT_MODULE` 补进部署配置**：浏览器验证 XSS 会读它，但 `.env.example` 与两份
+  compose 都没登记——发版前的环境变量审计当场抓住（「代码读了但部署配不上」的同型缺陷）。三处已补，
+  默认留空即用镜像内已装好的 playwright。
 - **补完客户授权清单不必再等 30 秒**：授权清单在读侧缓存 30 秒，而**「一条授权都没有」这个结果也一起被缓存**。
   弱口令检测在发出任何认证包之前会自己再问一遍范围，问的就是那份缓存——服务刚起来时清单是空的，操作员补上
   第一条授权之后的半分钟内，执行器仍按「没有授权就按老语义放行」对着范围外主机发包；认证包发出去收不回，
