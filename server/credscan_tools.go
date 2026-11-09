@@ -79,6 +79,8 @@ func (s *Server) toolCredscanStart() actool.CoreTool {
 					msg := "该协议暂不支持：" + name
 					if r := scanner.CredUnsupportedReason(name); r != "" {
 						msg += "（" + r + "）"
+					} else if !scanner.CredProtocolKnown(name) {
+						msg += "（本平台不测该协议，未发起连接）"
 					}
 					return actool.Errorf(msg + "（未发起任何连接）"), nil
 				}

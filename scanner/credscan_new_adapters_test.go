@@ -12,11 +12,14 @@ import (
 	"testing"
 )
 
-// 12 个原「降级」协议的 hit/deny 双路径。
+// 原「降级」协议的 hit/deny 双路径。
 //
-// 这些协议里有一半（WinRM/RDP/CS/RouterOS）在现有三个 Ubuntu 靶机上起不了真服务，
-// 所以用进程内协议桩逐条钉「握手层接受 vs 明确拒绝」：桩只回协议真实的帧，适配器必须
-// 从帧里读出结论，而不是「连上了就算命中」。真机验证缺口在各适配器文件头已如实标注。
+// 桩只回协议真实的帧，适配器必须从帧里读出结论，而不是「连上了就算命中」。这些用例是
+// **回归保护**，不是「功能已实现」的证据：桩与适配器可能错得一模一样（2026-11-09 就撞到过，
+// 见进度手册 §5.9），能起真服务的协议一律以 `credscan-lab` 的真机用例为准。
+//
+// 已删除的协议：Oracle / WebLogic 控制台 / WinRM / CobaltStrike。它们没有可复现的真服务，
+// 按负责人决定整条不做（协议名、适配器、桩、字典条目一起删），不再用桩维持「支持」的假象。
 
 // ── MSSQL ────────────────────────────────────────────────────────────────────
 
@@ -235,83 +238,6 @@ func TestCredRouterOSHitDeny(t *testing.T) {
 	}
 }
 
-// ── Cobalt Strike Team Server ────────────────────────────────────────────────
-
-func TestCredCobaltStrikeHitDeny(t *testing.T) {
-	ep := newCredTestEndpoint(t, func(c net.Conn) {
-		// Try 只发一帧登录包：读 4 字节长度 + 载荷即可。
-		frame := csReadFramePayload(c)
-		if strings.Contains(string(frame), "admin") {
-			writeString(c, string(csFrame([]byte{0x00})))
-			return
-		}
-		writeString(c, string(csFrame([]byte{0x01})))
-	})
-	ctx := credCtx(t)
-
-	hit, err := cobaltstrikeCredAdapter{}.Try(ctx, credEP(ep.addr, "cobaltstrike"), Credential{Username: "admin", Password: "p"})
-	if err != nil || hit.Outcome != CredHit {
-		t.Fatalf("hit = %+v err=%v", hit, err)
-	}
-	deny, err := cobaltstrikeCredAdapter{}.Try(ctx, credEP(ep.addr, "cobaltstrike"), Credential{Username: "bob", Password: "x"})
-	if err != nil || deny.Outcome != CredDeny {
-		t.Fatalf("deny = %+v err=%v", deny, err)
-	}
-}
-
-// csReadFramePayload 读一个 4 字节长度帧的载荷（含 java magic）。
-func csReadFramePayload(c net.Conn) []byte {
-	head := make([]byte, 4)
-	if _, err := readFull(c, head); err != nil {
-		return nil
-	}
-	n := int(binary.BigEndian.Uint32(head))
-	if n <= 0 || n > credReadMax {
-		return nil
-	}
-	body := make([]byte, n)
-	_, _ = readFull(c, body)
-	return body
-}
-
-// ── Oracle TNS ───────────────────────────────────────────────────────────────
-
-func TestCredOracleHitDeny(t *testing.T) {
-	ep := newCredTestEndpoint(t, func(c net.Conn) {
-		w := &credWire{conn: c}
-		if _, _, err := tnsRead(w); err != nil { // Connect
-			return
-		}
-		writeString(c, string(tnsPacket(2, []byte("(DESCRIPTION=(ACCEPT))")))) // Accept
-		_, authBody, err := tnsRead(w)
-		if err != nil {
-			return
-		}
-		if strings.Contains(string(authBody), "AUTH_USER=admin") {
-			writeString(c, string(tnsPacket(6, []byte("AUTH_OK (SESSION_ESTABLISHED)"))))
-			return
-		}
-		writeString(c, string(tnsPacket(6, []byte("ORA-01017: invalid username/password; logon denied"))))
-	})
-	ctx := credCtx(t)
-
-	ok, banner, err := oracleCredAdapter{}.Identify(ctx, credEP(ep.addr, "oracle"))
-	if err != nil || !ok || !strings.Contains(banner, "TNS") {
-		t.Fatalf("identify = %v %q %v", ok, banner, err)
-	}
-	hit, err := oracleCredAdapter{}.Try(ctx, credEP(ep.addr, "oracle"), Credential{Username: "admin", Password: "p"})
-	if err != nil || hit.Outcome != CredHit {
-		t.Fatalf("hit = %+v err=%v", hit, err)
-	}
-	deny, err := oracleCredAdapter{}.Try(ctx, credEP(ep.addr, "oracle"), Credential{Username: "scott", Password: "x"})
-	if err != nil || deny.Outcome != CredDeny {
-		t.Fatalf("deny = %+v err=%v", deny, err)
-	}
-	if !strings.Contains(deny.Reason, "ORA-01017") {
-		t.Fatalf("deny reason = %q", deny.Reason)
-	}
-}
-
 // ── RDP ──────────────────────────────────────────────────────────────────────
 
 func rdpConfirm(selected uint32) []byte {
@@ -355,7 +281,7 @@ func TestCredRDPHitDeny(t *testing.T) {
 	}
 }
 
-// ── WinRM ────────────────────────────────────────────────────────────────────
+// ── HTTP 桩（Jenkins / JBoss 共用） ──────────────────────────────────────────
 
 func httpStubReply(c net.Conn, status int, headers map[string]string, body string) {
 	var b strings.Builder
@@ -367,54 +293,6 @@ func httpStubReply(c net.Conn, status int, headers map[string]string, body strin
 	b.WriteString("Connection: close\r\n\r\n")
 	b.WriteString(body)
 	writeString(c, b.String())
-}
-
-func TestCredWinRMHitDeny(t *testing.T) {
-	ep := newCredTestEndpoint(t, func(c net.Conn) {
-		req := readLine(c)
-		// 真实 WinRM 跑在 Microsoft-HTTPAPI 上：未认证请求回 401 时也带这个 Server 头，
-		// 那正是 Identify 能确认「这是 WinRM 而不是任意 HTTP」的证据。
-		challenge := map[string]string{
-			"Server":           "Microsoft-HTTPAPI/2.0",
-			"WWW-Authenticate": `Basic realm="winrm"`,
-		}
-		switch {
-		case !strings.Contains(req, "Authorization:"):
-			httpStubReply(c, 401, challenge, "")
-		case strings.Contains(req, "YWRtaW46cA=="): // admin:p
-			httpStubReply(c, 200, nil, `<s:Envelope><w:IdentifyResponse>wsman</w:IdentifyResponse></s:Envelope>`)
-		default:
-			httpStubReply(c, 401, challenge, "")
-		}
-	})
-	ctx := credCtx(t)
-
-	ok, banner, err := winrmCredAdapter{}.Identify(ctx, credEP(ep.addr, "winrm"))
-	if err != nil || !ok || !strings.Contains(strings.ToUpper(banner), "WINRM") {
-		t.Fatalf("identify = %v %q %v", ok, banner, err)
-	}
-	hit, err := winrmCredAdapter{}.Try(ctx, credEP(ep.addr, "winrm"), Credential{Username: "admin", Password: "p"})
-	if err != nil || hit.Outcome != CredHit {
-		t.Fatalf("hit = %+v err=%v", hit, err)
-	}
-	deny, err := winrmCredAdapter{}.Try(ctx, credEP(ep.addr, "winrm"), Credential{Username: "bob", Password: "x"})
-	if err != nil || deny.Outcome != CredDeny {
-		t.Fatalf("deny = %+v err=%v", deny, err)
-	}
-}
-
-func TestCredWinRMNegotiateIsInconclusive(t *testing.T) {
-	ep := newCredTestEndpoint(t, func(c net.Conn) {
-		_ = readLine(c)
-		httpStubReply(c, 401, map[string]string{"WWW-Authenticate": "Negotiate"}, "")
-	})
-	res, err := winrmCredAdapter{}.Try(credCtx(t), credEP(ep.addr, "winrm"), Credential{Username: "a", Password: "b"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Outcome != CredInconclusive || !strings.Contains(res.Reason, "SPNEGO") {
-		t.Fatalf("res = %+v", res)
-	}
 }
 
 // ── Jenkins（表单多轮） ──────────────────────────────────────────────────────

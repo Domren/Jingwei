@@ -50,20 +50,13 @@ var credBuiltin = CredDictionary{
 		{Username: "ftp", Password: "ftp"},
 		{Username: "ubuntu", Password: "ubuntu"},
 		{Username: "tomcat", Password: "tomcat"},
-		{Username: "oracle", Password: "oracle"},
 		{Username: "www", Password: "www"},
 		{Username: "elastic", Password: "elastic"},
-		// 下列几组是新增协议最常见的出厂/示例弱口令（MSSQL 的 sa、Oracle 的
-		// scott/tiger 与管理账号、WebLogic/JBoss/Jenkins 控制台、svnserve、RouterOS）。
-		// 刻意只放最典型的，不做穷举；大字典仍归操作员显式导入的档位。
+		// 下列几组是新增协议最常见的出厂/示例弱口令（MSSQL 的 sa、JBoss/Jenkins 控制台、
+		// svnserve、RouterOS）。刻意只放最典型的，不做穷举；大字典仍归操作员显式导入的档位。
 		{Username: "sa", Password: "sa"},
 		{Username: "sa", Password: ""},
 		{Username: "sa", Password: "123456"},
-		{Username: "scott", Password: "tiger"},
-		{Username: "sys", Password: "oracle"},
-		{Username: "system", Password: "oracle"},
-		{Username: "weblogic", Password: "weblogic"},
-		{Username: "weblogic", Password: "welcome1"},
 		{Username: "jboss", Password: "jboss"},
 		{Username: "jenkins", Password: "jenkins"},
 		{Username: "svn", Password: "svn"},

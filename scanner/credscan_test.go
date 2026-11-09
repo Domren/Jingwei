@@ -477,8 +477,8 @@ func TestCredAttemptEvidenceCarriesRawBytes(t *testing.T) {
 }
 
 func TestCredProtocolSupportTable(t *testing.T) {
-	// 三档（rdp / weblogic-console / jboss-console）本版已实现适配器，必须报支持。
-	for _, p := range []string{"rdp", "weblogic-console", "jboss-console", "snmp"} {
+	// 三档（rdp / jboss-console）本版已实现适配器，必须报支持。
+	for _, p := range []string{"rdp", "jboss-console", "snmp"} {
 		if !CredProtocolSupported(p) {
 			t.Fatalf("%q 已实现适配器，应当报支持", p)
 		}
@@ -486,6 +486,16 @@ func TestCredProtocolSupportTable(t *testing.T) {
 	for _, p := range []string{"ssh", "redis", "mysql", "ftp"} {
 		if !CredProtocolSupported(p) {
 			t.Fatalf("%q 应当是支持的协议", p)
+		}
+	}
+	// 2026-11-09 按决定整体砍掉的四个协议：名字都不能再被认出来——留着名字就等于
+	// 让人以为「能测但没测出结论」，报告里那条 inconclusive 会被读成环境问题。
+	for _, p := range []string{"oracle", "weblogic-console", "winrm", "cobaltstrike"} {
+		if CredProtocolKnown(p) {
+			t.Fatalf("%q 已删除，不该再被当成已知协议", p)
+		}
+		if CredAdapterFor(p) != nil {
+			t.Fatalf("%q 已删除，不该还有适配器", p)
 		}
 	}
 }

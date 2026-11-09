@@ -116,24 +116,30 @@ qemu-system-x86_64 -enable-kvm -m 512 -smp 2 \
   `JW_CRED_LAB_HTTP` 指到别处）上，任何一个确认成功都是缺陷。
 - **空凭据不能判成命中**：Redis 未开认证与 PG trust 两类除外——那两条的空口令本身就是结论。
 
-## 本台覆盖不到、且**没有**真机验证的协议
+## 已删除的四个协议（2026-11-09，负责人决定）
 
-1.6.0 补的二档/三档适配器里还剩 4 条在这台机器上起不了真服务。这不是「暂时跳过」，
-是**缺口**，写在各自的适配器文件头里，发版台账也不许把它们算成已验证：
+Oracle / WebLogic 控制台 / WinRM / CobaltStrike 这四条在这里起不了真服务，也找不到别的
+可复现环境，**按负责人决定整条删除**——协议名、适配器、进程内桩、字典条目一起删，协议目录
+从 35 个降到 31 个。这不是「暂时跳过」：只靠桩的「支持」不算支持，留着选项反而会让一次
+`inconclusive` 被读成「环境不通」。
 
-| 协议 | 为什么这里跑不了 | 现在验到了哪一步 |
-| :-- | :-- | :-- |
-| Oracle | Oracle XE 镜像约 2GB 且要跑完整 O3LOGON（DES/AUTH_SESSKEY）与 12c 的 PBKDF2 才能判口令——现在的实现只到 TNS Connect/Accept + 认证回执分类，真机上必然 deny | 进程内协议桩：AUTH_OK→hit、ORA-01017→deny |
-| WebLogic | 官方镜像要 Oracle 账号接受协议、约 12GB；替代路径是老版 wls zip + JDK8 | 进程内协议桩（表单三跳流程） |
-| WinRM | 只在 Windows 上；不实现 SPNEGO 时服务端只给 Negotiate，正确口令也只能落 `inconclusive`。可执行方案见 `windows-sandbox/` | 进程内协议桩 + Windows 沙箱方案文档 |
-| Cobalt Strike | 商业 Team Server，私协议且拿不到合法服务端 | 进程内协议桩 |
+| 协议 | 当时为什么验不了 |
+| :-- | :-- |
+| Oracle | 认证要 O3LOGON（DES + AUTH_SESSKEY）与 12c 的 PBKDF2，原型只做到「发认证请求 + 按 ORA-01017 判拒绝」，命中路径走不通；XE 镜像要 Oracle 账号登录下载 |
+| WebLogic | 官方镜像要 Oracle 账号接受协议、约 12GB；表单登录与版本强相关（12c/14c 差异未覆盖） |
+| WinRM | 只在 Windows 上，且服务端普遍要求 SPNEGO——不实现 SPNEGO 时正确口令也只能落 `inconclusive`。为它准备的 `windows-sandbox/`（.wsb + 反代脚本）随之一并删除 |
+| Cobalt Strike | 商业 Team Server，私协议且拿不到合法服务端 |
 
-「进程内协议桩」指的是 `scanner/credscan_new_adapters_test.go`：桩按协议真实编码回帧
-（Login7/NTLMSSP 的用户名是 UTF-16LE、svnserve 的 PLAIN 是 base64、WinRM 的识别证据是
-`Microsoft-HTTPAPI` 的 Server 头），因此它能抓住实现错误，但**代替不了真服务**——
-这也是把缺口逐条列出来的原因。上面已经真机验过的 6 条，桩仍保留作为回归保护，
-但桩的帧必须按真机抓到的形状写：MSSQL/SMB/JBoss 三条的桩原本是按**错误实现**写的，
-所以测试一直绿（见下面「坑」里的前三条）。
+要加回来必须三件一起：可复现的真服务、适配器、本目录里的真机用例。原型的实现可查
+`8de3869` 之前的提交。
+
+**留下的教训**（比这四条本身值钱）：上面已经真机验过的 8 条，桩仍保留作回归保护，但桩的帧
+必须按真机抓到的形状写——MSSQL/SMB/JBoss/Jenkins 四条最初的桩是按**错误实现**写的，测试一直绿
+（见下面「坑」里对应的几条）。桩与适配器由同一个人按同一份（错的）理解写出来，两边对得上，
+测试就绿了。
+
+**唯一没有真机用例的协议**是 `smtp-ssl`（465 隐式 TLS）：它和 `pop3-ssl`/`imap-ssl` 走同一套
+`upgradeTLS` 路径，但那两个验过不代表它验过。补法很便宜（postfix 开 465 + 自签证书），本轮没做。
 
 ## 已知的环境坑（写下来是为了下次别再踩）
 

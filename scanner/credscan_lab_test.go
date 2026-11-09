@@ -104,7 +104,7 @@ func TestCredLabNoProtocolGuessing(t *testing.T) {
 	for _, proto := range []string{"redis", "postgresql", "mysql", "mongodb", "ftp", "telnet", "socks5", "ssh",
 		// 1.6.0 补的二档/三档里，非 HTTP 形态的那些也要过这一关：它们在真机上
 		// 最容易「看见端口开着就认下协议」，而这一条正是要拦那种实现。
-		"mssql", "smb", "svn", "rdp", "snmp", "routeros", "cobaltstrike", "oracle"} {
+		"mssql", "smb", "svn", "rdp", "snmp", "routeros"} {
 		adapter := CredAdapterFor(proto)
 		if adapter == nil {
 			t.Fatalf("协议 %q 没注册", proto)

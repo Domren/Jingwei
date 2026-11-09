@@ -149,27 +149,27 @@
   报告模板对这两类条目的修复建议分别是「验证监控覆盖」与「先按 WSUS/SCCM/DISM 核实再装补丁」。
   识别结果同时作为决策输入：会话里已识别的防护会随后续 `intranet_exec` 命令结果一起交回给 agent，
   不必先猜再去查。
-- **弱口令检测补齐最后 12 个协议（B3 收尾）**：此前登记为「暂不支持」的 12 项全部有适配器，
-  协议目录里 35 个协议名全部可测。各自实现到协议握手层并如实标注缺口：MSSQL（TDS PreLogin /
-  Login7 + LOGINACK 确认，口令按 [MS-TDS] 混淆；TLS/SSPI 未实现）、SMB（SMB2 NEGOTIATE +
-  SESSION_SETUP 的 NTLMSSP 三消息，**NTLMv2 应答由本模块真算**：MD4 → HMAC-MD5 + TargetInfo）、
-  WinRM（`POST /wsman` + SOAP Identify；不实现 SPNEGO，服务端只给 Negotiate 时落 inconclusive）、
-  Oracle（TNS Connect/Accept + 认证回执，拒绝时把服务端原文写进 Reason；O3LOGON 未实现）、
-  RouterOS（API 句子协议）、CobaltStrike（Team Server 登录帧）、**SVN（真 CRAM-MD5）**、
-  **SNMP（v1/v2c community，走 UDP）**、Jenkins（crumb → 表单 → `whoAmI` 三跳）、
-  WebLogic 与 JBoss 控制台（JBoss 走 `/management` 的 HTTP Digest）。判定口径不变：只有服务端
-  亲口「接受」才算命中；`community` 错时 SNMP 按 RFC 3412 静默丢弃，结论是 inconclusive 并写明
-  「静默丢弃，已与端口不通区分」——**不写成 deny**。传输层为此加了 UDP 支持与 UDP 版证据渲染
-  （标签 `(UDP)`、复现命令改用 `SOCK_DGRAM` + `sendto`，照 TCP 版写 `create_connection` 的复现
-  命令必然连不上）。
-  **真机验证（8 条）**：SNMP、SVN 之外，MSSQL（真 SQL Server 2022 Linux）、SMB（真 Samba 4.24）、
-  Jenkins（真 Jenkins LTS）、JBoss（真 WildFly 25）、RouterOS（真 RouterOS 7.16.2 CHR）都已跑通
-  命中与拒绝两条路径；RDP（真 xrdp 0.10）如实落 `inconclusive`——xrdp 只允许 TLS，协商阶段就拒绝
-  标准安全层，口令一个字节没发出去，写 deny 等于伪造结论。这批真机共修掉 7 个缺陷，其中 Jenkins
-  原先会**任何口令都判命中**（`whoAmI` 对匿名会话也回 `authenticated:true`），进程内桩一直是绿的。
-  **仍缺真机**：Oracle（缺 O3LOGON/PBKDF2，镜像要 Oracle 账号）、WebLogic（镜像 ~12GB）、
-  WinRM（缺 SPNEGO，只能 inconclusive，且需 Windows 靶机）、CobaltStrike（商业私协议，无合法
-  服务端）。缺口与原因逐条写在 `tools/e2e/credscan-lab/README.md`，**不算已验证**。
+- **弱口令检测补齐 8 个协议、砍掉 4 个验不了的（B3 收尾）**：此前登记为「暂不支持」的 12 项里，
+  8 项实现了适配器并进了真机验证：MSSQL（TDS PreLogin / Login7 + LOGINACK 确认，口令按
+  [MS-TDS] 混淆；TLS/SSPI 未实现）、SMB（SMB2 NEGOTIATE + SESSION_SETUP 的 NTLMSSP 三消息，
+  **NTLMv2 应答由本模块真算**：MD4 → HMAC-MD5 + TargetInfo）、RouterOS（API 句子协议）、
+  **SVN（真 CRAM-MD5）**、**SNMP（v1/v2c community，走 UDP）**、Jenkins（crumb → 表单 →
+  `whoAmI` 三跳）、JBoss/WildFly 管理台（`/management` 的 HTTP Digest）、RDP（X.224 +
+  Negotiation，只判安全层）。判定口径不变：只有服务端亲口「接受」才算命中；`community` 错时
+  SNMP 按 RFC 3412 静默丢弃，结论是 inconclusive 并写明「静默丢弃，已与端口不通区分」——
+  **不写成 deny**。传输层为此加了 UDP 支持与 UDP 版证据渲染（标签 `(UDP)`、复现命令改用
+  `SOCK_DGRAM` + `sendto`，照 TCP 版写 `create_connection` 的复现命令必然连不上）。
+  其余 4 项（Oracle / WebLogic 控制台 / WinRM / CobaltStrike）没有可复现的真服务：
+  Oracle 与 WebLogic 的镜像要 Oracle 账号（WebLogic 约 12GB）、WinRM 要 Windows 靶机、
+  CS 是商业私协议，只有进程内桩能跑。**这 4 条连同协议名、适配器、桩、字典条目一起删除**，
+  协议目录从 35 个降到 31 个——只靠桩的「支持」不算支持，留着选项反而会让一次 inconclusive
+  被读成「环境不通」。当初的原型代码可查 `8de3869` 之前的提交。
+  **真机验证（8 条双路径 + 1 条如实 inconclusive）**：MSSQL（SQL Server 2022 Linux）、
+  SMB（Samba 4.24）、Jenkins（LTS）、JBoss（WildFly 25）、RouterOS（7.16.2 CHR）、SNMP、SVN
+  都跑通了命中与拒绝两条路径；RDP（xrdp 0.10）落 `inconclusive`——xrdp 只允许 TLS，协商阶段
+  就拒绝标准安全层，口令一个字节没发出去，写 deny 等于伪造结论。这批真机共修掉 7 个缺陷，
+  其中 Jenkins 原先会**任何口令都判命中**（`whoAmI` 对匿名会话也回 `authenticated:true`），
+  进程内桩一直是绿的。31 个协议里唯一没有真机用例的是 `smtp-ssl`（465），台账里记未验。
 - **浏览器真实验证 XSS（D1）**：镜像里的 Chromium 原先只用于取证截图，现在用来判定 payload
   是否**真的执行**——逐条在无头浏览器里打开被测点，执行信号只认对话框弹出、写入标记变量、
   或页面脚本错误里带标记三种。**反射与执行分开记**：反射以服务端原始 HTML 判定（用渲染后的

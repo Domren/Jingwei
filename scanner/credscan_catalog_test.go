@@ -6,13 +6,13 @@ import (
 	"testing"
 )
 
-// 12 个原降级协议在本版都实现了适配器：目录里必须逐项标为支持、端口正确、
+// 原降级协议里留下来的 8 个都实现了适配器：目录里必须逐项标为支持、端口正确、
 // 且不再带「暂不支持」原因。少一项，界面上就静默少一个可勾的协议。
 func TestCredCatalogDowngradedProtocolsNowSupported(t *testing.T) {
 	former := map[string]int{
-		"mssql": 1433, "smb": 445, "winrm": 5985, "oracle": 1521,
-		"routeros": 8728, "cobaltstrike": 50050, "jenkins": 8080, "svn": 3690,
-		"snmp": 161, "rdp": 3389, "weblogic-console": 7001, "jboss-console": 8080,
+		"mssql": 1433, "smb": 445,
+		"routeros": 8728, "jenkins": 8080, "svn": 3690,
+		"snmp": 161, "rdp": 3389, "jboss-console": 8080,
 	}
 	catalog := map[string]CredProtocolInfo{}
 	for _, p := range CredProtocolCatalog() {
@@ -46,6 +46,34 @@ func TestCredCatalogDowngradedProtocolsNowSupported(t *testing.T) {
 		if info.Supported && info.Note != "" {
 			t.Fatalf("支持的协议 %q 不该带降级原因", name)
 		}
+	}
+}
+
+// 2026-11-09 按负责人决定整体砍掉的四个协议：协议名不许残留在目录里。
+// 留着名字的危害不是「多一个选项」，而是选项跑完会落 inconclusive——
+// 报告里读起来像「环境没通」，实际是「我们根本不做」。
+func TestCredCatalogDroppedProtocolsAbsent(t *testing.T) {
+	dropped := []string{"oracle", "weblogic-console", "winrm", "cobaltstrike"}
+	catalog := map[string]CredProtocolInfo{}
+	names := []string{}
+	for _, p := range CredProtocolCatalog() {
+		catalog[p.Name] = p
+		names = append(names, p.Name)
+	}
+	for _, name := range dropped {
+		if _, ok := catalog[name]; ok {
+			t.Fatalf("协议 %q 已删除，不该再出现在目录里", name)
+		}
+		if CredProtocolKnown(name) {
+			t.Fatalf("协议 %q 已删除，不该再被认出来", name)
+		}
+		if CredAdapterFor(name) != nil {
+			t.Fatalf("协议 %q 已删除，不该还有适配器", name)
+		}
+	}
+	// 31 = 35 - 4。数量写死是有意的：加/删协议必须来这里改一次并说明原因。
+	if len(catalog) != 31 {
+		t.Fatalf("目录应有 31 个协议，实得 %d：%v", len(catalog), names)
 	}
 }
 

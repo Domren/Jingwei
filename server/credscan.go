@@ -666,6 +666,11 @@ func (s *Server) createCredTask(w http.ResponseWriter, r *http.Request) {
 			msg := "该协议暂不支持：" + name
 			if r := scanner.CredUnsupportedReason(name); r != "" {
 				msg += "（" + r + "）"
+			} else if !scanner.CredProtocolKnown(name) {
+				// 名字都不在目录里：要么是拼错了，要么是本平台明确不测的协议
+				// （Oracle/WebLogic/WinRM/CobaltStrike 于 2026-11-09 删除）。
+				// 说「未知」比留一句「暂不支持」更好——后者会让人等一个永远不来的版本。
+				msg += "（本平台不测该协议，未发起连接）"
 			}
 			writeErr(w, 400, msg)
 			return

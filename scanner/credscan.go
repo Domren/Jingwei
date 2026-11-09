@@ -100,22 +100,27 @@ const (
 
 // credDefaultPorts 是第三级用的默认端口表：key 是协议名，value 是该协议最常见的端口。
 // 再强调一次：这张表只回答「去测哪个端口」，不回答「那个端口是什么协议」。
+//
+// 这张表同时是「本模块认识哪些协议」的正本（`CredProtocolCatalog` 由它 + 适配器注册表
+// 合成）。2026-11-09 按负责人决定移除了四个协议名——Oracle(1521)、WebLogic 控制台(7001)、
+// WinRM(5985)、CobaltStrike(50050)：它们没有可复现的真服务（Oracle/WebLogic 镜像要 Oracle
+// 账号、WinRM 要 Windows 靶机、CS 是商业私协议），只有进程内协议桩能跑，而桩证明不了
+// 「服务端会怎么回」。删掉名字比留着一个永远判不出结论的选项更诚实；要恢复就先摆出真服务。
 var credDefaultPorts = map[string]int{
 	"ssh": 22, "mysql": 3306, "postgresql": 5432, "redis": 6379, "mongodb": 27017,
 	"ftp": 21, "telnet": 23, "socks5": 1080, "memcached": 11211, "elasticsearch": 9200,
 	"vnc": 5900, "zookeeper": 2181, "smtp": 25, "pop3": 110, "imap": 143,
 	"smtp-ssl": 465, "pop3-ssl": 995, "imap-ssl": 993, "ldap": 389, "ldaps": 636,
 	"snmp": 161, "http-basic": 80, "webdav": 80, "tomcat-console": 8080,
-	"mssql": 1433, "smb": 445, "winrm": 5985, "oracle": 1521,
-	"routeros": 8728, "cobaltstrike": 50050, "jenkins": 8080, "svn": 3690,
-	"rdp": 3389, "weblogic-console": 7001, "jboss-console": 8080,
+	"mssql": 1433, "smb": 445, "routeros": 8728, "jenkins": 8080, "svn": 3690,
+	"rdp": 3389, "jboss-console": 8080,
 }
 
-// credUnsupportedProtocols 曾登记三档「握手不透明」的降级协议。本版把 12 个降级项
-// 逐一实现了适配器（见各 credscan_*.go），故这里不再保留任何条目：留着会让
-// runCredEndpoint 在发起连接之前就把已实现的协议判成 CredUnsupported。
-// 保留空表是为了保持 CredProtocolSupported / CredUnsupportedReason 的口径不变；
-// 真正未实现（没注册适配器）的协议由 runCredEndpoint 的 adapter==nil 分支落 unsupported。
+// credUnsupportedProtocols 登记「认识但明确不做」的协议：命中即落 CredUnsupported，
+// 一个包都不发。当前为空——被砍掉的四个协议是连同协议名一起从目录里删掉的，
+// 属于「不认识」，由 server 侧的表单校验直接拒，比这里留一条「暂不支持」更干净。
+// 保留空表是为了保持 CredProtocolSupported / CredUnsupportedReason 的口径不变：
+// 哪天有协议要降级（比如临时摘掉某个适配器），把理由写在这里，别写进注释里。
 var credUnsupportedProtocols = map[string]string{}
 
 // CredDefaultPort 返回协议的常见端口（0 表示没有默认端口，例如纯 HTTP 形态）。

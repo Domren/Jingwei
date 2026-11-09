@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// HTTP 表单类控制台：Jenkins（crumb + 表单）、WebLogic 控制台、JBoss/WildFly 管理台。
+// HTTP 表单类控制台：Jenkins（crumb + 表单）、JBoss/WildFly 管理台。
 //
 // 真机验证状态（2026-11-09）：
 //   - Jenkins：已在真机 Jenkins LTS 验证 hit/deny。真机暴露并修掉两处——2.x 的登录端点是
@@ -22,9 +22,10 @@ import (
 //   - JBoss/WildFly：已在真机 WildFly 25 验证 hit/deny。管理台的认证点是 /management 的
 //     HTTP Digest（ManagementRealm），Basic 带着正确口令也是 401；/console 未认证直接 302，
 //     根本不做认证，用它当探针永远判不出结论。
-//   - WebLogic：未在真机验证（官方镜像需 Oracle 账号接受协议、约 12GB；替代路径要老版
-//     wls zip + JDK8）。流程按 /console/login/LoginForm.jsp → j_security_check →
-//     console.portal 写成，但只在进程内协议桩上验过。
+//
+// 曾经的 WebLogic 控制台分支（登录页 cookie → j_security_check → console.portal）没有真机
+// 验证过（官方镜像要 Oracle 账号、约 12GB）。2026-11-09 负责人决定这条不做，适配器连同
+// 协议名一起删除——只靠进程内桩的"支持"不算支持。
 //
 // 与 http-basic 那类「一发一看」不同，表单登录是多轮：先取 crumb/cookie、再提交表单、
 // 最后用一个受保护的认证探针确认会话真的被接受。三条纪律沿用整个模块：
@@ -220,8 +221,6 @@ func (a formCredAdapter) login(ctx context.Context, w *credWire, addr string, ep
 	switch a.protocol {
 	case "jenkins":
 		return jenkinsLogin(ctx, w, addr, ep, cred)
-	case "weblogic-console":
-		return weblogicLogin(ctx, w, addr, ep, cred)
 	case "jboss-console":
 		return jbossLogin(ctx, w, addr, ep, cred)
 	default:
@@ -308,57 +307,6 @@ func jenkinsLogin(ctx context.Context, w *credWire, addr string, ep CredEndpoint
 	default:
 		return formInconclusive, fmt.Sprintf("Jenkins 认证探针 HTTP %d，未确认会话", st3), nil
 	}
-}
-
-// weblogicLogin：登录页 cookie → j_security_check → console.portal 主页探针。
-func weblogicLogin(ctx context.Context, w *credWire, addr string, ep CredEndpoint,
-	cred Credential) (formResult, string, error) {
-	req1 := formRequest("GET", formPath(ep, "/console/login/LoginForm.jsp"), ep.Host, nil, "")
-	st1, h1, _, err := formRound(ctx, w, addr, req1)
-	if err != nil {
-		return formInconclusive, "", err
-	}
-	cookie := formSetCookie(h1)
-	headers := []string{}
-	if cookie != "" {
-		headers = append(headers, "Cookie: "+cookie)
-	}
-	body := formBody("j_username", cred.Username, "j_password", cred.Password,
-		"j_character_encoding", "UTF-8")
-	req2 := formRequest("POST", formPath(ep, "/console/j_security_check"), ep.Host, headers, body)
-	st2, h2, b2, err := formRound(ctx, w, addr, req2)
-	if err != nil {
-		return formInconclusive, "", err
-	}
-	loc2 := strings.ToLower(h2["location"])
-	low2 := strings.ToLower(string(b2))
-	if strings.Contains(loc2, "loginform") || strings.Contains(loc2, "login.jsp") ||
-		(st2 == 200 && (strings.Contains(low2, "authentication denied") ||
-			strings.Contains(low2, "loginform") || strings.Contains(low2, "invalid"))) {
-		return formDenied, fmt.Sprintf("WebLogic 控制台登录被拒绝 (HTTP %d)", st2), nil
-	}
-	if c2 := formSetCookie(h2); c2 != "" {
-		cookie = c2
-	}
-	vh := []string{}
-	if cookie != "" {
-		vh = append(vh, "Cookie: "+cookie)
-	}
-	req3 := formRequest("GET", formPath(ep, "/console/console.portal"), ep.Host, vh, "")
-	st3, h3, b3, err := formRound(ctx, w, addr, req3)
-	if err != nil {
-		return formInconclusive, "", err
-	}
-	loc3 := strings.ToLower(h3["location"])
-	low3 := strings.ToLower(string(b3))
-	if st3 >= 200 && st3 < 300 && !strings.Contains(loc3, "login") &&
-		strings.Contains(low3, "weblogic") && !strings.Contains(low3, "loginform") {
-		return formAccepted, fmt.Sprintf("WebLogic 控制台会话已认证 (HTTP %d→%d→%d)", st1, st2, st3), nil
-	}
-	if st3 == 401 || st3 == 403 || strings.Contains(loc3, "login") {
-		return formDenied, fmt.Sprintf("WebLogic 控制台认证探针 HTTP %d", st3), nil
-	}
-	return formInconclusive, fmt.Sprintf("WebLogic 控制台认证探针 HTTP %d，既非主页也非拒绝", st3), nil
 }
 
 // ── HTTP Digest（WildFly/JBoss 管理接口用） ─────────────────────────────────
@@ -508,6 +456,5 @@ func jbossLogin(ctx context.Context, w *credWire, addr string, ep CredEndpoint,
 
 func init() {
 	RegisterCredAdapter(formCredAdapter{protocol: "jenkins"})
-	RegisterCredAdapter(formCredAdapter{protocol: "weblogic-console"})
 	RegisterCredAdapter(formCredAdapter{protocol: "jboss-console"})
 }

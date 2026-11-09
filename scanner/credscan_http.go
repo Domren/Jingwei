@@ -131,17 +131,6 @@ func httpProof(protocol string, status int, hdr map[string]string, body []byte) 
 			return "页面含 Jenkins 特有标记"
 		}
 		return ""
-	case "weblogic-console":
-		if v := hdr["server"]; strings.Contains(strings.ToLower(v), "weblogic") {
-			return "Server: " + v
-		}
-		if v := hdr["x-powered-by"]; strings.Contains(strings.ToLower(v), "weblogic") {
-			return "X-Powered-By: " + v
-		}
-		if strings.Contains(strings.ToLower(string(body)), "weblogic") {
-			return "控制台页含 WebLogic 标记"
-		}
-		return ""
 	case "jboss-console":
 		// ManagementRealm / JBoss / WildFly 的 realm 名是它特有的，一般 Web 服务器不会用。
 		if v := hdr["www-authenticate"]; v != "" &&
@@ -157,21 +146,6 @@ func httpProof(protocol string, status int, hdr map[string]string, body []byte) 
 		low := strings.ToLower(string(body))
 		if strings.Contains(low, "jboss") || strings.Contains(low, "wildfly") {
 			return "页面含 JBoss/WildFly 标记"
-		}
-		return ""
-	case "winrm":
-		// WinRM 端点跑在 Microsoft-HTTPAPI 上，未认证时用 Negotiate/Kerberos 质询。
-		if v := hdr["server"]; strings.Contains(strings.ToLower(v), "microsoft-httpapi") {
-			return "Server: " + v
-		}
-		if v := hdr["www-authenticate"]; v != "" &&
-			(strings.Contains(strings.ToLower(v), "negotiate") || strings.Contains(strings.ToLower(v), "kerberos")) {
-			return "WWW-Authenticate: " + v
-		}
-		low := strings.ToLower(string(body))
-		if strings.Contains(low, "wsman") || strings.Contains(low, "winrm") ||
-			strings.Contains(low, "schemas.dmtf.org/wbem/wsman") {
-			return "应答含 WSMan/WinRM 标记"
 		}
 		return ""
 	default:
