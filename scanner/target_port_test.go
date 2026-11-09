@@ -69,14 +69,22 @@ func TestParseTargetHostPort(t *testing.T) {
 		}
 	}
 
-	// IPv6 仍然不支持，但报错要说清是 IPv6 的事，不是「端口无效」。
-	for _, raw := range []string{"::1", "2001:db8::1", "[2001:db8::1]:22"} {
-		_, err := ParseTarget(raw)
-		if err == nil {
-			t.Fatalf("%q 目前不支持，应当报错", raw)
+	// C6：IPv6 与 IPv4 同走 KindIP，Host 存裸地址，交给 net.JoinHostPort 拨号。
+	for _, c := range []struct {
+		raw  string
+		host string
+		port int
+	}{
+		{"::1", "::1", 0},
+		{"2001:db8::1", "2001:db8::1", 0},
+		{"[2001:db8::1]:22", "2001:db8::1", 22},
+	} {
+		got, err := ParseTarget(c.raw)
+		if err != nil {
+			t.Fatalf("%q 应当解析成功，却报错: %v", c.raw, err)
 		}
-		if !strings.Contains(err.Error(), "IPv4") {
-			t.Fatalf("%q 的报错要指向 IPv4 限制，实得 %q", raw, err.Error())
+		if got.Kind != KindIP || got.Host != c.host || got.Port != c.port {
+			t.Fatalf("%q 解析成 %+v，想要 kind=ip host=%s port=%d", c.raw, got, c.host, c.port)
 		}
 	}
 }

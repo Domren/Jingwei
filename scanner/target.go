@@ -6,6 +6,7 @@ package scanner
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"regexp"
@@ -39,11 +40,17 @@ type Target struct {
 
 var domainRE = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$`)
 
-// ParseTargets parses and deduplicates raw targets. It accepts URLs, IPv4
-// addresses, CIDR blocks (/24 or narrower) and DNS names.
+// ParseTargets parses and deduplicates raw targets. It accepts URLs, IPv4/IPv6
+// addresses, IPv4 CIDR blocks (/24 or narrower) and DNS names.
+//
+// 一条非法输入只跳过它自己，并把原因写明（日志 + 全空时的汇总错误），绝不再
+// 像旧版那样 return nil, err 把整批丢掉：进度手册 §5 记过「一个 IPv6 地址让整批
+// 端口探测静默不发生」，根因就在这里。C3 当年绕过本函数直接构造 Target，
+// 现在从根上修好，让混批里其它 IP 照常进 Resolve/Discover。
 func ParseTargets(raws []string) ([]Target, error) {
 	out := make([]Target, 0, len(raws))
 	seen := map[string]bool{}
+	var skipped []string
 	for _, raw := range raws {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
@@ -51,7 +58,8 @@ func ParseTargets(raws []string) ([]Target, error) {
 		}
 		t, err := ParseTarget(raw)
 		if err != nil {
-			return nil, err
+			skipped = append(skipped, fmt.Sprintf("%q（%v）", raw, err))
+			continue
 		}
 		// 端口参与去重：10.0.0.1 与 10.0.0.1:2222 是两条不同的输入意图。
 		key := string(t.Kind) + "|" + strings.ToLower(t.Host) + "|" + strconv.Itoa(t.Port) + "|" + t.URL
@@ -61,7 +69,14 @@ func ParseTargets(raws []string) ([]Target, error) {
 		seen[key] = true
 		out = append(out, t)
 	}
+	if len(skipped) > 0 {
+		log.Printf("ParseTargets: 跳过 %d 个无效目标（其余目标照常探测）: %s",
+			len(skipped), strings.Join(skipped, "; "))
+	}
 	if len(out) == 0 {
+		if len(skipped) > 0 {
+			return nil, fmt.Errorf("至少需要一个有效目标（全部输入均无效: %s）", strings.Join(skipped, "; "))
+		}
 		return nil, fmt.Errorf("至少需要一个有效目标")
 	}
 	return out, nil
@@ -96,10 +111,15 @@ func ParseTarget(raw string) (Target, error) {
 		return t, nil
 	}
 	// host:port：操作员写死端口时以它为准（弱口令检测的三级端口决策第一级）。
-	// SplitHostPort 拆不动的（裸 IPv6 ::1、2001:db8::1）不报错，继续往下走，
-	// 由 IP 分支给出「仅支持 IPv4」这种准确提示，而不是把 IPv6 误拆成 host:port。
+	// [IPv6]:port 由 SplitHostPort 正常拆开；裸 IPv6（::1、2001:db8::1）拆不动，
+	// 不报错，继续往下由 IP 分支识别成 KindIP，而不是把 IPv6 误拆成 host:port。
 	if strings.Contains(raw, ":") {
 		if strings.Contains(raw, "/") {
+			// C6 决策：不支持 IPv6 CIDR，但必须点名报错，不能借 host:port/
+			// 网段的通用提示含糊过去，更不能静默跳过。
+			if cip, _, cerr := net.ParseCIDR(raw); cerr == nil && cip.To4() == nil {
+				return Target{}, fmt.Errorf("仅支持 IPv4 CIDR: %s", raw)
+			}
 			return Target{}, fmt.Errorf("目标格式无效（host:port 不带路径，网段不带端口）: %s", raw)
 		}
 		if host, portStr, err := net.SplitHostPort(raw); err == nil {
@@ -135,11 +155,18 @@ func ParseTarget(raw string) (Target, error) {
 		return Target{Raw: raw, Kind: KindCIDR, Host: (&net.IPNet{IP: ip4.Mask(ipnet.Mask), Mask: ipnet.Mask}).String()}, nil
 	}
 	if ip := net.ParseIP(raw); ip != nil {
-		ip4 := ip.To4()
-		if ip4 == nil {
-			return Target{}, fmt.Errorf("仅支持 IPv4: %s", raw)
+		if ip4 := ip.To4(); ip4 != nil {
+			return Target{Raw: raw, Kind: KindIP, Host: ip4.String()}, nil
 		}
-		return Target{Raw: raw, Kind: KindIP, Host: ip4.String()}, nil
+		// IPv6 与 IPv4 同走 KindIP。Host 存规范化后的裸地址（不带方括号）：
+		// Discover/fingerprint 用 net.JoinHostPort 拨号时会自动补 [ ]，
+		// 若这里存了 [::1] 反而会拼成 [[::1]]:port。
+		return Target{Raw: raw, Kind: KindIP, Host: ip.String()}, nil
+	}
+	// 冒号还在、又不是合法 IP/URL/host:port 的（2001:db8::zz、[::1]、
+	// fe80::1%eth0）点名拒绝，别落到域名分支给一句看不出 IPv6 的提示。
+	if strings.Contains(raw, ":") {
+		return Target{}, fmt.Errorf("无效 IPv6 地址: %s", raw)
 	}
 	host := strings.TrimSuffix(strings.ToLower(raw), ".")
 	if len(host) > 253 || !domainRE.MatchString(host) || numericTLD(host) {
