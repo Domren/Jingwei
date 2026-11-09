@@ -743,6 +743,12 @@ func checkShellAliveV2(ctx context.Context, c *DeepClient, shellURL string, p Sh
 		return false, fmt.Sprintf("HTTP %d（认证失败或 shell 已失效）", resp.StatusCode)
 	}
 	if _, err := decodeShellResponse(p, resp.Body); err != nil {
+		// 上传点不解析 PHP 时，回显是载荷源码本身——这跟「密钥不对」是两回事。
+		if strings.EqualFold(strings.TrimSpace(p.Type), "php") {
+			if note, ok := PHPSourceNote(resp.Body); ok {
+				return false, note
+			}
+		}
 		return false, v2AliveNote(resp.Body, err)
 	}
 	return true, "加密通道验证通过"

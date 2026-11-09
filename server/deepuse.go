@@ -1170,21 +1170,21 @@ func (r *deepRun) runWAFBypass(summary map[string]any) (string, string, string, 
 			note = note + "；需对照重放确认非拦截/验证码页假命中"
 		}
 		rec := db.WAFBypassResult{
-			TaskID:         r.task.ID,
-			Target:         base,
-			WAFDetected:    det.Detected,
-			WAFVendor:      det.Vendor,
-			Variant:        p.Name,
-			VariantDesc:    p.Desc,
-			Method:         p.Method,
-			Path:           p.Path,
-			Verdict:        p.Verdict,
-			Note:           note,
-			RespLength:     p.Length,
-			Attempt:        p.Attempt,
-			StopReason:     p.StopReason,
-			BlockFeature:   run.BlockFeature,
-			FinalVerdict:   run.FinalVerdict,
+			TaskID:          r.task.ID,
+			Target:          base,
+			WAFDetected:     det.Detected,
+			WAFVendor:       det.Vendor,
+			Variant:         p.Name,
+			VariantDesc:     p.Desc,
+			Method:          p.Method,
+			Path:            p.Path,
+			Verdict:         p.Verdict,
+			Note:            note,
+			RespLength:      p.Length,
+			Attempt:         p.Attempt,
+			StopReason:      p.StopReason,
+			BlockFeature:    run.BlockFeature,
+			FinalVerdict:    run.FinalVerdict,
 			BaselineBlocked: run.BaselineBlocked,
 		}
 		if p.StatusCode > 0 {
@@ -1350,6 +1350,34 @@ func (r *deepRun) runWebshellInject(summary map[string]any) (string, string, str
 			existing.ID, displayOr(existing.PayloadSHA256, "未记录"), existing.ID, note)
 	}
 	summary["note"] = note
+	// E3：PHP 壳投放后立刻读一次运行时环境。用探测到的事实决定「这个壳能干什么」，
+	// 而不是等操作员发命令时才发现 disable_functions 把壳废了。探测失败只记证据，
+	// 不把已成功的投放判成失败。
+	if landURL != "" && strings.EqualFold(payload.Type, "php") && payload.Protocol == scanner.ShellProtocolV2 {
+		if env, envErr := scanner.QueryShellInfo(r.ctx, client, landURL, payload); envErr == nil {
+			assessed := scanner.AssessShellEnv(env)
+			if raw, mErr := json.Marshal(assessed); mErr == nil {
+				if err := r.pg.UpdateWebshellPHPEnv(ws.ID, raw); err != nil {
+					r.logf("inject", "写入 PHP 环境失败: %v", err)
+				}
+			}
+			summary["php_env"] = assessed
+			if len(assessed.Warnings) > 0 {
+				r.logf("inject", "PHP 环境：%s；%s", displayOr(assessed.PHPVersion, "unknown"),
+					strings.Join(assessed.Warnings, "；"))
+			} else {
+				r.logf("inject", "PHP 环境：%s（%s），命令执行与文件管理可用",
+					displayOr(assessed.PHPVersion, "unknown"), displayOr(assessed.SAPI, "unknown"))
+			}
+		} else {
+			probeNote := map[string]string{"probe_error": envErr.Error()}
+			if raw, mErr := json.Marshal(probeNote); mErr == nil {
+				_ = r.pg.UpdateWebshellPHPEnv(ws.ID, raw)
+			}
+			summary["php_env_error"] = envErr.Error()
+			r.logf("inject", "PHP 环境探测失败（不视为投放失败）: %v", envErr)
+		}
+	}
 	r.setProgress("inject", map[string]any{"webshell_id": ws.ID, "alive": alive})
 	return "done", "done", "", summary
 }

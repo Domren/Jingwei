@@ -1862,6 +1862,10 @@ ALTER TABLE webshells ADD COLUMN IF NOT EXISTS key_version INTEGER NOT NULL DEFA
 -- 属于这个落地文件：一个 webshell 可以绑任意多个内网会话，每个会话已经各自记着
 -- cwd（intranet_sessions.cwd），这里再存一份就是同一个目标上的第二个真相。
 ALTER TABLE webshells ADD COLUMN IF NOT EXISTS os_kind TEXT NOT NULL DEFAULT '';
+-- php_env 存一次投放后探测到的 PHP 运行时环境（版本/SAPI/disable_functions/
+-- open_basedir）。选路与「这个壳能不能执行命令」都靠它当证据，探测失败时显式
+-- 存 probe_error，而不是留空让人误以为环境干净。
+ALTER TABLE webshells ADD COLUMN IF NOT EXISTS php_env JSONB NOT NULL DEFAULT '{}';
 DROP TRIGGER IF EXISTS trg_webshells_upd ON webshells;
 CREATE TRIGGER trg_webshells_upd BEFORE UPDATE ON webshells
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -1894,6 +1898,8 @@ CREATE INDEX IF NOT EXISTS idx_memshells_webshell ON java_memshells(webshell_id,
 CREATE INDEX IF NOT EXISTS idx_memshells_created ON java_memshells(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memshells_target ON java_memshells(target);
 CREATE INDEX IF NOT EXISTS idx_memshells_task ON java_memshells(task_id);
+-- E3：投放前探测到的 JVM 版本作为选型证据留存，兼容既有库。
+ALTER TABLE java_memshells ADD COLUMN IF NOT EXISTS java_version TEXT NOT NULL DEFAULT '';
 DROP TRIGGER IF EXISTS trg_memshells_upd ON java_memshells;
 CREATE TRIGGER trg_memshells_upd BEFORE UPDATE ON java_memshells
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();

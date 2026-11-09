@@ -384,25 +384,25 @@ FROM exploit_records WHERE task_id=$1 ORDER BY id ASC`, taskID)
 // yields a different Attempts/StopReason/FinalVerdict instead of just a list of
 // per-variant verdicts.
 type WAFBypassResult struct {
-	ID             int64     `json:"id"`
-	TaskID         int64     `json:"task_id"`
-	Target         string    `json:"target"`
-	WAFDetected    bool      `json:"waf_detected"`
-	WAFVendor      string    `json:"waf_vendor"`
-	Variant        string    `json:"variant"`
-	VariantDesc    string    `json:"variant_desc"`
-	Method         string    `json:"method"`
-	Path           string    `json:"path"`
-	StatusCode     *int      `json:"status_code,omitempty"`
-	RespLength     int       `json:"resp_length"`
-	Verdict        string    `json:"verdict"`
-	Note           string    `json:"note"`
-	Attempt        int       `json:"attempt"`
-	StopReason     string    `json:"stop_reason"`
-	BlockFeature   string    `json:"block_feature"`
-	FinalVerdict   string    `json:"final_verdict"`
-	BaselineBlocked bool     `json:"baseline_blocked"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID              int64     `json:"id"`
+	TaskID          int64     `json:"task_id"`
+	Target          string    `json:"target"`
+	WAFDetected     bool      `json:"waf_detected"`
+	WAFVendor       string    `json:"waf_vendor"`
+	Variant         string    `json:"variant"`
+	VariantDesc     string    `json:"variant_desc"`
+	Method          string    `json:"method"`
+	Path            string    `json:"path"`
+	StatusCode      *int      `json:"status_code,omitempty"`
+	RespLength      int       `json:"resp_length"`
+	Verdict         string    `json:"verdict"`
+	Note            string    `json:"note"`
+	Attempt         int       `json:"attempt"`
+	StopReason      string    `json:"stop_reason"`
+	BlockFeature    string    `json:"block_feature"`
+	FinalVerdict    string    `json:"final_verdict"`
+	BaselineBlocked bool      `json:"baseline_blocked"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // AddWAFBypassResult stores one bypass attempt.
@@ -449,28 +449,29 @@ FROM waf_bypass_results WHERE task_id=$1 ORDER BY id ASC`, taskID)
 // API's perspective: responses only expose has_password/has_secret so a shell
 // credential never round-trips to the browser or into logs.
 type Webshell struct {
-	ID            int64      `json:"id"`
-	Name          string     `json:"name"`
-	URL           string     `json:"url"`
-	ShellType     string     `json:"shell_type"`
-	Protocol      string     `json:"protocol"`
-	Password      string     `json:"-"`
-	HasPassword   bool       `json:"has_password"`
-	Secret        string     `json:"-"`
-	HasSecret     bool       `json:"has_secret"`
-	Carrier       string     `json:"carrier"`
-	PayloadSHA256 string     `json:"payload_sha256"`
-	KeyVersion    int        `json:"key_version"`
-	Target        string     `json:"target"`
-	Source        string     `json:"source"`
-	TaskID        *int64     `json:"task_id,omitempty"`
-	Status        string     `json:"status"`
-	Note          string     `json:"note"`
-	LastChecked   *time.Time `json:"last_checked,omitempty"`
-	LastOutput    string     `json:"last_output"`
-	OSKind        string     `json:"os_kind"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID            int64           `json:"id"`
+	Name          string          `json:"name"`
+	URL           string          `json:"url"`
+	ShellType     string          `json:"shell_type"`
+	Protocol      string          `json:"protocol"`
+	Password      string          `json:"-"`
+	HasPassword   bool            `json:"has_password"`
+	Secret        string          `json:"-"`
+	HasSecret     bool            `json:"has_secret"`
+	Carrier       string          `json:"carrier"`
+	PayloadSHA256 string          `json:"payload_sha256"`
+	KeyVersion    int             `json:"key_version"`
+	Target        string          `json:"target"`
+	Source        string          `json:"source"`
+	TaskID        *int64          `json:"task_id,omitempty"`
+	Status        string          `json:"status"`
+	Note          string          `json:"note"`
+	LastChecked   *time.Time      `json:"last_checked,omitempty"`
+	LastOutput    string          `json:"last_output"`
+	OSKind        string          `json:"os_kind"`
+	PHPEnv        json.RawMessage `json:"php_env,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
 }
 
 // WebshellInput is the create/update payload for a webshell. Secret is never
@@ -529,14 +530,14 @@ RETURNING `+webshellCols,
 
 const webshellCols = `id, name, url, shell_type, protocol, password, secret, carrier,
 	payload_sha256, key_version, target, source, task_id, status, note,
-	last_checked, last_output, os_kind, created_at, updated_at`
+	last_checked, last_output, os_kind, php_env, created_at, updated_at`
 
 func (d *DB) oneWebshell(row interface{ Scan(...any) error }) (*Webshell, error) {
 	var w Webshell
 	if err := row.Scan(&w.ID, &w.Name, &w.URL, &w.ShellType, &w.Protocol, &w.Password, &w.Secret,
 		&w.Carrier, &w.PayloadSHA256, &w.KeyVersion, &w.Target, &w.Source,
 		&w.TaskID, &w.Status, &w.Note, &w.LastChecked, &w.LastOutput, &w.OSKind,
-		&w.CreatedAt, &w.UpdatedAt); err != nil {
+		&w.PHPEnv, &w.CreatedAt, &w.UpdatedAt); err != nil {
 		return nil, err
 	}
 	w.HasPassword = w.Password != ""
@@ -629,7 +630,7 @@ func (d *DB) ReclaimWebshellForReinject(id int64, in WebshellInput) (*Webshell, 
 	return d.oneWebshell(d.QueryRow(`UPDATE webshells
 SET name=$2, url=$3, shell_type=$4, protocol=$5, password=$6, secret=$7, carrier=$8,
     payload_sha256=$9, key_version=$10, target=$11, source=$12, task_id=$13, note=$14,
-    status='unknown', last_output='', last_checked=NULL, os_kind=''
+    status='unknown', last_output='', last_checked=NULL, os_kind='', php_env='{}'
 WHERE id=$1
 RETURNING `+webshellCols,
 		id, strings.TrimSpace(in.Name), strings.TrimSpace(in.URL), shellType, protocol,
@@ -642,6 +643,18 @@ func (d *DB) UpdateWebshellState(id int64, status, output, note string) error {
 	_, err := d.Exec(`UPDATE webshells
 SET status=$2, last_output=$3, note=CASE WHEN $4='' THEN note ELSE $4 END, last_checked=now()
 WHERE id=$1`, id, status, output, note)
+	return err
+}
+
+// UpdateWebshellPHPEnv records the PHP runtime environment probed from a
+// deployed shell. A probe failure is stored as its own JSON (probe_error)
+// instead of being written as an empty object, so "we did not look" and "the
+// target is clean" stay distinguishable.
+func (d *DB) UpdateWebshellPHPEnv(id int64, env []byte) error {
+	if len(env) == 0 {
+		env = []byte(`{}`)
+	}
+	_, err := d.Exec(`UPDATE webshells SET php_env=$2 WHERE id=$1`, id, env)
 	return err
 }
 
@@ -722,6 +735,7 @@ type JavaMemshell struct {
 	Target      string     `json:"target"`
 	Container   string     `json:"container"`
 	ServletAPI  string     `json:"servlet_api"`
+	JavaVersion string     `json:"java_version"`
 	Status      string     `json:"status"`
 	Note        string     `json:"note"`
 	LastChecked *time.Time `json:"last_checked,omitempty"`
@@ -733,30 +747,31 @@ type JavaMemshell struct {
 // JavaMemshellInput is the server-side insert payload. Secret is sealed by the
 // caller; the client never supplies it.
 type JavaMemshellInput struct {
-	WebshellID *int64
-	TaskID     *int64
-	Type       string
-	Name       string
-	Path       string
-	URL        string
-	Port       int
-	Secret     string
-	Carrier    string
-	Target     string
-	Container  string
-	ServletAPI string
-	Status     string
-	Note       string
+	WebshellID  *int64
+	TaskID      *int64
+	Type        string
+	Name        string
+	Path        string
+	URL         string
+	Port        int
+	Secret      string
+	Carrier     string
+	Target      string
+	Container   string
+	ServletAPI  string
+	JavaVersion string
+	Status      string
+	Note        string
 }
 
 const javaMemshellCols = `id, webshell_id, task_id, type, name, path, url, port, secret,
-	carrier, target, container, servlet_api, status, note, last_checked, last_output,
-	created_at, updated_at`
+	carrier, target, container, servlet_api, java_version, status, note, last_checked,
+	last_output, created_at, updated_at`
 
 func scanJavaMemshell(row interface{ Scan(...any) error }) (*JavaMemshell, error) {
 	var m JavaMemshell
 	if err := row.Scan(&m.ID, &m.WebshellID, &m.TaskID, &m.Type, &m.Name, &m.Path, &m.URL,
-		&m.Port, &m.Secret, &m.Carrier, &m.Target, &m.Container, &m.ServletAPI,
+		&m.Port, &m.Secret, &m.Carrier, &m.Target, &m.Container, &m.ServletAPI, &m.JavaVersion,
 		&m.Status, &m.Note, &m.LastChecked, &m.LastOutput, &m.CreatedAt, &m.UpdatedAt); err != nil {
 		return nil, err
 	}
@@ -777,13 +792,14 @@ func (d *DB) CreateJavaMemshell(in JavaMemshellInput) (*JavaMemshell, error) {
 	}
 	return scanJavaMemshell(d.QueryRow(`
 INSERT INTO java_memshells(webshell_id, task_id, type, name, path, url, port, secret,
-    carrier, target, container, servlet_api, status, note)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    carrier, target, container, servlet_api, java_version, status, note)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 RETURNING `+javaMemshellCols,
 		in.WebshellID, in.TaskID, strings.ToLower(strings.TrimSpace(in.Type)),
 		strings.TrimSpace(in.Name), strings.TrimSpace(in.Path), strings.TrimSpace(in.URL),
 		in.Port, in.Secret, strings.TrimSpace(in.Carrier), strings.TrimSpace(in.Target),
-		strings.TrimSpace(in.Container), strings.TrimSpace(in.ServletAPI), status, in.Note))
+		strings.TrimSpace(in.Container), strings.TrimSpace(in.ServletAPI),
+		strings.TrimSpace(in.JavaVersion), status, in.Note))
 }
 
 // GetJavaMemshell returns one memory-shell record.

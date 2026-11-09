@@ -142,10 +142,11 @@ func (s *Server) deployJavaMemshell(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "请求格式错误")
 		return
 	}
-	typ, valid := scanner.NormalizeMemshellType(req.Type)
-	if !valid {
-		writeErr(w, 400, "type 必须是 "+strings.Join(scanner.MemshellTypes, "/"))
-		return
+	if strings.TrimSpace(req.Type) != "" {
+		if _, valid := scanner.NormalizeMemshellType(req.Type); !valid {
+			writeErr(w, 400, "type 必须是 "+strings.Join(scanner.MemshellTypes, "/"))
+			return
+		}
 	}
 	pg := s.pg(w)
 	if pg == nil {
@@ -187,16 +188,15 @@ func (s *Server) deployJavaMemshell(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "父 webshell 的内存马探测失败："+truncateText(probeOut, 160))
 		return
 	}
-	container := probeFields["container"]
-	servletAPI := probeFields["servlet_api"]
-	if typ != scanner.MemshellTypeAgent && container != "tomcat" {
-		writeErr(w, 400, "目标容器不是 Tomcat，当前仅支持 agent 型内存马")
+	probe := scanner.ParseMemshellProbe(probeFields)
+	container := probe.Container
+	servletAPI := probe.ServletAPI
+	selection, selErr := scanner.SelectMemshellType(probe, req.Type)
+	if selErr != nil {
+		writeErr(w, 400, selErr.Error())
 		return
 	}
-	if available := "," + probeFields["types"] + ","; !strings.Contains(available, ","+typ+",") {
-		writeErr(w, 400, "目标 JVM 不支持 "+typ+" 型内存马（可用："+probeFields["types"]+"）")
-		return
-	}
+	typ := selection.Type
 
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
@@ -294,22 +294,29 @@ func (s *Server) deployJavaMemshell(w http.ResponseWriter, r *http.Request) {
 	if target == "" {
 		target = msURL
 	}
-	note := fmt.Sprintf("container=%s api=%s", displayOr(container, "unknown"), displayOr(servletAPI, "unknown"))
+	source := "manual"
+	if selection.Auto {
+		source = "auto"
+	}
+	note := fmt.Sprintf("container=%s api=%s java=%s type=%s(%s) %s",
+		displayOr(container, "unknown"), displayOr(servletAPI, "unknown"),
+		displayOr(probe.JavaVersion, "unknown"), typ, source, selection.Reason)
 	ms, err := pg.CreateJavaMemshell(db.JavaMemshellInput{
-		WebshellID: &shell.ID,
-		TaskID:     shell.TaskID,
-		Type:       typ,
-		Name:       name,
-		Path:       spec.Path,
-		URL:        msURL,
-		Port:       port,
-		Secret:     sealed,
-		Carrier:    carrier,
-		Target:     target,
-		Container:  container,
-		ServletAPI: servletAPI,
-		Status:     "alive",
-		Note:       note,
+		WebshellID:  &shell.ID,
+		TaskID:      shell.TaskID,
+		Type:        typ,
+		Name:        name,
+		Path:        spec.Path,
+		URL:         msURL,
+		Port:        port,
+		Secret:      sealed,
+		Carrier:     carrier,
+		Target:      target,
+		Container:   container,
+		ServletAPI:  servletAPI,
+		JavaVersion: probe.JavaVersion,
+		Status:      "alive",
+		Note:        note,
 	})
 	if err != nil {
 		s.rollbackMemshell(ctx, client, shell.URL, parentPayload, typ, name, spec.Path)
@@ -317,7 +324,7 @@ func (s *Server) deployJavaMemshell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.registerMemshellResource(ms)
-	writeJSON(w, 201, map[string]any{"memshell": ms})
+	writeJSON(w, 201, map[string]any{"memshell": ms, "selection": selection})
 }
 
 func (s *Server) rollbackMemshell(ctx context.Context, client *scanner.DeepClient,
