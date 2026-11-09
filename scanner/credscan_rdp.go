@@ -1,7 +1,6 @@
 package scanner
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -9,21 +8,22 @@ import (
 
 // RDP (X.224) 探针。
 //
-// 未在真机验证：RDP 只在 Windows 靶机上起得来，本平台没有该环境。本适配器实现的是
-// X.224 Connection Request/Confirm 层的可复现形态：CR 里带 RDP Negotiation Request
-// （requestedProtocols=PROTOCOL_RDP），CC 回 RDP Negotiation Response——「TPKT + CC(0xD0)
-// + 0x02 00 08 00 协商应答」是 RDP 特有证据，不靠 3389 端口猜。selectedProtocol 要求
-// TLS/CredSSP 时如实落 inconclusive（本平台不实现该安全层）。
+// 已在真机 xrdp 0.10（Linux）上验证识别路径。本适配器实现的是 X.224 Connection
+// Request/Confirm 层：CR 里带 RDP Negotiation Request（requestedProtocols=PROTOCOL_RDP），
+// CC 回 RDP Negotiation Response——「TPKT + CC(0xD0) + 0x02 ?? 08 00 协商应答」是 RDP
+// 特有证据，不靠 3389 端口猜。
 //
-// 限制（如实写明）：CredSSP/NLA 与 RDP standard security 的 RC4/RSA 加密、MCS/GCC 完整
-// 协商未实现；凭据帧是简化形态，命中判定依赖服务端明确回执。hit/deny 双路径由
-// scanner/credscan_adapters_test.go 的进程内协议桩验证，不写「已在真机跑通」。
+// 真机结论（如实写）：xrdp 0.10 只允许 TLS，回的是 Negotiation **flags=0x01（失败）**，
+// selectedProtocol=0。适配器据此落 inconclusive 并写明「服务端拒绝标准安全层」——
+// 这是正确行为，不是缺陷；识别标记也因此必须接受 flags=0x01（早期只认 0x00，真机上
+// 把合法 RDP 判成了「不是 RDP」）。
+//
+// 限制：CredSSP/NLA 与 standard security 的 RC4/RSA 加密、MCS/GCC 完整协商未实现。
+// 这两个安全层不实现，凭据判定就永远到不了 hit/deny——这是设计上的边界，不是待修 bug。
 
 type rdpCredAdapter struct{}
 
 func (rdpCredAdapter) Protocol() string { return "rdp" }
-
-var rdpNegRspMarker = []byte{0x02, 0x00, 0x08, 0x00}
 
 // rdpConnectRequest：TPKT(4) + X.224 CR(15)，末 8 字节是 RDP Negotiation Request。
 func rdpConnectRequest() []byte {
@@ -59,13 +59,18 @@ func rdpReadTPKT(w *credWire) ([]byte, error) {
 	return append(head, body...), err
 }
 
-// rdpSelectedProtocol 从 CC 帧里取协商出的安全协议；-1 表示没找到协商应答。
-func rdpSelectedProtocol(raw []byte) int {
-	idx := bytes.Index(raw, rdpNegRspMarker)
-	if idx < 0 || idx+8 > len(raw) {
-		return -1
+// rdpNegotiation 从 CC 帧里取 RDP Negotiation Response：
+// type=0x02, flags(0=成功/1=失败), length=8, selectedProtocol(4)。
+// flags 必须允许 0x01——服务端拒绝客户端请求的安全层时回的就是 flags=1，
+// 它同样是 RDP 特有证据（真机 xrdp 0.10 只允许 TLS 时就是这样，selectedProtocol=0）。
+func rdpNegotiation(raw []byte) (flags byte, proto int, ok bool) {
+	for i := 0; i+8 <= len(raw); i++ {
+		if raw[i] != 0x02 || raw[i+2] != 0x08 || raw[i+3] != 0x00 {
+			continue
+		}
+		return raw[i+1], int(binary.LittleEndian.Uint32(raw[i+4:])), true
 	}
-	return int(binary.LittleEndian.Uint32(raw[idx+4:]))
+	return 0, 0, false
 }
 
 func (a rdpCredAdapter) Identify(ctx context.Context, ep CredEndpoint) (bool, string, error) {
@@ -84,9 +89,12 @@ func (a rdpCredAdapter) Identify(ctx context.Context, ep CredEndpoint) (bool, st
 	if len(raw) < 6 || raw[5] != 0xd0 { // X.224 Connection Confirm
 		return false, credPreview(raw), nil
 	}
-	proto := rdpSelectedProtocol(raw)
-	if proto < 0 {
+	flags, proto, ok := rdpNegotiation(raw)
+	if !ok {
 		return false, credPreview(raw), nil
+	}
+	if flags != 0 {
+		return true, fmt.Sprintf("RDP X.224 Connection Confirm（协商失败：服务端拒绝所请求的安全层，selectedProtocol=%d）", proto), nil
 	}
 	return true, fmt.Sprintf("RDP X.224 Connection Confirm（selectedProtocol=%d）", proto), nil
 }
@@ -107,11 +115,16 @@ func (a rdpCredAdapter) Try(ctx context.Context, ep CredEndpoint, cred Credentia
 	if err != nil {
 		return res.withErr(err)
 	}
-	proto := rdpSelectedProtocol(cc)
-	res.Banner = fmt.Sprintf("RDP X.224 CC（selectedProtocol=%d）", proto)
-	if proto < 0 {
+	flags, proto, ok := rdpNegotiation(cc)
+	res.Banner = fmt.Sprintf("RDP X.224 CC（flags=%d, selectedProtocol=%d）", flags, proto)
+	if !ok {
 		res.Outcome = CredInconclusive
 		res.Reason = "X.224 CC 里没有 RDP Negotiation Response，不能按 RDP 协议下结论"
+		return res, nil
+	}
+	if flags != 0 {
+		res.Outcome = CredInconclusive
+		res.Reason = "服务端拒绝了 RDP 标准安全层（Negotiation flags=0x01），只接受 TLS/CredSSP；本平台不实现该安全层，未提交凭据"
 		return res, nil
 	}
 	if proto != 0 {

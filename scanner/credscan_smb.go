@@ -5,9 +5,15 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/md5"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"strings"
+	"time"
 	"unicode/utf16"
+
+	"golang.org/x/crypto/md4"
 )
 
 // SMB2 (445) 登录探针：NetBIOS session 帧 + SMB2 NEGOTIATE + SESSION_SETUP 的
@@ -15,11 +21,16 @@ import (
 // hit 的握手层「接受」信号是最后一次 SESSION_SETUP 的 STATUS_SUCCESS(0)，
 // LOGON_FAILURE(0xC000006D) 是明确拒绝，ACCOUNT_LOCKED_OUT(0xC0000234) 是锁定。
 //
-// 限制（如实写明）：[MS-NLMP] 的 NTOWFv1(MD4) / NTLMv2(HMAC-MD5 + AV-pair blob) 密码学
-// 未实现（本轮不引 x/crypto/md4、也不自实现 MD4），Type3 里的 NT 质询应答是按口令派生的
-// 占位值。真机部署前必须按 [MS-NLMP] 补齐 NTLM 计算，或让 Samba 允许对应机制。
-// lab 登记了 Samba 用例，但本轮未在真机验证 hit 路径；SMB2/NTLMSSP 帧状态机与
-// STATUS_* 判定由进程内协议桩覆盖。不写「已在真机跑通」。
+// 认证按 [MS-NLMP] 3.3.2 的 NTLMv2 实现：NTOWFv1 = MD4(UTF16LE(口令))，
+// NTOWFv2 = HMAC-MD5(NTOWFv1, UTF16LE(UPPER(用户)+域))，应答 = HMAC-MD5(NTOWFv2,
+// ServerChallenge||blob) || blob。域与 TargetInfo 都取服务端质询里给的那份原样回填。
+//
+// 已在真机 Samba 4.24 上验证 hit/deny 双路径。真机暴露并修掉三处：NEGOTIATE 的方言
+// 数组必须从体偏移 36 起（塞进 ClientGuid 区会让服务端断连），且不能声明 3.1.1
+// （它要求 negotiate context）；MessageId 必须从 0 开始（Samba 的序列号校验会拒 1）；
+// 第二次 SESSION_SETUP 必须带回服务端上一次响应里的 SessionId，否则 INVALID_PARAMETER。
+//
+// 限制：未实现 NTLMv1 与签名/密封（session key 下发但不用）；SMB3 加密未协商。
 
 type smbCredAdapter struct{}
 
@@ -59,25 +70,39 @@ func smb2Header(command uint16, status uint32, messageID uint64) []byte {
 	h := make([]byte, 64)
 	copy(h, smb2Magic)
 	binary.LittleEndian.PutUint16(h[4:], 64) // StructureSize
+	binary.LittleEndian.PutUint16(h[6:], 1)  // CreditCharge
 	binary.LittleEndian.PutUint32(h[8:], status)
 	binary.LittleEndian.PutUint16(h[12:], command)
+	binary.LittleEndian.PutUint16(h[14:], 1) // CreditRequest
 	binary.LittleEndian.PutUint64(h[24:], messageID)
 	return h
 }
 
+// smb2Negotiate 组 NEGOTIATE Request：36 字节固定体 + DialectCount*2 字节方言数组。
+// 方言数组从体偏移 36 开始，不是塞进 ClientGuid/ClientStartTime 里——塞错位置服务端
+// 解析到「方言数量 5 但数组不存在」，直接断连。
+// 只谈到 0x0224(SMB 3.0.2)：3.1.1 必须带 negotiate context（preauth 完整性），
+// 不带会被拒，而我们用不到 3.1.1 的加密/预授权。
 func smb2Negotiate() []byte {
-	h := smb2Header(smb2CmdNegotiate, 0, 1)
+	dialects := []uint16{0x0202, 0x0210, 0x0222, 0x0224}
+	h := smb2Header(smb2CmdNegotiate, 0, 0)
 	body := make([]byte, 36)
-	binary.LittleEndian.PutUint16(body[0:], 36) // StructureSize
-	binary.LittleEndian.PutUint16(body[2:], 5)  // DialectCount
-	for i, d := range []uint16{0x0202, 0x0210, 0x0222, 0x0224, 0x0311} {
-		binary.LittleEndian.PutUint16(body[36-10+i*2:], d)
+	binary.LittleEndian.PutUint16(body[0:], 36)                    // StructureSize
+	binary.LittleEndian.PutUint16(body[2:], uint16(len(dialects))) // DialectCount
+	binary.LittleEndian.PutUint16(body[4:], 1)                     // SecurityMode: signing enabled
+	for _, d := range dialects {
+		tmp := make([]byte, 2)
+		binary.LittleEndian.PutUint16(tmp, d)
+		body = append(body, tmp...)
 	}
 	return append(h, body...)
 }
 
-func smb2SessionSetup(messageID uint64, secBuf []byte) []byte {
+func smb2SessionSetup(messageID, sessionID uint64, secBuf []byte) []byte {
 	h := smb2Header(smb2CmdSessionSetup, 0, messageID)
+	// 第二次 SESSION_SETUP 必须带回服务端上一次响应里的 SessionId，
+	// 带 0 会被判 STATUS_INVALID_PARAMETER（真机 Samba 4.24 实测）。
+	binary.LittleEndian.PutUint64(h[40:], sessionID)
 	body := make([]byte, 24)
 	binary.LittleEndian.PutUint16(body[0:], 25)  // StructureSize
 	binary.LittleEndian.PutUint16(body[12:], 88) // SecurityBufferOffset = 64 + 24
@@ -126,30 +151,101 @@ func ntlmNegotiate() []byte {
 	return b
 }
 
-// smbNTResponse 是 NT 质询应答的占位实现：HMAC-MD5(口令派生 key, ServerChallenge)。
-// 它不是 [MS-NLMP] 的 NTLMv2/v1，见文件头限制说明。
-func smbNTResponse(pass string, challenge []byte) []byte {
-	key := md5.Sum(smbUTF16(pass))
-	h := hmac.New(md5.New, key[:])
-	h.Write(challenge)
-	return h.Sum(nil)
+// ntlmType2 是 [MS-NLMP] 2.2.1.2 CHALLENGE_MESSAGE 里我们算 NTLMv2 需要的部分。
+type ntlmType2 struct {
+	challenge  []byte
+	targetName string
+	targetInfo []byte
+	flags      uint32
 }
 
-// ntlmChallengeOf 取 Type2 固定偏移 24..32 的 ServerChallenge。
-func ntlmChallengeOf(sec []byte) []byte {
-	if len(sec) < 32 || !bytes.HasPrefix(sec, []byte("NTLMSSP\x00")) {
+func smbDecodeUTF16(b []byte) string {
+	u := make([]uint16, len(b)/2)
+	for i := range u {
+		u[i] = binary.LittleEndian.Uint16(b[i*2:])
+	}
+	return string(utf16.Decode(u))
+}
+
+// ntlmParseType2 解析服务端质询。TargetInfo 必须原样回填进 NTLMv2 blob——
+// 自己拼一份 AV-pair 会被 Windows 判成无效（Samba 宽松些，但没必要赌）。
+func ntlmParseType2(sec []byte) *ntlmType2 {
+	if len(sec) < 32 || !bytes.HasPrefix(sec, []byte("NTLMSSP\x00")) ||
+		binary.LittleEndian.Uint32(sec[8:]) != 2 {
 		return nil
 	}
-	return append([]byte(nil), sec[24:32]...)
+	t := &ntlmType2{
+		challenge: append([]byte(nil), sec[24:32]...),
+		flags:     binary.LittleEndian.Uint32(sec[20:]),
+	}
+	if n, off := int(binary.LittleEndian.Uint16(sec[12:])), int(binary.LittleEndian.Uint32(sec[16:])); n > 0 && off+n <= len(sec) {
+		t.targetName = smbDecodeUTF16(sec[off : off+n])
+	}
+	if len(sec) >= 48 {
+		n, off := int(binary.LittleEndian.Uint16(sec[40:])), int(binary.LittleEndian.Uint32(sec[44:]))
+		if n > 0 && off+n <= len(sec) {
+			t.targetInfo = append([]byte(nil), sec[off:off+n]...)
+		}
+	}
+	return t
 }
 
-func ntlmAuth(cred Credential, challenge []byte) []byte {
-	nt := smbNTResponse(cred.Password, challenge)
-	domain, user, ws := smbUTF16("."), smbUTF16(cred.Username), smbUTF16("JW")
+// ntlmV2Response 按 [MS-NLMP] 3.3.2 算 NTLMv2：
+//
+//	NTOWFv1 = MD4(UTF16LE(password))
+//	NTOWFv2 = HMAC-MD5(NTOWFv1, UTF16LE(UPPER(user) + domain))
+//	blob    = 0x01010000 | 00000000 | FILETIME | ClientChallenge | 00000000 | TargetInfo | 00000000
+//	proof   = HMAC-MD5(NTOWFv2, ServerChallenge || blob)
+//	应答    = proof || blob
+//
+// 用户名必须大写后再拼域，且域用的是服务端在质询里给的名字——这两点任一处写错，
+// Samba 与 Windows 都只会回 LOGON_FAILURE，看起来跟口令错一模一样。
+func ntlmV2Response(cred Credential, t2 *ntlmType2) []byte {
+	m := md4.New()
+	m.Write(smbUTF16(cred.Password))
+	v1 := m.Sum(nil)
+
+	dom := t2.targetName
+	if dom == "" {
+		dom = "."
+	}
+	h := hmac.New(md5.New, v1)
+	h.Write(smbUTF16(strings.ToUpper(cred.Username) + dom))
+	v2 := h.Sum(nil)
+
+	blob := []byte{0x01, 0x01, 0x00, 0x00, 0, 0, 0, 0}
+	ft := make([]byte, 8) // FILETIME：从 1601 起的 100ns 计数
+	binary.LittleEndian.PutUint64(ft, uint64(time.Now().Unix()+11644473600)*10000000)
+	blob = append(blob, ft...)
+	cli := make([]byte, 8)
+	if _, err := io.ReadFull(rand.Reader, cli); err != nil {
+		copy(cli, []byte("jwlabcbr"))
+	}
+	blob = append(blob, cli...)
+	blob = append(blob, 0, 0, 0, 0)
+	if len(t2.targetInfo) > 0 {
+		blob = append(blob, t2.targetInfo...)
+	} else {
+		blob = append(blob, 0, 0, 0, 0) // EOL
+	}
+	blob = append(blob, 0, 0, 0, 0)
+
+	hh := hmac.New(md5.New, v2)
+	hh.Write(t2.challenge)
+	hh.Write(blob)
+	return append(hh.Sum(nil), blob...)
+}
+
+func ntlmAuth(cred Credential, t2 *ntlmType2) []byte {
+	nt := ntlmV2Response(cred, t2)
+	dom := t2.targetName
+	if dom == "" {
+		dom = "."
+	}
+	domain, user, ws := smbUTF16(dom), smbUTF16(cred.Username), smbUTF16("JW")
 	const hdr = 64
 	off := hdr
-	lmOff := off
-	ntOff := off + 0
+	ntOff := off
 	domOff := ntOff + len(nt)
 	usrOff := domOff + len(domain)
 	wsOff := usrOff + len(user)
@@ -157,13 +253,13 @@ func ntlmAuth(cred Credential, challenge []byte) []byte {
 	out := make([]byte, hdr)
 	copy(out, []byte("NTLMSSP\x00"))
 	binary.LittleEndian.PutUint32(out[8:], 3) // type 3
-	smbSecField(out[12:], 0, lmOff)           // LM response（空）
+	smbSecField(out[12:], 0, 0)               // LM response 空：null 字段的 offset 也必须为 0
 	smbSecField(out[20:], len(nt), ntOff)
 	smbSecField(out[28:], len(domain), domOff)
 	smbSecField(out[36:], len(user), usrOff)
 	smbSecField(out[44:], len(ws), wsOff)
 	smbSecField(out[52:], 0, keyOff)
-	binary.LittleEndian.PutUint32(out[60:], 0x078208a0)
+	binary.LittleEndian.PutUint32(out[60:], t2.flags)
 	out = append(out, nt...)
 	out = append(out, domain...)
 	out = append(out, user...)
@@ -188,8 +284,9 @@ func (a smbCredAdapter) Identify(ctx context.Context, ep CredEndpoint) (bool, st
 		return false, credPreview(frame), nil
 	}
 	dialect := 0
-	if len(frame) >= 72 {
-		dialect = int(binary.LittleEndian.Uint16(frame[70:]))
+	if len(frame) >= 70 {
+		// DialectRevision 在 SMB2 头之后的结构体偏移 4：64+4 = 68。
+		dialect = int(binary.LittleEndian.Uint16(frame[68:]))
 	}
 	return true, fmt.Sprintf("SMB2 NEGOTIATE 响应（dialect 0x%04x）", dialect), nil
 }
@@ -210,7 +307,7 @@ func (a smbCredAdapter) Try(ctx context.Context, ep CredEndpoint, cred Credentia
 		return res.withErr(err)
 	}
 	// 第一次 SESSION_SETUP：NTLMSSP_NEGOTIATE
-	if err = w.write(smb2Frame(smb2SessionSetup(2, ntlmNegotiate()))); err != nil {
+	if err = w.write(smb2Frame(smb2SessionSetup(1, 0, ntlmNegotiate()))); err != nil {
 		return res.withErr(err)
 	}
 	ss1, err := smb2ReadFrame(w)
@@ -234,14 +331,18 @@ func (a smbCredAdapter) Try(ctx context.Context, ep CredEndpoint, cred Credentia
 		res.Reason = fmt.Sprintf("SESSION_SETUP 未进入 NTLMSSP 质询（status=0x%08x）", st1)
 		return res, nil
 	}
-	challenge := ntlmChallengeOf(smb2SecurityBuffer(ss1))
-	if challenge == nil {
+	t2 := ntlmParseType2(smb2SecurityBuffer(ss1))
+	if t2 == nil {
 		res.Outcome = CredInconclusive
 		res.Reason = "SESSION_SETUP 应答里没有合法的 NTLMSSP CHALLENGE"
 		return res, nil
 	}
-	// 第二次 SESSION_SETUP：NTLMSSP_AUTH
-	if err = w.write(smb2Frame(smb2SessionSetup(3, ntlmAuth(cred, challenge)))); err != nil {
+	// 第二次 SESSION_SETUP：NTLMSSP_AUTH（NTLMv2 应答），必须带回上一步的 SessionId。
+	var sessionID uint64
+	if len(ss1) >= 48 {
+		sessionID = binary.LittleEndian.Uint64(ss1[40:])
+	}
+	if err = w.write(smb2Frame(smb2SessionSetup(2, sessionID, ntlmAuth(cred, t2)))); err != nil {
 		return res.withErr(err)
 	}
 	ss2, err := smb2ReadFrame(w)

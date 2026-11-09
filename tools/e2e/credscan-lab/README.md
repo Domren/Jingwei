@@ -29,6 +29,22 @@ Ubuntu-1 上的软件包只有在本轮新装时才由 `down.sh` 卸载（用 `/
 `go test ./...` 默认口径下这个包也是绿的，**这是刻意的**：真机验证没跑就要红，得靠人记得
 在发版前带上 `JW_CRED_LAB=1` 重跑一次，并把结果写进进度手册 §4 的台账。
 
+### 1.6.0 那一批（六个协议，独立清单）
+
+Jenkins / MSSQL / SMB / JBoss(WildFly) / RDP / RouterOS 这六条的口令是起服务时写死的（容器
+`init` 与 CHR 首次配置），不能像 `up.sh` 那样现生成，所以单独一份清单：
+
+```bash
+tools/e2e/credscan-lab/docker-labs.sh up        # jenkins / mssql / wildfly 三个容器
+tools/e2e/credscan-lab/six-pack.sh              # 写 /tmp/jw-cred-lab-6/lab.json
+JW_CRED_LAB=1 JW_CRED_LAB_MANIFEST=/tmp/jw-cred-lab-6/lab.json \
+  go test ./scanner -run TestCredLabProtocols -count=1 -v
+```
+
+只用 `-run TestCredLabProtocols`：`up.sh` 那批服务（Redis/PG/MySQL/…）这会儿没起，跑整包会
+先失败在「真机清单读不到」上——**这不是回归**，是清单来源不同。`six-pack.sh` 只写清单不起服务；
+SMB / RDP / RouterOS 三条按下面「手动起剩下三条」起。
+
 ## 这一台覆盖什么
 
 | 协议 | 覆盖的认证形态 | 位置 |
@@ -54,6 +70,39 @@ Ubuntu-1 上的软件包只有在本轮新装时才由 `down.sh` 卸载（用 `/
 | POP3-SSL / IMAP-SSL | dovecot 隐式 TLS（安装时自签证书） | Ubuntu-1:995 / 993 |
 | LDAP / LDAPS | slapd + `uid=jwcred,ou=people,dc=lab,dc=local` 简单 bind；LDAPS 用自签证书（`SLAPD_SERVICES` 要含 `ldaps:///`） | Ubuntu-1:389 / 636 |
 | VNC | TigerVNC VncAuth（`-BlacklistThreshold 1000` 关闭验证期间的黑名单） | Ubuntu-1:5901 |
+| Jenkins | 真 Jenkins LTS（容器，`init.groovy.d` 预建账号跳过安装向导）：`/j_spring_security_check` 提交 + `whoAmI` 认证探针 | 容器 `jw-lab-jenkins`，127.0.0.1:18080 |
+| MSSQL | 真 SQL Server 2022 Linux（TDS 与 Windows 版同协议，差别只在 SSPI）：PreLogin + Login7 → `LOGINACK(0xAD)`/`ERROR(0xAA)` | 容器 `jw-lab-mssql`，127.0.0.1:11433 |
+| SMB | 真 Samba 4.24：SMB2 NEGOTIATE + NTLMSSP 三消息，**NTLMv2 应答真算**（MD4 + HMAC-MD5） | 宿主机 445，配置在 `/tmp/jw-smb` |
+| JBoss / WildFly | 真 WildFly 25 管理接口：`/management` 的 **HTTP Digest**（ManagementRealm）；Basic 带着正确口令也是 401 | 容器 `jw-lab-wildfly`，127.0.0.1:19990 |
+| RDP | 真 xrdp 0.10：X.224 + RDP Negotiation。**只验识别与安全层判定**——xrdp 只允许 TLS，适配器据此落 `inconclusive`，不判口令 | 宿主机 3389 |
+| RouterOS | 真 RouterOS 7.16.2 CHR（qemu + KVM）：句子协议 `/login`，`!done` 才算接受 | 127.0.0.1:18728（转发到 CHR 的 8728） |
+
+容器批用 `docker-labs.sh up`（jenkins / mssql / wildfly 三条），Samba 与 xrdp 直接起在宿主机上，
+RouterOS 走 qemu（见下）。
+
+### 手动起剩下三条（不进 `up.sh`）
+
+`up.sh` 只碰「装包能还原」的服务；Samba/xrdp 要 root、CHR 要 128MB 镜像与串口自动化，
+所以单独起：
+
+```bash
+# Samba（445）：/run/samba/ncalrpc 必须先建，否则 smbd 直接退
+mkdir -p /run/samba/ncalrpc
+useradd -M -s /usr/sbin/nologin jwlab
+printf 'jwlab123\njwlab123\n' | smbpasswd -s -a jwlab
+smbd -D --no-process-group
+
+# xrdp（3389）
+mkdir -p /var/run/xrdp/sockdir && xrdp -n >/tmp/xrdp.log 2>&1 &
+
+# RouterOS CHR：官源慢，用 Range 分段下；qemu 起来后必须走完首次改密码
+qemu-system-x86_64 -enable-kvm -m 512 -smp 2 \
+  -drive file=chr-7.16.2.img,format=raw,if=ide \
+  -netdev user,id=n0,hostfwd=tcp:127.0.0.1:18728-:8728 -device e1000,netdev=n0 \
+  -display none -serial unix:/tmp/chr-serial.sock,server=on,wait=off \
+  -daemonize -pidfile /tmp/chr.pid
+# 串口：admin / 空密码 → 强制改密码 → jwlab123（两次）
+```
 
 每个用例都断言四件事：`Identify` 在真服务上确认协议**且留下非空 banner**（报告要能说明凭什么）；
 正确凭据落到清单声明的结果态；错误凭据落到 `deny` 并**同样留下证据**；清单里写了 `expect_tls` 的用例，
@@ -69,25 +118,22 @@ Ubuntu-1 上的软件包只有在本轮新装时才由 `down.sh` 卸载（用 `/
 
 ## 本台覆盖不到、且**没有**真机验证的协议
 
-1.6.0 补的二档/三档适配器里有 10 条在这台机器上起不了真服务。这不是「暂时跳过」，
+1.6.0 补的二档/三档适配器里还剩 4 条在这台机器上起不了真服务。这不是「暂时跳过」，
 是**缺口**，写在各自的适配器文件头里，发版台账也不许把它们算成已验证：
 
 | 协议 | 为什么这里跑不了 | 现在验到了哪一步 |
 | :-- | :-- | :-- |
-| MSSQL | 服务端是 Windows/Linux 的 TDS 实现，镜像拉不动（`mcr.microsoft.com` 出网受限）；且 Login7 布局尚未按 [MS-TDS] 逐字段核对、TLS/SSPI 未实现 | 进程内协议桩：LOGINACK(0xAD)→hit、ERROR(0xAA)→deny |
-| SMB | 同上；且 [MS-NLMP] 的 NTOWFv1(MD4)/NTLMv2 未实现，Type3 的 NT 应答是派生占位值——真 Samba 必然拒绝，跑出来的 deny 与适配器无关 | 进程内协议桩：STATUS_SUCCESS→hit、0xC000006D→deny、0xC0000234→locked |
-| RDP | 需要 Windows 终端服务或 xrdp；适配器只到 TPKT/X.224 + 连接确认，安全层（CredSSP/NLA）未实现 | 进程内协议桩 |
-| WinRM | 只在 Windows 上；且本平台不实现 SPNEGO，服务端要 Negotiate 时只能落 inconclusive | 进程内协议桩 + `TestCredWinRMNegotiateIsInconclusive` |
-| Oracle | 没有可用实例；O3LOGON(DES/AUTH_SESSKEY) 与 12c PBKDF2 未实现 | 进程内协议桩：AUTH_OK→hit、ORA-01017→deny |
-| RouterOS | 只能跑在 Mikrotik 设备/CHR 上 | 进程内协议桩 |
-| Cobalt Strike | 商业 Team Server，私协议 | 进程内协议桩 |
-| WebLogic / JBoss | 控制台容器太重且镜像拉不动；JBoss 走 Basic（一轮）、WebLogic 走表单三跳 | 进程内协议桩 |
-| Jenkins | 可装但需要 JDK + 服务；表单三跳（crumb → j_acegi_security_check → whoAmI）已在桩里钉住 | 进程内协议桩 |
+| Oracle | Oracle XE 镜像约 2GB 且要跑完整 O3LOGON（DES/AUTH_SESSKEY）与 12c 的 PBKDF2 才能判口令——现在的实现只到 TNS Connect/Accept + 认证回执分类，真机上必然 deny | 进程内协议桩：AUTH_OK→hit、ORA-01017→deny |
+| WebLogic | 官方镜像要 Oracle 账号接受协议、约 12GB；替代路径是老版 wls zip + JDK8 | 进程内协议桩（表单三跳流程） |
+| WinRM | 只在 Windows 上；不实现 SPNEGO 时服务端只给 Negotiate，正确口令也只能落 `inconclusive`。可执行方案见 `windows-sandbox/` | 进程内协议桩 + Windows 沙箱方案文档 |
+| Cobalt Strike | 商业 Team Server，私协议且拿不到合法服务端 | 进程内协议桩 |
 
 「进程内协议桩」指的是 `scanner/credscan_new_adapters_test.go`：桩按协议真实编码回帧
 （Login7/NTLMSSP 的用户名是 UTF-16LE、svnserve 的 PLAIN 是 base64、WinRM 的识别证据是
 `Microsoft-HTTPAPI` 的 Server 头），因此它能抓住实现错误，但**代替不了真服务**——
-这也是把缺口逐条列出来的原因。
+这也是把缺口逐条列出来的原因。上面已经真机验过的 6 条，桩仍保留作为回归保护，
+但桩的帧必须按真机抓到的形状写：MSSQL/SMB/JBoss 三条的桩原本是按**错误实现**写的，
+所以测试一直绿（见下面「坑」里的前三条）。
 
 ## 已知的环境坑（写下来是为了下次别再踩）
 
@@ -126,3 +172,25 @@ Ubuntu-1 上的软件包只有在本轮新装时才由 `down.sh` 卸载（用 `/
   跑完整 14 条要先把 Ubuntu-1 起来（`wslrun.sh`，路径可用 `JW_LAB_RUN` / `JW_LAB_DISTRO` 覆盖）。
 - **`down.sh` 只清理本验证台**：它删临时容器、临时用户、恢复被改过的系统配置、删清单与口令文件；
   **不动三台边界/内网靶机上已有的渗透载荷**，那是另一套台账管的。
+- **docker daemon 的代理指向 Clash 时什么都拉不下来**：`/etc/systemd/system/docker.service.d/http-proxy.conf`
+  里写着 `127.0.0.1:7890`，Clash 关着时 `docker pull` 直接 `connection refused`。不是缺陷，是环境：
+  把 drop-in 挪走、镜像走 `docker.m.daocloud.io` / `docker.1ms.run` 前缀直连即可。
+  `mcr.microsoft.com` 的镜像要用 `m.daocloud.io/mcr.microsoft.com/...`；`jenkins` 的官方仓库是
+  `jenkins/jenkins`（`library/jenkins` 是 2018 年废弃的旧镜像，镜像源上普遍 403/404）。
+- **Samba 4.24 起 smbd 要求 `/run/samba/ncalrpc` 存在**，否则启动即退，日志只有一句
+  `mkdir failed on directory /run/samba/ncalrpc`。另外 `smb ports` 在这个版本已改成
+  `server smb transports`（值是 tcp/rdma，**不是端口号**），想换端口只能改监听地址或在
+  容器里做映射。
+- **WildFly 官方镜像只绑 127.0.0.1**：`jboss/wildfly` 的 CMD 是 `standalone.sh -b 0.0.0.0`，
+  没带 `-bmanagement`，所以 9990 只监听容器内回环，宿主端口映射连不进去。要 `-bmanagement 0.0.0.0`。
+- **WildFly 管理台是 Digest，不是 Basic**：`/management` 回
+  `WWW-Authenticate: Digest realm="ManagementRealm"`，`curl -u admin:正确口令` 照样 401；
+  而 `/console` 未认证直接 302 到 index.html，**根本不做认证**——拿它当认证探针永远判不出结论。
+  管理用户要用 `add-user.sh -m`（ManagementRealm），`-a` 建的是 application realm。
+- **CHR 镜像官源单连接只有 ~18KB/s**：40MB 的 zip 要下 40 分钟。官源支持 Range，用 8 段并行
+  （每段校验长度并重试）能压到 3 分钟。首次启动的串口是**全屏重绘**，按行读会错过
+  `new password>`；而且它会**强制改密码**——没按提示走完就退出，镜像里的 admin 密码会变成
+  一个谁都不知道的值，只能重新解压镜像重来。
+- **真机最值钱的地方是「桩按错误实现写的」**：MSSQL 的桩按错误的 Login7 布局回帧、SMB 的桩
+  按占位 NT 应答回帧、JBoss 的桩按 Basic 回帧，三条测试当时全绿，真机一跑全崩。桩只能证明
+  「代码与桩一致」，证明不了「与协议一致」。

@@ -100,7 +100,7 @@ func smb2Reply(cmd uint16, status uint32, msgID uint64, body []byte) []byte {
 func smb2NegotiateReply() []byte {
 	body := make([]byte, 64)
 	binary.LittleEndian.PutUint16(body[0:], 65)
-	binary.LittleEndian.PutUint16(body[len(body)-2:], 0x0311) // dialect at frame[70]
+	binary.LittleEndian.PutUint16(body[4:], 0x0302) // DialectRevision -> frame[68]
 	return smb2Reply(smb2CmdNegotiate, 0, 1, body)
 }
 
@@ -424,22 +424,27 @@ func TestCredJenkinsHitDeny(t *testing.T) {
 		line := readLine(c)
 		switch {
 		case strings.Contains(line, "GET /login"):
-			// Jenkins 的识别点在登录页：页面里必须有 Jenkins 特有的表单动作。
+			// Jenkins 2.x 的登录页表单动作是 j_spring_security_check（1.x 才是 Acegi 那个）。
 			httpStubReply(c, 200, nil,
-				`<html><head><title>Jenkins</title></head><body>`+
-					`<form name="login" action="j_acegi_security_check" method="post"></form></body></html>`)
+				`<html><head><title>Sign in [Jenkins]</title></head><body>`+
+					`<form name="login" action="j_spring_security_check" method="post"></form></body></html>`)
 		case strings.Contains(line, "GET /crumbIssuer/api/json"):
-			httpStubReply(c, 200, map[string]string{"Set-Cookie": "JSESSIONID=abc; Path=/"},
+			httpStubReply(c, 200, map[string]string{"Set-Cookie": "JSESSIONID=anon; Path=/"},
 				`{"crumb":"c1","crumbRequestField":"Jenkins-Crumb"}`)
-		case strings.Contains(line, "POST /j_acegi_security_check"):
-			// 请求行、头和正文通常在同一个 TCP 段里到达，一次读全即可。
+		case strings.Contains(line, "POST /j_spring_security_check"):
 			if strings.Contains(line, "j_username=admin") {
-				httpStubReply(c, 302, map[string]string{"Location": "/"}, "")
+				httpStubReply(c, 302, map[string]string{"Location": "/", "Set-Cookie": "JSESSIONID=authed; Path=/"}, "")
 				return
 			}
-			httpStubReply(c, 200, nil, `<div>Invalid username or password</div>`)
+			httpStubReply(c, 302, map[string]string{"Location": "/loginError"}, "")
 		case strings.Contains(line, "GET /whoAmI/api/json"):
-			httpStubReply(c, 200, nil, `{"authenticated":true,"name":"admin"}`)
+			// 真 Jenkins 对匿名用户也回 "authenticated":true（匿名本身是一个
+			// Authentication）。桩照实回，否则「任何口令都判命中」的误报测不出来。
+			if strings.Contains(line, "JSESSIONID=authed") {
+				httpStubReply(c, 200, nil, `{"_class":"hudson.security.WhoAmI","authenticated":true,"name":"admin"}`)
+				return
+			}
+			httpStubReply(c, 200, nil, `{"_class":"hudson.security.WhoAmI","authenticated":true,"name":"anonymous"}`)
 		default:
 			httpStubReply(c, 404, nil, "")
 		}
@@ -460,9 +465,133 @@ func TestCredJenkinsHitDeny(t *testing.T) {
 	}
 }
 
+// 只认 Acegi 端点的老服务端（1.x）要能靠 404 回退走到，不能一律 inconclusive。
+func TestCredJenkinsAcegiFallback(t *testing.T) {
+	ep := newCredTestEndpoint(t, func(c net.Conn) {
+		line := readLine(c)
+		switch {
+		case strings.Contains(line, "POST /j_spring_security_check"):
+			httpStubReply(c, 404, nil, "")
+		case strings.Contains(line, "POST /j_acegi_security_check"):
+			if strings.Contains(line, "j_username=admin") {
+				httpStubReply(c, 302, map[string]string{"Location": "/", "Set-Cookie": "JSESSIONID=authed; Path=/"}, "")
+				return
+			}
+			httpStubReply(c, 302, map[string]string{"Location": "/loginError"}, "")
+		case strings.Contains(line, "GET /crumbIssuer/api/json"):
+			httpStubReply(c, 200, nil, `{"crumb":"c1","crumbRequestField":"Jenkins-Crumb"}`)
+		case strings.Contains(line, "GET /whoAmI/api/json"):
+			if strings.Contains(line, "JSESSIONID=authed") {
+				httpStubReply(c, 200, nil, `{"authenticated":true,"name":"admin"}`)
+				return
+			}
+			httpStubReply(c, 200, nil, `{"authenticated":true,"name":"anonymous"}`)
+		default:
+			httpStubReply(c, 200, nil, `<title>Jenkins</title>`)
+		}
+	})
+	ctx := credCtx(t)
+	hit, err := formCredAdapter{protocol: "jenkins"}.Try(ctx, credEP(ep.addr, "jenkins"), Credential{Username: "admin", Password: "p"})
+	if err != nil || hit.Outcome != CredHit {
+		t.Fatalf("acegi fallback hit = %+v err=%v", hit, err)
+	}
+}
+
 // jenkinsCredAdapterIdentify 直接复用适配器的 Identify，避免测试另写一份识别逻辑。
 func jenkinsCredAdapterIdentify(ctx context.Context, ep *credTestEndpoint) (bool, string, error) {
 	return formCredAdapter{protocol: "jenkins"}.Identify(ctx, credEP(ep.addr, "jenkins"))
+}
+
+// ── JBoss / WildFly（Digest） ────────────────────────────────────────────────
+
+// jbossTestDigest 在测试里独立算一遍 Digest 应答：不调生产代码的 digestAuthorization，
+// 否则 nonce/qop 口径错了两边会一起错。真机 WildFly 25 证实 /management 只认 Digest，
+// Basic 即使口令正确也回 401。
+func jbossTestDigest(user, pass, realm, nonce, nc, cnonce, method, uri string) string {
+	sum := func(s string) string {
+		h := md5.Sum([]byte(s))
+		return fmt.Sprintf("%x", h)
+	}
+	ha1 := sum(user + ":" + realm + ":" + pass)
+	ha2 := sum(method + ":" + uri)
+	return sum(ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":auth:" + ha2)
+}
+
+// digestHeaderValue 从请求文本里取 Authorization 头里某个键的值。
+func digestHeaderValue(req, key string) string {
+	needle := key + `="`
+	i := strings.Index(req, needle)
+	if i < 0 {
+		// 不带引号的形态（qop=auth / nc=00000001）
+		needle = key + "="
+		i = strings.Index(req, needle)
+		if i < 0 {
+			return ""
+		}
+		rest := req[i+len(needle):]
+		j := strings.IndexAny(rest, ", \r\n")
+		if j < 0 {
+			return rest
+		}
+		return rest[:j]
+	}
+	rest := req[i+len(needle):]
+	j := strings.Index(rest, `"`)
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
+}
+
+func TestCredJBossDigestHitDeny(t *testing.T) {
+	const (
+		realm = "ManagementRealm"
+		nonce = "dcd98b7102dd2f0e8b11d0f600bfb0c093"
+		user  = "admin"
+		pass  = "jwlab123"
+		uri   = "/management"
+	)
+	ep := newCredTestEndpoint(t, func(c net.Conn) {
+		line := readLine(c)
+		if !strings.Contains(line, "GET "+uri) {
+			httpStubReply(c, 404, nil, "")
+			return
+		}
+		if !strings.Contains(line, "Authorization: Digest") {
+			// 未带凭据：WildFly 真实行为是 401 + Digest 质询，不是 Basic。
+			httpStubReply(c, 401, map[string]string{
+				"WWW-Authenticate": `Digest realm="` + realm + `", nonce="` + nonce +
+					`", opaque="00000000000000000000000000000000", algorithm=MD5, qop=auth`,
+			}, "")
+			return
+		}
+		got := digestHeaderValue(line, "response")
+		want := jbossTestDigest(digestHeaderValue(line, "username"), pass, realm, nonce,
+			digestHeaderValue(line, "nc"), digestHeaderValue(line, "cnonce"), "GET", uri)
+		if got != "" && got == want {
+			httpStubReply(c, 200, nil, `{"outcome":"success","result":[]}`)
+			return
+		}
+		httpStubReply(c, 401, map[string]string{
+			"WWW-Authenticate": `Digest realm="` + realm + `", nonce="` + nonce + `", qop=auth`,
+		}, `<html><body>401 - Unauthorized</body></html>`)
+	})
+	ctx := credCtx(t)
+
+	ok, banner, err := formCredAdapter{protocol: "jboss-console"}.Identify(ctx, credEP(ep.addr, "jboss-console"))
+	if err != nil || !ok || !strings.Contains(strings.ToUpper(banner), "JBOSS") {
+		t.Fatalf("identify = %v %q %v", ok, banner, err)
+	}
+	hit, err := formCredAdapter{protocol: "jboss-console"}.Try(ctx, credEP(ep.addr, "jboss-console"),
+		Credential{Username: user, Password: pass})
+	if err != nil || hit.Outcome != CredHit {
+		t.Fatalf("hit = %+v err=%v", hit, err)
+	}
+	deny, err := formCredAdapter{protocol: "jboss-console"}.Try(ctx, credEP(ep.addr, "jboss-console"),
+		Credential{Username: user, Password: "wrongpw"})
+	if err != nil || deny.Outcome != CredDeny {
+		t.Fatalf("deny = %+v err=%v", deny, err)
+	}
 }
 
 // ── SNMP（UDP） ──────────────────────────────────────────────────────────────

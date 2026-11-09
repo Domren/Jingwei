@@ -2,6 +2,8 @@ package scanner
 
 import (
 	"context"
+	"crypto/md5"
+	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -11,6 +13,18 @@ import (
 )
 
 // HTTP 表单类控制台：Jenkins（crumb + 表单）、WebLogic 控制台、JBoss/WildFly 管理台。
+//
+// 真机验证状态（2026-11-09）：
+//   - Jenkins：已在真机 Jenkins LTS 验证 hit/deny。真机暴露并修掉两处——2.x 的登录端点是
+//     /j_spring_security_check（不是 1.x 的 Acegi），且 whoAmI 对匿名用户也回
+//     "authenticated":true（匿名本身是一个 Authentication），只看这个字段会把任何口令
+//     都判成命中，必须连 name 一起看。
+//   - JBoss/WildFly：已在真机 WildFly 25 验证 hit/deny。管理台的认证点是 /management 的
+//     HTTP Digest（ManagementRealm），Basic 带着正确口令也是 401；/console 未认证直接 302，
+//     根本不做认证，用它当探针永远判不出结论。
+//   - WebLogic：未在真机验证（官方镜像需 Oracle 账号接受协议、约 12GB；替代路径要老版
+//     wls zip + JDK8）。流程按 /console/login/LoginForm.jsp → j_security_check →
+//     console.portal 写成，但只在进程内协议桩上验过。
 //
 // 与 http-basic 那类「一发一看」不同，表单登录是多轮：先取 crumb/cookie、再提交表单、
 // 最后用一个受保护的认证探针确认会话真的被接受。三条纪律沿用整个模块：
@@ -131,8 +145,13 @@ func formRound(ctx context.Context, w *credWire, addr string, req []byte) (int, 
 }
 
 func (a formCredAdapter) identifyPath(ep CredEndpoint) string {
-	if a.protocol == "jenkins" {
+	switch a.protocol {
+	case "jenkins":
 		return formPath(ep, "/login")
+	case "jboss-console":
+		// WildFly/JBoss AS 7+ 的认证点在管理接口上：/console 只是静态页面，
+		// 未认证也回 302，拿不到任何凭据判定。真机 WildFly 25 实测。
+		return formPath(ep, "/management")
 	}
 	return formPath(ep, "/console")
 }
@@ -237,10 +256,20 @@ func jenkinsLogin(ctx context.Context, w *credWire, addr string, ep CredEndpoint
 	}
 	body := formBody("j_username", cred.Username, "j_password", cred.Password,
 		"from", formPath(ep, "/"), "Submit", "Sign in")
-	req2 := formRequest("POST", formPath(ep, "/j_acegi_security_check"), ep.Host, headers, body)
+	// Jenkins 2.x 起登录端点改成了 /j_spring_security_check（1.x 才是 Acegi 那个）。
+	// 先打新的，404 再回退旧的：端点不对的代价是「谁都被判 inconclusive」，不是误报，
+	// 但同样等于没验。
+	req2 := formRequest("POST", formPath(ep, "/j_spring_security_check"), ep.Host, headers, body)
 	st2, h2, b2, err := formRound(ctx, w, addr, req2)
 	if err != nil {
 		return formInconclusive, "", err
+	}
+	if st2 == 404 {
+		req2 = formRequest("POST", formPath(ep, "/j_acegi_security_check"), ep.Host, headers, body)
+		st2, h2, b2, err = formRound(ctx, w, addr, req2)
+		if err != nil {
+			return formInconclusive, "", err
+		}
 	}
 	loc2 := strings.ToLower(h2["location"])
 	low2 := strings.ToLower(string(b2))
@@ -266,10 +295,13 @@ func jenkinsLogin(ctx context.Context, w *credWire, addr string, ep CredEndpoint
 		return formInconclusive, "", err
 	}
 	low3 := strings.ToLower(string(b3))
+	// whoAmI 对匿名用户也回 "authenticated":true（匿名本身是一个 Authentication），
+	// 只看这个字段会把任何口令都判成命中。必须连 name 一起看：真登录才有用户名。
+	name3 := strings.ToLower(formJSONString(b3, "name"))
 	switch {
-	case st3 == 200 && strings.Contains(low3, `"authenticated":true`):
-		return formAccepted, fmt.Sprintf("Jenkins 会话已认证 (HTTP %d→%d→%d)", st1, st2, st3), nil
-	case st3 == 200 && (strings.Contains(low3, "anonymous") || strings.Contains(low3, `"authenticated":false`)):
+	case st3 == 200 && strings.Contains(low3, `"authenticated":true`) && name3 != "" && name3 != "anonymous":
+		return formAccepted, fmt.Sprintf("Jenkins 会话已认证 (HTTP %d→%d→%d, user=%s)", st1, st2, st3, name3), nil
+	case st3 == 200 && (name3 == "anonymous" || strings.Contains(low3, `"authenticated":false`)):
 		return formDenied, "Jenkins 登录未建立认证会话（探针仍是匿名）", nil
 	case st3 == 401 || st3 == 403:
 		return formDenied, fmt.Sprintf("Jenkins 认证探针 HTTP %d", st3), nil
@@ -329,31 +361,149 @@ func weblogicLogin(ctx context.Context, w *credWire, addr string, ep CredEndpoin
 	return formInconclusive, fmt.Sprintf("WebLogic 控制台认证探针 HTTP %d，既非主页也非拒绝", st3), nil
 }
 
-// jbossLogin：JBoss AS 7 / WildFly 管理控制台走 HTTP Basic（无状态，一轮即判定）。
-// 空凭据这一轮刻意不带 Authorization，正是「无凭据对照」本身。
+// ── HTTP Digest（WildFly/JBoss 管理接口用） ─────────────────────────────────
+//
+// WildFly 与 JBoss AS 7+ 的管理接口（9990/management）用 ManagementRealm 的
+// HTTP Digest 认证，Basic 一律 401——带对了口令也拿不到 200。真机 WildFly 25
+// 实测：`curl -u admin:正确口令 /management` 仍回 401 + Digest 质询。
+//
+// /console 更不走认证：未认证直接 302 到 index.html，用它做认证探针会永远
+// 判不出结论。认证点必须是 /management。
+
+// splitDigestParams 按逗号切分认证头参数，跳过引号内的逗号。
+func splitDigestParams(s string) []string {
+	var out []string
+	var cur strings.Builder
+	inQuote := false
+	for _, r := range s {
+		switch {
+		case r == '"':
+			inQuote = !inQuote
+			cur.WriteRune(r)
+		case r == ',' && !inQuote:
+			out = append(out, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if cur.Len() > 0 {
+		out = append(out, cur.String())
+	}
+	return out
+}
+
+// parseDigestChallenge 解析 "Digest realm=..., nonce=..., qop=..." 里的键值。
+func parseDigestChallenge(h string) map[string]string {
+	low := strings.ToLower(h)
+	i := strings.Index(low, "digest")
+	if i < 0 {
+		return nil
+	}
+	m := map[string]string{}
+	for _, part := range splitDigestParams(h[i+len("digest"):]) {
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		k = strings.ToLower(strings.TrimSpace(k))
+		v = strings.Trim(strings.TrimSpace(v), `"`)
+		if k != "" {
+			m[k] = v
+		}
+	}
+	return m
+}
+
+func md5hex(s string) string {
+	sum := md5.Sum([]byte(s))
+	return fmt.Sprintf("%x", sum)
+}
+
+func digestCNonce() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "jwlabcnonce"
+	}
+	return fmt.Sprintf("%x", b)
+}
+
+// digestAuthorization 按 RFC 7616 算 Authorization 头（MD5 / qop=auth）。
+func digestAuthorization(cred Credential, ch map[string]string, method, uri string) string {
+	realm, nonce := ch["realm"], ch["nonce"]
+	ha1 := md5hex(cred.Username + ":" + realm + ":" + cred.Password)
+	ha2 := md5hex(method + ":" + uri)
+
+	var resp, extra string
+	if q := ch["qop"]; q != "" {
+		// 服务端可能给 qop="auth,auth-int"，只取 auth（auth-int 要对正文做哈希）。
+		ncs := "00000001"
+		cn := digestCNonce()
+		resp = md5hex(ha1 + ":" + nonce + ":" + ncs + ":" + cn + ":auth:" + ha2)
+		extra = fmt.Sprintf(`, qop=auth, nc=%s, cnonce="%s"`, ncs, cn)
+	} else {
+		resp = md5hex(ha1 + ":" + nonce + ":" + ha2)
+	}
+	out := fmt.Sprintf(`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s", algorithm=MD5%s`,
+		cred.Username, realm, nonce, uri, resp, extra)
+	if op := ch["opaque"]; op != "" {
+		out += fmt.Sprintf(`, opaque="%s"`, op)
+	}
+	return out
+}
+
+// jbossLogin：先裸请一次 /management 拿质询，再按质询类型（Digest 优先）重发。
+// 空凭据这一轮仍会走完整流程——服务端的 401 就是「无凭据对照」的结果。
 func jbossLogin(ctx context.Context, w *credWire, addr string, ep CredEndpoint,
 	cred Credential) (formResult, string, error) {
-	headers := []string{}
-	if cred.Username != "" || cred.Password != "" {
-		token := base64.StdEncoding.EncodeToString([]byte(cred.Username + ":" + cred.Password))
-		headers = append(headers, "Authorization: Basic "+token)
-	}
-	req := formRequest("GET", formPath(ep, "/console"), ep.Host, headers, "")
-	st, hdr, body, err := formRound(ctx, w, addr, req)
+	path := formPath(ep, "/management")
+
+	req1 := formRequest("GET", path, ep.Host, nil, "")
+	st1, h1, _, err := formRound(ctx, w, addr, req1)
 	if err != nil {
 		return formInconclusive, "", err
 	}
-	if st == 401 || st == 407 {
-		return formDenied, fmt.Sprintf("JBoss 控制台拒绝该凭据 (HTTP %d，realm=%s)", st, hdr["www-authenticate"]), nil
-	}
-	if st >= 200 && st < 300 {
-		low := strings.ToLower(string(body))
-		if st == 200 || strings.Contains(low, "jboss") || strings.Contains(low, "wildfly") ||
-			strings.Contains(low, "management") {
-			return formAccepted, fmt.Sprintf("JBoss 控制台接受该凭据 (HTTP %d)", st), nil
+	challenge := h1["www-authenticate"]
+	if st1 >= 200 && st1 < 300 {
+		// 管理接口不要求认证：空凭据是可用凭据，非空不算命中（与 SMB 那条同一口径）。
+		if cred.Username == "" && cred.Password == "" {
+			return formAccepted, fmt.Sprintf("管理接口不要求认证 (HTTP %d)，空凭据即可", st1), nil
 		}
+		return formDenied, fmt.Sprintf("管理接口不要求认证 (HTTP %d)，非空凭据不构成可用凭据", st1), nil
 	}
-	return formInconclusive, fmt.Sprintf("JBoss 控制台返回 HTTP %d，未确认凭据", st), nil
+	if challenge == "" {
+		return formInconclusive, fmt.Sprintf("JBoss 管理接口返回 HTTP %d，但未给出认证质询", st1), nil
+	}
+
+	low := strings.ToLower(challenge)
+	var auth string
+	switch {
+	case strings.Contains(low, "digest"):
+		ch := parseDigestChallenge(challenge)
+		if ch == nil || ch["nonce"] == "" {
+			return formInconclusive, "Digest 质询无法解析：" + credPreview([]byte(challenge)), nil
+		}
+		auth = digestAuthorization(cred, ch, "GET", path)
+	case strings.Contains(low, "basic"):
+		token := base64.StdEncoding.EncodeToString([]byte(cred.Username + ":" + cred.Password))
+		auth = "Basic " + token
+	default:
+		return formInconclusive, "认证方式既非 Digest 也非 Basic：" + credPreview([]byte(challenge)), nil
+	}
+
+	req2 := formRequest("GET", path, ep.Host, []string{"Authorization: " + auth}, "")
+	st2, _, b2, err := formRound(ctx, w, addr, req2)
+	if err != nil {
+		return formInconclusive, "", err
+	}
+	switch {
+	case st2 >= 200 && st2 < 300:
+		return formAccepted, fmt.Sprintf("JBoss 管理接口接受该凭据 (HTTP %d)", st2), nil
+	case st2 == 401 || st2 == 403:
+		return formDenied, fmt.Sprintf("JBoss 管理接口拒绝该凭据 (HTTP %d)", st2), nil
+	}
+	return formInconclusive, fmt.Sprintf("JBoss 管理接口返回 HTTP %d，未确认凭据：%s",
+		st2, credPreview(b2)), nil
 }
 
 func init() {
