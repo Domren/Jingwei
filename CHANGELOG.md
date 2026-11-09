@@ -6,7 +6,7 @@
 
 （暂无）
 
-## [1.6.0] - 2026-11-09（未发布：代码工作已收口，打 tag 与发版待负责人授权）
+## [1.6.0] - 2026-11-09
 
 ### 新增
 
@@ -283,6 +283,44 @@
   硬编码，检查版本存在性、日期一致、顺序递减、条目非空、硬编码与标题同版本、以及「未发布」
   标记与 README 的发布状态是否自洽。`go test ./...` 会跑仓库真实文件——发版时漏改一半会在
   测试里红，而不是等用户拉到 tag 发现文档对不上。
+
+### 验证
+
+- 全量测试四口径（并行/串行 × URI/keyword DSN，`tools/four-test.sh`，含「按提交检出编译」的
+  HEAD 自洽检查）**全绿**；`gofmt` / `go vet` / `npx tsc --noEmit` / `tools/docaudit` 干净。
+- 弱口令检测真机验证台：**31 个协议全部有真实服务端用例**——一档 14 协议的双路径基线（1.5.0 台账）之外，
+  本批补验 MSSQL（SQL Server 2022 Linux）、SMB（Samba 4.24）、Jenkins（LTS）、JBoss（WildFly 25）、
+  RouterOS（7.16.2 CHR）、SVN（真 svnserve，CRAM-MD5）、SNMP（真 snmpd，UDP 静默丢弃如实落不可判定）、
+  smtp-ssl（aiosmtpd 隐式 TLS，断言 `tls=true`）；RDP（xrdp 0.10）如实落不可判定（协商阶段即拒标准
+  安全层，口令未发出）。Oracle / WebLogic / WinRM / CobaltStrike 因拿不到可复现真服务整条删除，
+  「只靠进程内桩的支持」不算支持。
+- 扫描：性能基线在隔离容器重建 18 格 × 3 采样（带环境指纹，不符拒比）；断点续扫实测 3 轮超时/打断
+  跑完 12 片、只补剩下；经隧道并发预算实网 SOCKS5 核验（nuclei 收敛到 4/40，排队任务释放后认领）。
+- XSS 浏览器执行验证：镜像内真 Chromium 三形态 e2e（原样回显执行 / HTML 转义不判反射 / textarea
+  仅反射），执行不起来落「待复核」而不是「没执行」。
+- WAF 自适应重试：三形态夹具（无 WAF 放行 / 全拦 / 仅基线被拦）8 例，预算封顶与参数 clamp 各有断言；
+  绕过结论强制人工复核。
+- 内网与维持：终端防护识别与补丁基线（scanner 10 例 + server 6 例 + 报告模板分支）；凭据复用批次台账
+  真 PG 用例（撤销只删本批新建、重放幂等）；密钥轮换补救在隔离实例全链演练；痕迹矩阵端到端真部署真撤销。
+- 子域名枚举：本机一次性实例 + 本机 hosts/监听（不出网、不打真实客户域名）；泛解析与未判定用本机真 DNS
+  （仅回环）验证；crt.sh 用线上响应形态固定样本，实网失败只记「覆盖面缺失」。
+- 界面：mock 演示站逐页巡检 0 脚本错误，且已钉为发版流水线必过项（`ui-visual`）；平台自身安全回归
+  （`tools/e2e/selfcheck.sh`）按发版流程执行，报告归档。
+
+### 升级
+
+- 数据库自动迁移新增表 `subdomain_tasks` / `subdomain_results` / `scan_task_shards` /
+  `intranet_credential_reuses` / `intranet_credential_reuse_attempts`，并给 `scan_tasks`
+  （`plan` / `resume_requested`）、`scan_task_shards`（`chunk` / `target`）、`waf_bypass_results`
+  （`attempt` / `stop_reason` / `block_feature` / `final_verdict` / `baseline_blocked`）、`webshells`
+  （`php_env`）、`java_memshells`（`java_version`）加列；全部 `IF NOT EXISTS` 幂等，**无破坏性变更，
+  可原地升级**。
+- **走隧道/代理的任务默认并发下调**（单次运行 25/50 → 4/40、端口探测 200 → 16），超预算的任务排队
+  而不是失败——「经隧道的全量扫描变慢」是预期行为，不要这层去「系统 → 设置 → 隧道并发预算」关闭。
+- 部署侧补登 `JW_PLAYWRIGHT_MODULE` 等运行变量到两份 compose 与 `.env.example`；旧部署请对齐新 compose，
+  否则浏览器验证 XSS 会因找不到模块落「待复核」。
+- 内置弱口令字典拆 core/vendor 两档（内容版本 `2026.11`）并按协议重排条目顺序；被删的 4 个协议在目录里
+  报「暂不支持（附原因）」，历史结果行原样保留。
 
 ## [1.5.0] - 2026-11-05（弱口令检测 · 客户授权清单 · 客户交付版报告）
 

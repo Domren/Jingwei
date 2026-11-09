@@ -15,16 +15,24 @@
 
 ---
 
-## Jingwei 1.5.0
+## Jingwei 1.6.0
 
-> 1.5.0 把「弱口令检测」做成可用模块：21 个协议、六态结论（命中 / 明确拒绝 / 连不上 / 账号锁定 / 不可判定 /
-> 不支持）、每次尝试都留原始报文，内部版与对外版两份报告；端口按三级决策且**默认端口表只决定测哪个端口、
-> 绝不用于推断协议**；同一账号连续被拒即止试，避免把账号打进锁定。同时把**客户授权清单**做成目标策略的
-> 一等输入——只要存在有效授权，agent 与界面直接建的扫描/弱口令任务都必须落在授权内；新增**客户交付版报告**
-> （中英双语、按资产分组、CVSS、报文附录）与两次扫描的增量视图。1.4.x 的收尾项（隧道真机修复、PowerShell
-> 会话、目标策略计数、跨源收紧）一并计入本版。
+> 1.6.0 是深度版本：弱口令检测从 21 协议扩到 **31 个协议且全部有真实服务端用例**——补齐 MSSQL / SMB /
+> Jenkins / JBoss / RouterOS / SVN / SNMP / smtp-ssl 等并在真服务上走命中与拒绝双路径，RDP 如实落
+> 「不可判定」；拿不到可复现真服务的 Oracle / WebLogic / WinRM / CobaltStrike 整条删除，**「只靠桩的支持」
+> 不算支持**。长跑可靠性成环：**断点续扫**（计划钉住模板与目标，中断只补剩下的，布局对不上就拒绝续扫而不是
+> 拼半旧半新）、隔离容器里重建的**扫描性能基线**（带环境指纹，不符拒比）、**隧道并发预算**（超预算排队，
+> 而不是把唯一通道挤死后误报「这一片没问题」）。判定口径再收：**XSS 交给镜像内 Chromium 真执行**（反射与
+> 执行分开记，跑不起来判「待复核」而不是「没执行」）、**WAF 自适应重试**（基线被拦才按拦截形态重排变形，
+> 预算封顶、四种停止原因逐发留痕，绕过结论强制人工复核）。侦察面新增**子域名枚举任务**（字典 + 泛解析判据 +
+> 解析 IP 直接进端口探测，第三方公开接口默认关）与**终端防护识别 / 补丁基线**（进程名精确匹配签名表，
+> 未命中补丁只记「待确认」，报告全程不给规避建议）。横向的副作用进了台账：**凭据跨主机复用**每批可整体
+> 撤销、「**维持痕迹矩阵**」自动列出每种手段留下什么与验证到什么程度、根密钥轮换后按条给出可执行补救。
+> 目标解析补上 IPv6（裸地址与 `[ipv6]:port`），一条坏目标不再拖垮整批。界面视觉验证与平台自检成为发版必过门。
 >
-> 此前版本摘要：1.4.2 是部署侧修复——`docker-compose.yml` 按白名单注入环境变量，
+> 此前版本摘要：1.5.0 把「弱口令检测」做成可用模块（21 协议、六态结论、原始报文、内外两份报告），
+> 把「客户授权清单」做成目标策略的一等输入，新增客户交付版报告与两次扫描的增量视图，并计入 1.4.x 清账项。
+> 1.4.2 是部署侧修复——`docker-compose.yml` 按白名单注入环境变量，
 > 导致代码里在读的 10 个运行时开关在容器里根本配不上——包括内网隧道的控制端地址
 > （`JINGWEI_PIVOT_SERVER`，缺它时 chisel 与 ssh 隧道的自动部署命令整体不可用）、
 > 范围管控强度 `JINGWEI_GUARD_ENFORCEMENT`、两类落地物的 TTL 与模型调用墙钟。现在这些开关都进了
@@ -41,9 +49,27 @@
 > 1.3.x 修复登录入口的验证码/限速/请求边界与 JWT 不可撤销问题，并在 1.3.0 补齐利用闭环：
 > 影响升级与弱口令自动链、内网横向、可撤销的权限维持台账、按台账逆序撤离。
 
-- **弱口令检测**：21 个协议（Redis / PostgreSQL / MySQL / MongoDB / SSH / Socks5 / FTP / Telnet / Web Basic /
-  WebDAV / Tomcat 管理台 / Elasticsearch / Memcached / Zookeeper / POP3 / IMAP / SMTP（含 SSL）/ LDAP / LDAPS / VNC），
+- **弱口令检测**：31 个协议、全部有真实服务端用例（SSH / MySQL / PostgreSQL / Redis / MongoDB / FTP /
+  Telnet / Socks5 / Web Basic / WebDAV / Tomcat 与 JBoss 管理台 / Elasticsearch / Memcached / Zookeeper /
+  SMTP / POP3 / IMAP（含隐式 TLS 变体）/ LDAP / LDAPS / VNC，以及本批补的 MSSQL / SMB / RouterOS /
+  Jenkins / SVN / SNMP）；RDP 如实落「不可判定」，4 个拿不到真服务的协议整条删除——「只靠桩的支持」不算支持。
   六态结论区分「验证过不存在」与「没测出来」，每条结论带逐字节的原始报文；只产出事实，**不自动登录、不复用**。
+- **断点续扫与性能基线**：POC 阶段按「模板段 × 目标组」分片、逐片落库，超时/打断后只补剩下的；模板或目标
+  变了就拒绝续扫而不是拼半旧半新。性能基线在一次性隔离容器里重建，带环境指纹、不符拒比。
+- **子域名枚举**：字典爆破 + A/AAAA/CNAME 解析做成一条任务，确认的名字与 IP 直接进资产图与端口探测；
+  泛解析、未判定、查询预算三条判据决定结果可不可信；第三方公开接口默认关（查它会把你给的根域名发给第三方）。
+- **WAF 自适应重试**：基线恒先发、被拦才按拦截形态重排变形（限速/验证码类优先改头、特征类优先编码、
+  规则类优先路径）；预算默认 8 发、硬上限 64，四种停止原因逐发留痕；绕过结论一律强制人工复核。
+- **浏览器真实执行验证 XSS**：镜像内 Chromium 逐条执行判定，反射与执行分开记；执行环境不可用落
+  「待复核」而不是「没执行」。
+- **凭据复用批次台账**：操作员主动发起的跨主机复用逐次入账（五类计数 + 每次尝试的证据 + 本批新建凭据），
+  可整体撤销——撤销只删本批新建的，历史尝试不抹。
+- **维持痕迹矩阵与密钥轮换补救**：17 种维持手段每种登记「留下什么、怎么验证清除、撤销后仍剩什么」，
+  撤离报告自动成表；换根密钥后按条给出可执行补救（重投载荷/标注残留/指明重填位置，不猜旧值）。
+- **终端防护识别与补丁基线**：进程/服务名精确匹配约 20 家杀软/EDR 签名，认不出的进「待人工确认」；
+  补丁按高信号通告的 KB 集合比对，未命中只记「待确认」；报告对这两类全程不给规避建议。
+- **隧道并发预算**：经隧道/代理的扫描按端点定并发口径，超预算的任务排队并写明等待原因，而不是把唯一
+  通道挤死后误报「这一片没问题」。
 - **客户授权清单**：IP/CIDR/域名 + 排除项 + 有效期。存在有效授权时，任何任务（含界面直接建的扫描与弱口令）
   的目标都必须落在授权内，拒绝原因点名是哪条授权不管用。
 - **客户交付版报告**：中英双语标签、授权与范围声明、按受影响资产分组的明细与修复建议汇总、CVSS、原始报文附录，
@@ -93,6 +119,24 @@
 > 对话、任务执行与 Agent 自动规划需要先在「系统 → LLM」配置模型。
 
 ## 版本历史
+
+### 1.6.0 — 2026-11-09
+
+- **弱口令检测 21→31 个协议，全部有真实服务端用例**：补 MSSQL / SMB / RouterOS / Jenkins / JBoss(WildFly) /
+  SVN / SNMP / smtp-ssl 并在真服务上走命中与拒绝双路径；RDP 如实「不可判定」；Oracle / WebLogic / WinRM /
+  CobaltStrike 因验不了整条删除。内置字典拆 core/vendor 两档（内容版本 `2026.11`）并按协议重排条目顺序。
+- **长跑可靠性**：断点续扫（分片计划钉住、布局不符拒绝续、打断只补剩下）、隔离容器性能基线（带环境指纹拒比）、
+  隧道并发预算（超限排队而不是把通道挤死）。
+- **判定口径**：XSS 由镜像内 Chromium 真执行判定（反射/执行分记，跑不起来判「待复核」）；WAF 自适应重试
+  （基线先探、按拦截形态重排、预算封顶与四种停止原因逐发留痕、绕过强制人工复核）；exec() 语境命令编码助手
+  （shell/argv/单串三种语境真实进程等价验证）。
+- **侦察与横向**：子域名枚举成任务（泛解析判据 + 解析 IP 直接进端口探测，公开接口默认关）；终端防护识别与
+  补丁基线进发现台账并作决策输入；凭据跨主机复用批次台账可整体撤销；维持痕迹矩阵与密钥轮换批量补救。
+- **工程**：IPv6 目标（裸地址与 `[ipv6]:port`，一条坏目标不拖垮整批）；界面视觉验证与平台自检进发版必过门；
+  CHANGELOG↔README 一致性自动校验；`tools/envaudit` 继续钉住「代码读了但部署配不上」。
+- **验证**：四组合全量测试全绿；31 协议真机用例（credscan-lab / six-pack / smtps-lab，SQL Server 2022、
+  Samba 4.24、WildFly 25、RouterOS CHR、Jenkins LTS、xrdp、snmpd、svnserve 等真实服务）；台账见
+  `docs/进度手册.md` §4.5–§4.7。
 
 ### 1.5.0 — 2026-11-05
 
@@ -307,7 +351,7 @@
 ### 方式一：使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.5.0 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.6.0 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 # 编辑 .env：至少修改 POSTGRES_PASSWORD
@@ -319,8 +363,8 @@ docker compose up -d
 
 ```bash
 mkdir jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.5.0/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.5.0/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.6.0/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.6.0/deploy/.env.example
 # 编辑 .env 后启动
 docker compose pull
 docker compose up -d
@@ -334,7 +378,7 @@ docker compose up -d
 镜像发布在 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.5.0
+docker pull ghcr.io/domren/jingwei:1.6.0
 ```
 
 仓库维护者将 Package 设为公开后可直接拉取。若镜像仍为私有，请使用具备
@@ -352,7 +396,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u Domren --password-stdin
 | --- | :---: | --- |
 | `POSTGRES_PASSWORD` | 是 | 数据库密码，建议使用字母数字强随机值 |
 | `POSTGRES_USER` / `POSTGRES_DB` | 否 | 默认均为 `jingwei` |
-| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.5.0` |
+| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.6.0` |
 | `JINGWEI_WEB_PORT` | 否 | Web/API 宿主端口，默认 `9790` |
 | `JINGWEI_PROXY_PORT` | 否 | 流量代理宿主端口，默认 `9791`，仅绑定 `127.0.0.1` |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | 否 | 也可启动后在 UI 配置 |
@@ -427,11 +471,11 @@ cd web && npm ci && npm run build:static && cd ..
 # 2. 嵌入前端并编译 Linux 二进制
 rm -rf server/webui/dist && cp -r web/out server/webui/dist
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.5.0" -o dist/amd64/jingwei ./cmd/jingwei
+  -ldflags "-s -w -X main.version=1.6.0" -o dist/amd64/jingwei ./cmd/jingwei
 
 # 3. 构建运行镜像
 docker build --network=host --build-arg TARGETARCH=amd64 \
-  -t jingwei:1.5.0 .
+  -t jingwei:1.6.0 .
 ```
 
 本地开发运行后端与前端的方法见 [DEPLOY.md](DEPLOY.md#从源码开发)。
