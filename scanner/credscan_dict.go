@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -80,6 +81,47 @@ func CredDictionaryByName(profile string) (CredDictionary, error) {
 		return credBuiltin, nil
 	}
 	return CredDictionary{}, &CredDictionaryError{Profile: name}
+}
+
+// credProtocolCommunityFirst 列出「凭据字段语义与用户/口令那一套不同」的协议，
+// 以及该协议最该先试的条目。SNMP 的凭据就是 community（只有口令字段有意义），
+// 内置字典里 40 多条 `root:root` 这类条目对它全是无效形状：每一条都会静默丢弃、
+// 等满一个应答窗口（1.5s）才落 inconclusive。不重排的话，一个 SNMP 端点光把字典
+// 空转到 `public` 就要一分多钟，而且预算耗尽时最先被牺牲的正是本该先试的那几条。
+var credProtocolCommunityFirst = map[string][]string{
+	"snmp": {"public", "private", "community"},
+}
+
+// OrderCredentialsForProtocol 按协议调整条目顺序：把该协议最该先试的条目提到前面，
+// 其余条目保持原有相对顺序（稳定分区）。**只重排，不增删**——少一条就等于在报告里
+// 声称测过一组其实没测的口令。
+func OrderCredentialsForProtocol(protocol string, creds []Credential) []Credential {
+	p := strings.ToLower(strings.TrimSpace(protocol))
+	first, ok := credProtocolCommunityFirst[p]
+	if !ok || len(creds) < 2 {
+		return creds
+	}
+	rank := make(map[string]int, len(first))
+	for i, pw := range first {
+		rank[pw] = i + 1
+	}
+	// rank 为 0 的排在后面；同一 rank 内按原顺序（sort.SliceStable 保证稳定）。
+	rankOf := func(c Credential) int {
+		if c.Username != "" {
+			return 0
+		}
+		return rank[c.Password]
+	}
+	out := make([]Credential, len(creds))
+	copy(out, creds)
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, rj := rankOf(out[i]), rankOf(out[j])
+		if ri == 0 || rj == 0 {
+			return ri != 0 // 有 rank 的在前
+		}
+		return ri < rj
+	})
+	return out
 }
 
 // CredDictionaryError 表示请求了不存在的字典档。

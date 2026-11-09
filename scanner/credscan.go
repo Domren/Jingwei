@@ -586,6 +586,9 @@ func runCredEndpoint(ctx, runCtx context.Context, endpoint CredEndpoint, creds [
 		endpoint.ProtocolConfirmed = true
 	}
 
+	// 尝试顺序按协议微调（SNMP 的 community 条目要先试），只重排不增删：
+	// 少一条就等于报告里声称测过一组其实没测的口令。
+	creds = OrderCredentialsForProtocol(endpoint.Protocol, creds)
 	for _, cred := range creds {
 		if reason := stopReason(); reason != "" {
 			emit(CredAttempt{Host: endpoint.Host, Port: endpoint.Port, Protocol: endpoint.Protocol,

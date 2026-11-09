@@ -81,7 +81,7 @@ func TestSubdomainTaskLifecycle(t *testing.T) {
 		{
 			Name: "api.example.com", Root: "example.com", Source: "dict",
 			Records: []SubdomainRecord{{Type: "A", Values: []string{"1.2.3.4"}}, {Type: "CNAME", Values: []string{"cdn.example.net"}}},
-			IPs: []string{"1.2.3.4"}, AssetID: &asset,
+			IPs:     []string{"1.2.3.4"}, AssetID: &asset,
 		},
 		{
 			Name: "junk.example.com", Root: "example.com", Source: "dict",

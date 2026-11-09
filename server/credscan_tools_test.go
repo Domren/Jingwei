@@ -37,13 +37,14 @@ func TestCredscanToolsStartAndStatus(t *testing.T) {
 		t.Fatalf("status 应当返回计数: %s", out2)
 	}
 
-	// 三档不支持的协议必须当场拒绝，不建任务。
+	// 没有适配器的协议必须当场拒绝，不建任务。1.6.0 把 rdp/mssql/snmp 都实现了，
+	// 这里改用真没实现的协议名——断言的是「拒绝发生在创建阶段、且声明未发起连接」。
 	raw := workflowCall(t, ctx, start, map[string]any{
-		"targets": []string{"10.0.0.1"}, "protocols": []string{"rdp"},
+		"targets": []string{"10.0.0.1"}, "protocols": []string{"legacy-proto-xyz"},
 	}, true)
-	if !strings.Contains(raw, "该协议暂不支持") || !strings.Contains(raw, "CredSSP/NLA") ||
+	if !strings.Contains(raw, "该协议暂不支持") || !strings.Contains(raw, "legacy-proto-xyz") ||
 		!strings.Contains(raw, "未发起任何连接") {
-		t.Fatalf("不支持协议的错误说明要带降级原因与未连接声明: %s", raw)
+		t.Fatalf("未实现协议的错误说明要带协议名与未连接声明: %s", raw)
 	}
 
 	// 工具产出的命中同样不带任何自动动作：凭据仍是 untested。

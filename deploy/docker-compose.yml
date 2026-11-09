@@ -69,6 +69,8 @@ services:
       # 配置文件与 Skill 目录路径覆盖。
       JINGWEI_CONFIG: ${JINGWEI_CONFIG:-}
       JINGWEI_SKILL_DIR: ${JINGWEI_SKILL_DIR:-}
+      # playwright 模块所在目录（浏览器真实验证 XSS 用）。镜像里已全局安装，通常留空即可。
+      JW_PLAYWRIGHT_MODULE: ${JW_PLAYWRIGHT_MODULE:-}
     ports:
       - "${JINGWEI_WEB_PORT:-9790}:8787"
       - "127.0.0.1:${JINGWEI_PROXY_PORT:-9791}:8788"

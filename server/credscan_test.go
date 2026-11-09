@@ -74,12 +74,11 @@ func TestCredTaskAPIRejectsUnsupportedAndBadInput(t *testing.T) {
 		body map[string]any
 		want string
 	}{
-		{"不支持的三档协议", map[string]any{
-			"targets": []string{"10.0.0.1"}, "protocols": []string{"rdp"}}, "该协议暂不支持"},
-		{"二档协议带降级原因", map[string]any{
-			"targets": []string{"10.0.0.1"}, "protocols": []string{"mssql"}}, "TDS"},
-		{"没有适配器的协议", map[string]any{
-			"targets": []string{"10.0.0.1"}, "protocols": []string{"snmp"}}, "该协议暂不支持"},
+		// 1.6.0 把二档/三档 12 项全实现了，rdp/mssql/snmp 现在都是 Supported。
+		// 这条用例改成钉「真的没有适配器的协议名」——它必须仍在创建阶段被拒，
+		// 而不是建出一个全是 unsupported 行的任务。
+		{"未实现的协议", map[string]any{
+			"targets": []string{"10.0.0.1"}, "protocols": []string{"legacy-proto-xyz"}}, "该协议暂不支持"},
 		{"空目标", map[string]any{
 			"targets": []string{" "}, "protocols": []string{"ssh"}}, "至少需要一个目标"},
 		{"非法目标", map[string]any{
