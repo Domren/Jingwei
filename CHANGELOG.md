@@ -190,6 +190,16 @@
 - **IPv6 目标支持（C6）**：目标解析接受裸 IPv6 与 `[IPv6]:port`，`host:port` 拨号形态正确
   （不会拼出 `[[::1]]:port`）；**一条坏目标不再拖垮整批**——原来一个 IPv6 地址会让整批端口探测
   静默不发生，现在只跳过它自己并写明原因；IPv6 CIDR 明确不支持但点名报错。
+- **WAF/防护感知的自适应重试（D3）**：此前 POC 被拦截后要么把 15 种变形无条件全发（没有预算、
+  不会止损，等于对着拦截设备刷请求），要么就此放弃。现在 baseline 恒为第一发，没被拦就当场停手；
+  被拦下才按拦截形态决定其余变形的先后——限速/验证码类优先改请求头、厂商特征类优先编码类、
+  路径/参数规则类优先路径类，组内保持确定顺序，可复现、不随机。尝试预算显式（默认 8 发、硬上限 64，
+  参数填多大都不会无限），命中即停、预算耗尽、连续被拦、连续出错四种停止原因逐发记录；详情页能看到
+  基线是否被拦、拦截形态、第几发、停止原因与最终结论——同一条 POC 在有/无 WAF 目标上的差异由此
+  成为可核对的数字。绕过结论本身**不**当作「漏洞成立」：verdict 新增 waf_bypass 复核清单
+  （拦截页/验证码页假命中、对照重放、WAF 静默改写、保留证据），一律强制人工复核。
+  核验：三形态夹具（无 WAF 放行 / 模拟 WAF 全拦 / 仅 baseline 拦）8 例测试，预算封顶与参数
+  clamp 各有断言。
 
 ### 变更
 
@@ -208,6 +218,8 @@
 - 数据库自动迁移新增 `subdomain_tasks` / `subdomain_results` 两张表（启动时 `IF NOT EXISTS` 建好，无需手工步骤）；
   新增接口 `POST/GET /api/subdomain/tasks`、`GET /api/subdomain/tasks/{id}`、`.../results`、`.../report`、
   `POST .../{id}/cancel`、`POST .../batch-delete`、`GET /api/subdomain/options`。
+- 数据库自动迁移给 `waf_bypass_results` 加 `attempt` / `stop_reason` / `block_feature` / `final_verdict` /
+  `baseline_blocked` 五列（启动时 `ADD COLUMN IF NOT EXISTS`，无需手工步骤），逐发留痕 D3 的自适应重试。
 - **一次漏扫的 POC 阶段不再是一次 nuclei 调用**：任务日志里会逐片报「分片 n/m 完成」，`summary` 多了
   `shards` 计数，列表上「分片 x/n」是这一轮的覆盖面。整轮耗时里多出每片一次 nuclei 启动的成本
   （按 D4 基线折算，一次全量扫描的 25 段约多 5–8 秒），换来的是中断后只补剩下的。
