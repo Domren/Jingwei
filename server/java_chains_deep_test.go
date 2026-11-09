@@ -31,7 +31,7 @@ func TestPickJavaChainsPreset(t *testing.T) {
 	if got := javaChainPresetPayload(scanner.JavaChainsPreset{}); got != "JavaNativePayload" {
 		t.Fatalf("expected default payload, got %s", got)
 	}
-	ordered := orderedJavaChainsPresets([]scanner.JavaChainsPreset{
+	ordered := orderedJavaChainsPresets(scanner.PlanJavaChain(scanner.JavaRuntime{}), []scanner.JavaChainsPreset{
 		{ID: "other"},
 		{ID: "java.fastjson.exec", Intent: "command-exec"},
 		{ID: "java.fastjson.jndi", Intent: "outbound-jndi"},

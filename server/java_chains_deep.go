@@ -90,6 +90,20 @@ func (r *deepRun) runJavaChains(templates []db.POCTemplate, target, mode string,
 	if callbackHost == "" {
 		callbackHost = cfg.CallbackHost
 	}
+	// E3 B 段：有 JDK 版本就按版本选路线；没有就明说「不做结论」，不假装远程
+	// 类加载可用。版本由操作员/前置探测给出（java_version 参数），本平台不在
+	// 这里做未验证的 exec 级判断。
+	javaVersion := stringParam(r.task.Params, "java_version")
+	plan := scanner.PlanJavaChain(scanner.ParseJavaVersion(javaVersion))
+	summary["java_chain_plan"] = plan
+	if plan.Route == scanner.JNDIRouteUnknown {
+		r.logf(mode, "未提供 java_version，java-chains 按通用顺序尝试（不对远程类加载是否可用下结论）")
+	} else {
+		r.logf(mode, "JDK %s → 路线 %s：%s", scanner.ParseJavaVersion(javaVersion).String(), plan.Route, plan.Reason)
+	}
+	for _, w := range plan.Warnings {
+		r.logf(mode, "JDK 版本提示：%s", w)
+	}
 	wait := intParam(r.task.Params, "java_chains_wait", 12)
 	if wait < 3 {
 		wait = 3
@@ -131,7 +145,7 @@ func (r *deepRun) runJavaChains(templates []db.POCTemplate, target, mode string,
 		generatedOK := false
 		var lastErr error
 		tried := 0
-		for _, preset := range orderedJavaChainsPresets(presets) {
+		for _, preset := range orderedJavaChainsPresets(plan, presets) {
 			if tried >= 3 || delivered || generatedOK {
 				break
 			}
@@ -350,17 +364,20 @@ func (r *deepRun) runJavaChains(templates []db.POCTemplate, target, mode string,
 }
 
 func pickJavaChainsPreset(presets []scanner.JavaChainsPreset) scanner.JavaChainsPreset {
-	return orderedJavaChainsPresets(presets)[0]
+	// 没有版本信息时不做版本重排，保持通用顺序。
+	return orderedJavaChainsPresets(scanner.PlanJavaChain(scanner.JavaRuntime{}), presets)[0]
 }
 
 // orderedJavaChainsPresets ranks delivery-capable presets first so a broken
 // preset (e.g. a missing gadget) can fall through to the next candidate.
-func orderedJavaChainsPresets(presets []scanner.JavaChainsPreset) []scanner.JavaChainsPreset {
+func orderedJavaChainsPresets(plan scanner.JavaChainPlan, presets []scanner.JavaChainsPreset) []scanner.JavaChainsPreset {
 	out := append([]scanner.JavaChainsPreset(nil), presets...)
 	sort.SliceStable(out, func(i, j int) bool {
 		return javaChainsPresetRank(out[i]) < javaChainsPresetRank(out[j])
 	})
-	return out
+	// 版本决策只重排、不丢弃：目标是「按 JDK 默认值把更可能成功的链放前面」，
+	// 后端有没有被加固过只有打了才知道，所以其余链仍是 fallback。
+	return scanner.OrderJavaChainsPresets(plan, out)
 }
 
 func javaChainsPresetRank(p scanner.JavaChainsPreset) int {
