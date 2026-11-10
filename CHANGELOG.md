@@ -259,7 +259,7 @@
   尝试顺序固定为 core 全量 → vendor 全量（与 1.6.0 的实际顺序一致，分档不改变先试出什么）；
   版本号 `2026.11` 随内容变动，`GET /api/credscan/protocols` 返回 `builtin_dict`（版本、各档条数、
   顺序说明），界面在选择器下方写明「内置字典 2026.11 · 共 N 组（通用 x / 厂商 y）」。维护口径
-  （加条目的门槛、复核节奏、改完怎么验）落在 `docs/弱口令字典维护口径.md`——此前只有一句
+  （加条目的门槛、复核节奏、改完怎么验）落在 `docs/开发手册.md` 附录A——此前只有一句
   「内置精简档」，没人说得清下一次该加什么、加到哪一档。
 - 数据库自动迁移新增 `subdomain_tasks` / `subdomain_results` 两张表（启动时 `IF NOT EXISTS` 建好，无需手工步骤）；
   新增接口 `POST/GET /api/subdomain/tasks`、`GET /api/subdomain/tasks/{id}`、`.../results`、`.../report`、
