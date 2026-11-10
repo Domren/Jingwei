@@ -4,7 +4,45 @@
 
 ## [Unreleased]
 
-（暂无）
+### 修复
+
+- **增量 diff 空列表序列化（1.6.0 回归）**：`computeScanDiff` 的 `new` / `gone` /
+  `severity_changed` 在没有对应条目时返回 `nil`，序列化成 JSON `null`；前端直接读
+  `diff.new.length` 与 `.map`，空增量场景会抛 `TypeError` 把增量面板打白。现在三个列表初始化为
+  非 nil 空切片，恒序列化为 `[]`。**夹具用例**：`TestScanDiffEmptyListsMarshalAsArrays` 断言
+  三类字段 JSON 均为 `[]`。
+- **对外交付导出：空正文证据 blob 缺失容错**：GET 类请求的请求体长度为 0，其 blob 哈希恒为
+  空串的 SHA256。源 blob 因历史清理或容器重建丢失时，`copySnapshots` 一律报错，拖垮整份导出。
+  现在对「长度 0 + 空正文哈希」的条目直接还原一个 0 字节文件（内容可由哈希无损校验），非空正文
+  缺失仍然报错以保证证据完整性。**夹具用例**：`TestCopySnapshotsRecoversMissingEmptyBody` 覆盖
+  空正文还原成功、非空缺失仍报错、补齐后整体成功三条路径。
+- **WAF 绕过变形：空参数名语义（R1）**：参数名为空时，此前基线不带载荷、其余变形却无条件拼出
+  `path?=<载荷>`——载荷挂在空参数名下，多数解析器不当注入点，「绕过成功」可能是假信号。现在基线只保留
+  原路径照常发送，其余变形一律标记 unsupported（「参数名为空：载荷无处安放」）**不发起请求、不占预算**，
+  记录里也不留 `?=` 这种看似发过的请求；全部变形无法安放载荷时停止原因记为 `no_attack_variant`。
+  界面 verdict 增加「未发起」档位。**夹具用例**：空参数名三档口径（基线可发且不带载荷 / 变形全 unsupported
+  且无查询串与请求体 / 运行器只发基线并记 `no_attack_variant`）已钉进 `scanner/deepuse_test.go`。
+- **WAF 绕过参数入口（R2）**：重试模式（自适应 / 全量）、请求预算、连续被拦止损、连续错误止损此前只能
+  用默认值。现在任务参数支持 `bypass_mode` / `max_attempts` / `max_consecutive_blocked` /
+  `max_consecutive_errors`（服务端收口：预算硬上限 64、乱值回落自适应），「新建绕过测试」表单增加
+  「高级选项」折叠区（带默认值与说明，全量模式下连拦止损置灰），任务详情汇总区显示实际生效模式。
+  全量模式语义：保持变形构造顺序、不做特征重排、不做连续被拦止损，命中即停与连续错误止损仍然生效。
+  **夹具用例**：全量模式全部被拦时必须发到预算耗尽且不做重排；clamp 模式回落口径。
+
+### 变更
+
+- 发版 checklist（开发手册 §9）增加两条：打 tag 前先 `git cat-file -t v<上一版>` 核对附注形态；
+  四组合门必须跑在发版提交上（R10，1.6.0 轻量 tag 同 SHA 双 run 的教训）。
+- **静态检查清零（内部）**：`staticcheck` 报出的 17 项死代码与 4 项废弃 API 全部处置——逐项对照
+  `docs/开发规划表-1.5.0-1.6.0.md`（R1–R11）与更新日志，确认无一属于「计划内待接线」，均为重构后遗留，
+  直接删除：未接线的提示常量 `findingTrafficGuidance`（其口径已被更严格的 report_finding 硬性要求取代）、
+  `isBlank` / `bytesIndexByte` / `recordWrite` / `readDatagram` / `mix` / `authErrorStatus` /
+  `scheduleRequestFromTask` / `admitPausedTask` / `releaseTask`、AC 自动机的两个构建期空字段、
+  `memshellValuePattern`（与 `validMemshellValue` 重复），以及测试里的 4 处未用字段与辅助函数。
+  废弃 API：`repeater` 不再给 `Transport.Dial` / `DialTLS` 赋 nil（仓库内无任何地方设置它们，
+  保留 `DialTLSContext = nil`），任务归档用 `tar.TypeReg` 取代 `tar.TypeRegA`；`x/crypto/md4` 按
+  [MS-NLMP] 的 NTOWFv1 必须保留，加 `//lint:ignore SA1019` 说明用途。另外清掉 4 处死赋值与 1 处空分支、
+  1 处空临界区。校验：`go build` / `go vet` / `gofmt` 干净，`staticcheck` 0 条，`go test ./...` 全绿。
 
 ## [1.6.0] - 2026-11-09
 
