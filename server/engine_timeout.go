@@ -94,9 +94,9 @@ func (e *Engine) resetTimeoutRevival(taskID string) {
 // stampFirstRun records first_run_at + deadline_at on the FIRST real run (LLM ready)
 // of a timeout task, once per process. No-op when the task has no timeout.
 func (e *Engine) stampFirstRun(t *Task) {
-	if t.TimeoutSeconds <= 0 {
-		return
-	}
+	// 盖章与「有没有设超时」无关：没设超时的任务同样要能在库里回答「什么时候真正开始跑」。
+	// 库里 tasks.status 只写 created→终态，running 是 API 派生的，first_run_at 是唯一的落库痕迹。
+	// deadline 仍只在 timeout>0 时算（StampFirstRun 内部按 timeout 决定是否给 deadline_at）。
 	if _, loaded := e.stamped.LoadOrStore(t.ID, true); loaded {
 		return
 	}

@@ -26,67 +26,192 @@ func prescanPortSpec(port int) string {
 	return strconv.Itoa(port)
 }
 
+// prescanGroup 是一份端口规格下要摸的目标：指到奇数端口的目标只摸那个口，web 类目标共用
+// "web"。混成一份清单会变成 N 只目标 × 全量 web 口的探测量。
+type prescanGroup struct {
+	portSpec string
+	urls     []string
+}
+
+func groupTargetsByPortSpec(ts []seedTarget) []prescanGroup {
+	idx := map[string]int{}
+	out := []prescanGroup{}
+	for _, t := range ts {
+		spec := prescanPortSpec(t.port)
+		if i, ok := idx[spec]; ok {
+			out[i].urls = append(out[i].urls, t.rawURL)
+			continue
+		}
+		idx[spec] = len(out)
+		out = append(out, prescanGroup{portSpec: spec, urls: []string{t.rawURL}})
+	}
+	return out
+}
+
+func appendUniqueStr(dst []string, seen map[string]bool, add ...string) []string {
+	for _, v := range add {
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		dst = append(dst, v)
+	}
+	return dst
+}
+
+// mergeDiscoverResults 把分组探测并成一份再落库：同一只 IP 被两个端口组摸到时必须去重，
+// 否则会重复登记资产、并把探测量算成虚高的覆盖。
+func mergeDiscoverResults(dst, src *scanner.DiscoverResult) {
+	if dst == nil || src == nil {
+		return
+	}
+	if dst.Resolved == nil {
+		dst.Resolved = &scanner.Resolved{}
+	}
+	if dst.Resolved.DomainsByIP == nil {
+		dst.Resolved.DomainsByIP = map[string][]string{}
+	}
+	seenIP := map[string]bool{}
+	for _, ip := range dst.Resolved.IPs {
+		seenIP[ip] = true
+	}
+	dst.Resolved.IPs = appendUniqueStr(dst.Resolved.IPs, seenIP, src.Resolved.IPs...)
+	seenDomain := map[string]bool{}
+	for _, d := range dst.Resolved.Domains {
+		seenDomain[d] = true
+	}
+	dst.Resolved.Domains = appendUniqueStr(dst.Resolved.Domains, seenDomain, src.Resolved.Domains...)
+	seenURL := map[string]bool{}
+	for _, u := range dst.Resolved.FixedURLs {
+		seenURL[u] = true
+	}
+	dst.Resolved.FixedURLs = appendUniqueStr(dst.Resolved.FixedURLs, seenURL, src.Resolved.FixedURLs...)
+	for ip, ds := range src.Resolved.DomainsByIP {
+		// 去重按「同一 IP 下」的域名清单做：全局 Domains 集合不包含只挂在 DomainsByIP 上的
+		// 域名，用它当闸会把同一条域名重复塞进同一 IP。
+		perIP := map[string]bool{}
+		for _, d := range dst.Resolved.DomainsByIP[ip] {
+			perIP[d] = true
+		}
+		dst.Resolved.DomainsByIP[ip] = appendUniqueStr(dst.Resolved.DomainsByIP[ip], perIP, ds...)
+	}
+	seenPort := map[string]bool{}
+	for _, pf := range dst.Ports {
+		seenPort[pf.IP+":"+strconv.Itoa(pf.Port)] = true
+	}
+	for _, pf := range src.Ports {
+		k := pf.IP + ":" + strconv.Itoa(pf.Port)
+		if seenPort[k] {
+			continue
+		}
+		seenPort[k] = true
+		dst.Ports = append(dst.Ports, pf)
+	}
+	seenSvc := map[string]bool{}
+	for _, sv := range dst.Services {
+		seenSvc[sv.URL] = true
+	}
+	for _, sv := range src.Services {
+		if seenSvc[sv.URL] {
+			continue
+		}
+		seenSvc[sv.URL] = true
+		dst.Services = append(dst.Services, sv)
+	}
+	seenP := map[string]bool{}
+	for _, p := range dst.PortList {
+		seenP[strconv.Itoa(p)] = true
+	}
+	for _, p := range src.PortList {
+		if seenP[strconv.Itoa(p)] {
+			continue
+		}
+		seenP[strconv.Itoa(p)] = true
+		dst.PortList = append(dst.PortList, p)
+	}
+}
+
 // prescanTask runs a bounded asset-discovery + POC pre-screen before the planner's
 // first round, so an LLM task starts from structured reconnaissance instead of the
 // goal text alone. This is the code-side enforcement of #96「先探测后渗透」: the
 // discovery results are persisted as assets (and POC hits as findings), and a
 // summary fact node is written so the planner's graph overview surfaces them.
 // Best-effort: any failure is logged and the task proceeds without pre-scan data.
+//
+// 清单里解析到的每个目标都进预扫（过去只取第一条，12 条授权目标里 11 条开局既不在资产图上
+// 也没被探测，覆盖只能等 planner 一轮轮补）。
 func (s *Server) prescanTask(ctx context.Context, t *Task) {
 	if s.m == nil || s.m.Assets() == nil || t == nil {
 		return
 	}
-	scheme, host, port, ok := parseTarget(t.Goal)
-	if !ok {
-		scheme, host, port, ok = parseTarget(t.Description)
+	cands := parseTargetList(t.Goal)
+	if len(cands) == 0 {
+		cands = parseTargetList(t.Description)
 	}
-	if !ok {
+	if len(cands) == 0 {
 		return
 	}
-	if gw := s.llmHost(); gw != "" && host == gw {
-		return
-	}
-	rawURL := scheme + "://" + host
-	if !(scheme == "https" && port == 443) && !(scheme == "http" && port == 80) {
-		rawURL += ":" + strconv.Itoa(port)
-	}
-	targets, err := scanner.ParseTargets([]string{rawURL})
-	if err != nil {
-		log.Printf("[prescan] task %s: %v", t.ID, err)
-		return
-	}
-	rules, err := s.m.PG().ListAssetInterceptRules()
-	if err == nil {
-		if reason, blocked := scanTargetBlockReason(rules, targets); blocked {
-			log.Printf("[prescan] task %s: 目标命中拦截规则，跳过预扫: %s", t.ID, reason)
-			return
+	gw := s.llmHost()
+	rules, ruleErr := s.m.PG().ListAssetInterceptRules()
+	kept := make([]seedTarget, 0, len(cands))
+	for _, c := range cands {
+		if gw != "" && c.host == gw {
+			log.Printf("[prescan] task %s: 目标 %s 是 LLM 网关，跳过预扫", t.ID, c.host)
+			continue
 		}
+		if ruleErr == nil {
+			if one, err := scanner.ParseTargets([]string{c.rawURL}); err == nil {
+				if reason, blocked := scanTargetBlockReason(rules, one); blocked {
+					// 逐条指名、只丢这一条：拦掉一只不该让其余授权目标一起失去预扫。
+					log.Printf("[prescan] task %s: 目标命中拦截规则，跳过该目标: %s", t.ID, reason)
+					continue
+				}
+			}
+		}
+		kept = append(kept, c)
+	}
+	if len(kept) == 0 {
+		return
 	}
 
 	s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "round", Summary: "第 0 轮资产发现 + POC 初筛"})
 
-	res, err := scanner.Discover(ctx, targets, scanner.DiscoverOptions{
-		Ports: prescanPortSpec(port), Concurrency: 200, Timeout: 900 * time.Millisecond,
-		MaxProbes: 3000, MaxPortChecks: maxScanPortChecks,
-		Logf: func(format string, args ...any) { log.Printf("[prescan "+t.ID+"] "+format, args...) },
-	})
-	if err != nil {
-		log.Printf("[prescan] task %s: 资产发现失败: %v", t.ID, err)
-		return
+	merged := &scanner.DiscoverResult{Resolved: &scanner.Resolved{DomainsByIP: map[string][]string{}}}
+	apps := []scanner.AppSystem{}
+	allTargets := []scanner.Target{}
+	for _, g := range groupTargetsByPortSpec(kept) {
+		targets, err := scanner.ParseTargets(g.urls)
+		if err != nil {
+			log.Printf("[prescan] task %s: %v", t.ID, err)
+			continue
+		}
+		res, err := scanner.Discover(ctx, targets, scanner.DiscoverOptions{
+			Ports: g.portSpec, Concurrency: 200, Timeout: 900 * time.Millisecond,
+			MaxProbes: 3000, MaxPortChecks: maxScanPortChecks,
+			Logf: func(format string, args ...any) { log.Printf("[prescan "+t.ID+"] "+format, args...) },
+		})
+		if err != nil {
+			log.Printf("[prescan] task %s: 资产发现失败（端口规格 %s）: %v", t.ID, g.portSpec, err)
+			continue
+		}
+		gapps, _ := scanner.AppDiscover(ctx, res.Services, scanner.AppDiscoverOptions{
+			MaxCandidates: 240, Concurrency: 8, Timeout: 8 * time.Second,
+			Logf: func(format string, args ...any) { log.Printf("[prescan "+t.ID+"] "+format, args...) },
+		})
+		mergeDiscoverResults(merged, res)
+		apps = append(apps, gapps...)
+		allTargets = append(allTargets, targets...)
 	}
-	apps, _ := scanner.AppDiscover(ctx, res.Services, scanner.AppDiscoverOptions{
-		MaxCandidates: 240, Concurrency: 8, Timeout: 8 * time.Second,
-		Logf: func(format string, args ...any) { log.Printf("[prescan "+t.ID+"] "+format, args...) },
-	})
 
 	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	as := s.m.Assets()
-	summary := prescanPersist(t, as, taskID, host, res, apps)
+	summary := prescanPersist(t, as, taskID, kept, merged, apps)
+	summary["targets"] = len(kept)
 
-	templates := prescanTemplates(s.m.PG(), res.Services, apps)
+	templates := prescanTemplates(s.m.PG(), merged.Services, apps)
 	pocCandidates := 0
 	if len(templates) > 0 {
-		nrun := scanner.RunNuclei(ctx, templates, prescanNucleiTargets(res, targets, apps), scanner.NucleiOptions{
+		nrun := scanner.RunNuclei(ctx, templates, prescanNucleiTargets(merged, allTargets, apps), scanner.NucleiOptions{
 			RateLimit: 100, Concurrency: 8, TimeoutSeconds: 120,
 		})
 		pocCandidates = prescanPersistCandidates(ctx, t, nrun.Results)
@@ -95,8 +220,8 @@ func (s *Server) prescanTask(ctx context.Context, t *Task) {
 	summary["poc_candidates"] = pocCandidates
 	if origin, err := t.Store.OriginFactID(); err == nil && origin > 0 {
 		_, _ = t.Store.AddNode(db.KindFact, map[string]any{
-			"text": fmt.Sprintf("预扫完成：开放端口 %d、Web 服务 %d、应用系统 %d、POC 初筛候选 %d（未验证，需专项工具确认）",
-				summary["open_ports"], summary["services"], summary["app_systems"], pocCandidates),
+			"text": fmt.Sprintf("预扫完成：目标 %d 个、开放端口 %d、Web 服务 %d、应用系统 %d、POC 初筛候选 %d（未验证，需专项工具确认）",
+				len(kept), summary["open_ports"], summary["services"], summary["app_systems"], pocCandidates),
 			"prescan": summary,
 		}, 5, "confirmed", "system", []int64{origin})
 	}
@@ -105,7 +230,7 @@ func (s *Server) prescanTask(ctx context.Context, t *Task) {
 
 // prescanPersist writes discovery + app-layer results into the shared asset
 // ledger (tagged with the task id and auto-scope) and returns a small digest.
-func prescanPersist(t *Task, as *db.AssetStore, taskID int64, seedHost string, res *scanner.DiscoverResult, apps []scanner.AppSystem) map[string]any {
+func prescanPersist(t *Task, as *db.AssetStore, taskID int64, seeds []seedTarget, res *scanner.DiscoverResult, apps []scanner.AppSystem) map[string]any {
 	summary := map[string]any{"resolved_ips": len(res.Resolved.IPs), "open_ports": len(res.Ports), "services": len(res.Services)}
 
 	portsByIP := map[string][]db.PortService{}
@@ -159,10 +284,14 @@ func prescanPersist(t *Task, as *db.AssetStore, taskID int64, seedHost string, r
 	}
 	summary["app_systems"] = len(apps)
 
-	if net.ParseIP(seedHost) == nil {
-		_ = as.AddAutoScope(taskID, "subdomain", seedHost, "", "")
-	} else {
-		_ = as.AddAutoScope(taskID, "service", "", rawURLOf(seedHost, 0), seedHost)
+	// 每个授权目标都进自动范围：过去只有被 seed 的那一条进去，其余目标即使被摸到也算范围外。
+	// IP 用带端口的原始 URL 落范围，不再压成 "http://ip"。
+	for _, seed := range seeds {
+		if net.ParseIP(seed.host) == nil {
+			_ = as.AddAutoScope(taskID, "subdomain", seed.host, "", "")
+			continue
+		}
+		_ = as.AddAutoScope(taskID, "service", "", seed.rawURL, seed.host)
 	}
 	return summary
 }
@@ -333,11 +462,4 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
-}
-
-func rawURLOf(host string, port int) string {
-	if port == 0 {
-		return "http://" + host
-	}
-	return "http://" + net.JoinHostPort(host, strconv.Itoa(port))
 }

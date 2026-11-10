@@ -1902,6 +1902,54 @@ func parseTarget(text string) (scheme, host string, port int, ok bool) {
 	return "", "", 0, false
 }
 
+// maxSeedTargets 给一次 seed 的目标数封顶：清单是操作员贴进来的，长度不可控；
+// 超出部分明确记日志「未登记」，不静默丢弃。
+const maxSeedTargets = 32
+
+type seedTarget struct {
+	scheme, host, rawURL string
+	port                 int
+}
+
+func targetRawURL(scheme, host string, port int) string {
+	u := scheme + "://" + host
+	if !(scheme == "https" && port == 443) && !(scheme == "http" && port == 80) {
+		u += ":" + strconv.Itoa(port)
+	}
+	return u
+}
+
+// parseTargetList 取出文本里**所有**可解析的目标，而不是第一个。操作员最常见的写法就是
+// 一行一个 URL/IP，只 seed 第一条会让其余授权目标开局既不在资产图上、也不进预扫
+// （2026-11-10 实机：12 条授权目标只有 1 条进了预扫，task_asset_links 长时间停在 3）。
+func parseTargetList(text string) []seedTarget {
+	seen := map[string]bool{}
+	out := make([]seedTarget, 0, 8)
+	for _, chunk := range strings.FieldsFunc(text, func(r rune) bool {
+		switch r {
+		case '\n', '\r', '\t', ' ', ',', ';', '|', '，', '；', '、', '。':
+			return true
+		}
+		return false
+	}) {
+		scheme, host, port, ok := parseTarget(chunk)
+		if !ok {
+			continue
+		}
+		key := scheme + "|" + strings.ToLower(host) + "|" + strconv.Itoa(port)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, seedTarget{scheme: scheme, host: host, rawURL: targetRawURL(scheme, host, port), port: port})
+		if len(out) >= maxSeedTargets {
+			log.Printf("[seed] 目标清单超过 %d 条，其余未登记（请拆分任务或改用范围导入）", maxSeedTargets)
+			break
+		}
+	}
+	return out
+}
+
 func portOr(s string, d int) int {
 	if n, err := strconv.Atoi(s); err == nil && n > 0 {
 		return n
@@ -1936,49 +1984,54 @@ func (s *Server) llmHost() string {
 }
 
 func (s *Server) seed(t *Task, text string) {
-	scheme, host, port, ok := parseTarget(text)
-	if !ok {
+	cands := parseTargetList(text)
+	if len(cands) == 0 {
 		log.Printf("[seed] task %s: 未能从 %q 解析出目标 host/IP，不创建站点（请手动配置 scope）", t.ID, text)
 		return
 	}
-	// P0-1 guard: never treat the configured LLM gateway as a target.
-	if gw := s.llmHost(); gw != "" && host == gw {
-		log.Printf("[seed] task %s: 目标 %q 是 LLM 网关，拒绝作为渗透目标", t.ID, host)
+	as := s.m.Assets()
+	if as == nil {
+		log.Printf("[seed] task %s: 资产存储不可用，%d 个目标未登记根资产", t.ID, len(cands))
 		return
 	}
-
-	u := scheme + "://" + host
-	if !(scheme == "https" && port == 443) && !(scheme == "http" && port == 80) {
-		u += ":" + strconv.Itoa(port)
-	}
-	var rootID int64
-	if as := s.m.Assets(); as != nil {
-		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	begin, _ := t.Store.OriginFactID()
+	gw := s.llmHost()
+	registered := 0
+	for _, c := range cands {
+		// never treat the configured LLM gateway as a target
+		if gw != "" && c.host == gw {
+			log.Printf("[seed] task %s: 目标 %q 是 LLM 网关，拒绝作为渗透目标", t.ID, c.host)
+			continue
+		}
+		var rootID int64
 		var uerr error
-		if net.ParseIP(host) != nil {
-			rootID, uerr = as.UpsertIP(db.UpsertIPReq{IP: host, TaskID: taskID})
-		} else if scheme == "https" || scheme == "http" {
-			rootID, uerr = as.UpsertHTTPService(db.UpsertHTTPServiceReq{URL: u, TaskID: taskID})
-		} else {
-			rootID, uerr = as.UpsertRootDomain(db.UpsertRootDomainReq{Domain: host, TaskID: taskID})
+		switch {
+		case net.ParseIP(c.host) != nil:
+			rootID, uerr = as.UpsertIP(db.UpsertIPReq{IP: c.host, TaskID: taskID})
+		case c.scheme == "https" || c.scheme == "http":
+			rootID, uerr = as.UpsertHTTPService(db.UpsertHTTPServiceReq{URL: c.rawURL, TaskID: taskID})
+		default:
+			rootID, uerr = as.UpsertRootDomain(db.UpsertRootDomainReq{Domain: c.host, TaskID: taskID})
 		}
 		// 吞掉错误会让 rootID 保持 0，后续 anchor 与 SetTaskAssetSource 全部跳过：
 		// 任务照跑，但资产图上没有根节点，且没有任何日志说明为什么。
 		if uerr != nil {
-			log.Printf("[seed] task %s: 初始化根资产 %q 失败: %v", t.ID, host, uerr)
+			log.Printf("[seed] task %s: 初始化根资产 %q 失败: %v", t.ID, c.host, uerr)
+			continue
 		}
-		if rootID > 0 {
-			_ = as.SetTaskAssetSource(taskID, rootID, "task", "由任务描述或目标初始化", nil)
+		if rootID <= 0 {
+			continue
 		}
-	}
-	// anchor the seeded assets to this task's begin root as lineage/provenance
-	// (the asset graph is global and shared; anchoring no longer gates reads).
-	if rootID > 0 {
-		if begin, _ := t.Store.OriginFactID(); begin > 0 {
+		_ = as.SetTaskAssetSource(taskID, rootID, "task", "由任务描述或目标初始化", nil)
+		// anchor the seeded assets to this task's begin root as lineage/provenance
+		// (the asset graph is global and shared; anchoring no longer gates reads).
+		if begin > 0 {
 			_ = t.Store.Anchor(begin, rootID)
 		}
+		registered++
 	}
-	log.Printf("[seed] task %s: 目标站点 %s", t.ID, u)
+	log.Printf("[seed] task %s: 登记 %d/%d 个目标站点", t.ID, registered, len(cands))
 	// 不在这里 Notify:首轮是否触发统一由 engine.Run 的 HasActiveIntent 决定(种子意图任务
 	// 跳过首轮)。seed 早于 Run 执行,若在此 Notify 会 buffered 到通道、被 plannerLoop 启动时
 	// 消费掉而绕过 Run 的门控 → 种子任务仍误触发首轮。

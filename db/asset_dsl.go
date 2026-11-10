@@ -244,10 +244,27 @@ func ParseDSL(s string) (*astNode, error) {
 	if err != nil {
 		return nil, err
 	}
-	if p.peek().kind != tkEOF {
-		return nil, fmt.Errorf("DSL 语法错误：意外的内容 '%s'", p.peek().kind)
+	if t := p.peek(); t.kind != tkEOF {
+		return nil, fmt.Errorf("DSL 语法错误：意外的内容 %s（两个条件之间要写 AND/OR；比较式写作 field>=值）", describeTok(t))
 	}
 	return node, nil
+}
+
+// describeTok 把出错位置的 token 还原成模型写出来的样子：只报 kind 名（'BARE'）
+// 等于没报，模型改不出正确的式子。
+func describeTok(t tok) string {
+	switch t.kind {
+	case tkBare:
+		if t.expr != nil {
+			return fmt.Sprintf("%q", t.expr.Value)
+		}
+		return "空词"
+	case tkField:
+		if t.expr != nil {
+			return fmt.Sprintf("%q", t.expr.Field+t.expr.Op+t.expr.Value)
+		}
+	}
+	return "'" + t.kind + "'"
 }
 
 // ── SQL builder ──────────────────────────────────────────────────────────────
@@ -413,6 +430,9 @@ func tryParseFieldExpr(s string, pos int) (Expr, int, bool) {
 	if !isKnownField(field) {
 		return Expr{}, pos, false
 	}
+	// 比较式两边带空格是模型的自然写法（`status_code >= 0`）：不在这里跳空白，整段会被
+	// 切成三个 BARE 词，报出来只有「意外的内容」，模型下一轮不知道该改哪里。
+	i = skipSpaces(s, i)
 	if i >= len(s) {
 		return Expr{}, pos, false
 	}
@@ -427,11 +447,19 @@ func tryParseFieldExpr(s string, pos int) (Expr, int, bool) {
 	default:
 		return Expr{}, pos, false
 	}
-	value, end := readToken(s, i)
-	if end == i {
+	valuePos := skipSpaces(s, i)
+	value, end := readToken(s, valuePos)
+	if end == valuePos {
 		return Expr{}, pos, false
 	}
 	return Expr{Field: field, Op: op, Value: value}, end, true
+}
+
+func skipSpaces(s string, i int) int {
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+		i++
+	}
+	return i
 }
 
 // readToken reads a quoted or unquoted token starting at pos.

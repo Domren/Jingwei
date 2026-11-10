@@ -4,7 +4,29 @@
 
 ## [Unreleased]
 
-（暂无）
+### 变更
+
+- **多目标任务的开局覆盖**：任务描述里一行一条目标时，根资产登记与开局预扫（资产发现 + POC
+  初筛）现在覆盖清单里的**每一条**。此前只取第一条，其余授权目标开局既不在资产图上也没被探测，
+  只能等规划轮逐只补——实机上一个 12 条目标的任务，开局只有 1 条进了预扫。目标按端口规格分组
+  探测（80/443 走 Web 端口集，指到奇数端口的只摸那个口），不会把探测量放大成 N×全量端口；
+  清单超过 32 条时明确记日志「其余未登记」，不静默丢弃。
+- **拦截规则改为逐条生效**：预扫时命中拦截规则的目标只跳过该条并指名原因；过去整轮预扫直接不做，
+  一只被拦的目标会连累其余全部目标失去开局侦察。
+- **任务开跑时间在库里可见**：未设置超时的任务同样在第一轮规划时写入首次运行时间。此前只有带
+  超时的任务会写，库里因此无法回答「这个任务到底开始跑了没有」（列表状态里的「运行中」是接口
+  派生的，不落库）。
+- **资产查询表达式容忍比较式中的空格**：`status_code >= 0` 与 `status_code>=0` 等价；此前带空格
+  会被判成语法错误。语法错误的提示现在会指出是哪一段内容不对，而不是只报内部词法类型名。
+
+### 验证
+
+- 夹具（新增）：`TestParseTargetListCoversEveryTarget`、`TestParseTargetListCapsAndDedupes`、
+  `TestGroupTargetsByPortSpec`、`TestMergeDiscoverResultsDedupes`、`TestSeedRegistersEveryTarget`、
+  `TestStampFirstRunPersistsWithoutTimeout`、`TestStampFirstRunStillComputesDeadline`、
+  `TestAssetDSLAllowsSpacesAroundOperator`、`TestAssetDSLErrorNamesOffendingWord`。
+- 实机：本机实例上的真实多目标任务（12 条授权目标）暴露出上述问题；修复前后的同任务对比
+  （登记目标数、开局预扫覆盖、首条漏洞时间点）在重跑后回填本节。
 
 ## [1.6.1] - 2026-11-10
 

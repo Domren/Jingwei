@@ -104,7 +104,8 @@ func TestPrescanPersistWritesAssetsAndScope(t *testing.T) {
 		Port: 8080, Scheme: "http", StatusCode: 200, Title: "Admin",
 		Technologies: []string{"php"}, ContentLength: 88,
 	}}
-	summary := prescanPersist(nil, pg.Assets(), task.ID, "prescan.example.com", res, apps)
+	summary := prescanPersist(nil, pg.Assets(), task.ID,
+		[]seedTarget{{scheme: "http", host: "prescan.example.com", rawURL: "http://prescan.example.com", port: 80}}, res, apps)
 	if summary["resolved_ips"] != 1 || summary["open_ports"] != 2 ||
 		summary["services"] != 1 || summary["app_systems"] != 1 {
 		t.Fatalf("summary = %+v", summary)
