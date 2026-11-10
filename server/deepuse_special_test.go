@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -14,6 +15,41 @@ import (
 	"github.com/Autumn-27/jingwei/scanner"
 	"github.com/Autumn-27/jingwei/verdict"
 )
+
+// dalfox 与 url.Values.Encode 都会把 <>\" 百分号编码。按原文 contains 会把
+// 正常的 Query 注入点误判成「载体不是 URL」，D1 的浏览器验证永远跑不起来。
+func TestXSSBrowserTargetsAcceptsEncodedQueryPayload(t *testing.T) {
+	r := &deepRun{task: &db.DeepTask{Params: map[string]any{}}}
+	p := probePoint{URL: "http://10.10.0.11/xss.php?q=hello", Method: "GET"}
+	payload := `><svg onload=alert(1) class=dlx31cb63d1>`
+
+	encoded := "http://10.10.0.11/xss.php?q=" + url.QueryEscape(payload)
+	targets, nonURL := r.xssBrowserTargets(p, []scanner.DalfoxFinding{
+		{Type: "V", Param: "q", Location: "Query", Payload: payload, URL: encoded},
+	})
+	if len(targets) != 1 || nonURL != 0 {
+		t.Fatalf("encoded query payload must be browser-testable: targets=%d nonURL=%d", len(targets), nonURL)
+	}
+	if !strings.Contains(targets[0].URL, url.QueryEscape(payload)) {
+		t.Fatalf("target URL lost the payload: %q", targets[0].URL)
+	}
+
+	// dalfox 只给参数名时按参数重建，重建后的编码 URL 同样要能通过。
+	targets, nonURL = r.xssBrowserTargets(p, []scanner.DalfoxFinding{
+		{Type: "V", Param: "q", Location: "Query", Payload: payload},
+	})
+	if len(targets) != 1 || nonURL != 0 {
+		t.Fatalf("rebuilt query URL must be browser-testable: targets=%d nonURL=%d", len(targets), nonURL)
+	}
+
+	// 非 GET/URL 载体（Cookie/Header）仍然不能交给浏览器直接打开。
+	targets, nonURL = r.xssBrowserTargets(p, []scanner.DalfoxFinding{
+		{Type: "V", Param: "q", Location: "Cookie", Payload: payload},
+	})
+	if len(targets) != 0 || nonURL != 1 {
+		t.Fatalf("cookie carrier must stay non-URL: targets=%d nonURL=%d", len(targets), nonURL)
+	}
+}
 
 func TestEncodeProbeQuery(t *testing.T) {
 	cases := []struct{ in, want string }{

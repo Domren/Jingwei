@@ -511,3 +511,50 @@ func TestSaveRawExchangesPersistsReproductionSequence(t *testing.T) {
 		}
 	}
 }
+
+// 空正文（GET 类请求）的源 blob 可能因历史数据清理/容器重建而缺失，
+// 但其内容可由哈希无损还原，导出时必须容错，不应把整份交付件打挂。
+func TestCopySnapshotsRecoversMissingEmptyBody(t *testing.T) {
+	s, _, _ := evidenceFixture(t)
+	ctx := context.Background()
+	respBody := []byte("data")
+	respHash := sha256.Sum256(respBody)
+	snap := db.TrafficEvidenceSnapshot{
+		ReqHash: emptyBodySHA256,
+		ReqLen:  0,
+		// 响应体有内容且源 blob 不存在，用于校验仍然会报错（不能凭空捏造非空正文）。
+		RespHash: hex.EncodeToString(respHash[:]),
+		RespLen:  int64(len(respBody)),
+	}
+	// 确保源目录里确实没有任何对应 blob。
+	dest := t.TempDir()
+	emptyPath, err := hashPath(dest, emptyBodySHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.CopySnapshots(ctx, []db.TrafficEvidenceSnapshot{snap}, dest); err == nil {
+		t.Fatal("非空缺失正文必须报错")
+	}
+	// 空正文一侧已经被还原，文件存在且为 0 字节。
+	if info, statErr := os.Stat(emptyPath); statErr != nil {
+		t.Fatalf("空正文未被还原: %v", statErr)
+	} else if info.Size() != 0 {
+		t.Fatalf("空正文还原后大小应为 0，实际 %d", info.Size())
+	}
+
+	// 把响应体的源 blob 补上，再次复制应整体成功。
+	srcPath, err := hashPath(s.Dir, snap.RespHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.MkdirAll(filepath.Dir(srcPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(srcPath, respBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dest2 := t.TempDir()
+	if err = s.CopySnapshots(ctx, []db.TrafficEvidenceSnapshot{snap}, dest2); err != nil {
+		t.Fatalf("补齐源 blob 后仍失败: %v", err)
+	}
+}

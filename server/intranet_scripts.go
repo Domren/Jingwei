@@ -17,12 +17,13 @@ import (
 // 脚本全部只读：不改配置、不下载外部内容、不做承诺之外的绕过。写操作归维持模块。
 
 type intranetScriptDef struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	OS      string `json:"os"` // linux / windows
-	Command string `json:"command"`
-	Parser  string `json:"-"`
-	Note    string `json:"note,omitempty"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	OS        string `json:"os"` // linux / windows
+	Command   string `json:"command"`
+	PShellCmd string `json:"-"` // PowerShell 会话下的等价命令；空则 fallback 到 Command
+	Parser    string `json:"-"`
+	Note      string `json:"note,omitempty"`
 }
 
 var intranetScriptCatalog = []intranetScriptDef{
@@ -53,35 +54,44 @@ var intranetScriptCatalog = []intranetScriptDef{
 		Command: `docker ps --format '{{.Names}}|{{.Image}}|{{.Ports}}' 2>/dev/null; podman ps 2>/dev/null | head -50`,
 		Note:    "运行中的容器与端口映射"},
 	{ID: "win-systeminfo", Name: "系统信息与补丁基线", OS: "windows", Parser: "patches",
-		Command: `systeminfo`,
-		Note:    "OS 版本与 build + 已安装补丁与基线比对（systeminfo 慢，约 30–60 秒）"},
+		Command:   `systeminfo`,
+		PShellCmd: `Get-CimInstance Win32_OperatingSystem | Select Caption,Version,BuildNumber,LastBootUpTime | Format-List; Get-HotFix | Sort-Object InstalledOn -Descending | Select -First 15 HotFixID,InstalledOn,Description | Format-Table -AutoSize`,
+		Note:      "OS 版本与 build + 已安装补丁（systeminfo 慢，约 30–60 秒；PS 版更快）"},
 	{ID: "win-users", Name: "本地用户", OS: "windows", Parser: "lines",
-		Command: `net user`,
-		Note:    "本机账号列表"},
+		Command:   `net user`,
+		PShellCmd: `Get-LocalUser | Select Name,Enabled,Description,LastLogon | Format-Table -AutoSize`,
+		Note:      "本机账号列表"},
 	{ID: "win-admins", Name: "管理员组", OS: "windows", Parser: "lines",
-		Command: `net localgroup administrators`,
-		Note:    "本地管理员成员"},
+		Command:   `net localgroup administrators`,
+		PShellCmd: `Get-LocalGroupMember -Group Administrators | Select Name,ObjectClass | Format-Table -AutoSize`,
+		Note:      "本地管理员成员"},
 	{ID: "win-ports", Name: "监听端口", OS: "windows", Parser: "windows_ports",
-		Command: `netstat -ano`,
-		Note:    "监听地址/端口/PID"},
+		Command:   `netstat -ano`,
+		PShellCmd: `Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Select LocalAddress,LocalPort,OwningProcess | Format-Table -AutoSize; Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Select LocalAddress,LocalPort,OwningProcess | Format-Table -AutoSize`,
+		Note:      "监听地址/端口/PID"},
 	{ID: "win-patches", Name: "补丁（wmic）", OS: "windows", Parser: "patches",
-		Command: `wmic qfe list brief`,
-		Note:    "已安装补丁与基线比对；wmic 在新版本上可能已移除，取不到就换 PowerShell 那条"},
-	{ID: "win-hotfixes", Name: "补丁（PowerShell）", OS: "windows", Parser: "patches",
-		Command: `powershell -NoProfile -Command "Get-HotFix | Select-Object HotFixID,InstalledOn | ConvertTo-Csv -NoTypeInformation"`,
-		Note:    "已安装补丁与基线比对（wmic 被移除时用这条）"},
+		Command:   `wmic qfe list brief`,
+		PShellCmd: `Get-HotFix | Select HotFixID,InstalledOn,Description | Format-Table -AutoSize`,
+		Note:      "已安装补丁与基线比对；wmic 在新版本上可能已移除，PS 版更稳"},
+	{ID: "win-hotfixes", Name: "补丁（PowerShell 直跑）", OS: "windows", Parser: "patches",
+		Command:   `powershell -NoProfile -Command "Get-HotFix | Select-Object HotFixID,InstalledOn | ConvertTo-Csv -NoTypeInformation"`,
+		PShellCmd: `Get-HotFix | Select HotFixID,InstalledOn,Description | Format-Table -AutoSize`,
+		Note:      "cmd 会话通过 powershell.exe 调用；纯 PS 会话直接执行"},
 	{ID: "win-endpoint", Name: "终端防护进程与服务", OS: "windows", Parser: "endpoint",
-		Command: `tasklist /fo csv /nh 2>nul & sc query type= service state= all 2>nul | findstr /i "SERVICE_NAME"`,
-		Note:    "按进程名/服务名识别杀软与 EDR；只登记有公开文档支撑的条目，认不出的列入待确认"},
+		Command:   `tasklist /fo csv /nh 2>nul & sc query type= service state= all 2>nul | findstr /i "SERVICE_NAME"`,
+		PShellCmd: `Get-Process | Select Id,ProcessName | Format-Table -AutoSize; Get-Service | Where StartType -ne Disabled | Select Name,DisplayName,Status | Format-Table -AutoSize`,
+		Note:      "按进程名/服务名识别杀软与 EDR；只登记有公开文档支撑的条目，认不出的列入待确认"},
 	{ID: "linux-endpoint", Name: "终端防护进程", OS: "linux", Parser: "endpoint",
 		Command: `ps -eo pid=,comm=,args= 2>/dev/null | head -200`,
 		Note:    "同上，Linux 侧；主机上通常没有终端防护，读不到列表时不做判断"},
 	{ID: "win-tasks", Name: "计划任务", OS: "windows", Parser: "windows_tasks",
-		Command: `schtasks /query /fo LIST`,
-		Note:    "任务名与状态"},
+		Command:   `schtasks /query /fo LIST`,
+		PShellCmd: `Get-ScheduledTask | Select TaskName,TaskPath,State | Format-Table -AutoSize`,
+		Note:      "任务名与状态"},
 	{ID: "win-priv", Name: "令牌特权", OS: "windows", Parser: "lines",
-		Command: `whoami /priv`,
-		Note:    "当前令牌特权"},
+		Command:   `whoami /priv`,
+		PShellCmd: `whoami /priv`,
+		Note:      "当前令牌特权（PS/cmd 语法一致，复用同一条）"},
 }
 
 // endpointOSKind 把脚本侧的 linux/windows 归到识别函数认的说法。
@@ -292,6 +302,9 @@ func (s *Server) runIntranetScript(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := s.intranetExec(r.Context(), pg, sess, script.Command, 45*time.Second)
+	if sessShell(sess) == intranetShellPowerShell && strings.TrimSpace(script.PShellCmd) != "" {
+		out = s.intranetExec(r.Context(), pg, sess, script.PShellCmd, 45*time.Second)
+	}
 	status := "done"
 	if out.IsError || out.TimedOut {
 		status = "failed"

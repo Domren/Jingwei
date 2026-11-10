@@ -137,6 +137,14 @@ func TestCredSMBHitDeny(t *testing.T) {
 			writeString(c, string(smb2Reply(smb2CmdSessionSetup, smb2StatusSuccess, 3, make([]byte, 8))))
 			return
 		}
+		// visitor：Samba 的 map to guest = bad user 会把不存在的账号降级成访客会话，
+		// STATUS 仍是 SUCCESS，只靠状态码会把任意口令判成命中。
+		if strings.Contains(string(auth), string(smbUTF16("visitor"))) {
+			body := make([]byte, 8)
+			binary.LittleEndian.PutUint16(body[2:], smb2SessionFlagGuest)
+			writeString(c, string(smb2Reply(smb2CmdSessionSetup, smb2StatusSuccess, 3, body)))
+			return
+		}
 		writeString(c, string(smb2Reply(smb2CmdSessionSetup, smb2StatusLogonFail, 3, make([]byte, 8))))
 	})
 	ctx := credCtx(t)
@@ -152,6 +160,14 @@ func TestCredSMBHitDeny(t *testing.T) {
 	deny, err := smbCredAdapter{}.Try(ctx, credEP(ep.addr, "smb"), Credential{Username: "guest", Password: "x"})
 	if err != nil || deny.Outcome != CredDeny {
 		t.Fatalf("deny = %+v err=%v", deny, err)
+	}
+	// 访客降级：服务端回 SUCCESS 但带 SESSION_FLAG_GUEST，不能算命中。
+	mapped, err := smbCredAdapter{}.Try(ctx, credEP(ep.addr, "smb"), Credential{Username: "visitor", Password: "whatever"})
+	if err != nil || mapped.Outcome != CredDeny {
+		t.Fatalf("guest-mapped = %+v err=%v", mapped, err)
+	}
+	if !strings.Contains(mapped.Reason, "访客") {
+		t.Fatalf("guest-mapped deny reason should explain the guest mapping: %q", mapped.Reason)
 	}
 }
 

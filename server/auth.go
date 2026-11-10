@@ -409,13 +409,6 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 	})
 }
 
-func authErrorStatus(err error) int {
-	if errors.Is(err, errInvalidAuthToken) {
-		return 401
-	}
-	return 503
-}
-
 // GET /api/auth/status — reports whether the admin password has been initialised.
 // 读失败必须回 503 而不是 initialized:false：前端在 initialized:false 时会把用户
 // 送到 /setup 去设置密码（login/page.tsx），把数据库故障包装成 200 等于把用户往

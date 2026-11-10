@@ -1954,12 +1954,18 @@ func (s *Server) seed(t *Task, text string) {
 	var rootID int64
 	if as := s.m.Assets(); as != nil {
 		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+		var uerr error
 		if net.ParseIP(host) != nil {
-			rootID, _ = as.UpsertIP(db.UpsertIPReq{IP: host, TaskID: taskID})
+			rootID, uerr = as.UpsertIP(db.UpsertIPReq{IP: host, TaskID: taskID})
 		} else if scheme == "https" || scheme == "http" {
-			rootID, _ = as.UpsertHTTPService(db.UpsertHTTPServiceReq{URL: u, TaskID: taskID})
+			rootID, uerr = as.UpsertHTTPService(db.UpsertHTTPServiceReq{URL: u, TaskID: taskID})
 		} else {
-			rootID, _ = as.UpsertRootDomain(db.UpsertRootDomainReq{Domain: host, TaskID: taskID})
+			rootID, uerr = as.UpsertRootDomain(db.UpsertRootDomainReq{Domain: host, TaskID: taskID})
+		}
+		// 吞掉错误会让 rootID 保持 0，后续 anchor 与 SetTaskAssetSource 全部跳过：
+		// 任务照跑，但资产图上没有根节点，且没有任何日志说明为什么。
+		if uerr != nil {
+			log.Printf("[seed] task %s: 初始化根资产 %q 失败: %v", t.ID, host, uerr)
 		}
 		if rootID > 0 {
 			_ = as.SetTaskAssetSource(taskID, rootID, "task", "由任务描述或目标初始化", nil)

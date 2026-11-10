@@ -14,16 +14,15 @@ import (
 // 断言「有没有发起连接」靠的就是这些计数——引擎的止损与不猜测规则，
 // 只有从调用次数才看得出来，光看返回值看不出「其实它偷偷试了三次」。
 type credFakeAdapter struct {
-	mu        sync.Mutex
-	protocol  string
-	identify  bool
-	idErr     error
-	outcome   CredOutcome
-	tryErr    error
-	idCalls   int
-	tryCalls  int
-	tryDelay  time.Duration
-	portCheck int
+	mu       sync.Mutex
+	protocol string
+	identify bool
+	idErr    error
+	outcome  CredOutcome
+	tryErr   error
+	idCalls  int
+	tryCalls int
+	tryDelay time.Duration
 	// tryFn 按凭据决定结果（nil 时用固定 outcome），用于按账号断言止损行为。
 	tryFn func(Credential) CredOutcome
 }

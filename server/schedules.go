@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/Autumn-27/jingwei/agent"
@@ -260,17 +259,4 @@ func (s *Server) startScheduleTasks(item *db.TaskSchedule, forceManualPause bool
 		_ = s.m.pg.RecordScheduleHistory(item.ID, taskID, "resume", true, message)
 	}
 	return started, errors
-}
-
-// scheduleRequestFromTask is used by the task creation handler without making
-// the public task API depend on database internals.
-func scheduleRequestFromTask(raw json.RawMessage) (*scheduleRequest, error) {
-	if len(strings.TrimSpace(string(raw))) == 0 || string(raw) == "null" {
-		return nil, nil
-	}
-	var req scheduleRequest
-	if err := json.Unmarshal(raw, &req); err != nil {
-		return nil, err
-	}
-	return &req, nil
 }

@@ -2,12 +2,14 @@
 
 import * as React from "react";
 
-import { Loader2Icon, PlayIcon, ShieldOffIcon } from "lucide-react";
+import { ChevronDownIcon, Loader2Icon, PlayIcon, ShieldOffIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
@@ -27,6 +29,10 @@ export default function DeepWafBypassPage() {
   const [param, setParam] = React.useState("id");
   const [payload, setPayload] = React.useState("' union select 1,2,3--");
   const [keywords, setKeywords] = React.useState("");
+  const [bypassMode, setBypassMode] = React.useState<"adaptive" | "full">("adaptive");
+  const [maxAttempts, setMaxAttempts] = React.useState("8");
+  const [maxConsecBlocked, setMaxConsecBlocked] = React.useState("5");
+  const [maxConsecErrors, setMaxConsecErrors] = React.useState("3");
 
   function openCreate() {
     setName("");
@@ -35,7 +41,22 @@ export default function DeepWafBypassPage() {
     setParam("id");
     setPayload("' union select 1,2,3--");
     setKeywords("");
+    setBypassMode("adaptive");
+    setMaxAttempts("8");
+    setMaxConsecBlocked("5");
+    setMaxConsecErrors("3");
     setCreateOpen(true);
+  }
+
+  // 数字输入留空即走服务端默认值；填了就必须是正整数（服务端另有上限收口）。
+  function parsePositive(value: string, label: string): number | undefined {
+    const trimmed = value.trim();
+    if (!trimmed) return undefined;
+    const n = Number(trimmed);
+    if (!Number.isInteger(n) || n <= 0) {
+      throw new Error(`${label}必须是正整数`);
+    }
+    return n;
   }
 
   async function submit() {
@@ -46,6 +67,17 @@ export default function DeepWafBypassPage() {
     }
     if (!path.trim()) {
       toast.error("请填写测试路径");
+      return;
+    }
+    let budget: number | undefined;
+    let consecBlocked: number | undefined;
+    let consecErrors: number | undefined;
+    try {
+      budget = parsePositive(maxAttempts, "请求预算");
+      consecBlocked = parsePositive(maxConsecBlocked, "连续被拦止损");
+      consecErrors = parsePositive(maxConsecErrors, "连续错误止损");
+    } catch (e) {
+      toast.error((e as Error).message);
       return;
     }
     setSubmitting(true);
@@ -63,6 +95,10 @@ export default function DeepWafBypassPage() {
             .split(/[\s,;]+/)
             .map((k) => k.trim())
             .filter(Boolean),
+          bypass_mode: bypassMode,
+          ...(budget !== undefined ? { max_attempts: budget } : {}),
+          ...(consecBlocked !== undefined ? { max_consecutive_blocked: consecBlocked } : {}),
+          ...(consecErrors !== undefined ? { max_consecutive_errors: consecErrors } : {}),
         },
       });
       toast.success(`已创建绕过测试 #${task.id}`);
@@ -150,6 +186,56 @@ export default function DeepWafBypassPage() {
                 placeholder="多个关键词用空格分隔"
               />
             </FieldRow>
+            <Collapsible>
+              <CollapsibleTrigger className="group flex w-full items-center justify-between rounded-md border border-dashed px-3 py-2 text-sm text-muted-foreground hover:text-foreground">
+                高级选项（模式 / 预算 / 止损阈值）
+                <ChevronDownIcon className="size-4 transition-transform group-data-[state=open]:rotate-180" />
+              </CollapsibleTrigger>
+              <CollapsibleContent className="flex flex-col gap-4 pt-4">
+                <FieldRow
+                  label="重试模式"
+                  hint="自适应：被拦后按拦截特征重排变形，连续被拦即止损；全量：按序尝试全部变形直到预算耗尽，每种形态都留记录"
+                >
+                  <Select value={bypassMode} onValueChange={(v) => setBypassMode(v as "adaptive" | "full")}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="adaptive">自适应（默认）</SelectItem>
+                      <SelectItem value="full">全量</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </FieldRow>
+                <FieldRow label="请求预算" hint="含基线在内的最大请求数，默认 8，硬上限 64；留空用默认值">
+                  <Input
+                    value={maxAttempts}
+                    onChange={(e) => setMaxAttempts(e.target.value)}
+                    inputMode="numeric"
+                    placeholder="8"
+                  />
+                </FieldRow>
+                <FieldRow
+                  label="连续被拦止损"
+                  hint="自适应模式下连续这么多次被拦即停止，默认 5；全量模式不生效；留空用默认值"
+                >
+                  <Input
+                    value={maxConsecBlocked}
+                    onChange={(e) => setMaxConsecBlocked(e.target.value)}
+                    inputMode="numeric"
+                    placeholder="5"
+                    disabled={bypassMode === "full"}
+                  />
+                </FieldRow>
+                <FieldRow label="连续错误止损" hint="连续这么多次传输错误即停止，默认 3；留空用默认值">
+                  <Input
+                    value={maxConsecErrors}
+                    onChange={(e) => setMaxConsecErrors(e.target.value)}
+                    inputMode="numeric"
+                    placeholder="3"
+                  />
+                </FieldRow>
+              </CollapsibleContent>
+            </Collapsible>
             <FieldRow label="任务名称">
               <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="留空自动生成" />
             </FieldRow>

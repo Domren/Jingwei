@@ -1061,6 +1061,14 @@ func (r *deepRun) verifyXSSPoint(p probePoint, creds probeCreds) probeResult {
 	return res
 }
 
+// xssURLHasPayload 判断 URL 是否真的带上了载荷：原文或百分号编码两种形态都算。
+func xssURLHasPayload(u, payload string) bool {
+	if strings.Contains(u, payload) {
+		return true
+	}
+	return strings.Contains(u, url.QueryEscape(payload))
+}
+
 // xssBrowserTargets builds the PoC URLs a browser can load directly. Only query
 // carriers qualify: a POST body / Cookie / Header payload would need form
 // automation, so those are counted separately and reported as not verified.
@@ -1082,7 +1090,7 @@ func (r *deepRun) xssBrowserTargets(p probePoint, findings []scanner.DalfoxFindi
 			continue
 		}
 		u := strings.TrimSpace(f.URL)
-		if !strings.Contains(u, payload) {
+		if !xssURLHasPayload(u, payload) {
 			// dalfox 的 data 字段在某些版本里只有参数名，按参数重建一次。
 			base, err := url.Parse(p.URL)
 			param := strings.TrimSpace(f.Param)
@@ -1095,7 +1103,10 @@ func (r *deepRun) xssBrowserTargets(p probePoint, findings []scanner.DalfoxFindi
 			base.RawQuery = q.Encode()
 			u = base.String()
 		}
-		if !strings.Contains(u, payload) {
+		// 注意：dalfox 给出的 URL 与 url.Values.Encode 都会做百分号编码，
+		// 载荷里的 > < " 不会以原文出现。按原文做 contains 会把正常的 Query
+		// 注入点全部误判成「载体不是 URL」，D1 的浏览器验证就永远跑不起来。
+		if !xssURLHasPayload(u, payload) {
 			nonURL++
 			continue
 		}

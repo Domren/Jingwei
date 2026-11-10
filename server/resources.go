@@ -142,27 +142,6 @@ func metadataInt64(md map[string]any, key string) int64 {
 	return 0
 }
 
-// releaseTask releases every resource owned by a task (used when a task ends or
-// is canceled and its external artifacts must not outlive it).
-func (m *resourceManager) releaseTask(ctx context.Context, taskID int64, note string) int {
-	if m == nil || m.s.m.pg == nil || taskID <= 0 {
-		return 0
-	}
-	rows, _, err := m.s.m.pg.ListManagedResources("", db.ManagedActive, 500, 0)
-	if err != nil {
-		return 0
-	}
-	released := 0
-	for _, r := range rows {
-		if r.TaskID != nil && *r.TaskID == taskID {
-			if ok, _ := m.release(ctx, r.ID, note); ok {
-				released++
-			}
-		}
-	}
-	return released
-}
-
 func (m *resourceManager) reap(ctx context.Context) {
 	if m == nil || m.s.m.pg == nil {
 		return

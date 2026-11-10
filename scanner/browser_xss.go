@@ -202,7 +202,9 @@ func RunBrowserXSS(ctx context.Context, opts BrowserXSSOptions) BrowserXSSRun {
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, node, scriptPath, inputPath)
 	if module != "" {
-		cmd.Env = append(os.Environ(), "JW_PLAYWRIGHT_MODULE="+module)
+		// NODE_PATH 让脚本目录（/tmp/...）里的 require('playwright') 也能解析到
+		// 全局安装；JW_PLAYWRIGHT_MODULE 则保留给显式覆盖的场景。
+		cmd.Env = append(os.Environ(), "JW_PLAYWRIGHT_MODULE="+module, "NODE_PATH="+module)
 	}
 	out, err := cmd.CombinedOutput()
 	run.Elapsed = time.Since(start)

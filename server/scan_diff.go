@@ -50,7 +50,15 @@ func scanDiffKey(r db.ScanTaskResult) string {
 // computeScanDiff 是纯函数：输入两轮结果与本轮可达主机集合，输出增量。
 // 同样的 key 出现多次时以最后一条为准（同一模板同一地址重复命中不重复计数）。
 func computeScanDiff(current, against []db.ScanTaskResult, reachable map[string]bool) scanDiff {
-	out := scanDiff{CurrentTotal: len(current), AgainstTotal: len(against)}
+	// 三个列表必须是空数组而不是 null：界面直接读 diff.new.length / .map，
+	// 没有增量的那一类如果序列化成 null，前端会抛 TypeError 把整个面板打白。
+	out := scanDiff{
+		CurrentTotal:    len(current),
+		AgainstTotal:    len(against),
+		New:             []scanDiffItem{},
+		Gone:            []scanGoneItem{},
+		SeverityChanged: []scanSeverityChange{},
+	}
 	cur := map[string]db.ScanTaskResult{}
 	order := []string{}
 	for _, r := range current {

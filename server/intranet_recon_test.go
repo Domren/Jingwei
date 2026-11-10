@@ -295,7 +295,7 @@ func TestAutoSelectTunnelUsesPivotServer(t *testing.T) {
 	}
 
 	t.Setenv("JINGWEI_PIVOT_SERVER", "")
-	deploy, reason, side = autoSelectTunnelCommand(db.IntranetTunnelKindSocks5, intranetProbeInfo{Bins: []string{"chisel"}}, tr)
+	deploy, reason, _ = autoSelectTunnelCommand(db.IntranetTunnelKindSocks5, intranetProbeInfo{Bins: []string{"chisel"}}, tr)
 	if deploy != "" || !strings.Contains(reason, "JINGWEI_PIVOT_SERVER") {
 		t.Fatalf("expected clear pivot error, deploy=%q reason=%q", deploy, reason)
 	}

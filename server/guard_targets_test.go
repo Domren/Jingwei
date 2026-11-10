@@ -264,10 +264,3 @@ func settingGuardMode(t *testing.T, pg *db.DB, mode string) func() {
 		_ = pg.SetSetting(settingGuardEnforcement, prev)
 	}
 }
-
-func must(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatal(err)
-	}
-}

@@ -16,6 +16,7 @@ import type {
   Company,
   CompanyScopeRule,
   Conversation,
+  DeepTask,
   EvidenceBodyPreview,
   FindingRetest,
   FindingTraffic,
@@ -55,6 +56,46 @@ const mockPortListeners = structuredClone(D.portListeners);
 const mockNotifyMeta = structuredClone(D.notifyMeta);
 const mockNotifyChannels = structuredClone(D.notifyChannels);
 const mockNotifyDeliveries = structuredClone(D.notifyDeliveries);
+
+// 深度利用任务演示数据：一条已完成的 waf_bypass（含高级选项参数回显）。
+let mockDeepTaskSeq = 1;
+const mockDeepTasks: DeepTask[] = [
+  {
+    id: 1,
+    name: "演示 WAF 绕过测试",
+    kind: "waf_bypass",
+    target: "https://demo.internal/api/query",
+    params: {
+      base_url: "https://demo.internal",
+      path: "/api/query",
+      param: "id",
+      payload: "' union select 1,2,3--",
+      bypass_mode: "adaptive",
+      max_attempts: 8,
+      max_consecutive_blocked: 5,
+      max_consecutive_errors: 3,
+    },
+    status: "done",
+    stage: "done",
+    progress: {},
+    summary: {
+      waf_detected: true,
+      waf_vendor: "Cloudflare",
+      baseline_blocked: true,
+      block_feature: "rule",
+      attempts: 6,
+      stop_reason: "consecutive_blocked",
+      final_verdict: "no_bypass",
+      bypass_mode: "adaptive",
+      bypassed: 0,
+      blocked: 5,
+      unsupported: 0,
+    },
+    auto_run: false,
+    created_at: new Date(Date.now() - 3600_000).toISOString(),
+    finished_at: new Date(Date.now() - 3500_000).toISOString(),
+  },
+];
 
 // ── 关联流量证据(finding traffic) ─────────────────────────────────────────────
 // 后端把请求/响应快照独立存到 evidence 表,前端详情页用 FindingTrafficPanel 展示。
@@ -470,7 +511,9 @@ function mockAssetMatchesDSL(asset: Asset, dsl: string): boolean {
 // finding belongs to the most specific resolvable asset, not every linked host.
 function mockSystemOfFinding(finding: (typeof mockFindings)[number]) {
   const rank: Record<string, number> = { service: 0, endpoint: 1, app: 2, subdomain: 3, ip: 4, root_domain: 5 };
-  let selected: { system: string; label: string; host?: string; port?: number; service?: string; rank: number } | undefined;
+  let selected:
+    | { system: string; label: string; host?: string; port?: number; service?: string; rank: number }
+    | undefined;
   for (const ref of finding.assets ?? []) {
     const asset = mockAssets.find((item) => String(item.id) === ref.id);
     if (!asset) continue;
@@ -481,7 +524,9 @@ function mockSystemOfFinding(finding: (typeof mockFindings)[number]) {
         const url = new URL(asset.url);
         if (!host) host = url.hostname.replace(/^\[|\]$/g, "");
         if (!port) port = Number(url.port) || (url.protocol === "https:" ? 443 : url.protocol === "http:" ? 80 : 0);
-      } catch { /* Unparseable URL has no usable host. */ }
+      } catch {
+        /* Unparseable URL has no usable host. */
+      }
     }
     let system: string;
     if (!host && asset.type === "app" && asset.app_name) {
@@ -494,13 +539,31 @@ function mockSystemOfFinding(finding: (typeof mockFindings)[number]) {
         try {
           const path = new URL(asset.url).pathname.toLowerCase();
           if (path && path !== "/") system += path;
-        } catch { /* Keep the host bucket. */ }
+        } catch {
+          /* Keep the host bucket. */
+        }
       }
     } else continue;
     const priority = rank[asset.type] ?? 9;
     if (selected && priority >= selected.rank) continue;
-    const label = system.startsWith("app:") ? host : `${host}${port ? `:${port}` : ""}${system.startsWith("svc:") && system.includes("/") ? ` ${system.slice(system.indexOf("/")).replace(/\/$/, "")}` : ""}`;
-    selected = { system, label, host, port, service: asset.type === "service" ? asset.service_name || asset.service_type : asset.type === "endpoint" ? "http" : asset.type === "app" ? "app" : "", rank: priority };
+    const label = system.startsWith("app:")
+      ? host
+      : `${host}${port ? `:${port}` : ""}${system.startsWith("svc:") && system.includes("/") ? ` ${system.slice(system.indexOf("/")).replace(/\/$/, "")}` : ""}`;
+    selected = {
+      system,
+      label,
+      host,
+      port,
+      service:
+        asset.type === "service"
+          ? asset.service_name || asset.service_type
+          : asset.type === "endpoint"
+            ? "http"
+            : asset.type === "app"
+              ? "app"
+              : "",
+      rank: priority,
+    };
   }
   return selected ?? { system: "__none__", label: "未关联系统", rank: 10 };
 }
@@ -1975,18 +2038,39 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   }
   if (path === "/exploration/findings/systems") {
     const list = mockApplyAssetScope(mockFilterFindings(q), q.get("asset_scope"));
-    const bySystem = new Map<string, {
-      system: string; label: string; host?: string; port?: number; service?: string;
-      count: number; critical: number; high: number; medium: number; low: number; last_found_at: string;
-    }>();
+    const bySystem = new Map<
+      string,
+      {
+        system: string;
+        label: string;
+        host?: string;
+        port?: number;
+        service?: string;
+        count: number;
+        critical: number;
+        high: number;
+        medium: number;
+        low: number;
+        last_found_at: string;
+      }
+    >();
     let findingTotal = 0;
     for (const finding of list) {
       const info = mockSystemOfFinding(finding);
       if (q.get("system") && q.get("system") !== info.system) continue;
       findingTotal++;
       const group = bySystem.get(info.system) ?? {
-        system: info.system, label: info.label, host: info.host, port: info.port, service: info.service,
-        count: 0, critical: 0, high: 0, medium: 0, low: 0, last_found_at: "",
+        system: info.system,
+        label: info.label,
+        host: info.host,
+        port: info.port,
+        service: info.service,
+        count: 0,
+        critical: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+        last_found_at: "",
       };
       group.count++;
       group[finding.severity]++;
@@ -1995,22 +2079,41 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     }
     const items = [...bySystem.values()].sort((a, b) => {
       const weight = (g: typeof a) => g.critical * 1000 + g.high * 100 + g.medium * 10 + g.low;
-      return weight(b) - weight(a) || b.count - a.count || b.last_found_at.localeCompare(a.last_found_at) || a.label.localeCompare(b.label);
+      return (
+        weight(b) - weight(a) ||
+        b.count - a.count ||
+        b.last_found_at.localeCompare(a.last_found_at) ||
+        a.label.localeCompare(b.label)
+      );
     });
     const rawPage = Number(q.get("page") ?? 1);
     const rawLimit = Number(q.get("limit") ?? 50);
     const page = Number.isFinite(rawPage) && rawPage > 0 ? Math.floor(rawPage) : 1;
     const pageSize = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(200, Math.floor(rawLimit)) : 50;
-    return { items: items.slice((page - 1) * pageSize, page * pageSize), total: items.length,
-      finding_total: findingTotal, page, page_size: pageSize };
+    return {
+      items: items.slice((page - 1) * pageSize, page * pageSize),
+      total: items.length,
+      finding_total: findingTotal,
+      page,
+      page_size: pageSize,
+    };
   }
   if (path === "/exploration/findings/ids") {
-    const list = mockApplySystemScope(mockApplyAssetScope(mockFilterFindings(q), q.get("asset_scope")), q.get("system"));
-    return { ids: list.map((finding) => Number(finding.finding_id ?? finding.id)).filter(Number.isFinite), count: list.length };
+    const list = mockApplySystemScope(
+      mockApplyAssetScope(mockFilterFindings(q), q.get("asset_scope")),
+      q.get("system"),
+    );
+    return {
+      ids: list.map((finding) => Number(finding.finding_id ?? finding.id)).filter(Number.isFinite),
+      count: list.length,
+    };
   }
   if (path === "/exploration/findings/groups") {
     const severityOrder = { critical: 4, high: 3, medium: 2, low: 1 } as const;
-    const list = mockApplySystemScope(mockApplyAssetScope(mockFilterFindings(q), q.get("asset_scope")), q.get("system"));
+    const list = mockApplySystemScope(
+      mockApplyAssetScope(mockFilterFindings(q), q.get("asset_scope")),
+      q.get("system"),
+    );
 
     const grouped = new Map<string, typeof list>();
     for (const finding of list) {
@@ -2252,7 +2355,10 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     // 全局:带 page/limit → 分页对象;否则裸数组(dashboard)。
     if (!q.has("page") && !q.has("limit")) return mockFindings.map(withFid);
     const sev = { critical: 4, high: 3, medium: 2, low: 1 } as const;
-    const list = mockApplySystemScope(mockApplyAssetScope(mockFilterFindings(q), q.get("asset_scope")), q.get("system"));
+    const list = mockApplySystemScope(
+      mockApplyAssetScope(mockFilterFindings(q), q.get("asset_scope")),
+      q.get("system"),
+    );
     list.sort((a, b) =>
       q.get("sort") === "severity"
         ? sev[b.severity] - sev[a.severity] || +new Date(b.ts) - +new Date(a.ts)
@@ -2581,7 +2687,8 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     const from = q.get("from") || "";
     const to = q.get("to") || "";
     if (status && !["pending", "allowed", "denied", "timeout"].includes(status)) throw new Error("无效审批状态");
-    if (decisionSource && !["model", "rule", "manual", "unknown"].includes(decisionSource)) throw new Error("无效判定来源");
+    if (decisionSource && !["model", "rule", "manual", "unknown"].includes(decisionSource))
+      throw new Error("无效判定来源");
     if ([...search].length > 200) throw new Error("搜索关键词不能超过 200 个字符");
     if (search.startsWith("#") && !/^#[1-9]\d*$/.test(search)) throw new Error("审批编号必须为 # 后接正整数");
     for (const value of [from, to]) {
@@ -2737,6 +2844,54 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       },
       outcomes: ["hit", "deny", "unreachable", "locked", "inconclusive", "unsupported"],
     };
+  }
+
+  // ── 深度利用任务（demo 内存态，参数口径与 server 一致：原样保存 params 并回显） ──
+  if (seg[0] === "deep" && seg[1] === "tasks") {
+    if (seg.length === 2 && m === "GET") {
+      const kind = q.get("kind") ?? "";
+      const items = mockDeepTasks.filter((t) => !kind || t.kind === kind);
+      const offset = Math.max(0, Number(q.get("offset")) || 0);
+      const limit = Math.max(1, Number(q.get("limit")) || 50);
+      return { tasks: items.slice(offset, offset + limit), total: items.length };
+    }
+    if (seg.length === 2 && m === "POST") {
+      const kind = String(b.kind ?? "");
+      const target = String(b.target ?? "").trim();
+      if (!kind || !target) throw new Error("kind and target are required");
+      const task: DeepTask = {
+        id: ++mockDeepTaskSeq,
+        name: String(b.name ?? "").trim() || `${kind} #${mockDeepTaskSeq}`,
+        kind: kind as DeepTask["kind"],
+        target,
+        params: (b.params as Record<string, unknown>) ?? {},
+        status: "done",
+        stage: "done",
+        progress: {},
+        summary: { demo: true, note: "演示模式不发送真实请求" },
+        auto_run: false,
+        created_at: new Date().toISOString(),
+        finished_at: new Date().toISOString(),
+      };
+      mockDeepTasks.unshift(task);
+      return task;
+    }
+    const id = Number(seg[2]);
+    const task = mockDeepTasks.find((t) => t.id === id);
+    if (!task) throw new Error("任务不存在");
+    if (seg.length === 3 && m === "GET") {
+      return {
+        task: structuredClone(task),
+        records: [],
+        waf_results: [],
+        waf_summary: task.kind === "waf_bypass" ? task.summary : undefined,
+      };
+    }
+    if (seg.length === 4 && seg[3] === "cancel" && m === "POST") return { ok: true };
+    if (seg.length === 3 && m === "DELETE") {
+      mockDeepTasks.splice(mockDeepTasks.indexOf(task), 1);
+      return { ok: true };
+    }
   }
 
   // ── 写操作兜底：成功但不落库 ──

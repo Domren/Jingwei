@@ -948,8 +948,11 @@ func (s *Server) deployPHPSemiPersist(ctx context.Context, pg *db.DB, parentID i
 		_ = runner(phpPersistRevokeCommand(layout), intranetPersistTimeout)
 		rollbackVerify := runner(phpPersistVerifyCommand(layout), intranetVerifyTimeout)
 		if strings.Contains(rollbackVerify.Output, intranetArtifactGone) {
+			// 这里不能只 append 到 warnings 再返回错误：warnings 只随成功结果下发，
+			// 错误路径上会被丢弃，清理失败的原因就再也看不到了。直接并进错误文本。
 			if _, derr := pg.DeleteWebshell(shell.ID); derr != nil {
-				warnings = append(warnings, "回滚后清理 webshell 记录失败："+derr.Error())
+				return nil, fmt.Errorf("登记落地物台账失败，已回滚，但清理 webshell 记录（#%d）失败：%s；根因：%w",
+					shell.ID, derr.Error(), aerr)
 			}
 			return nil, fmt.Errorf("登记落地物台账失败，已回滚：%w", aerr)
 		}

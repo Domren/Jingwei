@@ -1816,7 +1816,11 @@ func (r *scanRun) selectTemplates(services []scanner.WebService) ([]scanner.Nucl
 		r.logf("match", "识别技术指纹 %d 个：%s", len(techs), strings.Join(techs, ", "))
 		// 无指纹不直接放弃：MatchTemplates 会回退到通用 dast 模板（反射型 SSTI/XSS 等），
 		// 让这类无需特定指纹的探测仍能对目标执行。
-		metas, err := r.pg.ListEnabledPOCMetadata()
+		// 这里必须赋给函数级 err：用 := 会派生一个只在 case 块内可见的 err，
+		// 下面 pocs 的加载错误就落到那个影子变量上，switch 之后的 err 检查永远是 nil，
+		// auto 模式下 POC 加载失败会静默变成「0 命中」。
+		var metas []db.POCTemplate
+		metas, err = r.pg.ListEnabledPOCMetadata()
 		if err != nil {
 			return nil, nil, fmt.Errorf("加载 POC 元数据失败: %w", err)
 		}

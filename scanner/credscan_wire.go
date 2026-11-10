@@ -147,22 +147,6 @@ func (c *credPeek) Read(b []byte) (int, error) {
 	return c.Conn.Read(b)
 }
 
-func bytesIndexByte(b []byte, c byte) int {
-	for i := 0; i < len(b); i++ {
-		if b[i] == c {
-			return i
-		}
-	}
-	return -1
-}
-
-func (w *credWire) recordWrite(b []byte) {
-	if len(b) == 0 || len(w.req) >= credReadMax {
-		return
-	}
-	w.req = append(w.req, b...)
-}
-
 func (w *credWire) write(b []byte) error {
 	if len(w.req) < credReadMax {
 		w.req = append(w.req, b...)
@@ -215,16 +199,12 @@ func (w *credWire) read() ([]byte, error) {
 	}
 }
 
-// readDatagram 读一个 UDP 数据报。UDP 不是字节流：一次 Read 就是一个完整报文，
-// 不能套 TCP 的 read()/readLine()（它们靠静默期收尾，会把「没应答」误判成「读完了」）。
+// readDatagramWithin 读一个 UDP 数据报，并允许协议给单次数据报等待定一个节奏
+// （SNMP 用较短的应答窗口），但仍受 w.deadline 这个单次尝试硬上限约束，不构成
+// 「适配器自定全局超时」。UDP 不是字节流：一次 Read 就是一个完整报文，不能套
+// TCP 的 read()/readLine()（它们靠静默期收尾，会把「没应答」误判成「读完了」）。
 // 返回的 error 由调用方分两类处理：ECONNREFUSED 是端口没人听（ICMP 不可达），
 // 超时是「有人听但不回话」——SNMP community 错正是被静默丢弃，两者必须分开。
-func (w *credWire) readDatagram() ([]byte, error) {
-	return w.readDatagramWithin(credFirstReadWait)
-}
-
-// readDatagramWithin 允许协议给单次数据报等待定一个节奏（SNMP 用较短的应答窗口），
-// 但仍受 w.deadline 这个单次尝试硬上限约束，不构成「适配器自定全局超时」。
 func (w *credWire) readDatagramWithin(wait time.Duration) ([]byte, error) {
 	buf := make([]byte, credReadMax)
 	_ = w.conn.SetReadDeadline(w.readDeadline(wait))

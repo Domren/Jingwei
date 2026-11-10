@@ -54,8 +54,7 @@ func newCredTestEndpoint(t *testing.T, handler func(c net.Conn)) *credTestEndpoi
 // 它返回了什么更能说明协议实现对不对。
 type recordingConn struct {
 	net.Conn
-	ep  *credTestEndpoint
-	buf []byte
+	ep *credTestEndpoint
 }
 
 // Read 记录的是「服务端收到的字节」，也就是适配器真正发出去的东西。

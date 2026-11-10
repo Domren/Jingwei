@@ -125,10 +125,6 @@ func clampByte(v int) uint8 {
 	return uint8(v)
 }
 
-func mix(a, b uint8, t float64) uint8 {
-	return clampByte(int(float64(a) + (float64(b)-float64(a))*t))
-}
-
 // blendPixel applies src over dst. Colours are kept opaque; only alpha controls
 // how strongly an overlay shape covers the texture underneath.
 func blendPixel(img *image.RGBA, x, y int, src color.RGBA) {

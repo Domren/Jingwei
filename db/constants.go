@@ -36,5 +36,8 @@ const (
 	RelDerivedFrom = "derived_from"
 	RelYields      = "yields"
 	RelProves      = "proves"
-	RelCovers      = "covers" // digest --covers--> member (cold-digest-spec §1); source of truth for "which digest folds node X"
+	RelCovers      = "covers"     // digest --covers--> member (cold-digest-spec §1); source of truth for "which digest folds node X"
+	RelTrusts      = "trusts"     // domain --trusts--> domain (AD trust, directional)
+	RelTrustedBy   = "trusted_by" // reverse materialization for fast reverse walks
+	RelContains    = "contains"   // domain --contains--> DC / member host
 )

@@ -104,13 +104,6 @@ func (s *Server) admitTask(t *Task, mode string) (queued bool, err error) {
 	return s.admitTaskWhen(t, mode, false)
 }
 
-// admitPausedTask is the task-control resume path. The paused precondition is
-// checked under the same scheduler lock as admission so a concurrent pause,
-// dequeue or FIFO promotion cannot leave database and Engine state divergent.
-func (s *Server) admitPausedTask(t *Task) (queued bool, err error) {
-	return s.admitTaskWhen(t, "resume", true)
-}
-
 func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (bool, error) {
 	return s.admitTaskWhenScheduled(t, mode, requirePaused, false)
 }

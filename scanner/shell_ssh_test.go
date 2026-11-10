@@ -19,14 +19,13 @@ import (
 // login, run one exec command and report an exit status, so the SSH transport can
 // be exercised without an external host.
 type sshTestServer struct {
-	listener  net.Listener
-	user      string
-	password  string
-	execute   func(cmd string) (string, int)
-	delay     time.Duration
-	hostKey   ssh.Signer
-	stall     chan struct{}
-	closeOnce sync.Once
+	listener net.Listener
+	user     string
+	password string
+	execute  func(cmd string) (string, int)
+	delay    time.Duration
+	hostKey  ssh.Signer
+	stall    chan struct{}
 
 	mu   sync.Mutex
 	seen []string

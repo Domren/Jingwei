@@ -429,6 +429,23 @@ func intranetShellKnown(shell string) bool {
 	return shell == intranetShellSh || shell == intranetShellCmd || shell == intranetShellPowerShell
 }
 
+// sessShell returns the interpreter stored in session metadata, defaulting to cmd
+// when OS is Windows and to sh otherwise. Windows upload/download/revoke scripts
+// branch on this value so that a PowerShell session never receives cmd.exe syntax.
+func sessShell(sess *db.IntranetSession) string {
+	if sess != nil {
+		if s, _ := sess.Metadata["shell"].(string); intranetShellKnown(s) {
+			return s
+		}
+	}
+	if sess != nil {
+		if o, _ := sess.Metadata["os"].(string); o == intranetOSWindows {
+			return intranetShellCmd
+		}
+	}
+	return intranetShellSh
+}
+
 // intranetIsSSH reports whether a session is carried by an SSH login instead of a
 // webshell. SSH sessions have no webshell_id by design: the hosts they cover are
 // the ones with no web service at all.
@@ -799,7 +816,6 @@ func intranetDownloadChunkCmd(path string, offset, n int64, compress bool) strin
 }
 
 func intranetUploadPOSIX(run intranetCommandRunner, path string, content []byte) (out intranetExecOutcome, compressed, existed bool, err error) {
-	out = intranetExecOutcome{ExitCode: -1}
 	probe := run("test -e "+shQuote(path)+" && echo JW_FILE_EXISTS || echo JW_FILE_NEW", 15*time.Second)
 	existed = strings.Contains(probe.Output, "JW_FILE_EXISTS")
 
@@ -898,7 +914,12 @@ func intranetWindowsPSAvailableCmd() string {
 	return `if exist "` + intranetWindowsPowerShellPath() + `" (echo ` + intranetPSMarker + `1) else (echo ` + intranetPSMarker + `0)`
 }
 
-func intranetUploadWindows(run intranetCommandRunner, path string, content []byte) (out intranetExecOutcome, compressed, existed bool, err error) {
+// intranetWindowsPSProbeCmd 探测目标文件是否存在（PowerShell 会话用）。
+func intranetWindowsPSProbeCmd(path string) string {
+	return "if (Test-Path -LiteralPath " + intranetPSQuote(path) + ") { 'JW_FILE_EXISTS' } else { 'JW_FILE_NEW' }"
+}
+
+func intranetUploadWindows(run intranetCommandRunner, shell, path string, content []byte) (out intranetExecOutcome, compressed, existed bool, err error) {
 	out = intranetExecOutcome{ExitCode: -1}
 	target, normalized, ok := intranetWindowsPath(path)
 	if !ok {
@@ -908,6 +929,11 @@ func intranetUploadWindows(run intranetCommandRunner, path string, content []byt
 	if strings.HasSuffix(normalized, `\`) {
 		out.IsError, out.Note = true, "Windows 目标路径必须是文件而不是目录"
 		return out, false, false, errors.New(out.Note)
+	}
+
+	// PowerShell 会话：走 PS 语法分支，全程不碰 cmd.exe / certutil / if exist。
+	if shell == intranetShellPowerShell {
+		return intranetUploadWindowsPS(run, normalized, target, content)
 	}
 
 	probe := run("if exist "+target+" (echo JW_FILE_EXISTS) else (echo JW_FILE_NEW)", 15*time.Second)
@@ -1059,6 +1085,105 @@ func intranetUploadWindowsGzip(run intranetCommandRunner, normalized, target str
 	return out, nil
 }
 
+// intranetUploadWindowsPS 是 PowerShell 会话下的完整上传路径：探测、base64
+// 分块临时文件、一次性解码覆盖、大小校验、清理全部走 PS 语法，避免
+// shellExec 的 cmd-on-PS 守卫。
+func intranetUploadWindowsPS(run intranetCommandRunner, normalized, target string, content []byte) (intranetExecOutcome, bool, bool, error) {
+	out := intranetExecOutcome{ExitCode: -1}
+
+	probe := run(intranetWindowsPSProbeCmd(target), 15*time.Second)
+	existed := strings.Contains(probe.Output, "JW_FILE_EXISTS")
+
+	gz, worthIt := gzipIntranetContent(content)
+	data := content
+	compressed := false
+	if worthIt {
+		data = gz
+		compressed = true
+	}
+
+	suffix := ".jw" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	b64Temp, _, ok := intranetWindowsPath(normalized + suffix + ".b64")
+	if !ok {
+		out.IsError, out.Note = true, "无法构造临时文件路径"
+		return out, false, false, errors.New(out.Note)
+	}
+	cleanup := func() {
+		_ = run("Remove-Item -Force "+intranetPSQuote(b64Temp)+" -ErrorAction SilentlyContinue; Write-Output 'JW_CLEANUP_OK'", 10*time.Second)
+	}
+	// 清理先跑一遍（第一次写前删可能不存在）。
+	cleanup()
+
+	for offset := 0; offset < len(data); offset += intranetWindowsUploadChunk {
+		end := offset + intranetWindowsUploadChunk
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := base64.StdEncoding.EncodeToString(data[offset:end])
+		appendPS := `[IO.File]::AppendAllText(` + intranetPSQuote(b64Temp) + `, ` + intranetPSQuote(chunk) + `, [Text.Encoding]::ASCII)`
+		part := run(appendPS+`; Write-Output 'JW_PS_APPEND_OK'`, 30*time.Second)
+		if part.IsError {
+			cleanup()
+			part.IsError = true
+			part.Note = fmt.Sprintf("写入第 %d 块失败: %s", offset/intranetWindowsUploadChunk+1, strings.TrimSpace(part.Output+part.Note))
+			return part, compressed, existed, errors.New(part.Note)
+		}
+	}
+
+	var sizeCmd string
+	if compressed {
+		// gzip 压缩：PS 原生解压覆盖。
+		var bytesToWritePS strings.Builder
+		fmt.Fprintf(&bytesToWritePS, `$gz=[Convert]::FromBase64String([Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes(%s)));`, intranetPSQuote(b64Temp))
+		fmt.Fprintf(&bytesToWritePS, `$ms=New-Object IO.MemoryStream(,$gz);`)
+		fmt.Fprintf(&bytesToWritePS, `$gzst=New-Object IO.Compression.GZipStream($ms,[IO.Compression.CompressionMode]::Decompress);`)
+		fmt.Fprintf(&bytesToWritePS, `$out=New-Object IO.MemoryStream;$gzst.CopyTo($out);`)
+		fmt.Fprintf(&bytesToWritePS, `[IO.File]::WriteAllBytes(%s,$out.ToArray());`, intranetPSQuote(target))
+		sizeCmd = bytesToWritePS.String() + `Write-Output 'JW_PS_GZIP_OK'`
+	} else {
+		// 明文：base64 解码 + 直接覆盖。
+		sizeCmd = `[IO.File]::WriteAllBytes(` + intranetPSQuote(target) +
+			`, [Convert]::FromBase64String([Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes(` + intranetPSQuote(b64Temp) + `))));` +
+			` Write-Output 'JW_PS_WRITE_OK'`
+	}
+	applied := run(sizeCmd, 30*time.Second)
+	if applied.IsError {
+		cleanup()
+		applied.IsError = true
+		applied.Note = "PS 解码/覆盖失败: " + strings.TrimSpace(applied.Output+applied.Note)
+		return applied, compressed, existed, errors.New(applied.Note)
+	}
+	// 大小校验（不管压缩还是明文，最终文件大小等于 len(content)）。
+	sizeCmd2 := `(Get-Item -LiteralPath ` + intranetPSQuote(target) + `).Length; Write-Output 'JW_PS_SIZE_OK'`
+	sizeOut := run(sizeCmd2, 20*time.Second)
+	// PS 下 Get-Item .Length 直接返回纯数字 + 换行 + OK 标记；只取第一行数字。
+	sizeLines := strings.Split(strings.TrimSpace(sizeOut.Output), "\n")
+	var got int
+	if len(sizeLines) > 0 {
+		got, _ = strconv.Atoi(strings.TrimSpace(sizeLines[0]))
+	}
+	if got != len(content) {
+		cleanup()
+		sizeOut.IsError = true
+		sizeOut.Note = fmt.Sprintf("PS 覆盖后大小不符（期望 %d，实际 %d）", len(content), got)
+		return sizeOut, compressed, existed, errors.New(sizeOut.Note)
+	}
+
+	cleanup()
+	out = applied
+	if compressed {
+		out.Output = fmt.Sprintf("已写入 %s（%d 字节，gzip 传输 %d 字节，PS 会话）", target, len(content), len(data))
+	} else {
+		out.Output = fmt.Sprintf("已写入 %s（%d 字节，PS 会话）", target, len(content))
+	}
+	return out, compressed, existed, nil
+}
+
+// intranetWindowsPSSizeCmd 读取 PS 会话下目标文件的字节大小。
+func intranetWindowsPSSizeCmd(path string) string {
+	return `(Get-Item -LiteralPath ` + intranetPSQuote(path) + `).Length`
+}
+
 func (s *Server) intranetUpload(ctx context.Context, pg *db.DB, sess *db.IntranetSession, path string, content []byte) (intranetExecOutcome, error) {
 	out := intranetExecOutcome{ExitCode: -1}
 	path = strings.TrimSpace(path)
@@ -1075,13 +1200,14 @@ func (s *Server) intranetUpload(ctx context.Context, pg *db.DB, sess *db.Intrane
 		return out, errors.New(out.Note)
 	}
 	osKind := s.intranetOS(ctx, pg, sess)
+	shell := sessShell(sess)
 	run := func(command string, timeout time.Duration) intranetExecOutcome {
 		return s.intranetRun(ctx, pg, sess, command, timeout)
 	}
 	var compressed, existed bool
 	var err error
 	if osKind == intranetOSWindows {
-		out, compressed, existed, err = intranetUploadWindows(run, path, content)
+		out, compressed, existed, err = intranetUploadWindows(run, shell, path, content)
 	} else {
 		out, compressed, existed, err = intranetUploadPOSIX(run, path, content)
 	}
@@ -1121,10 +1247,18 @@ func (s *Server) registerUploadedArtifact(ctx context.Context, pg *db.DB, sess *
 			_ = pg.AddIntranetSessionEvent(sess.ID, "artifact", targetPath, "上传成功但登记落地物失败: Windows 路径无法生成撤销命令", true)
 			return
 		}
-		// del 幂等：目标已被外部删除时也应该能正常走完撤销并由验证确认；
-		// cmd 内建 echo 不重置 ERRORLEVEL，末尾显式归零。
-		revoke = "del /f /q " + quoted + " >nul 2>&1 & echo " + intranetArtifactOK + " & cmd /c exit 0"
-		verify = "(if exist " + quoted + " (echo " + intranetArtifactPresent + ") else (echo " + intranetArtifactGone + ")) & cmd /c exit 0"
+		shell := sessShell(sess)
+		if shell == intranetShellPowerShell {
+			revoke = `Remove-Item -Force -LiteralPath ` + intranetPSQuote(targetPath) +
+				` -ErrorAction SilentlyContinue; Write-Output '` + intranetArtifactOK + `'`
+			verify = `if (Test-Path -LiteralPath ` + intranetPSQuote(targetPath) +
+				`) { '` + intranetArtifactPresent + `' } else { '` + intranetArtifactGone + `' }`
+		} else {
+			// del 幂等：目标已被外部删除时也应该能正常走完撤销并由验证确认；
+			// cmd 内建 echo 不重置 ERRORLEVEL，末尾显式归零。
+			revoke = "del /f /q " + quoted + " >nul 2>&1 & echo " + intranetArtifactOK + " & cmd /c exit 0"
+			verify = "(if exist " + quoted + " (echo " + intranetArtifactPresent + ") else (echo " + intranetArtifactGone + ")) & cmd /c exit 0"
+		}
 	}
 	art, err := pg.AddIntranetArtifact(db.IntranetArtifactInput{
 		TaskID: taskID, SessionID: sess.ID, Host: sess.Host,
@@ -1232,17 +1366,23 @@ func intranetDownloadPOSIX(run intranetCommandRunner, path string, maxBytes int)
 	return data, total, truncated, compressed, out
 }
 
-func intranetWindowsPSDownloadChunkCmd(normalized string, offset, n int64) string {
-	script := fmt.Sprintf(`$p='%s';$fs=[IO.File]::OpenRead($p);[void]$fs.Seek(%d,'Begin');`+
-		`$buf=New-Object byte[] %d;$n=$fs.Read($buf,0,%d);$fs.Close();`+
+func intranetWindowsPSDownloadChunkCmd(normalized, shell string, offset, n int64) string {
+	script := fmt.Sprintf(`$p=%s;$fs=[IO.File]::OpenRead($p);[void]$fs.Seek(%d,'Begin');`+
+		`$buf=New-Object byte[] %d;$r=$fs.Read($buf,0,%d);$fs.Close();`+
 		`$ms=New-Object IO.MemoryStream;$gz=New-Object IO.Compression.GZipStream($ms,[IO.Compression.CompressionMode]::Compress);`+
-		`$gz.Write($buf,0,$n);$gz.Close();[Convert]::ToBase64String($ms.ToArray())`,
-		normalized, offset, n, n)
+		`$gz.Write($buf,0,$r);$gz.Close();[Convert]::ToBase64String($ms.ToArray())`,
+		intranetPSQuote(normalized), offset, n, n)
+	if shell == intranetShellPowerShell {
+		// 纯 PS 会话：直接 Write-Output marker，不调 powershell.exe（避免命中
+		// shellExec 的 cmd-on-PS 守卫 marker `-NoProfile -NonInteractive -Command`）。
+		return `Write-Output '` + intranetChunkMarker + `'; ` + script + `; Write-Output '` + intranetChunkEndMarker + `'`
+	}
+	// cmd 会话：原有的 cmd 包装（echo marker & powershell.exe & echo end）。
 	return "echo " + intranetChunkMarker + " & \"" + intranetWindowsPowerShellPath() +
 		"\" -NoProfile -NonInteractive -Command \"" + script + "\" & echo " + intranetChunkEndMarker
 }
 
-func intranetDownloadWindowsPS(run intranetCommandRunner, normalized string, total int64) ([]byte, intranetExecOutcome, bool) {
+func intranetDownloadWindowsPS(run intranetCommandRunner, normalized, shell string, total int64) ([]byte, intranetExecOutcome, bool) {
 	out := intranetExecOutcome{ExitCode: -1}
 	var buf bytes.Buffer
 	for offset := int64(0); offset < total; offset += int64(intranetDownloadChunk) {
@@ -1250,7 +1390,7 @@ func intranetDownloadWindowsPS(run intranetCommandRunner, normalized string, tot
 		if offset+n > total {
 			n = total - offset
 		}
-		part := run(intranetWindowsPSDownloadChunkCmd(normalized, offset, n), 60*time.Second)
+		part := run(intranetWindowsPSDownloadChunkCmd(normalized, shell, offset, n), 60*time.Second)
 		raw, ok := parseIntranetChunk(part.Output)
 		if part.IsError || !ok {
 			if strings.TrimSpace(part.Note) == "" {
@@ -1306,14 +1446,18 @@ func intranetDownloadWindowsCertutil(run intranetCommandRunner, path, target str
 	return data, total, false, out
 }
 
-func intranetDownloadWindows(run intranetCommandRunner, path string, maxBytes int) ([]byte, int64, bool, bool, intranetExecOutcome) {
+func intranetDownloadWindows(run intranetCommandRunner, shell, path string, maxBytes int) ([]byte, int64, bool, bool, intranetExecOutcome) {
 	out := intranetExecOutcome{ExitCode: -1}
 	target, normalized, ok := intranetWindowsPath(path)
 	if !ok {
 		out.IsError, out.Note = true, "Windows 目标路径必须是盘符绝对路径，且不能包含引号、% 或通配符"
 		return nil, 0, false, false, out
 	}
-	sizeOut := run(intranetWindowsSizeCmd(target), 20*time.Second)
+	sizeCmd := intranetWindowsSizeCmd(target)
+	if shell == intranetShellPowerShell {
+		sizeCmd = intranetWindowsPSSizeCmd(target)
+	}
+	sizeOut := run(sizeCmd, 20*time.Second)
 	total, err := strconv.ParseInt(strings.TrimSpace(sizeOut.Output), 10, 64)
 	if err != nil || sizeOut.IsError {
 		out.IsError, out.Note = true, "无法读取文件大小（文件可能不存在或不是普通文件）"
@@ -1330,7 +1474,7 @@ func intranetDownloadWindows(run intranetCommandRunner, path string, maxBytes in
 	}
 	ps := run(intranetWindowsPSAvailableCmd(), 15*time.Second)
 	if strings.Contains(ps.Output, intranetPSMarker+"1") {
-		data, psOut, ok := intranetDownloadWindowsPS(run, normalized, total)
+		data, psOut, ok := intranetDownloadWindowsPS(run, normalized, shell, total)
 		if ok {
 			psOut.Output = fmt.Sprintf("已读取 %s（%d 字节，共 %d 字节，PowerShell 分块 gzip）", path, len(data), total)
 			return data, total, false, true, psOut
@@ -1356,6 +1500,7 @@ func (s *Server) intranetDownload(ctx context.Context, pg *db.DB, sess *db.Intra
 		maxBytes = intranetDownloadLimit
 	}
 	osKind := s.intranetOS(ctx, pg, sess)
+	shell := sessShell(sess)
 	run := func(command string, timeout time.Duration) intranetExecOutcome {
 		return s.intranetRun(ctx, pg, sess, command, timeout)
 	}
@@ -1363,7 +1508,7 @@ func (s *Server) intranetDownload(ctx context.Context, pg *db.DB, sess *db.Intra
 	var total int64
 	var truncated, compressed bool
 	if osKind == intranetOSWindows {
-		data, total, truncated, compressed, out = intranetDownloadWindows(run, path, maxBytes)
+		data, total, truncated, compressed, out = intranetDownloadWindows(run, shell, path, maxBytes)
 	} else {
 		data, total, truncated, compressed, out = intranetDownloadPOSIX(run, path, maxBytes)
 	}

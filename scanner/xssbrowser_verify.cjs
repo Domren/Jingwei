@@ -19,8 +19,14 @@
 const fs = require('fs');
 
 function loadPlaywright() {
+  const path = require('path');
   const candidates = [];
-  if (process.env.JW_PLAYWRIGHT_MODULE) candidates.push(process.env.JW_PLAYWRIGHT_MODULE);
+  // JW_PLAYWRIGHT_MODULE 可能是模块本体的目录，也可能是 npm 的全局根目录
+  // （`npm root -g`）。两种都要认，否则全局安装的 playwright 会被判成缺失。
+  if (process.env.JW_PLAYWRIGHT_MODULE) {
+    candidates.push(process.env.JW_PLAYWRIGHT_MODULE);
+    candidates.push(path.join(process.env.JW_PLAYWRIGHT_MODULE, 'playwright'));
+  }
   candidates.push('playwright', 'playwright-core');
   const failures = [];
   for (const c of candidates) {

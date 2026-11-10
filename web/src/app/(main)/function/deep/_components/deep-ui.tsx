@@ -169,6 +169,8 @@ export function wafVerdictMeta(verdict: string): { label: string; className: str
       return { label: "被拦截", className: "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400" };
     case "passed":
       return { label: "无拦截", className: "border-sky-500/30 bg-sky-500/10 text-sky-600" };
+    case "unsupported":
+      return { label: "未发起", className: "border-muted-foreground/30 text-muted-foreground" };
     default:
       return { label: "错误", className: "border-amber-500/30 bg-amber-500/10 text-amber-600" };
   }
@@ -608,6 +610,7 @@ const WAF_STOP_REASON_LABEL: Record<string, string> = {
   completed: "全部发完",
   context_canceled: "任务取消",
   no_variants: "无变形",
+  no_attack_variant: "无可用变形（未发包）",
 };
 
 const WAF_FEATURE_LABEL: Record<string, string> = {
@@ -636,26 +639,33 @@ export function WAFResultList({
   const attempts = summary?.attempts;
   const stopReason = String(summary?.stop_reason ?? "");
   const finalVerdict = String(summary?.final_verdict ?? "");
+  const bypassMode = String(summary?.bypass_mode ?? "");
   return (
     <div className="flex flex-col gap-3">
       {summary && (
         <div className="flex flex-wrap gap-2 text-xs">
-          <Badge variant="outline" className={baselineBlocked ? "border-red-500/30 bg-red-500/10 text-red-600" : "border-sky-500/30 bg-sky-500/10 text-sky-600"}>
+          <Badge
+            variant="outline"
+            className={
+              baselineBlocked
+                ? "border-red-500/30 bg-red-500/10 text-red-600"
+                : "border-sky-500/30 bg-sky-500/10 text-sky-600"
+            }
+          >
             基线{baselineBlocked ? "被拦截" : "未拦截"}
           </Badge>
-          {blockFeature && (
-            <Badge variant="outline">拦截特征：{WAF_FEATURE_LABEL[blockFeature] ?? blockFeature}</Badge>
-          )}
-          {attempts !== undefined && attempts !== null && (
-            <Badge variant="outline">尝试 {String(attempts)} 次</Badge>
-          )}
-          {stopReason && (
-            <Badge variant="outline">停止：{WAF_STOP_REASON_LABEL[stopReason] ?? stopReason}</Badge>
-          )}
+          {bypassMode && <Badge variant="outline">模式：{bypassMode === "full" ? "全量" : "自适应"}</Badge>}
+          {blockFeature && <Badge variant="outline">拦截特征：{WAF_FEATURE_LABEL[blockFeature] ?? blockFeature}</Badge>}
+          {attempts !== undefined && attempts !== null && <Badge variant="outline">尝试 {String(attempts)} 次</Badge>}
+          {stopReason && <Badge variant="outline">停止：{WAF_STOP_REASON_LABEL[stopReason] ?? stopReason}</Badge>}
           {finalVerdict && (
             <Badge
               variant="outline"
-              className={finalVerdict === "bypassed" ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600" : "border-muted-foreground/20"}
+              className={
+                finalVerdict === "bypassed"
+                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600"
+                  : "border-muted-foreground/20"
+              }
             >
               结论：{finalVerdict === "bypassed" ? "存在可绕过" : "未绕过"}
             </Badge>

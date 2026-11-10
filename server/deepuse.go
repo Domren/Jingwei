@@ -1152,15 +1152,28 @@ func (r *deepRun) runWAFBypass(summary map[string]any) (string, string, string, 
 	}
 
 	variants := scanner.BuildBypassVariants(path, param, payload)
-	r.logf("waf", "开始绕过测试：%d 种变形", len(variants))
-	run := scanner.RunBypassProbes(r.ctx, client, base, variants, keywords, scanner.DefaultBypassConfig())
-	bypassed, blocked := 0, 0
+	if strings.TrimSpace(param) == "" {
+		r.logf("waf", "参数名为空：载荷无处安放，%d 种变形记为 unsupported 且不发起请求，只发送基线对照", len(variants)-1)
+	}
+	cfg := scanner.DefaultBypassConfig()
+	cfg.MaxAttempts = intParam(r.task.Params, "max_attempts", cfg.MaxAttempts)
+	cfg.MaxConsecutiveBlocked = intParam(r.task.Params, "max_consecutive_blocked", cfg.MaxConsecutiveBlocked)
+	cfg.MaxConsecutiveErrors = intParam(r.task.Params, "max_consecutive_errors", cfg.MaxConsecutiveErrors)
+	if mode := stringParam(r.task.Params, "bypass_mode"); mode != "" {
+		cfg.Mode = mode
+	}
+	r.logf("waf", "开始绕过测试：%d 种变形（模式 %s，预算 %d，连拦/连错止损 %d/%d）",
+		len(variants), cfg.Mode, cfg.MaxAttempts, cfg.MaxConsecutiveBlocked, cfg.MaxConsecutiveErrors)
+	run := scanner.RunBypassProbes(r.ctx, client, base, variants, keywords, cfg)
+	bypassed, blocked, unsupported := 0, 0, 0
 	for _, p := range run.Probes {
-		if p.Verdict == "bypassed" {
+		switch p.Verdict {
+		case "bypassed":
 			bypassed++
-		}
-		if p.Verdict == "blocked" {
+		case "blocked":
 			blocked++
+		case "unsupported":
+			unsupported++
 		}
 		note := p.Note
 		// A "bypassed" probe is only evidence that the payload reached the
@@ -1198,15 +1211,17 @@ func (r *deepRun) runWAFBypass(summary map[string]any) (string, string, string, 
 	summary["variants"] = len(run.Probes)
 	summary["bypassed"] = bypassed
 	summary["blocked"] = blocked
+	summary["unsupported"] = unsupported
 	summary["baseline_blocked"] = run.BaselineBlocked
 	summary["block_feature"] = run.BlockFeature
 	summary["attempts"] = run.Attempts
 	summary["stop_reason"] = run.StopReason
 	summary["final_verdict"] = run.FinalVerdict
+	summary["bypass_mode"] = run.Mode
 	summary["bypass_review"] = verdict.BypassReview().Checks
 	r.setProgress("waf", map[string]any{"bypassed": bypassed, "blocked": blocked})
-	r.logf("waf", "绕过测试完成：%d 种变形可绕过，%d 种被拦截；尝试 %d 次，停止原因 %q",
-		bypassed, blocked, run.Attempts, run.StopReason)
+	r.logf("waf", "绕过测试完成：%d 种变形可绕过，%d 种被拦截，%d 种无法安放载荷；尝试 %d 次，停止原因 %q",
+		bypassed, blocked, unsupported, run.Attempts, run.StopReason)
 	return "done", "done", "", summary
 }
 

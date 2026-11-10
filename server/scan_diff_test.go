@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -52,5 +53,20 @@ func TestComputeScanDiffEmptyCurrent(t *testing.T) {
 	diff := computeScanDiff(nil, base, nil)
 	if len(diff.Gone) != 1 || !strings.Contains(diff.Gone[0].Reason, "无法区分") {
 		t.Fatalf("gone = %+v", diff.Gone)
+	}
+}
+
+// 没有增量的列表必须序列化成 []，不能是 null：界面直接读 .length / .map，
+// null 会让增量面板在前端抛 TypeError。
+func TestScanDiffEmptyListsMarshalAsArrays(t *testing.T) {
+	diff := computeScanDiff(nil, nil, nil)
+	raw, err := json.Marshal(diff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"new":[]`, `"gone":[]`, `"severity_changed":[]`} {
+		if !strings.Contains(string(raw), field) {
+			t.Fatalf("JSON 缺少 %s：%s", field, raw)
+		}
 	}
 }

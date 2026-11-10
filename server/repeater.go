@@ -293,8 +293,6 @@ func (s *Server) repeaterTransport(useRecordingProxy, insecure bool) http.RoundT
 		// Clear a custom TLS dialer before installing the guarded dialer; when
 		// DialTLSContext is set, net/http bypasses DialContext entirely.
 		transport.DialTLSContext = nil
-		transport.DialTLS = nil
-		transport.Dial = nil
 		// Let the request context enforce timeout_ms for the entire dial.
 		transport.DialContext = (&net.Dialer{
 			KeepAlive: 30 * time.Second,

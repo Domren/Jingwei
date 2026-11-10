@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf16"
 
+	//lint:ignore SA1019 NTLMv2 的 NTOWFv1 按 [MS-NLMP] 规定必须是 MD4，只用于计算口令散列，不用于防篡改
 	"golang.org/x/crypto/md4"
 )
 
@@ -45,6 +46,11 @@ const (
 	smb2StatusMoreProc  = 0xc0000016
 	smb2StatusLogonFail = 0xc000006d
 	smb2StatusLockedOut = 0xc0000234
+	// SESSION_SETUP 响应体偏移 2 的 SessionFlags：guest / null 会话即使
+	// status=SUCCESS 也不代表凭据有效（Samba 的 map to guest = bad user 就是
+	// 把任意不存在的账号降级成访客会话）。不认这两位会把「任意口令」判成命中。
+	smb2SessionFlagGuest = 0x0001
+	smb2SessionFlagNull  = 0x0002
 )
 
 func smb2Frame(msg []byte) []byte {
@@ -115,6 +121,15 @@ func smb2Status(frame []byte) uint32 {
 		return 0xffffffff
 	}
 	return binary.LittleEndian.Uint32(frame[8:])
+}
+
+// smb2SessionFlags 取 SESSION_SETUP 响应体的 SessionFlags（64 字节头之后的
+// StructureSize(2) 之后）。帧不完整时返回 0，按「无特殊标记」处理。
+func smb2SessionFlags(frame []byte) uint16 {
+	if len(frame) < 68 {
+		return 0
+	}
+	return binary.LittleEndian.Uint16(frame[66:68])
 }
 
 func smb2SecurityBuffer(frame []byte) []byte {
@@ -352,6 +367,18 @@ func (a smbCredAdapter) Try(ctx context.Context, ep CredEndpoint, cred Credentia
 	res.Banner = fmt.Sprintf("SMB2 SESSION_SETUP status=0x%08x", smb2Status(ss2))
 	switch smb2Status(ss2) {
 	case smb2StatusSuccess:
+		if flags := smb2SessionFlags(ss2); flags&(smb2SessionFlagGuest|smb2SessionFlagNull) != 0 {
+			if cred.Username == "" && cred.Password == "" {
+				res.Outcome = CredHit
+				res.Reason = "该 SMB 端点允许匿名访客会话（SessionFlags=guest/null），无需凭据即可访问"
+			} else {
+				// 真机 Samba（map to guest = bad user）实测：不存在的账号也会回 SUCCESS，
+				// 只是被降级成访客会话。此时凭据并未通过认证，必须判拒绝。
+				res.Outcome = CredDeny
+				res.Reason = fmt.Sprintf("凭据被服务端映射为访客会话（SessionFlags=0x%04x），实际未通过认证", flags)
+			}
+			return res, nil
+		}
 		res.Outcome = CredHit
 	case smb2StatusLogonFail:
 		res.Outcome = CredDeny

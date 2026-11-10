@@ -193,13 +193,12 @@ func scriptReferencesBounded(command, dir string, depth int, remaining *int) []s
 			return true
 		}
 		args, resolved := constantCallArgs(args, constants)
-		name, ok := staticCommandName(args[0])
-		if !resolved || !ok {
+		if _, ok := staticCommandName(args[0]); !resolved || !ok {
 			refs = append(refs, scriptReference{problem: "动态命令入口，无法确定是否执行脚本"})
 			return true
 		}
 		wrappedArgs := args
-		args, name, ok = unwrapScriptCall(args)
+		args, name, ok := unwrapScriptCall(args)
 		if !ok {
 			refs = append(refs, scriptReference{problem: "包装命令的执行入口不确定"})
 			return true

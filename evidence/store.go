@@ -509,18 +509,17 @@ func (s *Store) CopySnapshots(ctx context.Context, snapshots []db.TrafficEvidenc
 	return s.DB.WithEvidenceTx(ctx, func(*sql.Tx) error { return s.copySnapshots(snapshots, dest) })
 }
 
+// emptyBodySHA256 是零字节正文的固定摘要。空正文没有内容可校验，允许在源
+// blob 缺失时无损还原，避免一条历史证据拖垮整份交付件导出。
+const emptyBodySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
 func (s *Store) copySnapshots(snapshots []db.TrafficEvidenceSnapshot, dest string) error {
 	for _, v := range snapshots {
 		for _, side := range []string{"request", "response"} {
 			if err := func() error {
-				f, length, err := s.OpenBody(v, side)
-				if err != nil {
-					return err
-				}
-				defer f.Close()
-				hash := v.ReqHash
+				hash, length := v.ReqHash, v.ReqLen
 				if side == "response" {
-					hash = v.RespHash
+					hash, length = v.RespHash, v.RespLen
 				}
 				target, err := hashPath(dest, hash)
 				if err != nil {
@@ -529,9 +528,22 @@ func (s *Store) copySnapshots(snapshots []db.TrafficEvidenceSnapshot, dest strin
 				if err = os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 					return err
 				}
+				if length == 0 && strings.EqualFold(hash, emptyBodySHA256) {
+					if _, statErr := os.Stat(target); statErr == nil {
+						return verifyFile(target, hash, 0)
+					} else if !os.IsNotExist(statErr) {
+						return statErr
+					}
+					return os.WriteFile(target, nil, 0o600)
+				}
+				f, bodyLen, err := s.OpenBody(v, side)
+				if err != nil {
+					return err
+				}
+				defer f.Close()
 				out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 				if os.IsExist(err) {
-					return verifyFile(target, hash, length)
+					return verifyFile(target, hash, bodyLen)
 				}
 				if err != nil {
 					return err

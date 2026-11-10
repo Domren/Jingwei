@@ -186,8 +186,6 @@ func GenerateMemshellPath() (string, error) {
 	return "/static/" + s + ".js", nil
 }
 
-var memshellValuePattern = `^[A-Za-z0-9_./-]+$`
-
 // ValidateMemshellSpec rejects values that would break the compact M record.
 func ValidateMemshellSpec(spec MemshellSpec) error {
 	if _, ok := NormalizeMemshellType(spec.Type); !ok {

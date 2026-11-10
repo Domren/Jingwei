@@ -625,8 +625,6 @@ type acBuildNode struct {
 	char       byte
 	sibling    int32
 	firstChild int32
-	fail       int32
-	suffix     int32
 	out        []int32
 }
 
