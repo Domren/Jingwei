@@ -15,9 +15,15 @@
 
 ---
 
-## Jingwei 1.6.0
+## Jingwei 1.6.1
 
-> 1.6.0 是深度版本：弱口令检测从 21 协议扩到 **31 个协议且全部有真实服务端用例**——补齐 MSSQL / SMB /
+> 1.6.1 是补账版本：修三台真机回归揪出的两处缺陷（扫描增量对比面板在空增量时白屏、对外交付
+> 导出被丢失的 0 字节证据 blob 拖垮），并收掉 WAF 绕过模块两条已知欠账——**空参数名不再拼出
+> `?=<载荷>` 的假注入点**（变形标「未发起」、不发包不占预算，堵死「绕过成功」的假信号来源），
+> 重试模式/请求预算/止损阈值进入表单「高级选项」与 API 收口（预算硬上限 64）。另做了一轮
+> `staticcheck` 清零。无数据库迁移、无行为开关变化，原地升级即可。
+>
+> 此前版本摘要：1.6.0 是深度版本：弱口令检测从 21 协议扩到 **31 个协议且全部有真实服务端用例**——补齐 MSSQL / SMB /
 > Jenkins / JBoss / RouterOS / SVN / SNMP / smtp-ssl 等并在真服务上走命中与拒绝双路径，RDP 如实落
 > 「不可判定」；拿不到可复现真服务的 Oracle / WebLogic / WinRM / CobaltStrike 整条删除，**「只靠桩的支持」
 > 不算支持**。长跑可靠性成环：**断点续扫**（计划钉住模板与目标，中断只补剩下的，布局对不上就拒绝续扫而不是
@@ -119,6 +125,15 @@
 > 对话、任务执行与 Agent 自动规划需要先在「系统 → LLM」配置模型。
 
 ## 版本历史
+
+### 1.6.1 — 2026-11-10
+
+- **补账版本**：修复扫描增量对比在空增量时前端白屏（差集列表恒序列化为 `[]`）、对外交付导出被
+  丢失的 0 字节证据 blob 拖垮（空正文无损还原、非空缺失仍报错）。
+- **WAF 绕过两条欠账收口**：空参数名不再产生 `?=<载荷>` 假注入点（变形标「未发起」，不发包、
+  不占预算、不留假痕迹）；重试模式/预算/止损阈值进表单高级选项与 API 收口（硬上限 64）。
+- **工程**：`staticcheck` 17 项死代码与 4 项废弃 API 逐项核对清零；发版 checklist 补 tag 形态与
+  门禁提交两条。无数据库迁移，原地升级。
 
 ### 1.6.0 — 2026-11-09
 
@@ -350,7 +365,7 @@
 ### 方式一：使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.6.0 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.6.1 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 # 编辑 .env：至少修改 POSTGRES_PASSWORD
@@ -362,8 +377,8 @@ docker compose up -d
 
 ```bash
 mkdir jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.6.0/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.6.0/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.6.1/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.6.1/deploy/.env.example
 # 编辑 .env 后启动
 docker compose pull
 docker compose up -d
@@ -377,7 +392,7 @@ docker compose up -d
 镜像发布在 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.6.0
+docker pull ghcr.io/domren/jingwei:1.6.1
 ```
 
 仓库维护者将 Package 设为公开后可直接拉取。若镜像仍为私有，请使用具备
@@ -395,7 +410,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u Domren --password-stdin
 | --- | :---: | --- |
 | `POSTGRES_PASSWORD` | 是 | 数据库密码，建议使用字母数字强随机值 |
 | `POSTGRES_USER` / `POSTGRES_DB` | 否 | 默认均为 `jingwei` |
-| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.6.0` |
+| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.6.1` |
 | `JINGWEI_WEB_PORT` | 否 | Web/API 宿主端口，默认 `9790` |
 | `JINGWEI_PROXY_PORT` | 否 | 流量代理宿主端口，默认 `9791`，仅绑定 `127.0.0.1` |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | 否 | 也可启动后在 UI 配置 |
@@ -470,11 +485,11 @@ cd web && npm ci && npm run build:static && cd ..
 # 2. 嵌入前端并编译 Linux 二进制
 rm -rf server/webui/dist && cp -r web/out server/webui/dist
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.6.0" -o dist/amd64/jingwei ./cmd/jingwei
+  -ldflags "-s -w -X main.version=1.6.1" -o dist/amd64/jingwei ./cmd/jingwei
 
 # 3. 构建运行镜像
 docker build --network=host --build-arg TARGETARCH=amd64 \
-  -t jingwei:1.6.0 .
+  -t jingwei:1.6.1 .
 ```
 
 本地开发运行后端与前端的方法见 [DEPLOY.md](DEPLOY.md#从源码开发)。
