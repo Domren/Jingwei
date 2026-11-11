@@ -386,6 +386,9 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if err := pg.EnsureLLMUsageTable(); err != nil {
 		log.Printf("[llmusage] create table: %v", err)
 	}
+	if err := pg.EnsureLLMRoundsTable(); err != nil {
+		log.Printf("[llmround] create table: %v", err)
+	}
 	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
 	m.egress = guard.NewEgressGuard()
 	m.guardPolicy = newGuardTargetPolicy(pg)
@@ -1911,6 +1914,29 @@ func (t *Task) NotifyCancelled(intentID int64, summary, reason string) {
 }
 
 // drainTriggers returns and clears the trigger events accumulated since the last round.
+//
+// R21：过去 drain 之后本轮失败，触发就永久丢失——worker 明明完成了，planner 却从没看到，
+// 只能等 10 分钟 heartbeat 兜底。现在拆成两步：peek 读 + commit 清。失败轮只 peek，
+// 下一轮重新读，触发不丢；成功轮才 commit。对应 §5.4 ④「三条不丢」的第一条。
+func (t *Task) peekTriggers() []agent.TriggerEvent {
+	t.trigMu.Lock()
+	defer t.trigMu.Unlock()
+	// 复制一份，防止调用方写共享切片。
+	out := make([]agent.TriggerEvent, len(t.pendingTriggers))
+	copy(out, t.pendingTriggers)
+	return out
+}
+
+// commitTriggers 清空 pendingTriggers；只有本轮确实走到下游（拿到 Plan 的成功返回）
+// 才调用。失败轮绝不能调用——否则失败轮的触发被无声吞掉。
+func (t *Task) commitTriggers() {
+	t.trigMu.Lock()
+	defer t.trigMu.Unlock()
+	t.pendingTriggers = nil
+}
+
+// drainTriggers 保留旧语义（读即清），只给「实在要失败且触发可丢弃」的极窄路径用。
+// 新代码请用 peekTriggers + commitTriggers。
 func (t *Task) drainTriggers() []agent.TriggerEvent {
 	t.trigMu.Lock()
 	defer t.trigMu.Unlock()

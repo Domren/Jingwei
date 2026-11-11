@@ -41,7 +41,7 @@ func (a httpCredAdapter) request(path, auth string) []byte {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s %s HTTP/1.1\r\n", a.method, path)
 	fmt.Fprintf(&b, "Host: %s\r\n", "@host@")
-	b.WriteString("User-Agent: Jingwei-CredScan\r\n")
+	b.WriteString(uaHeaderLine())
 	b.WriteString("Accept: */*\r\n")
 	b.WriteString("Connection: close\r\n")
 	if auth != "" {

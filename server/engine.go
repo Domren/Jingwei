@@ -14,6 +14,7 @@ import (
 	"github.com/Autumn-27/jingwei/agent"
 	"github.com/Autumn-27/jingwei/db"
 	"github.com/Autumn-27/jingwei/intercept"
+	"github.com/Autumn-27/jingwei/llmrec"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -114,6 +115,10 @@ type Engine struct {
 	runtimeMu sync.Mutex
 	runtimes  map[string]*taskRuntime
 
+	// llmSup 是 R21 的监督者：首帧超时主动 cancel + 每轮留痕（llm_round）。
+	// 与 e.llmCalls（「此刻有几发在飞」）不同：那个是计数，这个是判据。
+	llmSup *llmrec.Supervisor
+
 	// per-task execution context: each planner.Plan / worker.Execute runs under it,
 	// so pausing can CANCEL an in-flight run (not just skip the next one). Recreated
 	// on resume since cancelling is one-shot. Every cancellation carries a named
@@ -171,6 +176,15 @@ func (e *Engine) nextPlannerRound(taskID string) int {
 	n := v.(int) + 1
 	e.plannerRound.Store(taskID, n)
 	return n
+}
+
+// plannerRoundNo 只读当前轮号（不推进）；监督轮记录用它做 RoundID 的稳定后缀。
+func (e *Engine) plannerRoundNo(taskID string) int {
+	v, _ := e.plannerRound.Load(taskID)
+	if v == nil {
+		return 0
+	}
+	return v.(int)
 }
 
 // Pause stops a task: marks it paused AND cancels any in-flight planner/worker run
@@ -387,10 +401,14 @@ func (e *Engine) ActiveLLMCalls(taskID string) int64 {
 func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix()) }
 
 func NewEngine(m *Manager) *Engine {
-	return &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
+	e := &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
 		execCancel: map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
 		work: map[int64]*workExecution{}, steerBox: map[int64][]string{},
 		runtimes: map[string]*taskRuntime{}}
+	if m != nil && m.pg != nil {
+		e.llmSup = llmrec.NewSupervisor(nil, m.pg)
+	}
+	return e
 }
 
 // registerWork records the cancel for the work currently running intentID.
@@ -917,14 +935,33 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			Summary: fmt.Sprintf("第 %d 轮规划", e.nextPlannerRound(t.ID))})
 		// what fired this round (worker done / finding; may be several — debounce
 		// coalesces a burst; empty for time/heartbeat wakes).
-		triggers := t.drainTriggers()
+		triggers := t.peekTriggers()
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		e.BeginLLMCall(t.ID)
-		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
+		// R21：每轮规划开一条监督 context；T1 内不见首帧主动 cancel（stalled），
+		// 每轮结束无条件落 llm_round（不靠 llm_record 开关，这是 R15 的正解）。
+		pctx := ectx
+		var supRound *llmrec.Round
+		if e.llmSup != nil {
+			roundID := t.ID + "-plan-" + strconv.Itoa(e.plannerRoundNo(t.ID))
+			supRound, pctx = e.llmSup.Begin(ectx, llmrec.RoundMeta{
+				RoundID: roundID, TaskID: taskIDInt, Worker: "planner", TriggerSrc: src,
+			})
+			// 首帧观测：provider 被包一层，首个流事件到达会喂给 supRound，
+			// 否则 T1 内没人回调，watchFirstEvent 会主动 cancel 本轮（stalled）。
+			// 首帧观测：本轮调用走带观测的 provider；观测器就是监督轮本身。
+			planner.SetProvider(supRound.WrapProvider(planner.Provider()))
+		}
+		met, reason, err := planner.Plan(pctx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
+		if supRound != nil {
+			supRound.End(err)
+		}
 		e.EndLLMCall(t.ID)
 		switch {
 		case err != nil && ectx.Err() == nil:
 			log.Printf("[planner] task %s 规划出错: %v", t.ID, err)
+			// 失败轮只读不清：触发留在 pending，等下一次唤醒重新读取（R21 ④第一条）。
+			// 不 commit；下一次成功轮才会清掉。
 		case met:
 			log.Printf("[planner] task %s 判定目标达成: %s", t.ID, reason)
 			// 所有目标达成 → 持久化任务状态为 done（前端 DTO 会优先展示该终态）。
@@ -937,6 +974,8 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			e.cancelExec(t.ID, agent.AbortGoalMet)
 		default:
 			log.Printf("[planner] task %s 规划完成", t.ID)
+			// 规划成功：触发已被消费，清 pending（R21 ④第一条的另一半）。
+			t.commitTriggers()
 		}
 		e.touch(t.ID)
 	}

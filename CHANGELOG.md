@@ -6,6 +6,26 @@
 
 ### 变更
 
+- **LLM 活性监督与中断恢复**：planner 每轮开一条监督 context——建连后
+  `JINGWEI_LLM_FIRST_EVENT_TIMEOUT`（默认 45s，可配）内不见首个流事件就主动 cancel
+  并记为 `stalled`，不再等 15 分钟墙钟；每轮无论成败都落 `llm_rounds` 一行
+  （status / error_class / attempts / trigger_src / 首帧时刻），错误分五类
+  （`transport_reset` / `stalled` / `rate_limited` / `account_invalid` / `empty_response`），
+  不再只靠日志。触发语义改为 **peek-commit**：失败轮只读不清，触发留在 pending
+  等下一次唤醒重新读取（不再丢「worker 完成了但 planner 从没看到」）；成功轮才 commit。
+  新增 `GET /api/tasks/{id}/llm-health`（按轮统计 + 按类别分布 + 废轮率告警，
+  废轮率超 30% 提示「该中转端不可用」）。
+- **出站报文不再带自研品牌与工具签名**：`User-Agent: Jingwei-CredScan` /
+  `Jingwei-DirScan` 两行从 HTTP 凭据探测与目录枚举里移除，改为统一走
+  `scanner.BrowserUA()`；默认一串与深度利用同口径的 Chrome UA，可用
+  `JINGWEI_OUTBOUND_UA` 覆盖（`none`=整条头都不发，便于需要"原生无头"的场景）。
+  nuclei / sqlmap / dalfox 同步注入同一串（不再用各自的工具签名 UA）。
+  手工拼 HTTP/1.1 报文的取证副本与真实出站来自同一来源，"显示的发了什么"与
+  "实际发了什么"不再分叉。
+- **请求重发不再替原始报文编造头部**：报文里没有 `User-Agent` 时，
+  Go 客户端此前会补一个 `Go-http-client/1.1`；没有 `Accept-Encoding` 时会补上
+  `Accept-Encoding: gzip`。现在两者都按原样发出（空值即不发送该头），只有用户
+  显式给的头部才会落到线上。
 - **多目标任务的开局覆盖**：任务描述里一行一条目标时，根资产登记与开局预扫（资产发现 + POC
   初筛）现在覆盖清单里的**每一条**。此前只取第一条，其余授权目标开局既不在资产图上也没被探测，
   只能等规划轮逐只补——实机上一个 12 条目标的任务，开局只有 1 条进了预扫。目标按端口规格分组
@@ -21,6 +41,20 @@
 
 ### 验证
 
+- 夹具（新增）：`TestClassifyError*` 5 条（五类错误文本归类）；`TestSupervisor*` 4 条
+  （stalled 主动 cancel / 正常轮不受影响 / 失败轮落账 / 关闭 L1 不主动 cancel）；
+  `TestPeekTriggersDoesNotConsume`、`TestCommitTriggersClearsAfterSuccess`、
+  `TestPeekReturnsCopy`、`TestPeekReadsAllKinds`（触发 peek-commit 语义）；
+  `TestEngineSupervisionStalled` / `TestEngineSupervisionTransportReset` /
+  `TestEngineSupervisionAccountInvalid`（三种故障形态在引擎层各走一遍，反向验证：
+  没有监督层时这三类故障只会表现为「进程还在但什么都不出」）；
+  `TestEnginePlannerTriggerSurvivesFailure`（失败后触发不丢，等下一轮重读）。
+- 夹具（新增）：`TestBrowserUADefaultHasNoBrand`、`TestBrowserUANoneEmitsNoHeader`、
+  `TestBrowserUACustomIsVerbatim`、`TestBrowserUARejectsCRLF`、
+  `TestDirFetchSendsNoBrandUserAgent`、`TestDirFetchEvidenceMatchesNoUA`、
+  `TestCredScanRequestsCarryNoBrand`（以上断言靶机侧收到的头，而非我们打算发什么）；
+  `TestRepeaterDoesNotInventUserAgent`、`TestRepeaterRespectsUserSuppliedUA`（请求重发的
+  输入输出一致性）。
 - 夹具（新增）：`TestParseTargetListCoversEveryTarget`、`TestParseTargetListCapsAndDedupes`、
   `TestGroupTargetsByPortSpec`、`TestMergeDiscoverResultsDedupes`、`TestSeedRegistersEveryTarget`、
   `TestStampFirstRunPersistsWithoutTimeout`、`TestStampFirstRunStillComputesDeadline`、
@@ -859,7 +893,7 @@
   两条 e2e 从 `tools/e2e/` 运行：内网 SSH 终端 17 项、WebShell 工作台 24 项全绿。密钥扫描：本轮会话用到的
   签名根密钥、靶机口令、测试库口令在工作树里 0 命中，`postgres://` 形态的匹配全是占位符，唯一的公网 IP 匹配来自
   `web/node_modules/zod` 的测试夹具（已 gitignore）。
-- **A1-A5 缺陷修复（本轮）**：单测侧新增 `TestShellExecReportsOnlyProbedFamily`（探测没答就不报告系统族，报告了才
+- **终端与密钥密封的缺陷修复（本轮）**：单测侧新增 `TestShellExecReportsOnlyProbedFamily`（探测没答就不报告系统族，报告了才
   能被写入台账）、`TestShellOSKindOfFallsBackWithoutCachingFailure` 改为断言 `confirmed=false`（旧版只断言回退值是
   POSIX，正是它让调用方敢把猜测当事实写进去）、`TestShellChannelErrorWordsDeadlines`（期限到点说「等待超时」，其它
   错误保持原话）、`TestAuditSealedSecretsCountsUnreadable`（同一把密钥解得开的记录报 0，换一把后按类别报数，且那一行

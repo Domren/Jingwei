@@ -150,10 +150,10 @@ func dirFetch(ctx context.Context, client *http.Client, rawURL string) (status i
 	if err != nil {
 		return 0, 0, "", nil, nil, err
 	}
-	reqObj.Header.Set("User-Agent", "Jingwei-DirScan")
+	ApplyBrowserUA(reqObj.Header.Set, reqObj.Header.Del)
 	reqObj.Header.Set("Accept", "*/*")
-	req = []byte(fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Jingwei-DirScan\r\nAccept: */*\r\n\r\n",
-		reqObj.URL.RequestURI(), reqObj.URL.Host))
+	req = []byte(fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\n%sAccept: */*\r\n\r\n",
+		reqObj.URL.RequestURI(), reqObj.URL.Host, uaHeaderLine()))
 	res, err := client.Do(reqObj)
 	if err != nil {
 		return 0, 0, "", req, nil, err

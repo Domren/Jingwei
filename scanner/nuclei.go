@@ -232,6 +232,11 @@ func RunNuclei(ctx context.Context, templates []NucleiTemplate, targets []string
 			"-retries", "1",
 			"-store-resp", "-store-resp-dir", rrDir,
 		}
+		// 不注入 -ua 时 nuclei 会用自己的默认串，等于在报文头里署名"这是 nuclei"。
+		// 统一走 BrowserUA()；none 口径则不注入（nuclei 自带默认值，此处只覆盖有值的情形）。
+		if ua := BrowserUA(); ua != "" {
+			args = append(args, "-ua", ua)
+		}
 		if proxy != "" {
 			args = append(args, "-proxy", proxy)
 		}

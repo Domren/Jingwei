@@ -159,7 +159,27 @@ func (s *Server) sendRepeater(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Header.Set(name, value)
 	}
+	// 原始报文里根本没有 UA 时，让 Go 客户端别替我们编一个 "Go-http-client/1.1"。
+	// 那既不是「原生无头」也不是「仿真浏览器」，而且把「这是我们发出的」写在头上（R20）。
+	// 只在用户没给 UA 时置空：给了就原样发，不覆盖任何人工设置的头部。
+	if _, ok := in.Headers["User-Agent"]; !ok {
+		if _, ok2 := in.Headers["user-agent"]; !ok2 {
+			req.Header.Set("User-Agent", "")
+		}
+	}
 
+	// Accept-Encoding 与 Content-Length 同理：raw 报文里没有就不能由客户端编造。
+	// net/http 会默认加 Accept-Encoding: gzip，这一条也要按给定头部封锁（R20）。
+	acceptEncGiven := false
+	for k := range in.Headers {
+		if strings.EqualFold(k, "Accept-Encoding") {
+			acceptEncGiven = true
+			break
+		}
+	}
+	if !acceptEncGiven {
+		req.Header.Set("Accept-Encoding", "")
+	}
 	transport := s.repeaterTransport(useRecordingProxy, in.InsecureSkipVerify)
 	if in.HTTPVersion != "" {
 		tr := transport.(*http.Transport)

@@ -201,6 +201,10 @@ func RunSQLMap(ctx context.Context, target string, opts SQLMapOptions) SQLMapRun
 		"--time-sec", clampRangeStr(opts.TimeSeconds, 1, 10, 3),
 		"--output-dir", filepath.Join(tmp, "out"),
 	}
+	// sqlmap 默认 UA 带工具签名（"sqlmap/1.x"），统一换成平台口径。
+	if ua := BrowserUA(); ua != "" {
+		args = append(args, "--user-agent", ua)
+	}
 	targetArgs, err := sqlmapTargetArgs(target, opts, tmp)
 	if err != nil {
 		run.Err = err

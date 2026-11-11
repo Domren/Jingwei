@@ -53,6 +53,13 @@ func NewPlanner(prov llm.Provider, model, workDir string, tx *transcript.Store, 
 	return &Planner{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, todos: map[int64]*actool.TodoStore{}}
 }
 
+// SetProvider 换规划用的 provider。R21 的 L1 判据靠它：监督层把 provider 包一层
+// 首帧观测，流不到就不响，于是「卡住」能被检出而不是干等 15 分钟墙钟。
+func (p *Planner) SetProvider(prov llm.Provider) { p.prov = prov }
+
+// Provider 返回当前 provider（测试与监督层用）。
+func (p *Planner) Provider() llm.Provider { return p.prov }
+
 func (p *Planner) SetCompactionWindowResolver(fn func() int) { p.windowFn = fn }
 
 // SetCompactor wires the cold-node compactor (cold-digest §7). Called each

@@ -15,10 +15,12 @@ import (
 
 // 这些变量不需要 compose 注入，理由必须写在这里，否则审计不放行。
 var exemptFromCompose = map[string]string{
-	"PATH":                 "系统变量，只用于与容器内 PATH 比对（intercept/python_modules.go）",
-	"NEW_PG_DSN":           "cmd/pocimport 的一次性迁移工具参数，在容器外由操作员提供",
-	"OLD_PG_DSN":           "cmd/pocimport 的一次性迁移工具参数，在容器外由操作员提供",
-	"JINGWEI_SHOT_BROWSER": "取证截图的浏览器路径，镜像内已内置，只有本机开发才需要覆盖",
+	"PATH":                            "系统变量，只用于与容器内 PATH 比对（intercept/python_modules.go）",
+	"NEW_PG_DSN":                      "cmd/pocimport 的一次性迁移工具参数，在容器外由操作员提供",
+	"OLD_PG_DSN":                      "cmd/pocimport 的一次性迁移工具参数，在容器外由操作员提供",
+	"JINGWEI_SHOT_BROWSER":            "取证截图的浏览器路径，镜像内已内置，只有本机开发才需要覆盖",
+	"JINGWEI_OUTBOUND_UA":             "出站 UA 口径：留空=内置浏览器串、none=不发 UA 头；默认值就是正确行为，不需要每台部署各配一份",
+	"JINGWEI_LLM_FIRST_EVENT_TIMEOUT": "LLM 首帧超时：默认 45s 已合理，用于在代理/中转端故障时快速判卡；不需要 compose 注入",
 }
 
 // 两份 compose 都必须带上这些键；.env.example 必须给出注释与留空默认。

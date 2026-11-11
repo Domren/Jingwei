@@ -219,6 +219,10 @@ func RunDalfox(ctx context.Context, opts DalfoxOptions) DalfoxRun {
 		// and bounded to the points the caller named.
 		"--skip-mining",
 	}
+	// dalfox 默认 UA 同样带工具签名，走平台统一口径。
+	if ua := BrowserUA(); ua != "" {
+		args = append(args, "--user-agent", ua)
+	}
 	if d := clampOptional(opts.DelayMS, 0, 5000); d > 0 {
 		args = append(args, "--delay", strconv.Itoa(d))
 	}
