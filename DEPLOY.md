@@ -1,6 +1,6 @@
 # Jingwei（精卫）Docker 部署指南
 
-适用版本：**v1.6.1**。Jingwei 自 1.0.0 起只通过容器镜像分发，
+适用版本：**v1.6.3**。Jingwei 自 1.0.0 起只通过容器镜像分发，
 部署、升级和回滚都使用 Docker Compose。
 
 - 镜像：`ghcr.io/domren/jingwei`
@@ -26,7 +26,7 @@ LLM 不是启动必需项，但对话、任务执行和 Agent 自动规划需要
 ### 2.1 使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.6.1 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.6.3 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 ```
@@ -35,8 +35,8 @@ cp .env.example .env
 
 ```bash
 mkdir -p jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.6.1/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.6.1/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.6.3/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.6.3/deploy/.env.example
 ```
 
 两种方式得到的目录结构相同：
@@ -52,7 +52,7 @@ curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.6.1/deploy/
 镜像默认发布到 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.6.1
+docker pull ghcr.io/domren/jingwei:1.6.3
 ```
 
 维护者把 Package 可见性设为 **Public** 后，以上命令无需登录。
@@ -70,9 +70,9 @@ unset GHCR_TOKEN
 
 | 标签 | 说明 |
 | --- | --- |
-| `1.6.1` / `v1.6.1` | 固定版本，生产环境推荐 |
+| `1.6.3` / `v1.6.3` | 固定版本，生产环境推荐 |
 | `latest` | 最新正式版 |
-| `v1.6.1-amd64` / `v1.6.1-arm64` | 单架构中间镜像，一般不用 |
+| `v1.6.3-amd64` / `v1.6.3-arm64` | 单架构中间镜像，一般不用 |
 
 ## 4. 配置 `.env`
 
@@ -82,7 +82,7 @@ unset GHCR_TOKEN
 POSTGRES_USER=jingwei
 POSTGRES_PASSWORD=请替换为强随机密码
 POSTGRES_DB=jingwei
-JINGWEI_IMAGE=ghcr.io/domren/jingwei:1.6.1
+JINGWEI_IMAGE=ghcr.io/domren/jingwei:1.6.3
 JINGWEI_WEB_PORT=9790
 JINGWEI_PROXY_PORT=9791
 ```
@@ -146,7 +146,7 @@ curl -fsS http://127.0.0.1:9790/api/health
 期望健康检查返回：
 
 ```json
-{"ok":true,"service":"jingwei","version":"1.6.1"}
+{"ok":true,"service":"jingwei","version":"1.6.3"}
 ```
 
 从 v1.1.0 升级时注意：环境变量前缀已由 `ARTEX_` 改为 `JINGWEI_`，旧变量不再读取。
@@ -369,9 +369,9 @@ rm -rf server/webui/dist
 cp -r web/out server/webui/dist
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.6.1" -o dist/amd64/jingwei ./cmd/jingwei
+  -ldflags "-s -w -X main.version=1.6.3" -o dist/amd64/jingwei ./cmd/jingwei
 
-docker build --network=host --build-arg TARGETARCH=amd64 -t jingwei:1.6.1 .
+docker build --network=host --build-arg TARGETARCH=amd64 -t jingwei:1.6.3 .
 ```
 
 ARM64 构建时把 `GOARCH` 与 `TARGETARCH` 改为 `arm64`，并在对应架构的机器上
@@ -404,7 +404,7 @@ docker compose logs --tail=100 postgres
 
 ### 10.2 无法拉取 GHCR 镜像
 
-- 确认镜像版本存在：`docker manifest inspect ghcr.io/domren/jingwei:1.6.1`
+- 确认镜像版本存在：`docker manifest inspect ghcr.io/domren/jingwei:1.6.3`
 - 若 Package 是私有的，先按第 3 节登录；Token 需要 `read:packages`。
 - 确认 Docker 所在网络可以访问 `ghcr.io`。
 - 如果报错是 `proxyconnect tcp: dial tcp 127.0.0.1:<port>: connect: connection refused`，

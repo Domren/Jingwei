@@ -15,9 +15,17 @@
 
 ---
 
-## Jingwei 1.6.1
+## Jingwei 1.6.3
 
-> 1.6.1 是补账版本：修三台真机回归揪出的两处缺陷（扫描增量对比面板在空增量时白屏、对外交付
+> 1.6.3 是可靠性版本：**LLM 活性监督补齐到 worker 侧**——worker 的每次模型调用都留轮
+> （`llm_rounds`）并参与首帧超时，端点卡死从「等 27 分钟意图墙钟」变成 T1 内主动斩掉；
+> 轮级 token 折算修复（流式 usage 分片折叠，失败轮也不再丢 token）；出站 HTTP 收口到
+> `http_send` 工具（强制浏览器 UA、经记录代理、不跟重定向）、任务级授权粒度（ip_port /
+> by_ip）与预算闸门（轮数 + 输入 token 双上限）落地；请求重发支持二进制正文（multipart
+> 文件上传不再损坏）。三靶机实机复跑：数据质量四判据全过、预算/超时收尾时序实测有效。
+> 无破坏性迁移，原地升级。
+>
+> 此前版本摘要：1.6.1 是补账版本：修三台真机回归揪出的两处缺陷（扫描增量对比面板在空增量时白屏、对外交付
 > 导出被丢失的 0 字节证据 blob 拖垮），并收掉 WAF 绕过模块两条已知欠账——**空参数名不再拼出
 > `?=<载荷>` 的假注入点**（变形标「未发起」、不发包不占预算，堵死「绕过成功」的假信号来源），
 > 重试模式/请求预算/止损阈值进入表单「高级选项」与 API 收口（预算硬上限 64）。另做了一轮
@@ -125,6 +133,19 @@
 > 对话、任务执行与 Agent 自动规划需要先在「系统 → LLM」配置模型。
 
 ## 版本历史
+
+### 1.6.3 — 2026-11-13
+
+- **LLM 活性监督补齐 worker 侧**：每次模型调用=一轮（`llm_rounds` 留痕 + 首帧超时 +
+  十类错误分类），端点卡死不再等 27 分钟意图墙钟；流式轮级 token 折算修复（此前恒 0）。
+- **出站收口与授权**：`http_send` 工具（强制浏览器 UA、记录代理出站、不跟重定向）+
+  运行时 .curlrc 兕底；任务创建必选授权粒度（ip_port / by_ip），guard 对未登记端口硬拒绝；
+  任务级预算闸门（规划轮数 + 累计输入 token，命中走与超时同一套优雅收尾并落 `stop_reason`）。
+- **worker 上下文增量化**：compaction 窗口压到 100K，早裁早省，单次调用输入 token 显著下降。
+- **请求重发二进制正文**：带 JWT 的 multipart 文件上传修复（body_base64 无损通道、
+  报文解析保留 CRLF）；出站报文不再带自研品牌与工具签名 UA。
+- **实机验收**（三 Ubuntu 靶机）：数据质量四判据全过、预算/超时收尾时序实测有效；
+  `go test ./...` 22 包全绿。无破坏性迁移，原地升级。
 
 ### 1.6.1 — 2026-11-10
 
@@ -365,7 +386,7 @@
 ### 方式一：使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.6.1 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.6.3 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 # 编辑 .env：至少修改 POSTGRES_PASSWORD
@@ -377,8 +398,8 @@ docker compose up -d
 
 ```bash
 mkdir jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.6.1/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.6.1/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.6.3/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.6.3/deploy/.env.example
 # 编辑 .env 后启动
 docker compose pull
 docker compose up -d
@@ -392,7 +413,7 @@ docker compose up -d
 镜像发布在 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.6.1
+docker pull ghcr.io/domren/jingwei:1.6.3
 ```
 
 仓库维护者将 Package 设为公开后可直接拉取。若镜像仍为私有，请使用具备
@@ -410,7 +431,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u Domren --password-stdin
 | --- | :---: | --- |
 | `POSTGRES_PASSWORD` | 是 | 数据库密码，建议使用字母数字强随机值 |
 | `POSTGRES_USER` / `POSTGRES_DB` | 否 | 默认均为 `jingwei` |
-| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.6.1` |
+| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.6.3` |
 | `JINGWEI_WEB_PORT` | 否 | Web/API 宿主端口，默认 `9790` |
 | `JINGWEI_PROXY_PORT` | 否 | 流量代理宿主端口，默认 `9791`，仅绑定 `127.0.0.1` |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | 否 | 也可启动后在 UI 配置 |
@@ -485,11 +506,11 @@ cd web && npm ci && npm run build:static && cd ..
 # 2. 嵌入前端并编译 Linux 二进制
 rm -rf server/webui/dist && cp -r web/out server/webui/dist
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.6.1" -o dist/amd64/jingwei ./cmd/jingwei
+  -ldflags "-s -w -X main.version=1.6.3" -o dist/amd64/jingwei ./cmd/jingwei
 
 # 3. 构建运行镜像
 docker build --network=host --build-arg TARGETARCH=amd64 \
-  -t jingwei:1.6.1 .
+  -t jingwei:1.6.3 .
 ```
 
 本地开发运行后端与前端的方法见 [DEPLOY.md](DEPLOY.md#从源码开发)。

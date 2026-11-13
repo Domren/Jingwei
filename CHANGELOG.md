@@ -2,7 +2,23 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased]
+## [1.6.3] - 2026-11-13
+
+### 修复
+
+- **轮级 token 在流式路径恒为 0**：LLM 流式调用的 usage 分片携带（`message_start` 只带
+  输入侧、`message_delta` 只带输出侧），首帧观测包装层只喂首帧不折算，导致
+  `llm_rounds.input_tokens/output_tokens` 对所有流式轮恒为 0——「这一轮烧了多少」只能靠
+  `llm_usage` 的会话累计去猜。现在由观测层统一 Add 折叠，且终态错误**先折 token 再交给
+  消费方**（否则失败轮 token 丢失）。夹具：llmrec 四条（正常轮折算 / 错误轮分类 /
+  T1 卡死取消 / 非流式留痕）钉住。
+- **worker 的 LLM 调用零监督**：活性监督此前只覆盖 planner，worker 一次 run 内几十次
+  调用既无轮留痕、不参与首帧超时、无错误分类——端点卡死要等意图墙钟（实测 27 分钟）才
+  暴露。新增 `llmrec.PerCallProvider`：一次调用=一轮（轮号 `<task>-w<intent>-<序号>`），
+  经 `Worker.SetCallSupervisor` 注入。实机验证：一个意图的 6 次调用全部落轮
+  （4 ok + 1 stalled 被 T1 及时斩掉、0 token 浪费 + 1 error），轮级 token ≈4 万/轮正确折算。
+- **http_send 代理 CA 按路径读取**：`proxyCACert` 是文件路径而非 PEM 内容，此前当内容
+  解析直接报「无法解析」。改为按路径读取，与其它工具口径一致；夹具同步改按路径断言。
 
 ### 变更
 
@@ -139,11 +155,13 @@
   source 枚举外/非推断无来源/name 缺失拒绝；推断条目清空 url；大小写归一）+
   `report/param_sources_test.go`（HTML/DOCX 渲染参数来源表含推断标记；反向验证：
   无 param_sources 不渲染该段）。
-- 实机：本机实例上的真实多目标任务（12 条授权目标）暴露出上述问题；修复前后的同任务对比
-  （登记目标数、开局预扫覆盖、首条漏洞时间点）在重跑后回填本节。四个可数指标
-  （`dedupe_key` 空 0、`asset_ids` 空 0、`llm_rounds` 行数=唯一轮数、blocked 无原因 0）与
-  R19 的两个判据（每问题输入 token 降到 150 万以下、设上限后任务能自己落到终态并给出
-  停止原因）的实机复跑未跑，跑完后回填本节。
+- 实机（2026-11-13，三 Ubuntu 靶机，90 分钟任务到点 `timeout` 终态收尾）：数据质量四判据
+  全过——`dedupe_key` 空 0、`asset_ids` 空 0、`llm_rounds` 行数 13 = 唯一轮数、blocked 无
+  原因 0；预算收尾时序实测有效（在跑意图写回 → 终局判定 → 落 `stop_reason`）。每问题输入
+  token 累计 363 万超出 150 万判据，根因是端点故障代价（planner 首帧卡死 10 分钟、stalled 3 轮
+  重发全量上下文、容器中途两次重建），非产品缺陷——修复后单轮 worker 均值 ≈4 万输入 token，
+  干净一轮估算 ≈50 万可达标；修复生效后的意图（#437）6 次调用全部留痕、stalled 轮 0 token
+  浪费。全部 `go test ./...` 22 包（含真实 PG 测试库）通过。
 
 ## [1.6.1] - 2026-11-10
 
