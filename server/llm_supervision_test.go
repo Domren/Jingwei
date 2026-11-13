@@ -43,16 +43,18 @@ func TestEngineSupervisionStalled(t *testing.T) {
 		t.Fatal("stalled 应在 T1 内主动 cancel，实际未 cancel")
 	}
 	// cancel 之后记账是同步的，但 watchFirstEvent 的 goroutine 落账在
-	// rctx.Done() 返回之后；给一小段缓冲再读，避免读到还没写完的中间态。
-	deadline := time.Now().Add(300 * time.Millisecond)
+	// rctx.Done() 返回之后；且 R21 ⑦ 会先落一条 status=running（在飞轮可见），
+	// 必须等它被改写成结论再读——只等「有行」会读到中间态，随机挂。
+	// （⑦ 本身由 llmrec 的 TestRunningRoundIsVisible 用 T1=0 钉住，这里不重复。）
+	deadline := time.Now().Add(2 * time.Second)
+	var rows []db.LLMRound
 	for time.Now().Before(deadline) {
-		if len(stub.snapshot()) > 0 {
+		rows = stub.snapshot()
+		if len(rows) == 1 && rows[0].Status != "running" {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-
-	rows := stub.snapshot()
 	if len(rows) != 1 {
 		t.Fatalf("stalled 应落 1 条，实际 %d", len(rows))
 	}

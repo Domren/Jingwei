@@ -102,15 +102,11 @@ func TestSupervisorStalled(t *testing.T) {
 	ctx := context.Background()
 	round, rctx := sup.Begin(ctx, RoundMeta{TaskID: 1, Worker: "planner", Model: "m"})
 
-	// R21 ⑦：本轮开始就先落一行 running（「在飞的轮」可见）。这一行不是结论，
-	// 等它被改写成 stalled 才算记账完成——只等「有行」会读到 running 就断言，必挂。
-	if rows := stub.snapshot(); len(rows) != 1 || rows[0].Status != "running" {
-		t.Fatalf("开始时应有且只有一条 running 行，实际 %+v", rows)
-	}
-
 	// 模拟：一直没有流事件进来。
 	<-rctx.Done() // 应被主动 cancel
 	// 等记账完成（watchFirstEvent 在 cancel 后把 running 行改写成 stalled）。
+	// R21 ⑦ 会在 Begin 时先落一条 status=running（在飞轮可见），只等「有行」会
+	// 读到中间态；⑦ 本身由 TestRunningRoundIsVisible 用 T1=0 钉住，这里只等结论。
 	deadline := time.Now().Add(2 * time.Second)
 	var rows []db.LLMRound
 	for time.Now().Before(deadline) {
