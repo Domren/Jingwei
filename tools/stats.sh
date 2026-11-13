@@ -31,8 +31,10 @@ DSN="${JINGWEI_PG_DSN:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --json) MODE="json" ;;
-    --check) MODE="check"; CHECK_FILE="${2:-}"; shift ;;
-    --dsn) DSN="${2:-}"; shift ;;
+    # 只有确实带了参数值才消费下一个；`--check` 裸跑要走到「需要手册路径」的
+    # 提示，而不是在这里 shift 到空、报一句看不懂的 can't shift that many。
+    --check) MODE="check"; if [ $# -ge 2 ]; then CHECK_FILE="$2"; shift; fi ;;
+    --dsn) if [ $# -ge 2 ]; then DSN="$2"; shift; fi ;;
     -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
     *) echo "未知参数：$1（--help 看用法）" >&2; exit 2 ;;
   esac
