@@ -61,6 +61,9 @@ services:
       JINGWEI_PIVOT_CHISEL_FINGERPRINT: ${JINGWEI_PIVOT_CHISEL_FINGERPRINT:-}
       # 单次模型调用的总墙钟（含 SDK 重试与流式读取），默认 15m；网关变慢时可调小。
       JINGWEI_LLM_CALL_TIMEOUT: ${JINGWEI_LLM_CALL_TIMEOUT:-}
+      # 规划轮「首帧」超时（R21 L1）：建连后这么久还不见第一个流事件就判 stalled 并
+      # 主动取消。默认 75s；中转端首帧常到 40–90s，压线时可放宽（纯数字=秒）。
+      JINGWEI_LLM_FIRST_EVENT_TIMEOUT: ${JINGWEI_LLM_FIRST_EVENT_TIMEOUT:-}
       # false/0/off 关闭流式输出（默认流式）。
       JINGWEI_LLM_STREAM: ${JINGWEI_LLM_STREAM:-}
       # 范围管控强度：strict（默认，读不到范围就拒绝，失败关闭）/ warn / off。

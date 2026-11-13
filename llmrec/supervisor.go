@@ -209,18 +209,34 @@ type firstEventProvider struct {
 func (p *firstEventProvider) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
 	return func(yield func(llm.StreamEvent, error) bool) {
 		first := true
+		// ⑥ 流式路径的 usage 折算：message_start 只带输入侧、message_delta 只带
+		// 输出侧，必须 Add 折叠（口径与 Recorder 一致）。此前这里只喂首帧、不折
+		// token，导致所有流式轮的 llm_rounds.input_tokens 恒为 0——「这一轮烧了
+		// 多少」只能靠 llm_usage 的会话累计去猜。
+		var used llm.Usage
 		for ev, err := range p.inner.Stream(ctx, req) {
 			if first && err == nil {
 				first = false
 				p.r.OnEvent()
 			}
-			if !yield(ev, err) {
+			if err == nil && (ev.Type == llm.SEMessageStart || ev.Type == llm.SEMessageDelta) {
+				used.Add(ev.Usage)
+			}
+			// 终态错误必须先折 usage 再交给消费方：调用方拿到 error 就会立刻
+			// End() 落库，晚一步折的 token 就丢了（实测失败轮 token 全 0）。
+			if err != nil {
+				p.r.AddUsage(used.InputTokens, used.OutputTokens)
+				if !yield(ev, err) {
+					return
+				}
 				return
 			}
-			if err != nil {
+			if !yield(ev, err) {
+				p.r.AddUsage(used.InputTokens, used.OutputTokens)
 				return
 			}
 		}
+		p.r.AddUsage(used.InputTokens, used.OutputTokens)
 	}
 }
 

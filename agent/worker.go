@@ -86,6 +86,10 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+	// supervise 把「一次 LLM 调用」包成一轮监督（R21 L2 的 worker 侧补齐）：
+	// server 注入 llmrec.PerCallProvider，每次 Stream/Complete 落一行 llm_round
+	// 并参与 T1 首帧超时与错误分类。nil = 不监督（离线/夹具场景）。
+	supervise func(base llm.Provider, taskID int64, worker, baseID string) llm.Provider
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -191,6 +195,13 @@ func (w *Worker) SetProxy(addr, caCert string) { w.proxyAddr, w.proxyCACert = ad
 
 // SetWebSearch selects the web_search backend for this worker (off by default).
 func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
+
+// SetCallSupervisor 注入「每次 LLM 调用 = 一轮」的监督构造器（见 llmrec.
+// PerCallProvider）。worker 一个 run 内会发几十次调用，此前这些轮既不参与首帧
+// 超时也没有轮记录，端点卡死只能等意图墙钟（实测 27 分钟）才发现。
+func (w *Worker) SetCallSupervisor(fn func(base llm.Provider, taskID int64, worker, baseID string) llm.Provider) {
+	w.supervise = fn
+}
 
 // proxyEnv builds the Bash-subprocess env that routes child-command HTTP through
 // the egress proxy (the recording MITM when capture is on, or the global proxy
@@ -502,8 +513,14 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if writeCurlRC(runDir) {
 		curlEnv = []string{"CURL_HOME=" + runDir}
 	}
+	// R21 L2 worker 侧：每次 LLM 调用包成一轮，落 llm_round 并参与 T1 首帧超时。
+	// 轮号前缀带意图 id（同一意图可能因 resume 分多次 run，序号继续递增即可区分）。
+	prov := w.prov
+	if w.supervise != nil {
+		prov = w.supervise(prov, taskID, "worker", fmt.Sprintf("%d-w%d", taskID, intent.ID))
+	}
 	opts := agentcore.Options{
-		Provider:        w.prov,
+		Provider:        prov,
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
 		Tools:           tools,

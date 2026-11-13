@@ -102,6 +102,10 @@ JINGWEI_PROXY_PORT=9791
 - `JINGWEI_LLM_CALL_TIMEOUT` 限制单次模型调用的总墙钟（含 SDK 重试与流式读取），默认 `15m`。
   网关变慢时会出现「任务在跑、日志里持续出现 `单次调用超过硬性墙钟`、漏洞数为 0」，
   此时调小为 `300s` 可让 worker 尽快放弃卡住的那一次并继续推进。
+- `JINGWEI_LLM_FIRST_EVENT_TIMEOUT` 是**首帧**超时（不是总墙钟）：建连后这么久还不见第一个
+  流事件就判 `stalled` 并主动取消，默认 `75s`。中转端首帧延迟常到 40–90s，日志里频繁出现
+  `error_class=stalled` 且 `first_event_at` 为空时，放宽到 `120`（纯数字按秒）。它与上面的
+  总墙钟是两件事：首帧超时管「对端不说话」，总墙钟管「说了但说不完」。
 - 如果需要限制访问来源，建议保持 `JINGWEI_PROXY_PORT` 只绑定 `127.0.0.1`，
   公网只开放反向代理端口。
 - **内网横向前必须先配 `JINGWEI_PIVOT_SERVER`**：隧道（chisel / `ssh -R`）的自动部署命令

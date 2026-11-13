@@ -39,9 +39,27 @@ const (
 
 // SetHTTPProxy 给本 ToolSet 的 http_send 注入记录代理与 CA（worker.execute 每次接线）。
 // addr 为空 = 直连；caCert 为空 = 系统证书池（本地 httptest 夹具用）。
+//
+// caCert 的形态与 worker 其他位置保持一致是**文件路径**（proxyEnv 里 CURL_CA_BUNDLE
+// 也是路径），但 http_send 要的是 PEM 内容——这里统一读成内容。夹具直接传 PEM 也认。
 func (t *ToolSet) SetHTTPProxy(addr, caCert string) {
 	t.httpProxy = strings.TrimSpace(addr)
-	t.httpCACert = strings.TrimSpace(caCert)
+	t.httpCACert = loadCACertPEM(caCert)
+}
+
+// loadCACertPEM 把「PEM 文本或证书文件路径」统一成 PEM 文本。
+// 读不到就原样返回，让 httpSendClient 的 AppendCertsFromPEM 报「无法解析」时
+// 至少能看出传进来的是什么（比静默回退到系统池安全：那会让 MITM 证书校验失败）。
+func loadCACertPEM(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || strings.Contains(v, "BEGIN CERTIFICATE") {
+		return v
+	}
+	b, err := os.ReadFile(v)
+	if err != nil {
+		return v
+	}
+	return string(b)
 }
 
 // forceBrowserUA 把调用方给的头部归一到平台 UA 口径：User-Agent 一律强制覆盖

@@ -637,6 +637,14 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
+	// R21 L2 worker 侧：worker 一次 run 内发几十次 LLM 调用，此前这些轮既没有
+	// llm_round 记录也不参与 T1 首帧超时（实测单意图卡到 27 分钟墙钟才被发现）。
+	// 这里把每次调用包成一轮，与 planner 共用同一个监督者（T1 口径一致）。
+	if sup := s.engine.llmSup; sup != nil {
+		wk.SetCallSupervisor(func(base llm.Provider, taskID int64, worker, baseID string) llm.Provider {
+			return llmrec.NewPerCallProvider(sup, base, taskID, worker, baseID)
+		})
+	}
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetFindingRecorder(s.evidenceStore())
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)
