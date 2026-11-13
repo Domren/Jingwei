@@ -405,6 +405,9 @@ export const api = {
     sourceTaskIds?: string[];
     companyIds?: number[];
     timeoutSeconds?: number;
+    maxRounds?: number;       // R19 序 4：任务级预算闸门——规划轮数上限；0/省略=不限
+    maxInputTokens?: number;  // R19 序 4：任务级预算闸门——累计输入 token 上限；0/省略=不限
+    scopeGranularity: string; // R19 序 5：授权粒度，必选：ip_port | by_ip（表单强制选择）
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
@@ -420,6 +423,9 @@ export const api = {
       source_task_ids: input.sourceTaskIds ?? [],
       company_ids: input.companyIds ?? [],
       timeout_seconds: input.timeoutSeconds ?? 0,
+      max_rounds: input.maxRounds ?? 0,
+      max_input_tokens: input.maxInputTokens ?? 0,
+      scope_granularity: input.scopeGranularity,
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
@@ -1055,6 +1061,8 @@ export const api = {
     url: string;
     headers?: Record<string, string>;
     body?: string;
+    // R17：二进制正文（multipart 文件上传）的无损通道，优先于 body。
+    body_base64?: string;
     timeout_ms?: number;
     insecure_skip_verify?: boolean;
     use_recording_proxy?: boolean;

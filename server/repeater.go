@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -33,14 +35,18 @@ var repeaterHopByHop = map[string]struct{}{
 }
 
 type repeaterSendRequest struct {
-	HTTPVersion        string            `json:"http_version"`
-	Method             *string           `json:"method"`
-	URL                string            `json:"url"`
-	Headers            map[string]string `json:"headers"`
-	Body               string            `json:"body"`
-	TimeoutMs          int               `json:"timeout_ms"`
-	InsecureSkipVerify bool              `json:"insecure_skip_verify"`
-	UseRecordingProxy  *bool             `json:"use_recording_proxy"`
+	HTTPVersion string            `json:"http_version"`
+	Method      *string           `json:"method"`
+	URL         string            `json:"url"`
+	Headers     map[string]string `json:"headers"`
+	Body        string            `json:"body"`
+	// R17：二进制正文（multipart 文件上传等）的无损通道。JSON string 是 UTF-8 语义，
+	// 裸 0x80-0xFF 字节在编码侧就被替换成 U+FFFD（复现夹具实测 486→742 bytes），
+	// 文本通道修不掉只能绕开；base64 存在时优先于 body。
+	BodyBase64         string `json:"body_base64"`
+	TimeoutMs          int    `json:"timeout_ms"`
+	InsecureSkipVerify bool   `json:"insecure_skip_verify"`
+	UseRecordingProxy  *bool  `json:"use_recording_proxy"`
 }
 
 type repeaterSendResponse struct {
@@ -131,9 +137,22 @@ func (s *Server) sendRepeater(w http.ResponseWriter, r *http.Request) {
 		useRecordingProxy = *in.UseRecordingProxy
 	}
 
+	// R17：body_base64（二进制正文无损通道）优先于文本 body；解码失败直接 400，
+	// 不静默降级——降级等于把一份被破坏的报文发给目标。
+	var rawBody []byte
+	if in.BodyBase64 != "" {
+		decoded, derr := base64.StdEncoding.DecodeString(in.BodyBase64)
+		if derr != nil {
+			writeErr(w, http.StatusBadRequest, "body_base64 不是合法的 base64："+derr.Error())
+			return
+		}
+		rawBody = decoded
+	} else if in.Body != "" {
+		rawBody = []byte(in.Body)
+	}
 	var body io.Reader
-	if in.Body != "" && method != http.MethodHead {
-		body = strings.NewReader(in.Body)
+	if len(rawBody) > 0 && method != http.MethodHead {
+		body = bytes.NewReader(rawBody)
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
@@ -261,6 +280,21 @@ func (s *Server) sendRepeater(w http.ResponseWriter, r *http.Request) {
 func repeaterBodyText(data []byte) string {
 	text := string(bytes.ToValidUTF8(data, []byte("�")))
 	return strings.ReplaceAll(text, "\x00", "�")
+}
+
+// trafficDetailWithBase64 给交换详情附上二进制正文的 base64 形式（R17）：原始报文
+// 的 JSON 文本通道会被 UTF-8 强制转换破坏（浏览器收到的就是坏字节），前端把它
+// 解码成字节后才能无损交接给重发。仅正文非合法 UTF-8 时附带，避免文本报文的
+// 载荷翻倍。
+func trafficDetailWithBase64(req, resp string) map[string]any {
+	out := map[string]any{"req": req, "resp": resp}
+	if !utf8.ValidString(req) {
+		out["req_base64"] = base64.StdEncoding.EncodeToString([]byte(req))
+	}
+	if !utf8.ValidString(resp) {
+		out["resp_base64"] = base64.StdEncoding.EncodeToString([]byte(resp))
+	}
+	return out
 }
 
 func (s *Server) repeaterTransport(useRecordingProxy, insecure bool) http.RoundTripper {

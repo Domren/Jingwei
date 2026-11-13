@@ -82,6 +82,10 @@ type ToolSet struct {
 	// enrich, if set, receives async auto-completion triggers (DNS resolve for a
 	// domain, HTTP probe for a site). nil = no engine enrichment.
 	enrich EnrichTrigger
+	// R20 序 5：http_send 的出站通道——记录代理地址与 CA PEM（worker.execute 每次接线）。
+	// 空 = 直连 + 系统证书池。
+	httpProxy  string
+	httpCACert string
 	// notify, if set, wakes the task's planner after a graph change that should be
 	// re-planned promptly (currently: a new hint). nil = no wake (the hint is still
 	// stored and read on the next round triggered by other events). debounced.
@@ -1331,7 +1335,7 @@ func severityDefaultCVSS(severity string) float64 {
 	}
 }
 
-const reportFindingDescription = "记录确认的漏洞。HTTP 漏洞的 evidence 用原始 HTTP 请求/响应报文（请求行、Host、关键请求头、响应状态行与关键响应片段）说明复现与验证结论，并配合 traffic_refs 绑定已采集的真实流量；非 HTTP 协议（Redis/MySQL/SSH 等）用 protocol 写明协议名，并把实际收发字节放进 raw_request/raw_response，evidence 写协议层结论。任何情况都不要用 curl 命令或口头描述代替报文。任务上下文传当前 intent_id。**必须同时填 reproduction 结构化复现过程**（入口点 / 前置条件 / 有序真实步骤 / 攻击链来源）：它在落库那一刻就固定下来并直接渲染进报告，事后没有任何人能替你准确还原，request/response 一律逐字取自真实执行。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。"
+const reportFindingDescription = "记录确认的漏洞。HTTP 漏洞的 evidence 用原始 HTTP 请求/响应报文（请求行、Host、关键请求头、响应状态行与关键响应片段）说明复现与验证结论，并配合 traffic_refs 绑定已采集的真实流量；非 HTTP 协议（Redis/MySQL/SSH 等）用 protocol 写明协议名，并把实际收发字节放进 raw_request/raw_response，evidence 写协议层结论。任何情况都不要用 curl 命令或口头描述代替报文。任务上下文传当前 intent_id。**必须同时填 reproduction 结构化复现过程**（入口点 / 前置条件 / 有序真实步骤 / 攻击链来源）：它在落库那一刻就固定下来并直接渲染进报告，事后没有任何人能替你准确还原，request/response 一律逐字取自真实执行。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。POC 里每个参数在 reproduction.param_sources 登记来源（来源 URL + 字段位置）；给不出来源的显式 inferred=true 标注「无来源（模型推断）」，不要编造来源。"
 
 // ReportFindingDefaults exposes the code-defined description and schema so
 // one-time DB migrations can backfill parameters added after an install was
@@ -1364,6 +1368,15 @@ func reportFindingSchema() map[string]any {
 					"proves":   str("这一步证明了什么，一句话"),
 				}, "request")},
 			"provenance": str("该漏洞的攻击链来源/依赖：从哪个入口、依赖哪些前置步骤或凭据得来"),
+			"param_sources": map[string]any{"type": "array", "description": "参数来源（R16）：POC 里每个参数的取值从哪来——来源请求/页面的 URL 与字段位置。给不出来源的参数必须传 inferred=true 显式标注「无来源（模型推断）」；操作员逐个复核，编造来源等同伪造证据",
+				"items": obj(map[string]any{
+					"name":     str("参数名"),
+					"value":    str("参数值（POC 里实际用的）"),
+					"source":   map[string]any{"type": "string", "enum": []string{"form", "json", "js", "path", "query", "cookie", "header"}, "description": "字段位置：表单字段 / 响应或请求 JSON 键 / 前端 JS 变量 / URL 路径参数 / 查询参数 / Cookie / 请求头"},
+					"url":      str("来源请求或页面的 URL（inferred=true 时省略）"),
+					"detail":   str("位置补充：如「POST /api/login 响应 JSON 的 data.token」「/download/:file 路径段」"),
+					"inferred": map[string]any{"type": "boolean", "description": "true=无来源（模型推断）：确实找不到来源时显式标注，不要编造 URL"},
+				}, "name", "source")},
 		}, "steps"),
 	}, "vulnclass", "severity", "summary", "cvss")
 }
@@ -1396,6 +1409,9 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			return actool.Errorf("report_finding 的 CVSS 基础分越界（须 0.0-10.0）。请保持 vulnclass/name/severity/summary/evidence 不变，重新调用并补上合法的 cvss。本次调用未登记漏洞，不会产生重复记录。"), nil
 		}
 		a.Reproduction.Normalize()
+		if err := a.Reproduction.NormalizeParamSources(); err != nil {
+			return actool.Errorf(err.Error() + "。请保持漏洞内容不变，重新调用 report_finding 并补全/修正 reproduction.param_sources。本次调用未登记漏洞，不会产生重复记录。"), nil
+		}
 		if a.Reproduction.Empty() {
 			return actool.Errorf("report_finding 必须提供结构化复现过程（reproduction 字段）：entry_point（入口接口）、prerequisites（前置条件，需要账号就写清怎么注册）、steps（至少 1 步，每步 request=你真实发过的请求原文、response=真实响应片段、expected/proves 各一句话）、provenance（攻击链来源）。这份过程会直接进报告，决定别人能否照着复现；你刚执行完，只有你能准确还原。请保持 vulnclass/name/severity/summary/evidence/traffic_refs 不变，重新调用并补上 reproduction。本次调用未登记漏洞，不会产生重复记录。"), nil
 		}

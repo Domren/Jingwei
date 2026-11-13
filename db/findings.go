@@ -27,17 +27,20 @@ type DBFinding struct {
 	EvidencePacketOmitted int                     // exchanges merged or dropped so the report stays readable
 	Screenshots           []FindingScreenshot     // evidence screenshots, populated only for export
 
-	ID              int64
-	TaskID          *int64
-	NodeID          *int64
-	VulnClass       string
-	Name            string // 漏洞名称(可读标题);为空时前端回退展示 VulnClass
-	Severity        string
-	Summary         string
-	Evidence        string
-	Worker          string
-	AssetIDs        []int64
-	Status          string
+	ID        int64
+	TaskID    *int64
+	NodeID    *int64
+	VulnClass string
+	Name      string // 漏洞名称(可读标题);为空时前端回退展示 VulnClass
+	Severity  string
+	Summary   string
+	Evidence  string
+	Worker    string
+	AssetIDs  []int64
+	Status    string
+	// DedupeKey 是服务端推导的身份（R18：类+主机+接口族）。导出归并层用它
+	// 判断「哪些条目是同一根因」；为空表示存量数据、按标题兜底。
+	DedupeKey       string
 	CVSS            *float64      // CVSS v3.1 基础分,0.0-10.0
 	Reproduction    *Reproduction // 结构化复现过程(agent 记录时就地落库);nil=未记录,报告回退到重构的验证步骤
 	Report          string        // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
@@ -221,7 +224,7 @@ const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.n
 	       f.evidence, f.worker, f.asset_ids, COALESCE(f.status, 'pending'), f.created_at,
 	       COALESCE(t.description, '') AS task_description, f.evidence_version, f.report_evidence_version, f.cvss,
  (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id),
- COALESCE(f.reproduction::text, '')`
+ COALESCE(f.reproduction::text, ''), COALESCE(f.dedupe_key, '')`
 
 // scanFindings materializes rows selected via findingSelectCols.
 func scanFindings(rows interface {
@@ -236,7 +239,7 @@ func scanFindings(rows interface {
 		var cvss sql.NullFloat64
 		var reproText string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
-			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &cvss, &f.TrafficCount, &reproText); err != nil {
+			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &cvss, &f.TrafficCount, &reproText, &f.DedupeKey); err != nil {
 			return nil, err
 		}
 		if cvss.Valid {
@@ -741,8 +744,8 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		var reproText string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &cvss, &f.TrafficCount, &reproText, &f.Report,
-			&f.HTTPRequest, &f.HTTPResponse, &f.ScanTaskID, &f.ScanTaskName); err != nil {
+			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &cvss, &f.TrafficCount, &reproText, &f.DedupeKey,
+			&f.Report, &f.HTTPRequest, &f.HTTPResponse, &f.ScanTaskID, &f.ScanTaskName); err != nil {
 			return nil, err
 		}
 		if cvss.Valid {
@@ -878,8 +881,8 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &cvss, &f.TrafficCount, &reproText, &f.Report,
-		&f.HTTPRequest, &f.HTTPResponse)
+		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &cvss, &f.TrafficCount, &reproText, &f.DedupeKey,
+		&f.Report, &f.HTTPRequest, &f.HTTPResponse)
 	if cvss.Valid {
 		f.CVSS = &cvss.Float64
 	}

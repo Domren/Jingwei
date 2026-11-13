@@ -86,7 +86,12 @@ func (s *Server) pgTokenByModel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"models": []db.ModelTokenStat{}})
 		return
 	}
-	models, err := pg.TokenByModel(id)
+	// 历史行可能以探索 id 字符串落 task_id（引擎挂载前的口径），按 exploration_id 兕底。
+	expID := int64(0)
+	if t, ok := s.m.Task(id); ok {
+		expID = t.ExpID
+	}
+	models, err := pg.TokenByModel(id, expID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return

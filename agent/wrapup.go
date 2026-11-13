@@ -119,7 +119,14 @@ var taskTimeoutWrapupDefaults = map[string]string{
 
 const workerTaskTimeoutDefault = "【任务超时·强制写回】整个任务已到超时上限，即将结束。这是最后机会，**现在立刻停止所有探索，把已识别但还没写回的内容全部落库**：(1) 确认漏洞用 report_finding（含 evidence + reproduction + traffic_refs）；(2) 探索结论用 record_fact（传 intent_id）；(3) 新资产用 insert_assets。**不要跳过任何一项**——写回是你的核心职责，探索只是手段。最后用一句话纯文本总结你在本意图上的关键结论。"
 
+// R19 序 4：任务预算（轮数/输入 token）到限收尾词。与超时词同一套写回清单，但
+// 到限原因不同——钱烧完了，不是时间到了。代码固定策略，不开放 DB 覆盖（预算闸门
+// 是平台行为边界，与 Settlement.DisabledTools 同级）。
+const workerTaskBudgetDefault = "【任务预算到限·强制写回】整个任务的规划轮数/输入 token 预算已用完，即将结束。这是最后机会，**现在立刻停止所有探索，把已识别但还没写回的内容全部落库**：(1) 确认漏洞用 report_finding（含 evidence + reproduction + traffic_refs）；(2) 探索结论用 record_fact（传 intent_id）；(3) 新资产用 insert_assets。**不要跳过任何一项**——写回是你的核心职责，探索只是手段。最后用一句话纯文本总结你在本意图上的关键结论。"
+
 const plannerTaskTimeoutDefault = "**整个任务已到达超时上限，即将结束**（不是本轮，是整个任务终止）。请基于当前【全部】事实与发现，做最后一次目标判定：对已被证据证明达成的目标调 prove_goal 标记 met（别漏判）。**不要再生成任何新意图**（此时派意图也不会再被执行）。判定完即收束，无需输出总结文本。"
+
+const plannerTaskBudgetDefault = "**整个任务的预算已到上限（规划轮数/输入 token），即将结束**（不是本轮，是整个任务终止）。请基于当前【全部】事实与发现，做最后一次目标判定：对已被证据证明达成的目标调 prove_goal 标记 met（别漏判）。**不要再生成任何新意图**（此时派意图也不会再被执行）。判定完即收束，无需输出总结文本。"
 
 // TaskTimeoutWrapupDefault 返回某 agent 的任务超时内置默认收尾词（供后台占位/恢复默认）。
 func TaskTimeoutWrapupDefault(agentKey string) string {
@@ -137,6 +144,23 @@ func resolveTaskTimeoutWrapup(agentKey string) string {
 	return TaskTimeoutWrapupDefault(agentKey)
 }
 
+// TaskBudgetWrapupDefault 返回某 agent 的任务预算内置默认收尾词（供后台占位/恢复默认）。
+func TaskBudgetWrapupDefault(agentKey string) string {
+	if w, ok := map[string]string{"worker": workerTaskBudgetDefault, "planner": plannerTaskBudgetDefault}[agentKey]; ok {
+		return w
+	}
+	return ""
+}
+
+// resolveTaskBudgetWrapup：预算收尾词是代码固定策略（不开放 DB 覆盖，见常量注释）；
+// 无预算词的 agent 回退 per-run 词。
+func resolveTaskBudgetWrapup(agentKey string) string {
+	if w := TaskBudgetWrapupDefault(agentKey); w != "" {
+		return w
+	}
+	return resolveWrapup(agentKey)
+}
+
 func resolveTaskTimeoutTurns(agentKey string) int {
 	if WrapupTaskTimeoutTurnsOverride != nil {
 		if v, ok := WrapupTaskTimeoutTurnsOverride(agentKey); ok && v > 0 {
@@ -151,14 +175,24 @@ func resolveTaskTimeoutTurns(agentKey string) int {
 //   - clamped=true  → 本次 run 被任务 deadline 夹逼：因 Timeout 收尾=任务到点→任务超时词；
 //     因 MaxTurns 收尾=夹逼窗口内步数先耗尽、任务还剩几分钟→回落 per-run 词。
 //   - clamped=false → 任务还早：两种 reason 都用 per-run 词（即退化为 wrapupSettlement）。
+//   - settle="budget" → 任务预算（轮数/输入 token）到限（R19 序 4）：无论哪种 reason
+//     收尾都换预算词——这是任务正在终止的窗口，不再是普通的 per-run 边界。
 //
 // 交给 harness 的 PromptByReason 在收尾时按【实际】reason 现场挑，无 build 时错配。
-func wrapupSettlementForTask(agentKey string, disabledTools []string, clamped bool) *harness.Settlement {
+func wrapupSettlementForTask(agentKey string, disabledTools []string, clamped bool, settle string) *harness.Settlement {
 	perRun := resolveWrapup(agentKey)
 	st := &harness.Settlement{
 		Prompt:        perRun, // 兜底(也是非 clamped 时两种 reason 的取值)
 		DisabledTools: disabledTools,
 		MaxTurns:      resolveWrapupTurns(agentKey),
+	}
+	if settle == "budget" {
+		st.PromptByReason = map[harness.TerminalReason]string{
+			harness.ReasonTimeout:  resolveTaskBudgetWrapup(agentKey), // 预算到限
+			harness.ReasonMaxTurns: perRun,                            // 步数先耗尽(夹逼窗口内)——仍按 per-run
+		}
+		st.MaxTurns = resolveTaskTimeoutTurns(agentKey)
+		return st
 	}
 	if clamped {
 		if tt := resolveTaskTimeoutWrapup(agentKey); tt != "" {

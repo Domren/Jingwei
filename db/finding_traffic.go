@@ -434,7 +434,16 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 			return nil, errors.New("intent_id 必须是本任务的意图（关联任务意图只读）")
 		}
 	}
-	identity := agentFindingIdentity(in, prepared)
+	// R18：身份与资产绑定改由服务端确定性推导，模型给的值只作提示。
+	//
+	// 旧实现在这里只用模型给的 dedupe_key / asset_ids，后果是「同一根因换端点
+	// 合不掉」「链式发现一条资产都没绑」（§4.4 的 #21/#23、#31/#32）。推导层
+	// 从证据里出现的全部 host:port 反查资产，并把身份收到「类+主机+接口族」粒度。
+	derived := deriveIdentityForTx(tx, in, prepared)
+	if len(derived.AssetIDs) > 0 {
+		in.AssetIDs = derived.AssetIDs
+	}
+	identity := derived.DedupeKey
 	if identity != "" {
 		var existingID, existingNode int64
 		err := tx.QueryRow(`SELECT id, COALESCE(node_id, 0) FROM findings WHERE dedupe_key=$1`, identity).Scan(&existingID, &existingNode)
@@ -550,6 +559,11 @@ func findingClassKey(vulnclass, name string) string {
 // host + path + parameter names + method. Payload values are deliberately
 // excluded so a second worker proving the same sink with a different payload
 // merges into the existing finding instead of creating a duplicate.
+// agentFindingTargetKey 取「主证据 URL」作为展示用的目标标识。
+//
+// 注意：它**不再**用于生成去重身份。R18 起身份由 DeriveFindingIdentity 从
+// 「类 + 全部证据主机 + 接口族」推导（见 db/finding_identity.go）；这个函数
+// 保留是因为报告与前端要用「这条洞打的是哪个 URL」这一句话。
 func agentFindingTargetKey(prepared []PreparedTrafficEvidence) string {
 	pick := func(p PreparedTrafficEvidence) string {
 		u, err := url.Parse(p.Snapshot.URL)
@@ -583,48 +597,6 @@ func agentFindingTargetKey(prepared []PreparedTrafficEvidence) string {
 		}
 	}
 	return ""
-}
-
-func normalizeIdentityText(s string) string {
-	var b strings.Builder
-	dash := false
-	for _, r := range strings.ToLower(s) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r > 0x7f {
-			b.WriteRune(r)
-			dash = false
-			continue
-		}
-		if !dash {
-			b.WriteByte('-')
-			dash = true
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if len(out) > 96 {
-		out = out[:96]
-	}
-	return out
-}
-
-// agentFindingIdentity returns the dedupe key for an agent-recorded finding.
-// A finding is keyed by task + weakness family + verified location; without
-// packets it falls back to the normalized name within the same family.
-func agentFindingIdentity(in RecordFindingInput, prepared []PreparedTrafficEvidence) string {
-	if in.TaskID <= 0 {
-		return ""
-	}
-	class := findingClassKey(in.VulnClass, in.Name)
-	if class == "" {
-		return ""
-	}
-	target := agentFindingTargetKey(prepared)
-	if target == "" {
-		target = normalizeIdentityText(in.Name)
-	}
-	if target == "" {
-		return ""
-	}
-	return fmt.Sprintf("agent:%d:%s:%s", in.TaskID, class, target)
 }
 
 func severityWeight(sev string) int {

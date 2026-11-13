@@ -1,7 +1,8 @@
 // Jingwei domain model — types used across the UI.
 // Derived from the functional spec (section 7: 关键数据形状).
 
-export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout";
+// TaskStatus 含 budget 终态（R19 序 4：任务级预算闸门——规划轮数/输入 token 到限收尾）。
+export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout" | "budget";
 export type EngineMode = "exploring" | "paused" | "stalled" | "idle";
 
 export interface Task {
@@ -41,6 +42,10 @@ export interface Task {
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
+  max_rounds?: number; // R19 序 4：规划轮数上限；0/缺省=不限
+  max_input_tokens?: number; // R19 序 4：累计输入 token 上限；0/缺省=不限
+  stop_reason?: string; // 到限收尾后「为什么停」：超时/轮数/token 上限（终态任务才有）
+  scope_granularity?: string; // R19 序 5：授权粒度 ip_port/by_ip（创建必选；空=存量任务旧行为）
 }
 
 export interface TaskCategory {
@@ -502,10 +507,20 @@ export interface FindingReproStep {
 }
 
 // FindingReproduction 是 agent 在记录漏洞时就地写下的结构化复现过程。
+export interface FindingParamSource {
+  name: string;
+  value?: string;
+  source: string; // form|json|js|path|query|cookie|header
+  url?: string;
+  detail?: string;
+  inferred?: boolean; // true=无来源（模型推断）
+}
+
 export interface FindingReproduction {
   entry_point?: string;
   prerequisites?: string[];
   provenance?: string;
+  param_sources?: FindingParamSource[]; // R16：POC 每个参数的来源；给不出来源显式标 inferred
   steps?: FindingReproStep[];
 }
 
@@ -1030,9 +1045,12 @@ export interface TrafficResp {
 }
 
 // Full raw request/response of one exchange (lazy-loaded on row select).
+// req_base64/resp_base64：正文非合法 UTF-8（二进制）时附带，供重发按原始字节交接（R17）。
 export interface TrafficDetail {
   req: string;
   resp: string;
+  req_base64?: string;
+  resp_base64?: string;
 }
 
 // One distinct recorded host with its exchange count (target picker).

@@ -12,6 +12,9 @@ import (
 type TaskClock struct {
 	DeadlineUnix int64 // absolute deadline (unix seconds); 0 = no task timeout
 	Final        bool  // coordinator-driven FINAL planner round (task ending now)
+	// Settle 是任务收尾原因："timeout"（墙钟到点）| "budget"（轮数/输入 token 预算到限；
+	// R19 序 4）。agent 按它挑任务收尾词（超时词/预算词）；空串=普通运行。
+	Settle string
 }
 
 type taskClockKey struct{}

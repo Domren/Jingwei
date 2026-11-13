@@ -77,6 +77,10 @@ const (
 
 var errWorkControlConflict = errors.New("work control conflict")
 
+// errActivityNoStore 表示任务还没有可写的活动库（裸 Task 或探索尚未建立）。
+// 记账是观测面，缺了它主流程仍要能跑完，因此这里返回可判别的错误而不是 panic。
+var errActivityNoStore = errors.New("activity store not ready")
+
 // retryableWorkerModelError excludes errors already handled by the task router.
 // In particular, a quota error after partial streaming advances the task cursor
 // for the next LLM call but must not replay this whole intent on the backup.
@@ -142,11 +146,12 @@ type Engine struct {
 	plannerRound sync.Map // taskID -> int, planner round counter (for UI round separators)
 
 	// 任务级超时(见 docs/任务级超时与收尾设计.md):
-	settling     sync.Map // taskID -> bool, 任务已进入收尾时序(停止派/领新意图)
-	deadline     sync.Map // taskID -> int64 unix, 绝对截止时刻(首次运行时盖章;0/缺省=不限)
-	stamped      sync.Map // taskID -> bool, first_run_at 是否已盖章(本进程内只盖一次)
-	inflight     sync.Map // taskID -> *int64, 在跑的 planner.Plan + worker.Execute 计数(用于 drain)
-	coordStarted sync.Map // taskID -> bool, deadline 协调器是否已启动(Run/reload 去重)
+	settling           sync.Map // taskID -> bool, 任务已进入收尾时序(停止派/领新意图)
+	deadline           sync.Map // taskID -> int64 unix, 绝对截止时刻(首次运行时盖章;0/缺省=不限)
+	stamped            sync.Map // taskID -> bool, first_run_at 是否已盖章(本进程内只盖一次)
+	inflight           sync.Map // taskID -> *int64, 在跑的 planner.Plan + worker.Execute 计数(用于 drain)
+	coordStarted       sync.Map // taskID -> bool, deadline 协调器是否已启动(Run/reload 去重)
+	budgetCoordStarted sync.Map // taskID -> bool, 预算协调器是否已启动(Run/reload 去重;R19 序 4)
 
 	// resolve returns a task's dedicated planner/worker (wired by the server as the
 	// authoritative task-router). nil,nil means this task is deliberately unavailable
@@ -156,6 +161,21 @@ type Engine struct {
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness func() bool
+	// llmTarget 返回该任务当前实际会用的 model 与 profile 名（R21 缺口③）。
+	// 轮记录缺这两列时，事后答不出「是哪个端点废的这一轮」，只能去翻日志。
+	// 由 server 层注入（它才知道 profile 链与 agent 绑定）；nil 时留空不报错。
+	llmTarget func(t *Task) (model, profileName string)
+
+	// consecutiveFail 记每个任务连续失败的规划轮数（⑤退避 与 L3 用）。
+	consecutiveFail sync.Map // taskID -> *int32
+	// noProgress 记连续零进展轮数（L3 判据）。
+	noProgress sync.Map // taskID -> *int32
+	// taskStalled 记已判过 stalled_task 的任务，避免每轮重复告警。
+	taskStalled sync.Map // taskID -> bool
+	// lastFailAt 记上一次失败轮的时刻（纳秒）；退避是否已等够由它算。
+	lastFailAt sync.Map // taskID -> int64
+	// lastProgress 记上一轮结束时的产出计数，用于「这一轮有没有新东西」。
+	lastProgress sync.Map // taskID -> progressSnapshot
 }
 
 type taskRuntime struct {
@@ -185,6 +205,156 @@ func (e *Engine) plannerRoundNo(taskID string) int {
 		return 0
 	}
 	return v.(int)
+}
+
+// ── R21 缺口⑤②/L3：连续失败与零进展的计数 ─────────────────────────────────
+//
+// 这些计数只活在本进程内：进程重启后清零是对的——重启本身就是一次人工干预，
+// 不该把重启前的失败序列继续算在退避里（否则「修好端点后重启」仍要被退避挡住）。
+
+// bumpConsecutiveFail 记一次失败轮并返回连续失败数。
+func (e *Engine) bumpConsecutiveFail(taskID string) int {
+	v, _ := e.consecutiveFail.LoadOrStore(taskID, new(int32))
+	return int(atomic.AddInt32(v.(*int32), 1))
+}
+
+// clearConsecutiveFail 在成功轮后清零。
+func (e *Engine) clearConsecutiveFail(taskID string) {
+	if v, ok := e.consecutiveFail.Load(taskID); ok {
+		atomic.StoreInt32(v.(*int32), 0)
+	}
+}
+
+// consecutiveFailures 读当前连续失败数。
+func (e *Engine) consecutiveFailures(taskID string) int {
+	if v, ok := e.consecutiveFail.Load(taskID); ok {
+		return int(atomic.LoadInt32(v.(*int32)))
+	}
+	return 0
+}
+
+// plannerBackoff 返回本轮失败后应当等待的时长（⑤）。
+//
+// 除了连续失败序列决定的退避，还要保证「退避期内的心跳唤醒不消耗 LLM 调用」：
+// 心跳默认每 10 分钟一次，而退避最长 2 分钟，所以只要退避在唤醒时生效即可。
+// 这里返回时长，由 runRound 入口判断「距上次失败是否还没等够」。
+func (e *Engine) plannerBackoff(taskID string, consecutive int) time.Duration {
+	d := llmrec.BackoffBefore(consecutive)
+	if d <= 0 {
+		return 0
+	}
+	// 记下「本轮失败发生在何时」，供下一次唤醒比对。
+	e.lastFailAt.Store(taskID, time.Now().UnixNano())
+	return d
+}
+
+// backoffRemaining 返回距离上次失败还需要等多久（0 表示可以立刻跑）。
+func (e *Engine) backoffRemaining(taskID string) time.Duration {
+	v, ok := e.lastFailAt.Load(taskID)
+	if !ok {
+		return 0
+	}
+	need := llmrec.BackoffBefore(e.consecutiveFailures(taskID))
+	if need <= 0 {
+		return 0
+	}
+	elapsed := time.Since(time.Unix(0, v.(int64)))
+	if elapsed >= need {
+		return 0
+	}
+	return need - elapsed
+}
+
+// noteProgress 实现 L3（§5.4 ①）：连续 N 轮零进展 → stalled_task。
+//
+// 「进展」的定义是「有新东西落库」而不是「进程还活着」：目标判定、新意图、
+// 新资产、新漏洞任一发生即算。这样长任务只要还有产出就不会被打断，
+// 而卡死的任务一定会被逮到——这正是 §4.2 那次「5 小时 48 分无人发现」的反面。
+func (e *Engine) noteProgress(t *Task, reason string, met bool) {
+	if met {
+		e.clearNoProgress(t.ID)
+		return
+	}
+	// 本轮有没有产出：拿意图/资产/发现的当前数与上一轮记的比。
+	cur := e.progressSnapshot(t)
+	prev, had := e.lastProgress.Load(t.ID)
+	e.lastProgress.Store(t.ID, cur)
+	if had && cur.newerThan(prev.(progressSnapshot)) {
+		e.clearNoProgress(t.ID)
+		return
+	}
+	if !had {
+		// 第一轮只建立基线，不算零进展。
+		return
+	}
+	n := e.bumpNoProgress(t.ID)
+	threshold := llmrec.DefaultStalledRounds
+	if e.llmSup != nil {
+		threshold = e.llmSup.StalledRounds()
+	}
+	if !llmrec.StalledTask(n, threshold) {
+		return
+	}
+	// 只告警一次，避免每轮都刷。
+	if _, loaded := e.taskStalled.LoadOrStore(t.ID, true); loaded {
+		return
+	}
+	log.Printf("[planner] task %s 连续 %d 轮零进展，判为 stalled_task（阈值 %d）", t.ID, n, threshold)
+	e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+		Summary: fmt.Sprintf("连续 %d 轮规划没有任何进展（无目标判定、无新意图、无新资产），已停下等待人工确认", n)})
+}
+
+// progressSnapshot 是一轮结束时的产出计数，用于判断「这一轮有没有新东西」。
+type progressSnapshot struct {
+	goalsMet  int
+	intents   int
+	assets    int
+	findings  int
+	collected int64
+}
+
+// newerThan 判断当前快照是否比上一轮有进展。任一计数增长即算有进展。
+func (p progressSnapshot) newerThan(q progressSnapshot) bool {
+	return p.goalsMet > q.goalsMet || p.intents > q.intents ||
+		p.assets > q.assets || p.findings > q.findings || p.collected > q.collected
+}
+
+// progressSnapshot 读当前任务的产出计数（best-effort：读不到就用 0，
+// 只影响「有没有进展」的判定灵敏度，不影响主流程）。
+func (e *Engine) progressSnapshot(t *Task) progressSnapshot {
+	var s progressSnapshot
+	if t == nil || t.Store == nil {
+		return s
+	}
+	if n, err := t.Store.CountGoalsMet(); err == nil {
+		s.goalsMet = n
+	}
+	if n, err := t.Store.CountIntents(); err == nil {
+		s.intents = n
+	}
+	if e.m != nil && e.m.pg != nil && t.ID != "" {
+		if id, err := strconv.ParseInt(t.ID, 10, 64); err == nil {
+			if n, err := e.m.pg.CountTaskAssets(id); err == nil {
+				s.assets = n
+			}
+			if n, err := e.m.pg.CountTaskFindings(id); err == nil {
+				s.findings = n
+			}
+		}
+	}
+	return s
+}
+
+func (e *Engine) bumpNoProgress(taskID string) int {
+	v, _ := e.noProgress.LoadOrStore(taskID, new(int32))
+	return int(atomic.AddInt32(v.(*int32), 1))
+}
+
+func (e *Engine) clearNoProgress(taskID string) {
+	if v, ok := e.noProgress.Load(taskID); ok {
+		atomic.StoreInt32(v.(*int32), 0)
+	}
+	e.taskStalled.Delete(taskID)
 }
 
 // Pause stops a task: marks it paused AND cancels any in-flight planner/worker run
@@ -342,15 +512,18 @@ func (e *Engine) execContextFor(parent context.Context, taskID string) context.C
 		// never hand out a live context while paused (guards the claim→Execute race)
 		c, cancel := context.WithCancelCause(parent)
 		cancel(agent.AbortPausedRaceGuard)
-		return c
+		return llmrec.WithTaskID(c, taskID)
 	}
 	if c := e.execCtx[taskID]; c != nil && c.Err() == nil {
-		return c
+		return llmrec.WithTaskID(c, taskID)
 	}
 	c, cancel := context.WithCancelCause(parent)
 	e.execCtx[taskID] = c
 	e.execCancel[taskID] = cancel
-	return c
+	// R19 序 4 前置：给任务主链路（planner/worker）的每次 LLM 调用显式挂任务注册 id。
+	// llm_usage.task_id 是 TEXT，历史上主链路行回退落的是会话解析出的探索 id 字符串
+	//（会话 id 基于探索 id，与任务注册 id 不可互换），按注册 id 查每任务 token 报表会静默返空。
+	return llmrec.WithTaskID(c, taskID)
 }
 
 // IsPaused reports whether a task is user-paused.
@@ -495,7 +668,15 @@ func (e *Engine) releaseWorkControl(intentID int64, run *workExecution, action s
 }
 
 func transitionIntentState(store *db.ExplorationStore, intentID int64, expected, state string) error {
-	changed, err := store.CompareAndSetIntentState(intentID, expected, state)
+	return transitionIntentStateWithReason(store, intentID, expected, state, "")
+}
+
+// transitionIntentStateWithReason 是带原因的版本（1.6.2 第 3 步）。
+//
+// 转 blocked 时必须给出原因，否则写入口会把它降级成 unknown。调用点要尽量
+// 给出**具体**原因（配额/守卫/资产丢失），给不出才留空 → unknown。
+func transitionIntentStateWithReason(store *db.ExplorationStore, intentID int64, expected, state, reason string) error {
+	changed, err := store.CompareAndSetIntentStateWithReason(intentID, expected, state, reason)
 	if err != nil {
 		return err
 	}
@@ -503,6 +684,42 @@ func transitionIntentState(store *db.ExplorationStore, intentID int64, expected,
 		return fmt.Errorf("%w: 意图 %d 不再是 %s 状态", db.ErrIntentStateConflict, intentID, expected)
 	}
 	return nil
+}
+
+// blockedReasonForError 把 worker 的失败原因归到 blocked 枚举。
+//
+// 这一步是「40 条原因为空」的直接修复点：旧代码只在 LLM 链耗尽时才写原因，
+// 其余错误一律走泛型路径落 NULL。现在每一种都映射到一个可行动的类别——
+// 运维看台账就知道该改配置、该补授权、还是该等预算。
+func blockedReasonForError(err error) string {
+	if err == nil {
+		return db.IntentBlockedUnknown
+	}
+	if isTaskLLMChainExhausted(err) {
+		return db.IntentBlockedLLMQuota
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "llm profile"), strings.Contains(msg, "no available fallback"),
+		strings.Contains(msg, "model_not_found"), strings.Contains(msg, "unreachable"):
+		return db.IntentBlockedLLMUnavailable
+	case strings.Contains(msg, "out_of_scope"), strings.Contains(msg, "不在授权范围"),
+		strings.Contains(msg, "not in scope"):
+		return db.IntentBlockedOutOfScope
+	case strings.Contains(msg, "guard"), strings.Contains(msg, "守卫"), strings.Contains(msg, "denied"):
+		return db.IntentBlockedGuardDenied
+	case strings.Contains(msg, "intent 必须是本任务的意图"), strings.Contains(msg, "asset"),
+		strings.Contains(msg, "资产"):
+		return db.IntentBlockedAssetMissing
+	case strings.Contains(msg, "budget"), strings.Contains(msg, "max_tokens"), strings.Contains(msg, "轮数"):
+		return db.IntentBlockedBudget
+	case strings.Contains(msg, "context canceled"), strings.Contains(msg, "任务已"),
+		strings.Contains(msg, "task stopped"):
+		return db.IntentBlockedTaskStopped
+	}
+	// 归不出来的：留空 → 写入口降级为 unknown。不硬编一个像模像样的原因，
+	// 那会让台账看起来完整、实际是猜的。
+	return ""
 }
 
 // SteerWork queues a mid-run course-correction for the work running intentID (the
@@ -742,6 +959,12 @@ func (e *Engine) emitActivity(t *Task, r db.Activity) db.Activity {
 func (e *Engine) appendActivity(t *Task, r db.Activity) (int64, error) {
 	var id int64
 	var err error
+	// 没有 Store 的任务（单测构造的裸 Task、或探索记录尚未建立的极早期）不该
+	// 让记账路径 panic：活动只是观测面，缺了它主流程仍必须能跑完。
+	// R21 的 L3 告警正是在这种「刚起、Store 还没就绪」的时刻最可能触发。
+	if t == nil || t.Store == nil {
+		return 0, errActivityNoStore
+	}
 	for attempt := 1; attempt <= 3; attempt++ {
 		if id, err = t.Store.AppendActivity(r); err == nil {
 			if attempt > 1 {
@@ -760,6 +983,11 @@ func (e *Engine) appendActivity(t *Task, r db.Activity) (int64, error) {
 // SetReadiness wires the global "an LLM provider is configured" predicate (read by
 // Ready() / the llm_configured indicator). Called once at startup.
 func (e *Engine) SetReadiness(fn func() bool) { e.readiness = fn }
+
+// SetLLMTargetResolver installs a resolver returning the model/profile a task
+// currently runs on. Wired by the server once at startup (only it knows the
+// profile chain and agent bindings). Nil → round records keep those columns empty.
+func (e *Engine) SetLLMTargetResolver(fn func(t *Task) (string, string)) { e.llmTarget = fn }
 
 // SetAgentResolver installs a per-task planner/worker resolver (wired by the server).
 // Called once at startup before any task loop runs, so no lock is needed on reads.
@@ -827,6 +1055,7 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 		runTaskRoutine(rt, func(loopCtx context.Context) { e.workerLoop(loopCtx, t, name) })
 	}
 	e.startDeadlineCoordinator(ctx, t) // 任务级超时定时器(仅 timeout>0;去重)
+	e.startBudgetCoordinator(ctx, t)   // 任务级预算协调器(R19 序 4;仅设上限的任务;去重)
 	// 仅在「完全没有活动意图(open+running)」时才 kick 首轮规划。带种子意图的任务:种子已
 	// 是 open,或已被上面刚起的 worker 抢先 claim 成 running——两种都算「有活干」,一律跳过
 	// 首轮 planner,worker 直接领种子意图开跑,跑完由 NotifyDone/心跳唤醒 planner。
@@ -899,6 +1128,13 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if e.isSettling(t.ID) {
 			return
 		}
+		// 失败退避（R21 缺口⑤）：连续失败后的这段窗口里，心跳与边沿唤醒都不该再
+		// 发 LLM 调用。不放在最前面是刻意的——暂停/删除/终态这些守卫更便宜，
+		// 先判它们能少打一行日志。
+		if wait := e.backoffRemaining(t.ID); wait > 0 {
+			log.Printf("[planner] task %s 失败退避中，剩余 %s，本轮跳过", t.ID, wait.Round(time.Second))
+			return
+		}
 		// goalless（人工直投）分支：任务已无 open 目标时 planner 不跑——跑了会重判
 		// met→cancelExec 杀掉用户经主 agent 直投的意图。是否结束改由 frontier 决定：
 		// 还有 open/running 意图 → 保持 running、静默等待；意图已全部跑干 → 落 done。
@@ -916,6 +1152,15 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 				}
 			}
 			return // goalless 分支永不进入 planner.Plan
+		}
+		// R19 序 4：预算闸门的同步快查——每次真正要花 LLM 的规划轮之前先对一次上限，
+		// 超限就不再发起本轮调用，把「协调器轮询窗口内白烧」夹到零。收尾时序本身
+		// （写台账、终局判定、落终态）由预算协调器执行（每 30s 兑底）。
+		if pg := e.m.PG(); pg != nil && (t.MaxRounds > 0 || t.MaxInputTokens > 0) {
+			if cause, hit := e.budgetHit(t, pg); hit {
+				log.Printf("[planner] task %s %s，跳过本轮规划，等收尾时序", t.ID, cause.label())
+				return
+			}
 		}
 		if !e.beginTaskOperation(t.ID) {
 			return
@@ -944,8 +1189,15 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		var supRound *llmrec.Round
 		if e.llmSup != nil {
 			roundID := t.ID + "-plan-" + strconv.Itoa(e.plannerRoundNo(t.ID))
+			// 缺口③：把本轮实际用的 model 与 profile 名带进轮记录。缺了这两列，
+			// 事后只能翻日志才知道「是哪个端点废的这一轮」。
+			model, profileName := "", ""
+			if e.llmTarget != nil {
+				model, profileName = e.llmTarget(t)
+			}
 			supRound, pctx = e.llmSup.Begin(ectx, llmrec.RoundMeta{
 				RoundID: roundID, TaskID: taskIDInt, Worker: "planner", TriggerSrc: src,
+				Model: model, ProfileName: profileName,
 			})
 			// 首帧观测：provider 被包一层，首个流事件到达会喂给 supRound，
 			// 否则 T1 内没人回调，watchFirstEvent 会主动 cancel 本轮（stalled）。
@@ -962,8 +1214,18 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			log.Printf("[planner] task %s 规划出错: %v", t.ID, err)
 			// 失败轮只读不清：触发留在 pending，等下一次唤醒重新读取（R21 ④第一条）。
 			// 不 commit；下一次成功轮才会清掉。
+			//
+			// R21 缺口⑤：光「不丢触发」会让唤醒条件立刻再次成立，于是规划循环对着
+			// 同一个坏端点每 20–30 秒轰一轮。这里记连续失败并退避，退避期内的心跳
+			// 唤醒直接跳过（不消耗 LLM 调用）。
+			n := e.bumpConsecutiveFail(t.ID)
+			if d := e.plannerBackoff(t.ID, n); d > 0 {
+				e.emitActivity(t, db.Activity{Worker: "planner", Kind: "text",
+					Summary: fmt.Sprintf("规划连续失败 %d 轮，退避 %s 后重试", n, d.Round(time.Second))})
+			}
 		case met:
 			log.Printf("[planner] task %s 判定目标达成: %s", t.ID, reason)
+			e.clearConsecutiveFail(t.ID)
 			// 所有目标达成 → 持久化任务状态为 done（前端 DTO 会优先展示该终态）。
 			if err := e.m.SetTaskStatus(t.ID, "done"); err != nil {
 				log.Printf("[planner] task %s 标记完成落库失败: %v", t.ID, err)
@@ -974,8 +1236,13 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			e.cancelExec(t.ID, agent.AbortGoalMet)
 		default:
 			log.Printf("[planner] task %s 规划完成", t.ID)
+			e.clearConsecutiveFail(t.ID)
 			// 规划成功：触发已被消费，清 pending（R21 ④第一条的另一半）。
 			t.commitTriggers()
+			// L3（§5.4 ①）：连续 N 轮零进展 → stalled_task，停下来问人。
+			// 判据用「本轮有没有任何进展」而不是「跑到第几轮」，这样长任务只要
+			// 还有产出就不会被打断，卡死的任务则一定会被逮到。
+			e.noteProgress(t, reason, met)
 		}
 		e.touch(t.ID)
 	}
@@ -1226,8 +1493,16 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		state = "exhausted"
 		log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
 	}
-	if state == "blocked" && isTaskLLMChainExhausted(err) {
-		_ = t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedLLMQuota)
+	// 1.6.2 第 3 步：转 blocked 必须带原因。旧代码只在 LLM 链耗尽时写原因，
+	// 其余错误全走泛型路径落 NULL（实测 40 条原因全空）。
+	if state == "blocked" {
+		reason := blockedReasonForError(err)
+		if reason == db.IntentBlockedLLMQuota {
+			// 配额耗尽有专门的写入口（它会带 completed_at），沿用。
+			_ = t.Store.SetIntentBlockedReason(intent.ID, reason)
+		} else if stateErr := transitionIntentStateWithReason(t.Store, intent.ID, "running", state, reason); stateErr != nil {
+			log.Printf("[worker %s] task %s 意图 #%d 终态 %s 落库失败: %v", name, t.ID, intent.ID, state, stateErr)
+		}
 	} else {
 		if stateErr := transitionIntentState(t.Store, intent.ID, "running", state); stateErr != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 终态 %s 落库失败: %v", name, t.ID, intent.ID, state, stateErr)

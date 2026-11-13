@@ -265,9 +265,58 @@ ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, from, re
 
 // SetNodeState updates any node's state (never deletes). content_version bumps
 // so a folded member's state flip invalidates its digest's cached body (§5.3).
+//
+// 1.6.2 第 3 步：转 blocked 时必须带原因。旧实现无条件 `blocked_reason=NULL`，
+// 于是经由此路径变 blocked 的意图（实测 40 条）原因全空，台账答不出「为什么
+// 还没完」，`ReopenIntentsByBlockedReason` 对它们也永远不生效。
+// 非 blocked 的状态仍然清空原因——那是正确的：离开 blocked 后原因不再适用。
 func (s *ExplorationStore) SetNodeState(id int64, state string) error {
-	_, err := s.db.Exec(`UPDATE exploration_nodes SET state=$1, blocked_reason=NULL, content_version=content_version+1 WHERE id=$2 AND exploration_id=$3`, state, id, s.expID)
+	return s.SetNodeStateWithReason(id, state, "")
+}
+
+// SetNodeStateWithReason 是 SetNodeState 的带原因版本。
+// state=="blocked" 时 reason 必须是合法枚举，否则直接报错——**不允许**
+// 静默用 NULL 落库，那正是这条欠账的成因。
+func (s *ExplorationStore) SetNodeStateWithReason(id int64, state, reason string) error {
+	blocked := state == "blocked"
+	reason = normalizeReasonForState(state, reason)
+	_, err := s.db.Exec(`UPDATE exploration_nodes
+SET state=$1,
+    blocked_reason=CASE WHEN $5 THEN NULLIF($4,'') ELSE NULL END,
+    content_version=content_version+1
+WHERE id=$2 AND exploration_id=$3`, state, id, s.expID, reason, blocked)
 	return err
+}
+
+// normalizeReasonForState 决定「这次写入要落什么原因」。
+//
+// 两条规则：
+//   - 非 blocked 状态一律清空——离开 blocked 后旧原因不再适用，留着会误导；
+//   - blocked 且调用方给了非空原因 → **原样保留**（调用方比这里更清楚成因）；
+//     没给 → unknown（如实表达「原因丢了」，绝不留 NULL）。
+//
+// 为什么不强制枚举：泛型写入的调用点分散在各处，强制归一化会把「network_unavailable」
+// 这类具体原因洗成 unknown，反而降低台账价值。枚举用于统计与筛选标签，
+// 未登记的值按原文展示即可。
+func normalizeReasonForState(state, reason string) string {
+	if state != "blocked" {
+		return ""
+	}
+	if r := strings.TrimSpace(reason); r != "" {
+		return r
+	}
+	return IntentBlockedUnknown
+}
+
+// MustNormalizeIntentBlockedReason 严格版：非法原因返回 error。
+// 给「明确知道自己在写 blocked」的调用点用（例如 LLM 配额、守卫拒绝），
+// 这些地方传了个拼错的原因就是编码错误，该在测试里红。
+func MustNormalizeIntentBlockedReason(reason string) (string, error) {
+	r, ok := NormalizeIntentBlockedReason(reason)
+	if !ok {
+		return "", errInvalidBlockedReason(reason)
+	}
+	return r, nil
 }
 
 // UpdateGoalPayload rewrites a goal node's payload text (and optional vulnclass);
@@ -349,11 +398,22 @@ WHERE exploration_id=$1 AND kind='intent' AND state='blocked'`, s.expID)
 }
 
 func (s *ExplorationStore) SetIntentState(id int64, state string) error {
+	return s.SetIntentStateWithReason(id, state, "")
+}
+
+// SetIntentStateWithReason 是 SetIntentState 的带原因版本（1.6.2 第 3 步）。
+// state=="blocked" 时原因必填；其它状态清空。详见 SetNodeStateWithReason 的说明。
+func (s *ExplorationStore) SetIntentStateWithReason(id int64, state, reason string) error {
 	// terminal states stamp completed_at; reopening (back to open/running) clears it.
 	terminal := state == "done" || state == "blocked" || state == "exhausted" || state == "stopped"
+	blocked := state == "blocked"
+	reason = normalizeReasonForState(state, reason)
 	_, err := s.db.Exec(`UPDATE exploration_nodes
-SET state=$1, blocked_reason=NULL, content_version=content_version+1, completed_at = CASE WHEN $4 THEN now() ELSE NULL END
-WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, state, id, s.expID, terminal)
+SET state=$1,
+    blocked_reason=CASE WHEN $6 THEN NULLIF($5,'') ELSE NULL END,
+    content_version=content_version+1,
+    completed_at = CASE WHEN $4 THEN now() ELSE NULL END
+WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, state, id, s.expID, terminal, reason, blocked)
 	return err
 }
 
@@ -361,10 +421,21 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, state, id, s.expID, termin
 // state still matches expected. It is the state boundary used by pause/resume and
 // worker settlement, so a stale API read cannot overwrite a concurrent finish.
 func (s *ExplorationStore) CompareAndSetIntentState(id int64, expected, state string) (bool, error) {
+	return s.CompareAndSetIntentStateWithReason(id, expected, state, "")
+}
+
+// CompareAndSetIntentStateWithReason 是带原因的 CAS 版本（1.6.2 第 3 步）。
+// 转 blocked 时原因必填；其它状态清空。
+func (s *ExplorationStore) CompareAndSetIntentStateWithReason(id int64, expected, state, reason string) (bool, error) {
 	terminal := state == "done" || state == "blocked" || state == "exhausted" || state == "stopped"
+	blocked := state == "blocked"
+	reason = normalizeReasonForState(state, reason)
 	res, err := s.db.Exec(`UPDATE exploration_nodes
-SET state=$1, blocked_reason=NULL, content_version=content_version+1, completed_at = CASE WHEN $5 THEN now() ELSE NULL END
-WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state=$4`, state, id, s.expID, expected, terminal)
+SET state=$1,
+    blocked_reason=CASE WHEN $7 THEN NULLIF($6,'') ELSE NULL END,
+    content_version=content_version+1,
+    completed_at = CASE WHEN $5 THEN now() ELSE NULL END
+WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state=$4`, state, id, s.expID, expected, terminal, reason, blocked)
 	if err != nil {
 		return false, err
 	}
@@ -2018,4 +2089,23 @@ func (s *ExplorationStore) ActivityByIDsForTerminalIntents(ids []int64) ([]Activ
 // exploration node is deleted). taskID and nodeID may be 0 (stored as NULL).
 func (s *ExplorationStore) AddStandaloneFinding(taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64) (int64, error) {
 	return s.db.AddFinding(taskID, nodeID, vulnclass, name, severity, summary, evidence, worker, assetIDs)
+}
+
+// CountGoalsMet 返回该探索里已判定达成的目标数。R21 的 L3 判据用它判断
+// 「这一轮有没有判出目标」——「有进展」的定义是有新东西落库，不是进程还活着。
+func (s *ExplorationStore) CountGoalsMet() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM exploration_nodes
+WHERE exploration_id=$1 AND kind=goal AND state=met`, s.expID).Scan(&n)
+	return n, err
+}
+
+// CountIntents 返回该探索的意图总数（含各终态）。
+// 与 CountOpenIntents 的区别：前者用于「这一轮有没有新意图产生」，
+// 后者用于「还有没有可领的活」。
+func (s *ExplorationStore) CountIntents() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM exploration_nodes
+WHERE exploration_id=$1 AND kind=intent`, s.expID).Scan(&n)
+	return n, err
 }

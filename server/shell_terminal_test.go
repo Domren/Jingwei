@@ -362,7 +362,9 @@ func TestPowerShellSessionRejectsCmdScriptsWithReason(t *testing.T) {
 		`reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v jw-x /t REG_SZ /d "cmd.exe /c whoami" /f 2>&1 && echo JW_ARTIFACT_OK`,
 		`sc create "jw-x" binPath= "cmd.exe /c whoami" start= auto 2>&1 & echo JW_ARTIFACT_OK`,
 		`del /f /q "C:\x.txt" >nul 2>&1 & echo JW_ARTIFACT_OK & cmd /c exit 0`,
-		`"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand AAAABBBB`,
+		// `-EncodedCommand` 单独出现不是 cmd 标记：平台的 wmi/startup/service 维持
+		// 模块就是用它把 PS 脚本交给 powershell.exe，在 PS 会话里同样合法。
+		// 真正该拦的是「经 cmd 调 powershell.exe」那种包装（见下一条）。
 		`echo __JW_CHUNK__ & "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "$p='C:\x'" & echo __JW_CHUNK_END__`,
 	}
 	for i, cmd := range cmdScripts {

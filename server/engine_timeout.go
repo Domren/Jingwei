@@ -10,6 +10,7 @@ import (
 
 	"github.com/Autumn-27/jingwei/agent"
 	"github.com/Autumn-27/jingwei/db"
+	"github.com/Autumn-27/jingwei/llmrec"
 )
 
 // 任务级超时协调器(见 docs/任务级超时与收尾设计.md §4/§8.5)。
@@ -60,6 +61,63 @@ func (e *Engine) beginTaskOperation(taskID string) bool {
 func (e *Engine) decInflight(taskID string) { atomic.AddInt64(e.inflightCounter(taskID), -1) }
 func (e *Engine) inflightCount(taskID string) int64 {
 	return atomic.LoadInt64(e.inflightCounter(taskID))
+}
+
+// ---------- settle 原因（R19 序 4） ----------
+
+// settleCause 区分两类任务到限收尾：绝对墙钟超时 vs 预算（轮数/输入 token）到限。
+// 两者走同一套有序时序（drain → 终局规划轮 → 终态），差别只在终局收尾词（agent
+// 按 TaskClock.Settle 挑）、活动台账文案与终态（timeout / budget）。
+type settleCause int
+
+const (
+	settleTimeout      settleCause = iota // 绝对墙钟到点
+	settleBudgetRounds                    // 规划轮数达到 max_rounds
+	settleBudgetTokens                    // 输入 token 达到 max_input_tokens
+)
+
+// settleKey 是 agent.TaskClock.Settle 的取值："timeout" | "budget"。agent 侧按它挑
+// 任务收尾词（超时词/预算词）。
+func (c settleCause) settleKey() string {
+	if c == settleTimeout {
+		return "timeout"
+	}
+	return "budget"
+}
+
+// status 是收尾落库的终态名（timeout / budget；met 优先 done 由调用方决定）。
+func (c settleCause) status() string { return c.settleKey() }
+
+// summary 是活动台账里「任务xx收尾」的短文案。
+func (c settleCause) summary() string {
+	if c == settleTimeout {
+		return "超时收尾"
+	}
+	return "预算到限收尾"
+}
+
+func (c settleCause) label() string {
+	switch c {
+	case settleBudgetRounds:
+		return "达到规划轮数上限"
+	case settleBudgetTokens:
+		return "达到输入 token 上限"
+	default:
+		return "到达超时上限"
+	}
+}
+
+// stopReasonText 是落 tasks.stop_reason 的台账文案（「为什么停」要能在台账里回答）。
+// done 不写。
+func (c settleCause) stopReasonText(t *Task) string {
+	switch c {
+	case settleBudgetRounds:
+		return fmt.Sprintf("达到规划轮数上限（max_rounds=%d）", t.MaxRounds)
+	case settleBudgetTokens:
+		return fmt.Sprintf("达到输入 token 上限（max_input_tokens=%d）", t.MaxInputTokens)
+	default:
+		return "到达超时上限"
+	}
 }
 
 // ---------- deadline ----------
@@ -175,17 +233,88 @@ func (e *Engine) deadlineCoordinator(ctx context.Context, t *Task) {
 			}
 			continue
 		}
-		e.settleTask(ctx, t)
+		e.settleTask(ctx, t, settleTimeout)
 		return
 	}
 }
 
-// settleTask runs the ordered settle sequence once (§4 steps ①–⑥).
-func (e *Engine) settleTask(ctx context.Context, t *Task) {
+// ---------- 预算协调器（R19 序 4：轮数 + 输入 token 双上限） ----------
+
+// budgetPollInterval 预算协调器的轮询间隔。与 deadline 协调器的「到点才动」不同，
+// 预算是累积量，只能周期查询；规划轮入口另有同步快查（plannerLoop），窗口内的
+// 白烧被夹到一轮以内。
+const budgetPollInterval = 30 * time.Second
+
+// startBudgetCoordinator 为设置了预算上限的任务启动预算协调器（与 deadline 协调器
+// 同一套去重/例程模式）。轮数与输入 token 任一命中即进入收尾时序。
+func (e *Engine) startBudgetCoordinator(ctx context.Context, t *Task) {
+	if t == nil || (t.MaxRounds <= 0 && t.MaxInputTokens <= 0) {
+		return
+	}
+	e.deleteMu.RLock()
+	if e.IsDeleting(t.ID) {
+		e.deleteMu.RUnlock()
+		return
+	}
+	if _, loaded := e.budgetCoordStarted.LoadOrStore(t.ID, true); loaded {
+		e.deleteMu.RUnlock()
+		return
+	}
+	rt := e.registerTaskRoutines(ctx, t.ID, 1)
+	e.deleteMu.RUnlock()
+	runTaskRoutine(rt, func(loopCtx context.Context) { e.budgetCoordinator(loopCtx, t) })
+}
+
+func (e *Engine) budgetCoordinator(ctx context.Context, t *Task) {
+	pg := e.m.PG()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if isTerminalStatus(e.m.TaskStatus(t.ID)) {
+			return
+		}
+		if pg != nil {
+			if cause, hit := e.budgetHit(t, pg); hit {
+				e.settleTask(ctx, t, cause)
+				return
+			}
+		}
+		if sleepCtx(ctx, budgetPollInterval) {
+			return
+		}
+	}
+}
+
+// budgetHit 查询任务当前用量并对上限；查询出错只记日志（下一轮再试），不误杀任务。
+func (e *Engine) budgetHit(t *Task, pg *db.DB) (settleCause, bool) {
+	rounds, tokens, err := pg.TaskBudgetUsage(t.ID, t.ExpID)
+	if err != nil {
+		log.Printf("[budget] task %s 查询预算用量失败: %v", t.ID, err)
+		return 0, false
+	}
+	if t.MaxRounds > 0 && rounds >= int64(t.MaxRounds) {
+		log.Printf("[budget] task %s 规划轮数 %d/%d 到限", t.ID, rounds, t.MaxRounds)
+		return settleBudgetRounds, true
+	}
+	if t.MaxInputTokens > 0 && tokens >= t.MaxInputTokens {
+		log.Printf("[budget] task %s 输入 token %d/%d 到限", t.ID, tokens, t.MaxInputTokens)
+		return settleBudgetTokens, true
+	}
+	return 0, false
+}
+
+// settleTask runs the ordered settle sequence once (§4 steps ①–⑥). cause 决定
+// 终局收尾词、台账文案与终态（timeout / budget；met 仍优先 done）。
+func (e *Engine) settleTask(ctx context.Context, t *Task, cause settleCause) {
 	if !e.markSettling(t.ID) {
 		return
 	}
-	log.Printf("[deadline] task %s 到达超时上限,进入收尾时序", t.ID)
+	log.Printf("[settle] task %s %s,进入收尾时序", t.ID, cause.label())
+	e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+		Summary: fmt.Sprintf("任务%s，进入收尾时序：在跑 worker 优雅写回，随后终局判定落终态", cause.label())})
 
 	// ④ 等在跑 worker/planner drain(在跑 run 因夹逼的 MaxDuration 自行进收尾);
 	// 超过 grace 仍未清空 → 硬 cancel 该任务 exec ctx(settling-aware 分支正确归类)。
@@ -202,34 +331,46 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 		}
 	}
 
-	// ⑤ 终局一轮 planner(任务超时词,最后目标判定,不产新意图)。
-	met := e.runFinalPlannerRound(ctx, t)
+	// ⑤ 终局一轮 planner(任务超时/预算收尾词,最后目标判定,不产新意图)。
+	met := e.runFinalPlannerRound(ctx, t, cause)
 	if !e.beginTaskOperation(t.ID) {
 		return
 	}
 	defer e.decInflight(t.ID)
 
-	// ⑥ 定终态(带守卫):met → done(completed);否则 timeout。若常规路径已先落 done,
-	// 守卫(SetTaskStatusGuarded)会拒绝覆盖,保留 completed 语义。
-	status := "timeout"
+	// ⑥ 定终态(带守卫):met → done(completed);否则按 cause 落 timeout/budget。
+	// 若常规路径已先落 done,守卫(SetTaskStatusGuarded)会拒绝覆盖,保留 completed 语义。
+	status := cause.status()
 	if met {
 		status = "done"
 	}
 	won, err := e.m.SetTaskStatusGuarded(t.ID, status)
 	switch {
 	case err != nil:
-		log.Printf("[deadline] task %s 落终态失败: %v", t.ID, err)
+		log.Printf("[settle] task %s 落终态失败: %v", t.ID, err)
 	case won:
-		log.Printf("[deadline] task %s 收尾完成,终态=%s", t.ID, status)
+		log.Printf("[settle] task %s 收尾完成,终态=%s", t.ID, status)
+		// 「为什么停」写进台账（R19 序 4）：超时/预算各留一句可读原因；done 不写。
+		if reason := cause.stopReasonText(t); status != "done" && reason != "" {
+			if idInt, perr := strconv.ParseInt(t.ID, 10, 64); perr == nil {
+				if pg := e.m.PG(); pg != nil {
+					if serr := pg.SetTaskStopReason(idInt, reason); serr != nil {
+						log.Printf("[settle] task %s 写 stop_reason 失败: %v", t.ID, serr)
+					} else {
+						t.updateLifecycle(func(s *taskLifecycleState) { s.StopReason = reason })
+					}
+				}
+			}
+		}
 	default:
-		log.Printf("[deadline] task %s 收尾时已是终态,保留原状态", t.ID)
+		log.Printf("[settle] task %s 收尾时已是终态,保留原状态", t.ID)
 	}
 }
 
 // runFinalPlannerRound drives exactly ONE terminal planner round with the
-// task-timeout planner words (final goal judgment; no new intents). Waits for the
+// task-timeout/budget planner words (final goal judgment; no new intents). Waits for the
 // LLM to be ready (bounded by ctx) so a completable task isn't mis-judged timeout.
-func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task) (met bool) {
+func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task, cause settleCause) (met bool) {
 	if e.IsDeleting(t.ID) {
 		return false
 	}
@@ -246,15 +387,18 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task) (met bool) {
 		}
 		planner, _ = e.snapshotFor(t)
 	}
-	// 独立 ctx(不挂 execCancel,避免 pause/硬 cancel 打断这最后一轮),带 Final 注入任务超时词。
-	fctx := e.clockCtx(ctx, t, true)
+	// 独立 ctx(不挂 execCancel,避免 pause/硬 cancel 打断这最后一轮),带 Final + Settle
+	// 注入对应收尾词(超时词/预算词,agent 按 TaskClock.Settle 挑)。
+	fctx := llmrec.WithTaskID(agent.WithTaskClock(ctx, agent.TaskClock{
+		DeadlineUnix: e.taskDeadline(t), Final: true, Settle: cause.settleKey(),
+	}), t.ID)
 	if !e.beginTaskOperation(t.ID) {
 		return false
 	}
 	defer e.decInflight(t.ID)
 	emit := func(r db.Activity) { e.emitActivity(t, r) }
 	e.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
-		Summary: fmt.Sprintf("任务超时收尾·终局判定(第 %d 轮)", e.nextPlannerRound(t.ID))})
+		Summary: fmt.Sprintf("任务%s·终局判定(第 %d 轮)", cause.summary(), e.nextPlannerRound(t.ID))})
 	tTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
 	met, reason, err := planner.Plan(fctx, tTaskID, e.m.assets, t.Store, t.Goal, t.drainTriggers(), emit)

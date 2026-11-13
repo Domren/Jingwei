@@ -102,6 +102,58 @@ func (s *AssetStore) upsertTaskScope(ts TaskScope) error {
 	return err
 }
 
+// TaskTargetPair 是 ip_port 严格粒度下的一条授权对（R19 序 5）：任务清单里登记的
+// host:port。由 seed 在任务创建时写入 task_scope(kind='target', source='manual')，
+// guard 的范围检查按它对 (host, port) 做硬约束；by_ip 粒度不读它。
+type TaskTargetPair struct {
+	Host string
+	Port int
+}
+
+// AddTaskTargetScope 把解析出的目标清单写成 task_scope(kind='target') 行，幂等
+// （uq_task_scope_v2）。host 已由 parseTarget 归一（小写）；port 恒 >0（parseTarget
+// 对裸 IP/域名补默认端口）。taskID<=0 或 host 为空 → no-op。
+func (s *AssetStore) AddTaskTargetScope(taskID int64, host string, port int) error {
+	if taskID <= 0 || strings.TrimSpace(host) == "" {
+		return nil
+	}
+	return s.upsertTaskScope(TaskScope{
+		TaskID: taskID, Kind: "target",
+		Value:  fmt.Sprintf("%s:%d", strings.ToLower(strings.TrimSpace(host)), port),
+		Source: "manual", Reason: "由任务描述目标清单登记（授权粒度 ip_port 的约束对）",
+	})
+}
+
+// ListTaskTargetPairs 读回 kind='target' 的授权对。Value 形如 "host:port"；形状不对
+// 的行跳过不猜（seed 保证形状）。guard 在 ip_port 粒度下按它判定。
+func (s *AssetStore) ListTaskTargetPairs(taskID int64) ([]TaskTargetPair, error) {
+	if taskID <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`SELECT COALESCE(value,'') FROM task_scope WHERE task_id=$1 AND kind='target'`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []TaskTargetPair{}
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		host, port, err := net.SplitHostPort(v)
+		if err != nil {
+			continue
+		}
+		p, perr := strconv.Atoi(port)
+		if perr != nil || p <= 0 {
+			continue
+		}
+		out = append(out, TaskTargetPair{Host: strings.ToLower(strings.TrimSuffix(host, ".")), Port: p})
+	}
+	return out, rows.Err()
+}
+
 // AddAutoScope records the conservative task scope implied by ONE explicitly-inserted
 // asset item (source='auto'). MUST be called only from insertAssets' top-level loop —
 // never from a db-layer side effect (linkHostAssets), so派生资产不会盲目扩大范围。

@@ -220,6 +220,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		b := s.agentsForTask(t)
 		return b.pl, b.wk
 	})
+	// R21 缺口③：轮记录要能回答「是哪个端点废的这一轮」。model/profile 名在
+	// server 层才知道（任务链、agent 绑定、全局配置三种来源），Engine 只负责记账。
+	s.engine.SetLLMTargetResolver(s.taskLLMTarget)
 	// Global readiness (Ready()/llm_configured): a global active LLM provider is
 	// installed. Task-level runnability is separate (ReadyFor → the resolver above).
 	s.engine.SetReadiness(func() bool {
@@ -350,6 +353,7 @@ func (s *Server) restoreTaskRuntimes() {
 		// loop——非活跃任务重启后也能在到点后被收尾(deadline 已过则立即走收尾时序)。
 		if !isTerminalStatus(lifecycle.Status) {
 			s.engine.startDeadlineCoordinator(s.ctx, t)
+			s.engine.startBudgetCoordinator(s.ctx, t) // R19 序 4：预算任务重启后也要能被收尾
 		}
 	}
 	go newScheduler(s).Run(s.ctx)
@@ -1710,6 +1714,9 @@ type createTaskReq struct {
 	CompanyIDs           []int64          `json:"company_ids,omitempty"`       // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
 	TimeoutSeconds       int              `json:"timeout_seconds"`             // 任务级超时(秒);0/省略=不限时
 	PlanHeartbeatSeconds int              `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
+	MaxRounds            int              `json:"max_rounds"`                  // R19 序 4：任务级预算闸门——规划轮数上限;0/省略=不限
+	MaxInputTokens       int64            `json:"max_input_tokens"`            // R19 序 4：任务级预算闸门——累计输入 token 上限;0/省略=不限
+	ScopeGranularity     string           `json:"scope_granularity"`           // R19 序 5：授权粒度，必选：ip_port(严格按清单 host:port) | by_ip(按 IP 授权全部端口)
 	SeedFirstIntent      *bool            `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
 	CoverageEnabled      *bool            `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
@@ -1735,6 +1742,19 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	if req.TimeoutSeconds < 0 {
 		req.TimeoutSeconds = 0
 	}
+	if req.MaxRounds < 0 {
+		req.MaxRounds = 0
+	}
+	if req.MaxInputTokens < 0 {
+		req.MaxInputTokens = 0
+	}
+	// R19 序 5：授权粒度是创建必选项——粒度错了等于授权口径错了，缺省不回退。
+	gran, gerr := db.NormalizeScopeGranularity(req.ScopeGranularity)
+	if gerr != nil {
+		writeErr(w, 400, gerr.Error())
+		return
+	}
+	req.ScopeGranularity = gran
 	if len(req.SourceTaskIDs) > db.MaxTaskSourceCount {
 		writeErr(w, 400, fmt.Sprintf("关联任务最多选择 %d 个", db.MaxTaskSourceCount))
 		return
@@ -1780,8 +1800,10 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		Name:     strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
-		CoverageEnabled: req.CoverageEnabled,
-		InterceptRules:  interceptRules,
+		MaxRounds: req.MaxRounds, MaxInputTokens: req.MaxInputTokens,
+		ScopeGranularity: req.ScopeGranularity,
+		CoverageEnabled:  req.CoverageEnabled,
+		InterceptRules:   interceptRules,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {
@@ -2025,6 +2047,12 @@ func (s *Server) seed(t *Task, text string) {
 			continue
 		}
 		_ = as.SetTaskAssetSource(taskID, rootID, "task", "由任务描述或目标初始化", nil)
+		// R19 序 5：把清单目标写成 task_scope(kind='target') 授权对——ip_port 严格粒度的
+		// 范围硬约束按它判定；by_ip 粒度同样落账（审计「授权书清单到底是什么」）。写失败
+		// 不阻断 seed，但必须留日志：ip_port 任务少了授权对等于全部拒绝，不是静默降级。
+		if serr := as.AddTaskTargetScope(taskID, c.host, c.port); serr != nil {
+			log.Printf("[seed] task %s: 登记 %q 授权对失败: %v", t.ID, c.host, serr)
+		}
 		// anchor the seeded assets to this task's begin root as lineage/provenance
 		// (the asset graph is global and shared; anchoring no longer gates reads).
 		if begin > 0 {
@@ -3967,7 +3995,7 @@ func (s *Server) getTrafficExchange(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"req": req, "resp": resp})
+	writeJSON(w, 200, trafficDetailWithBase64(req, resp))
 }
 
 // getTrafficBlob streams one oversized body by its sha256. Bodies past the inline

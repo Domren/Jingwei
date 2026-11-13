@@ -761,3 +761,50 @@ func (s *Server) emitManualTaskLLMSwitch(t *Task, previousID, nextID *int64) db.
 	}})
 	return s.engine.emitActivity(t, db.Activity{Worker: "system", Kind: "llm_switch", Summary: summary, Detail: summary, Metadata: metadata})
 }
+
+// taskLLMTarget 返回任务当前实际生效的 model 与 profile 名（R21 缺口③）。
+//
+// 轮记录缺这两列时，事后只能翻日志才知道「是哪个端点废的这一轮」。这里复用
+// activeCfg 的解析顺序（agent 绑定 → 任务激活 profile → 全局），保证记下来的
+// 就是这一次真正会用的那个端点，而不是「配置里写了什么」。
+func (s *Server) taskLLMTarget(t *Task) (model, profileName string) {
+	if t == nil {
+		return "", ""
+	}
+	r := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "planner"}
+	cfg, ok := r.activeCfg()
+	if !ok {
+		return "", ""
+	}
+	model = cfg.Model
+	// profile 名：任务链模式下取激活 profile 的 Name；agent 绑定/全局配置没有
+	// profile 行，留空比编一个「global」更诚实（前端按空值显示「默认」）。
+	if id := activeProfileIDOf(s, t); id > 0 {
+		if p, err := s.m.pg.ProfileByID(id); err == nil && p != nil {
+			profileName = p.Name
+		}
+	}
+	return model, profileName
+}
+
+// activeProfileIDOf 返回任务当前激活的 profile id（无则 0）。
+func activeProfileIDOf(s *Server, t *Task) int64 {
+	if t == nil || s == nil || s.m == nil || s.m.pg == nil {
+		return 0
+	}
+	id, err := parseTaskID(t.ID)
+	if err != nil {
+		return 0
+	}
+	pt, err := s.m.pg.GetTask(id)
+	if err != nil || pt == nil {
+		return 0
+	}
+	if _, _, ok := s.agentBindingProvider("planner"); ok {
+		return 0 // agent 绑定不走 profile 链
+	}
+	if len(pt.LLMProfileIDs) > 0 && pt.ActiveLLMProfileID != nil {
+		return *pt.ActiveLLMProfileID
+	}
+	return 0
+}

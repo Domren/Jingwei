@@ -64,16 +64,22 @@ func TestPowerShellSessionRefusesCmdTransferAndPersist(t *testing.T) {
 
 	before := len(shell.all())
 
-	// 上传：仍是 cmd 形态的分块/certutil 脚本，必须明确失败。
+	// 上传/下载已按 PS 语法移植（R3）：这里不再断言「必须失败」，而是断言
+	// 投递出去的每一条命令都不是 cmd 语法——功能可用，且不会被自己的守卫拦。
 	upOut, upErr := s.intranetUpload(ctx, pg, sess, `C:\Users\labuser\x.txt`, []byte("hello jingwei"))
-	if upErr == nil || !upOut.IsError {
-		t.Fatalf("PowerShell 会话的上传必须明确失败，不能静默成功: out=%+v err=%v", upOut, upErr)
+	if upErr == nil && !upOut.IsError {
+		t.Log("上传走通（PS 语法已移植）")
+	} else if strings.Contains(upOut.Note, "PowerShell 会话拒绝执行") {
+		t.Fatalf("PS 上传仍被自己的守卫拦下，说明脚本没移植干净: %q", upOut.Note)
+	} else {
+		// 进程内靶机不实现真实文件系统，大小校验失败属预期；只要不是守卫拒绝，
+		// 且投递的脚本全是 PS 语法，就算通过。
+		t.Logf("上传在靶机上按预期停下（非守卫原因）：%q", upOut.Note)
 	}
 
-	// 下载：仍是 cmd 形态的 for/certutil 脚本，必须明确失败。
 	_, _, _, dlOut := s.intranetDownload(ctx, pg, sess, `C:\Users\labuser\x.txt`, 0)
-	if !dlOut.IsError {
-		t.Fatalf("PowerShell 会话的下载必须明确失败，不能静默成功: %+v", dlOut)
+	if strings.Contains(dlOut.Note, "PowerShell 会话拒绝执行") {
+		t.Fatalf("PS 下载仍被自己的守卫拦下，说明脚本没移植干净: %q", dlOut.Note)
 	}
 
 	// 权限维持：入口直接点名拒绝，不生成、不投递、不落库。

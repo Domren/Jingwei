@@ -36,6 +36,7 @@ type reproView struct {
 	EntryPoint    string
 	Prerequisites []string
 	Provenance    string
+	ParamSources  []db.ParamSource
 	Steps         []reproStepView
 }
 
@@ -69,6 +70,7 @@ func buildReproView(f *db.DBFinding) *reproView {
 		EntryPoint:    strings.TrimSpace(f.Reproduction.EntryPoint),
 		Prerequisites: f.Reproduction.Prerequisites,
 		Provenance:    strings.TrimSpace(f.Reproduction.Provenance),
+		ParamSources:  f.Reproduction.ParamSources,
 	}
 	for i, st := range f.Reproduction.Steps {
 		row := reproStepView{No: i + 1, Expected: st.Expected, Proves: st.Proves}
@@ -90,6 +92,21 @@ func buildReproView(f *db.DBFinding) *reproView {
 		v.Steps = append(v.Steps, row)
 	}
 	return v
+}
+
+// paramSourceWhere 渲染一个参数的「来源」列：url/detail 或「无来源（模型推断）」。
+func paramSourceWhere(ps db.ParamSource) string {
+	if ps.Inferred {
+		if ps.Detail != "" {
+			return "无来源（模型推断）：" + ps.Detail
+		}
+		return "无来源（模型推断）"
+	}
+	where := ps.URL
+	if ps.Detail != "" {
+		where += " " + ps.Detail
+	}
+	return where
 }
 
 // requestTargetAndBody pulls the request-target and body out of a raw request
@@ -126,6 +143,19 @@ func writeReproductionHTML(b *strings.Builder, v *reproView) {
 		}
 		if v.Provenance != "" {
 			fmt.Fprintf(b, `<tr><th>攻击链来源</th><td class="small">%s</td></tr>`, h(v.Provenance))
+		}
+		b.WriteString(`</tbody></table>`)
+	}
+	if len(v.ParamSources) > 0 {
+		b.WriteString(`<h5 style="margin:10px 0 4px">参数来源</h5>`)
+		b.WriteString(`<table><thead><tr><th>参数</th><th>值</th><th>位置</th><th>来源</th></tr></thead><tbody>`)
+		for _, ps := range v.ParamSources {
+			value := ps.Value
+			if value == "" {
+				value = "（空）"
+			}
+			fmt.Fprintf(b, `<tr><td class="small">%s</td><td class="small">%s</td><td class="small">%s</td><td class="small" style="word-break:break-all">%s</td></tr>`,
+				h(ps.Name), h(value), h(ps.Source), h(paramSourceWhere(ps)))
 		}
 		b.WriteString(`</tbody></table>`)
 	}
@@ -171,6 +201,16 @@ func writeReproductionDOCX(b *docxBuilder, v *reproView) {
 	}
 	if v.Provenance != "" {
 		b.kv([]string{"攻击链来源", v.Provenance})
+	}
+	if len(v.ParamSources) > 0 {
+		b.para("参数来源", "Small")
+		for _, ps := range v.ParamSources {
+			value := ps.Value
+			if value == "" {
+				value = "（空）"
+			}
+			b.bullet(fmt.Sprintf("%s = %s（%s，%s）", ps.Name, value, ps.Source, paramSourceWhere(ps)))
+		}
 	}
 	for _, st := range v.Steps {
 		title := fmt.Sprintf("步骤 %d", st.No)

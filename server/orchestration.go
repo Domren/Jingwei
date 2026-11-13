@@ -249,6 +249,9 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			"source_task_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": fmt.Sprintf("可选：只读继承的来源任务 id 列表(最多 %d 个)。子任务可只读引用这些任务已探明的资产/结论作为起点；与 parent_ref 的纯父子指针不同，这是内容继承。", db.MaxTaskSourceCount)},
 			"llm_profile_id":         map[string]any{"type": "integer", "description": "可选：指定本子任务 planner/worker 用的 LLM 配置 id(见 list_llm_profiles)；留空则继承父任务、再回退全局激活配置"},
 			"timeout_seconds":        map[string]any{"type": "integer", "description": "可选：任务级超时(秒)。到点后触发优雅收尾并进入 timeout 终态；留空或 0 = 不限时"},
+			"max_rounds":             map[string]any{"type": "integer", "description": "可选：任务级预算闸门——规划轮数上限。到限走优雅收尾并进入 budget 终态(停止原因写进台账)；留空或 0 = 不限"},
+			"max_input_tokens":       map[string]any{"type": "integer", "description": "可选：任务级预算闸门——累计输入 token 上限。到限走优雅收尾并进入 budget 终态；留空或 0 = 不限"},
+			"scope_granularity":      map[string]any{"type": "string", "description": "可选：授权粒度。ip_port=严格按清单 host:port（只有清单登记的端口可测）；by_ip=按 IP 授权、全部端口可测。留空 = 继承父任务；无父任务则 by_ip"},
 			"plan_heartbeat_seconds": map[string]any{"type": "integer", "description": "可选：planner 心跳触发间隔(秒)。距上轮规划结束/任务开始满该值且期间无触发 → 触发一轮规划(兜底死锁 + 唤醒去监督飞行中的 worker)。留空或 0 = 默认 600(10min)；"},
 			"seed_first_intent":      map[string]any{"type": "boolean", "description": "可选：对于简单任务可开启，创建时直接下发一条种子意图(内容=描述+目标)让 worker 免等首轮 planner 直接开跑测试；默认 false(走标准先规划再执行)。"},
 		}, "description", "goal"),
@@ -260,6 +263,9 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 				SourceTaskIDs        []string        `json:"source_task_ids"`
 				LLMProfileID         json.RawMessage `json:"llm_profile_id"`
 				TimeoutSeconds       int             `json:"timeout_seconds"`
+				MaxRounds            int             `json:"max_rounds"`
+				MaxInputTokens       int64           `json:"max_input_tokens"`
+				ScopeGranularity     string          `json:"scope_granularity"`
 				PlanHeartbeatSeconds int             `json:"plan_heartbeat_seconds"`
 				SeedFirstIntent      bool            `json:"seed_first_intent"`
 			}
@@ -272,6 +278,27 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			}
 			if a.TimeoutSeconds < 0 {
 				a.TimeoutSeconds = 0
+			}
+			if a.MaxRounds < 0 {
+				a.MaxRounds = 0
+			}
+			if a.MaxInputTokens < 0 {
+				a.MaxInputTokens = 0
+			}
+			// R19 序 5：授权粒度——显式 > 继承父任务 > by_ip；每次任务都带明确粒度。
+			gran := a.ScopeGranularity
+			if gran == "" && a.ParentRef != "" {
+				if pt, ok := s.m.Task(a.ParentRef); ok && pt.ScopeGranularity != "" {
+					gran = pt.ScopeGranularity
+				}
+			}
+			if gran == "" {
+				gran = db.ScopeGranularityByIP
+			}
+			if norm, nerr := db.NormalizeScopeGranularity(gran); nerr != nil {
+				return actool.Errorf(nerr.Error()), nil
+			} else {
+				a.ScopeGranularity = norm
 			}
 			// 只读继承来源任务：数量上限 + 每个 id 有效/去重/存在，校验规则与 HTTP 建任务一致。
 			if len(a.SourceTaskIDs) > db.MaxTaskSourceCount {
@@ -333,6 +360,9 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 				SourceTaskIDs:        sourceIDs,
 				LLMProfileIDs:        llmIDs,
 				TimeoutSeconds:       a.TimeoutSeconds,
+				MaxRounds:            a.MaxRounds,
+				MaxInputTokens:       a.MaxInputTokens,
+				ScopeGranularity:     a.ScopeGranularity,
 				PlanHeartbeatSeconds: a.PlanHeartbeatSeconds,
 			})
 			if err != nil {

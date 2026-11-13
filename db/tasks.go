@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -46,6 +47,14 @@ type Task struct {
 	// planner 心跳触发间隔(秒)：距上轮 plan 结束/任务开始满该值且期间无触发 → 触发一轮。
 	// 下限=默认=300(5min)，低于一律抬到 300(在 CreateTask 归一)。见 docs/planner-trigger-impl-plan.md
 	PlanHeartbeatSeconds int `json:"plan_heartbeat_seconds"`
+	// R19 序 4：任务级预算闸门（轮数 + 输入 token 双上限）。0=不限。到限走与超时同一套
+	// 收尾时序，终态落 budget，「为什么停」写 stop_reason。
+	MaxRounds      int    `json:"max_rounds"`
+	MaxInputTokens int64  `json:"max_input_tokens"`
+	StopReason     string `json:"stop_reason,omitempty"`
+	// R19 序 5：授权粒度（创建必选）。ip_port=严格按清单 host:port；by_ip=按 IP 授权、
+	// 全部端口可测；空串=存量任务旧行为（等同 by_ip）。范围硬约束见 guard 的 Check。
+	ScopeGranularity string `json:"scope_granularity,omitempty"`
 	// CoverageEnabled 是「资产覆盖度功能」总开关(默认 true)。false 时：不计算/不展示测试
 	// 覆盖度、不自动累积 task_scope(source=auto)、不给 agent 开放 add_task_scope/
 	// list_untested_assets、态势里不注入 coverage 块(scope 字段仍保留)。company 关联
@@ -73,7 +82,7 @@ type TaskDeletePreparation struct {
 // IsTerminal reports whether a task status is a terminal (finished) state.
 // 单一真源，替换散落各处的 done/failed 硬编码判定。
 func IsTerminal(status string) bool {
-	return status == "done" || status == "failed" || status == "timeout"
+	return status == "done" || status == "failed" || status == "timeout" || status == "budget"
 }
 
 // CreateTask creates an exploration + task in one transaction and returns the task.
@@ -132,6 +141,27 @@ func normalizeHeartbeat(sec int) int {
 	return sec
 }
 
+// 授权粒度（R19 序 5）：任务创建必选，二选一。
+const (
+	ScopeGranularityIPPort = "ip_port" // 严格按清单登记的 host:port
+	ScopeGranularityByIP   = "by_ip"   // 按 IP 授权，全部端口可测
+)
+
+// NormalizeScopeGranularity 校验并归一授权粒度。空串报错（必选项）；未知值报错，
+// 不静默回退——粒度错了等于授权口径错了，宁可建不了任务。
+func NormalizeScopeGranularity(v string) (string, error) {
+	switch strings.TrimSpace(strings.ToLower(v)) {
+	case ScopeGranularityIPPort:
+		return ScopeGranularityIPPort, nil
+	case ScopeGranularityByIP:
+		return ScopeGranularityByIP, nil
+	case "":
+		return "", fmt.Errorf("必须选择授权粒度（ip_port=严格按清单 host:port；by_ip=按 IP 授权、全部端口可测）")
+	default:
+		return "", fmt.Errorf("授权粒度无效：%q（可选 ip_port / by_ip）", v)
+	}
+}
+
 func (d *DB) CreateTask(description, goal string, llmProfileID *int64, timeoutSeconds, planHeartbeatSeconds int) (*Task, error) {
 	var ids []int64
 	if llmProfileID != nil {
@@ -158,6 +188,11 @@ type TaskCreateOptions struct {
 	CoverageEnabled *bool
 	// InterceptRules 是任务级资产拦截规则,创建时随任务在同一事务内写入 task_intercept_rules。
 	InterceptRules []TaskInterceptRuleInput
+	// R19 序 4：任务级预算闸门。0/省略=不限。
+	MaxRounds      int
+	MaxInputTokens int64
+	// R19 序 5：授权粒度（创建必选，见 NormalizeScopeGranularity）。
+	ScopeGranularity string
 }
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
@@ -171,6 +206,11 @@ func (d *DB) CreateTaskWithOptions(description, goal string, opts TaskCreateOpti
 		return nil, err
 	}
 	opts.CompanyIDs = companyIDs
+	// R19 序 5：每个任务都必须带明确的授权粒度。HTTP 创建路径已强制二选一（必选项，
+	// 由负责人显式选）；编排/旧包装路径缺省 by_ip（与存量行为一致），绝不落空串。
+	if opts.ScopeGranularity == "" {
+		opts.ScopeGranularity = ScopeGranularityByIP
+	}
 	tx, err := d.Begin()
 	if err != nil {
 		return nil, err
@@ -225,12 +265,14 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		SourceTaskIDs:  append([]int64(nil), opts.SourceTaskIDs...),
 		CompanyIDs:     append([]int64(nil), opts.CompanyIDs...),
 		TimeoutSeconds: opts.TimeoutSeconds, PlanHeartbeatSeconds: opts.PlanHeartbeatSeconds,
-		CoverageEnabled: coverageEnabled,
+		MaxRounds: opts.MaxRounds, MaxInputTokens: opts.MaxInputTokens,
+		ScopeGranularity: opts.ScopeGranularity,
+		CoverageEnabled:  coverageEnabled,
 	}
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled)
-VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9)
-RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, max_rounds, max_input_tokens, scope_granularity)
+VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12)
+RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.MaxRounds, opts.MaxInputTokens, opts.ScopeGranularity).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -363,11 +405,11 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, COALESCE(name,''), remark, category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at`
+description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at, COALESCE(max_rounds,0), COALESCE(max_input_tokens,0::bigint), COALESCE(stop_reason,''), COALESCE(scope_granularity,'')`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
-	if err := sc.Scan(&t.ID, &t.Name, &t.Remark, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt); err != nil {
+	if err := sc.Scan(&t.ID, &t.Name, &t.Remark, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt, &t.MaxRounds, &t.MaxInputTokens, &t.StopReason, &t.ScopeGranularity); err != nil {
 		return nil, err
 	}
 	t.Pinned = t.PinnedAt != nil
@@ -378,6 +420,25 @@ func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 func (d *DB) SetParentRef(id int64, parentRef string) error {
 	_, err := d.Exec(`UPDATE tasks SET parent_ref=NULLIF($2,'') WHERE id=$1`, id, parentRef)
 	return err
+}
+
+// SetTaskStopReason 把收尾原因写进 tasks.stop_reason（R19 序 4：任务到限收尾后
+// 「为什么停」要能在台账里回答——超时写「到达超时上限」，预算写「达到规划轮数上限 /
+// 达到输入 token 上限」。非终态不应调用；由 settleTask 在终态落库成功后调用。
+func (d *DB) SetTaskStopReason(id int64, reason string) error {
+	_, err := d.Exec(`UPDATE tasks SET stop_reason=$2 WHERE id=$1`, id, reason)
+	return err
+}
+
+// TaskScopeGranularity 读任务的授权粒度（R19 序 5）。任务不存在或未设置返回 ""
+// （等同 by_ip 旧行为）；读库错误原样上抛——调用方（guard）按失败关闭处理。
+func (d *DB) TaskScopeGranularity(id int64) (string, error) {
+	var g string
+	err := d.QueryRow(`SELECT COALESCE(scope_granularity,'') FROM tasks WHERE id=$1`, id).Scan(&g)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return g, err
 }
 
 // ListTasks returns alive tasks with pinned tasks first, then newest ids.

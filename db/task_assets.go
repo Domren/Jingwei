@@ -423,3 +423,18 @@ ORDER BY context.inherited, intent.id DESC, asset.id`, taskID)
 	}
 	return out, rows.Err()
 }
+
+// CountTaskAssets 返回该任务已关联的资产数（R21 的 L3 零进展判据用：
+// 「这一轮有没有新资产」）。只数链接表，不数全局资产，避免把别的任务算进来。
+func (d *DB) CountTaskAssets(taskID int64) (int, error) {
+	var n int
+	err := d.QueryRow(`SELECT COUNT(*) FROM task_asset_links WHERE task_id=$1`, taskID).Scan(&n)
+	return n, err
+}
+
+// CountTaskFindings 返回该任务的漏洞数（同上，L3 判据用）。
+func (d *DB) CountTaskFindings(taskID int64) (int, error) {
+	var n int
+	err := d.QueryRow(`SELECT COUNT(*) FROM findings WHERE task_id=$1`, taskID).Scan(&n)
+	return n, err
+}

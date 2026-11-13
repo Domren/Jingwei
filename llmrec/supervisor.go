@@ -15,18 +15,25 @@ import (
 
 // 监督者（R21 §5.4）：把「进程在不在」升级成「LLM 在不在干活」。
 //
-// 两件事：
+// 三件事：
 //   - L1 首帧超时：建连后 T1 内没有首个流事件，主动 cancel 并记 stalled。
-//     这是新增的那把刀——现有 15 分钟墙钟给 thinking 模型留的宽口子不能用来判卡。
 //   - L2 轮次留痕：每轮一定有 status/error_class/attempts/trigger_src，失败也落，
 //     不靠 llm_record 开关（那是 R15 的账）。
+//   - L3 零进展：连续 N 轮没有任何进展（goal met / 新意图 / 新资产 / token 变化）
+//     判 stalled_task，停下来问人。判据由调用方提供「本轮是否有进展」。
 //
-// 用法：
+// 十条补丁（R21 §5.1）在本文件的落点：
 //
-//	sup := NewSupervisor(recorder, pg)
-//	round := sup.Begin(ctx, meta)   // 开一轮，返回监督 context
-//	defer round.End(nil)             // 结束；失败传 err
-//	round.OnEvent()                  // 每个流事件回调一次（喂首帧时间）
+//	① 分类器新增 unreachable / upstream_5xx / model_not_found      → classify.go
+//	② 告警判据与轮数无关、首轮即响                                  → 见 server/llm_health.go
+//	③ RoundMeta 补 model/profile_name（由调用方填）
+//	④ attempts 记本轮真实发数（BeginAttempt）
+//	⑤ 失败轮退避（同一 provider 连续失败后强制等待）                → BackoffBefore
+//	⑥ 轮级 token（AddUsage，End 时落库）
+//	⑦ 进行中的轮可见（Begin 即落一行 status=running，End 时更新）
+//	⑧ 同一轮去重记账（Round.recorded 守卫 + db 侧 upsert）
+//	⑨ 逐发错误汇总（Round.AttemptClass 记每一次的形态）
+//	⑩ T1 默认 75s + 两侧共用解析函数
 type Supervisor struct {
 	pg       dbInterface
 	recorder *Recorder
@@ -35,9 +42,10 @@ type Supervisor struct {
 	stalledRounds     int
 }
 
-// dbInterface 是 db.DB 的最小面：本层只需要 InsertLLMRound。测试用 stub。
+// dbInterface 是 db.DB 的最小面：本层只需要轮的写入与更新。测试用 stub。
 type dbInterface interface {
 	InsertLLMRound(r *db.LLMRound) error
+	UpdateLLMRound(r *db.LLMRound) error
 }
 
 // NewSupervisor 构造；pg 为 nil 时只监督、不记账（用于无库场景）。
@@ -49,12 +57,15 @@ func NewSupervisor(rec *Recorder, pg dbInterface) *Supervisor {
 // SetFirstEventTimeout 给夹具用：把 T1 压到毫秒级。生产代码不改它。
 func (s *Supervisor) SetFirstEventTimeout(d time.Duration) { s.firstEventTimeout = d }
 
-// SetStalledRounds 同上：把"连续 N 轮零进展"阈值压低。
+// SetStalledRounds 同上：把「连续 N 轮零进展」阈值压低。
 func (s *Supervisor) SetStalledRounds(n int) { s.stalledRounds = n }
+
+// StalledRounds 给 L3 判据读（缺口：过去只有常量与 setter，没有任何判据读它）。
+func (s *Supervisor) StalledRounds() int { return s.stalledRounds }
 
 var roundSeq atomic.Int64
 
-// newRoundID 生成一轮的标识（同进程内唯一；重试共用一个）。
+// newRoundID 生成一轮的标识（同进程内唯一；重试共用同一个）。
 func newRoundID() string {
 	return fmt.Sprintf("r-%d-%d", time.Now().UnixNano(), roundSeq.Add(1))
 }
@@ -71,10 +82,6 @@ type RoundMeta struct {
 }
 
 // Round 是一轮调用的监督句柄。
-// Round 同时是 llmrec 侧的一轮句柄和 agent.FirstEventObserver 的实现者。
-// 这里刻意不 import agent（llmrec 是底层包）：接口对齐靠编译期断言。
-var _ interface{ OnEvent() } = (*Round)(nil)
-
 type Round struct {
 	sup     *Supervisor
 	meta    RoundMeta
@@ -83,28 +90,44 @@ type Round struct {
 	mu           sync.Mutex
 	firstEventAt time.Time
 	ended        bool
+	recorded     bool // ⑧ 同一轮只落一次终态
 	cancel       context.CancelFunc
 	cancelCtx    context.Context
+
+	// ⑥ 轮级 token：由调用方在收到 usage 时累加。
+	inTokens  int
+	outTokens int
+
+	// ⑨ 逐发错误：每一发（含重试）的真实形态都留下，分类按「最后一次有意义
+	// 的错误」判，而不是被最外层的 context canceled 盖掉。
+	attempts  int
+	lastClass ErrorClass
+	classes   []string
 }
 
 // Begin 开一轮，返回监督 context（含主动 cancel）。调用方拿到 ctx 后正常发调用；
 // 若 T1 内没等到首帧，Round 会主动 cancel 这个 ctx，调用方的流被切断并落到
 // ErrClassTimeout。
+//
+// ⑦ 进行中的轮可见：Begin 即落一行 status=running（EndedAt 为空），
+// 这样「有没有轮在跑、跑到哪」不必翻日志。
 func (s *Supervisor) Begin(ctx context.Context, meta RoundMeta) (*Round, context.Context) {
 	if meta.RoundID == "" {
 		meta.RoundID = newRoundID()
 	}
-	r := &Round{sup: s, meta: meta, started: time.Now()}
+	if meta.Attempts < 1 {
+		meta.Attempts = 1
+	}
+	r := &Round{sup: s, meta: meta, started: time.Now(), attempts: meta.Attempts}
 	r.cancelCtx, r.cancel = context.WithCancel(ctx)
+	s.insertRunning(r)
 	if s.firstEventTimeout > 0 {
 		go r.watchFirstEvent()
 	}
 	return r, r.cancelCtx
 }
 
-// BeginFor 在一轮里同时给监督 context 和首帧观测 provider。这样 L1 的
-// "首个流事件时刻"不是凭调用方自觉回调，而是从流本身取——流不到,观察者就不响。
-// WrapFirstEvent 在 agent 包（底层观测器），llmrec 不反向依赖 agent。
+// BeginFor 在一轮里同时给监督 context 和首帧观测 provider。
 func (s *Supervisor) BeginFor(ctx context.Context, meta RoundMeta, inner llm.Provider) (*Round, context.Context, llm.Provider) {
 	r, rctx := s.Begin(ctx, meta)
 	return r, rctx, r.WrapProvider(inner)
@@ -118,11 +141,31 @@ func (r *Round) WrapProvider(inner llm.Provider) llm.Provider {
 	return &firstEventProvider{inner: inner, r: r}
 }
 
+// insertRunning ⑦：本轮开始时先落一行，让「在飞的轮」可见。
+// 失败不影响主流程（记账是 best-effort）。
+func (s *Supervisor) insertRunning(r *Round) {
+	if s.pg == nil {
+		return
+	}
+	rec := r.baseRecord()
+	rec.Status = "running"
+	_ = s.pg.InsertLLMRound(rec)
+}
+
+// baseRecord 组装一条轮记录的公共字段。
+func (r *Round) baseRecord() *db.LLMRound {
+	return &db.LLMRound{
+		RoundID: r.meta.RoundID, TaskID: strconv.FormatInt(r.meta.TaskID, 10),
+		Worker: r.meta.Worker, Model: r.meta.Model, ProfileName: r.meta.ProfileName,
+		Attempts: r.meta.Attempts, TriggerSrc: r.meta.TriggerSrc, StartedAt: r.started,
+	}
+}
+
 // watchFirstEvent 每 2s 检查一次首帧；超过 T1 没见就 cancel。检查而不是一次
 // AfterFunc，是为了在 Round.End 后能立即停掉这条 goroutine（不会误伤晚到的首帧）。
 //
 // 轮询间隔取 T1 的 1/20（下限 25ms，上限 2s）：夹具把 T1 压到几十毫秒时
-// 也能在合理时间内触发，生产默认 45s 时轮询间隔仍是 2s，不增加开销。
+// 也能在合理时间内触发，生产默认 75s 时轮询间隔仍是 2s，不增加开销。
 func (r *Round) watchFirstEvent() {
 	interval := r.sup.firstEventTimeout / 20
 	if interval < 25*time.Millisecond {
@@ -145,9 +188,11 @@ func (r *Round) watchFirstEvent() {
 				return
 			}
 			if time.Since(r.started) > r.sup.firstEventTimeout {
+				// ⑨ 这次的形态是 stalled，先记进逐发清单再取消。
+				r.noteAttemptClass(ErrClassStalled)
 				r.cancel()
-				// stalled 也要落账；Attempts 取当前值，trigger_src 保留。
-				r.record(context.Canceled, ErrClassStalled)
+				// ⑧ 用统一的终态落库路径，避免「先落 stalled 再落 error」两行。
+				r.finish(context.Canceled, ErrClassStalled)
 				return
 			}
 		}
@@ -184,6 +229,7 @@ func (p *firstEventProvider) Complete(ctx context.Context, req llm.CompletionReq
 	if err == nil {
 		p.r.OnEvent()
 	}
+	p.r.AddUsage(usage.InputTokens, usage.OutputTokens)
 	return msg, text, usage, err
 }
 
@@ -196,64 +242,184 @@ func (r *Round) OnEvent() {
 	}
 }
 
-// End 结束一轮并记账。err 为最终错误（可为 nil）；wallErr 是上层墙钟
-// （用来把「超时」与「对端流重置」区分开）。attempts 在这一轮里可能 >1。
+// AddUsage ⑥ 累加本轮消耗的 token。流式调用结束时应由调用方回报；
+// 多次重试时累加（重试也花钱）。
+func (r *Round) AddUsage(in, out int) {
+	if in == 0 && out == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.inTokens += in
+	r.outTokens += out
+}
+
+// BeginAttempt ④ 记一次实际发出（含同 provider 重试）。
+//
+// 语义：Begin 之后这一轮已经发了第 1 次，所以每次**重试前**调用本方法表示
+// 「还要再发一次」。返回值是即将开始的这一次的序号（第 2 次、第 3 次…）。
+func (r *Round) BeginAttempt() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.attempts++
+	return r.attempts
+}
+
+// Attempts 返回当前已发次数（供调用方与夹具读）。
+func (r *Round) Attempts() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.attempts
+}
+
+// NoteAttemptError ⑨ 记下这一发的真实错误形态。
+// 调用方在每次重试前调用，把「内层遇到的 429/502/504」留下来——
+// 否则重试成功后这些原因就消失了，最终只剩一个 context canceled。
+func (r *Round) NoteAttemptError(err error) {
+	if err == nil {
+		return
+	}
+	r.noteAttemptClass(ClassifyError(err, nil))
+}
+
+func (r *Round) noteAttemptClass(class ErrorClass) {
+	if class == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastClass = class
+	r.classes = append(r.classes, string(class))
+}
+
+// AttemptClasses 返回逐发错误形态（按发生顺序）。
+func (r *Round) AttemptClasses() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string{}, r.classes...)
+}
+
+// End 结束一轮并记账。err 为最终错误（可为 nil）。
 func (r *Round) End(err error) {
 	r.mu.Lock()
-	if r.ended {
+	already := r.ended
+	r.mu.Unlock()
+	if already {
+		return
+	}
+	r.cancel()
+	r.finish(err, "")
+}
+
+// finish 是唯一的终态落库路径（⑧）：先到者写，后到者丢弃。
+// forced 非空时用它作为分类（stalled 路径显式指定）。
+func (r *Round) finish(err error, forced ErrorClass) {
+	r.mu.Lock()
+	if r.recorded {
 		r.mu.Unlock()
 		return
 	}
+	r.recorded = true
 	r.ended = true
 	first := r.firstEventAt
+	attempts := r.attempts
+	in, out := r.inTokens, r.outTokens
+	recorded := append([]string{}, r.classes...)
+	last := r.lastClass
 	r.mu.Unlock()
-	r.cancel()
-	r.recordLocked(err, first)
-}
 
-// recordLocked 在 End 之后落一条记录；stalled 的提前记账由 watchFirstEvent 做。
-func (r *Round) recordLocked(err error, first time.Time) {
-	class := ClassifyError(err, nil)
+	class := forced
+	if class == "" {
+		class = ClassifyError(err, nil)
+	}
+	// ⑨ 最终错误常常是被包装过的 context.Canceled / context.DeadlineExceeded，
+	// 而内层真实原因（429/502）只留在逐发清单里。这时以「最后一次有意义的
+	// 错误」为准，避免同一次故障先记 rate_limited 又记 other。
+	if class == ErrClassOther && last != "" && last != ErrClassOther {
+		class = last
+	}
+	// 我们自己 cancel 出来的 Canceled：如果逐发里已有明确的传输/限流形态，用它；
+	// 否则归 stalled 之外的 timeout 语义不成立，仍留 other 并保留逐发清单。
+	if class == ErrClassOther && err != nil && len(recorded) > 0 {
+		for i := len(recorded) - 1; i >= 0; i-- {
+			if recorded[i] != string(ErrClassOther) {
+				class = ErrorClass(recorded[i])
+				break
+			}
+		}
+	}
+
 	status := "ok"
-	if err != nil {
+	if err != nil || forced != "" {
 		status = "error"
 	}
+	if forced == ErrClassStalled {
+		status = "stalled"
+	}
+
 	if r.sup.pg == nil {
 		return
 	}
-	var fe *time.Time
+	rec := r.baseRecord()
+	rec.Status = status
+	rec.ErrorClass = string(class)
+	rec.Attempts = attempts
+	rec.InputTokens = in
+	rec.OutputTokens = out
+	rec.AttemptClasses = recorded
 	if !first.IsZero() {
-		fe = &first
+		fe := first
+		rec.FirstEventAt = &fe
 	}
 	now := time.Now()
-	rec := &db.LLMRound{
-		RoundID: r.meta.RoundID, TaskID: strconv.FormatInt(r.meta.TaskID, 10), Worker: r.meta.Worker,
-		Model: r.meta.Model, ProfileName: r.meta.ProfileName,
-		Status: status, ErrorClass: string(class),
-		Attempts: r.meta.Attempts, TriggerSrc: r.meta.TriggerSrc,
-		StartedAt: r.started, FirstEventAt: fe, EndedAt: &now,
+	rec.EndedAt = &now
+	// 先尝试更新（Begin 已插入 running 行）；没有可更新的行再插入。
+	// 这样同一 round_id 永远只有一行（⑧）。
+	if err := r.sup.pg.UpdateLLMRound(rec); err != nil {
+		_ = r.sup.pg.InsertLLMRound(rec)
 	}
-	_ = r.sup.pg.InsertLLMRound(rec)
 }
 
-// record 给 watchFirstEvent 用：stalled 还没等到 End，也要落账。
-func (r *Round) record(err error, class ErrorClass) {
-	if r.sup.pg == nil {
-		return
+// BackoffBefore ⑤ 失败轮退避：同一端点连续失败后，下一次唤醒必须等够时间，
+// 否则「失败轮不 commit 触发」会让唤醒条件立刻再次成立，规划循环变成对
+// 坏端点的持续轰击（实测每 20–30 秒一整轮）。
+//
+// 返回建议等待时长（0 表示不用等）。判据用「连续失败轮数」，与 total 无关，
+// 所以端点一坏就能立刻生效（缺口②的另一半）。
+func BackoffBefore(consecutiveFailures int) time.Duration {
+	switch {
+	case consecutiveFailures <= 0:
+		return 0
+	case consecutiveFailures == 1:
+		return 5 * time.Second
+	case consecutiveFailures == 2:
+		return 15 * time.Second
+	case consecutiveFailures == 3:
+		return 45 * time.Second
+	default:
+		// 封顶 2 分钟：再久会让「端点恢复后仍要等」变得难以察觉。
+		return 2 * time.Minute
 	}
-	r.mu.Lock()
-	first := r.firstEventAt
-	r.mu.Unlock()
-	now := time.Now()
-	var fe *time.Time
-	if !first.IsZero() {
-		fe = &first
+}
+
+// Converged 是 L3 判据的输入：本轮有没有任何进展。
+// 任一为真即算有进展——目标判定、新意图、新资产、实质 token 消耗。
+type Progress struct {
+	GoalMet   int
+	NewIntent int
+	NewAsset  int
+}
+
+// Converged 判断这一轮是否有进展。
+func (p Progress) Converged() bool {
+	return p.GoalMet > 0 || p.NewIntent > 0 || p.NewAsset > 0
+}
+
+// StalledTask 判断是否该判「无声停摆」并停下来问人。
+// 只在「连续 N 轮零进展」时为真；中途有任何进展就清零。
+func StalledTask(consecutiveNoProgress, threshold int) bool {
+	if threshold <= 0 {
+		threshold = DefaultStalledRounds
 	}
-	_ = r.sup.pg.InsertLLMRound(&db.LLMRound{
-		RoundID: r.meta.RoundID, TaskID: strconv.FormatInt(r.meta.TaskID, 10), Worker: r.meta.Worker,
-		Model: r.meta.Model, ProfileName: r.meta.ProfileName,
-		Status: "stalled", ErrorClass: string(class),
-		Attempts: r.meta.Attempts, TriggerSrc: r.meta.TriggerSrc,
-		StartedAt: r.started, FirstEventAt: fe, EndedAt: &now,
-	})
+	return consecutiveNoProgress >= threshold
 }

@@ -61,8 +61,28 @@ type stubDB struct {
 func (s *stubDB) InsertLLMRound(r *db.LLMRound) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 与真实库的 ON CONFLICT 同语义：同一 round_id 只一行。
+	for i := range s.rows {
+		if s.rows[i].RoundID == r.RoundID {
+			s.rows[i] = *r
+			return nil
+		}
+	}
 	s.rows = append(s.rows, *r)
 	return nil
+}
+
+// UpdateLLMRound 与真实库同语义：按 round_id 原地更新，没有则报不存在。
+func (s *stubDB) UpdateLLMRound(r *db.LLMRound) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.rows {
+		if s.rows[i].RoundID == r.RoundID {
+			s.rows[i] = *r
+			return nil
+		}
+	}
+	return db.ErrLLMRoundNotFound
 }
 
 func (s *stubDB) snapshot() []db.LLMRound {

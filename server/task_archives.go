@@ -389,6 +389,7 @@ func (s *Server) loadRestoredTask(taskID int64) {
 	}
 	if !isTerminalStatus(lifecycle.Status) {
 		s.engine.startDeadlineCoordinator(s.ctx, restored)
+		s.engine.startBudgetCoordinator(s.ctx, restored) // R19 序 4：恢复的预算任务也要能被收尾
 	}
 }
 

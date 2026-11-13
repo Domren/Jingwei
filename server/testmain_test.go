@@ -64,6 +64,28 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	watermark := toolUsageWatermark(pg)
+	// 隔离 schema 跨轮次复用，上一轮失败留下的非终态任务会占满并发槽；而测试环境
+	// 没有可用的 LLM，reconcileConcurrency 会把每个新任务都停进队列，于是依赖
+	// 「任务能开跑」的用例（core 的 goal 播种、归档、深挖、备注）全变成红。
+	// 每轮开跑前把残留任务置为暂停并释放队列占位——只动测试 schema，不改产品行为。
+	if _, err := pg.Exec(`UPDATE tasks
+   SET paused=true, queued=false, queued_at=NULL, queue_mode=''
+ WHERE status NOT IN ('done','failed','timeout','budget')`); err != nil {
+		fmt.Fprintf(os.Stderr, "server suite: reset leftover tasks: %v\n", err)
+		_ = conn.Close()
+		_ = pg.Close()
+		os.Exit(1)
+	}
+	// 并发开关同样会被上一轮用例改脏（有测试 SetConcurrency(true,1) 后中途失败没还原）。
+	// 测试环境没有可用 LLM，一旦并发开=true，reconcileConcurrency 会把每个新建任务
+	// 停进队列（queued=true），归档/深挖/备注/goal 播种全部失败。这里统一复位为关；
+	// 需要验证并发行为的用例（task_admission_test 等）自己会显式打开并在 defer 里还原。
+	if err := pg.SetSetting(settingConcurrencyOn, "false"); err != nil {
+		fmt.Fprintf(os.Stderr, "server suite: reset concurrency setting: %v\n", err)
+		_ = conn.Close()
+		_ = pg.Close()
+		os.Exit(1)
+	}
 	code := m.Run()
 	reapToolUsage(pg, watermark)
 	// os.Exit skips deferred calls, so the lock and pool are released explicitly:

@@ -271,6 +271,7 @@ func (s *Server) startAdmittedTask(t *Task, mode string) {
 	// coordinator exists after resume; resetTimeoutRevival cleared the completed
 	// coordinator's marker and the next real call will stamp a fresh deadline.
 	s.engine.startDeadlineCoordinator(s.ctx, t)
+	s.engine.startBudgetCoordinator(s.ctx, t) // R19 序 4：预算任务 resume 后同样保底
 }
 
 func (s *Server) reconcileConcurrency() {

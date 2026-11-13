@@ -525,7 +525,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     exploration_id BIGINT NOT NULL UNIQUE
                      REFERENCES explorations(id) ON DELETE RESTRICT,
     status         TEXT NOT NULL DEFAULT 'created'
-                     CHECK (status IN ('created','running','paused','done','failed','timeout')),
+                     CHECK (status IN ('created','running','paused','done','failed','timeout','budget')),
     paused         BOOLEAN NOT NULL DEFAULT false,
     queued         BOOLEAN NOT NULL DEFAULT false,
     queued_at      TIMESTAMPTZ,
@@ -537,6 +537,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     parent_ref     TEXT,
     timeout_seconds INTEGER NOT NULL DEFAULT 0,
     plan_heartbeat_seconds INTEGER NOT NULL DEFAULT 300,
+    max_rounds      INTEGER NOT NULL DEFAULT 0,
+    max_input_tokens BIGINT NOT NULL DEFAULT 0,
+    stop_reason     TEXT NOT NULL DEFAULT '',
+    scope_granularity TEXT NOT NULL DEFAULT '',
     coverage_enabled BOOLEAN NOT NULL DEFAULT true,
     pinned_at      TIMESTAMPTZ,
     first_run_at   TIMESTAMPTZ,
@@ -554,6 +558,22 @@ CREATE TRIGGER trg_tasks_upd BEFORE UPDATE ON tasks
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 -- planner 心跳触发间隔(秒);补旧库。默认 300s(5min)。见 docs/planner-trigger-impl-plan.md
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_heartbeat_seconds INTEGER NOT NULL DEFAULT 300;
+-- R19 序 4：任务级预算闸门（规划轮数 + 输入 token 双上限）。0=不限。到限走与超时同一套
+-- 收尾时序（settle），终态落 budget，「为什么停」写 stop_reason。输入 token 按
+-- llm_usage.exploration_id 累计；轮数按 llm_rounds 按任务计数（planner 每轮一行）。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS max_rounds INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS max_input_tokens BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS stop_reason TEXT NOT NULL DEFAULT '';
+-- budget 终态：旧库的 CHECK 不含它，必须重建约束，否则预算收尾落终态会被 CHECK 拒绝。
+-- 约束是内联匿名定义，PostgreSQL 自动命名为 tasks_status_check；重建时校验扫描全表，
+-- 任务表量级极小，代价可忽略。
+ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_status_check;
+ALTER TABLE tasks ADD CONSTRAINT tasks_status_check CHECK (status IN ('created','running','paused','done','failed','timeout','budget'));
+-- R19 序 5：授权粒度（任务创建必选）。'ip_port'=只有清单登记的 host:port 可测；
+-- 'by_ip'=按 IP 授权、全部端口可测。空串=存量任务旧行为（等同 by_ip）；新任务
+-- 由创建 API 强制二选一。范围硬约束在 guard 的 Check 按 tasks.scope_granularity 分支，
+-- 清单本身由 seed 写入 task_scope(kind='target', value='host:port')。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS scope_granularity TEXT NOT NULL DEFAULT '';
 -- 并发上限挂起态;补旧库。true=因并发上限排队、等待空位自动启动。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued BOOLEAN NOT NULL DEFAULT false;
 -- 资产覆盖度功能开关;补旧库。true(默认)=计算/展示测试覆盖度、自动累积测试范围、
@@ -759,7 +779,7 @@ WHERE t.active_llm_profile_id IS NULL
 CREATE TABLE IF NOT EXISTS task_scope (
     id          BIGSERIAL PRIMARY KEY,
     task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    kind        TEXT NOT NULL CHECK (kind IN ('company','root_domain','subdomain','ip','cidr','icp','keyword')),
+    kind        TEXT NOT NULL CHECK (kind IN ('company','root_domain','subdomain','ip','cidr','icp','keyword','target')),
     company_id  BIGINT REFERENCES companies(id) ON DELETE CASCADE,  -- kind='company'
     domain      TEXT,          -- root_domain / subdomain
     net         CIDR,          -- ip / cidr
@@ -770,9 +790,11 @@ CREATE TABLE IF NOT EXISTS task_scope (
 );
 -- 旧库升级：扩展任务范围，使其与企业范围的单文本框识别能力一致。
 ALTER TABLE task_scope ADD COLUMN IF NOT EXISTS value TEXT;
+-- R19 序 5：kind 增加 'target'——授权清单的 host:port 对（seed 写入、source='manual'），
+-- ip_port 严格粒度的范围硬约束按它判定。CHECK 重建同段覆盖 CREATE 与旧库。
 ALTER TABLE task_scope DROP CONSTRAINT IF EXISTS task_scope_kind_check;
 ALTER TABLE task_scope ADD CONSTRAINT task_scope_kind_check
-    CHECK (kind IN ('company','root_domain','subdomain','ip','cidr','icp','keyword'));
+    CHECK (kind IN ('company','root_domain','subdomain','ip','cidr','icp','keyword','target'));
 -- 去重：同一 task 的同一条范围只存一次（自动填批量插入靠它幂等）。
 DROP INDEX IF EXISTS uq_task_scope;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_task_scope_v2 ON task_scope(

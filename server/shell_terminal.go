@@ -179,7 +179,11 @@ func powershellCmdScriptReason(command string) string {
 		"reg add ", "reg delete ", "reg query ",
 		"sc create ", "sc stop ", "sc delete ", "sc query ",
 		"cmd /c exit 0", ">nul 2>&1", // 台账撤销/验证的退出码归零
-		"-EncodedCommand ", "-NoProfile -NonInteractive -Command", // 经 cmd 调 powershell.exe
+		// 只钉「经 cmd 调 powershell.exe」这一种包装形态。`-EncodedCommand` 单独
+		// 出现不算：平台自己的 PS 维持模块（wmi/startup/service）就是用它把脚本
+		// 编码后交给 powershell.exe，在 PowerShell 会话里同样是合法调用。把它一起
+		// 钉住会让 5 个 Windows 维持模块被自己的守卫全数拒掉（2026-11-12 R3 实测）。
+		"-NoProfile -NonInteractive -Command", // 经 cmd 调 powershell.exe 的分块下载包装
 	} {
 		if strings.Contains(command, marker) {
 			return powershellCmdRejectReason(marker)
@@ -198,17 +202,24 @@ func powershellCmdRejectReason(marker string) string {
 }
 
 // isCmdBase64Append matches the platform's chunked upload writer
-// `echo <40+ base64 chars>>>C:\path.b64`. An operator's `echo ... > file` in a
-// PowerShell terminal essentially never looks like this, while every upload
-// chunk is still caught — the guard must not let a chunk slip through after the
-// first `if exist` probe was already rejected.
+// `echo <40+ base64 chars>>>C:\path.b64` and its first-chunk form
+// `echo <40+ base64 chars>>C:\path.b64` (single `>` overwrites). An operator's
+// `echo ... > file` in a PowerShell terminal essentially never carries a 40+
+// character base64 run, while every upload chunk is still caught — the guard
+// must not let a chunk slip through after the first `if exist` probe was
+// already rejected, and the first chunk is not exempt just because it uses one
+// `>` instead of two.
 func isCmdBase64Append(command string) bool {
 	if !strings.HasPrefix(command, "echo ") {
 		return false
 	}
-	i := strings.Index(command, ">>")
+	i := strings.Index(command, ">")
 	if i < 0 {
 		return false
+	}
+	opLen := 1
+	if strings.HasPrefix(command[i:], ">>") {
+		opLen = 2
 	}
 	body := strings.TrimSpace(command[len("echo "):i])
 	if len(body) < 40 {
@@ -220,7 +231,7 @@ func isCmdBase64Append(command string) bool {
 			return false
 		}
 	}
-	return strings.Contains(command[i+2:], `:\`)
+	return strings.Contains(command[i+opLen:], `:\`)
 }
 
 // shellExec runs one command on any channel and splits the cwd/exit-code

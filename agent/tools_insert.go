@@ -655,6 +655,9 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// list_findings 保留：报漏洞前先查本任务已确认漏洞，避免重复上报同一漏洞。
 		t.listFindings(),
 		t.addFinding(), t.recordFact(), t.recordIntelligence(),
+		// http_send：对目标的 HTTP 探测/利用统一走它（R20 序 5，强制 UA + 记录代理）。
+		// 模型经 Bash 自调 curl 的 UA 泄漏由 .curlrc 兕底（见 worker.execute 的 CURL_HOME）。
+		t.httpSend(),
 		// asset management (handlers guard nil store internally)。
 		// add_company_scope 不给 worker：定义企业资产范围属规划/主控/Auto 的职责，worker 只执行探索。
 		t.insertAssets(), t.listAssets(),

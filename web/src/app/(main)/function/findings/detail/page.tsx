@@ -342,6 +342,44 @@ function FindingDetailInner() {
                           {finding.reproduction.provenance}
                         </p>
                       ) : null}
+                      {/* R16：POC 每个参数的来源；给不出来源的显式标「无来源（模型推断）」 */}
+                      {finding.reproduction.param_sources?.length ? (
+                        <div>
+                          <span className="text-xs font-medium text-muted-foreground">参数来源：</span>
+                          <table className="mt-1 w-full border-collapse text-xs">
+                            <thead>
+                              <tr className="text-left text-muted-foreground">
+                                <th className="border px-2 py-1">参数</th>
+                                <th className="border px-2 py-1">值</th>
+                                <th className="border px-2 py-1">位置</th>
+                                <th className="border px-2 py-1">来源</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {finding.reproduction.param_sources.map((ps, i) => (
+                                <tr key={`${ps.name}:${i}`} className="align-top">
+                                  <td className="border px-2 py-1 font-mono">{ps.name}</td>
+                                  <td className="border px-2 py-1 font-mono break-all">{ps.value || "（空）"}</td>
+                                  <td className="border px-2 py-1">{ps.source}</td>
+                                  <td className="border px-2 py-1 break-all">
+                                    {ps.inferred ? (
+                                      <span>
+                                        无来源（模型推断）
+                                        {ps.detail ? <span className="text-muted-foreground">：{ps.detail}</span> : null}
+                                      </span>
+                                    ) : (
+                                      <span className="break-all">
+                                        {ps.url}
+                                        {ps.detail ? <span className="text-muted-foreground"> {ps.detail}</span> : null}
+                                      </span>
+                                    )}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : null}
                     </div>
                     {finding.reproduction.steps.map((step, i) => (
                       <div

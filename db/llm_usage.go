@@ -79,18 +79,28 @@ VALUES (NULLIF($1,''),$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),$6,$7,$8,$9,$
 }
 
 // TokenByModel aggregates a task's LLM token usage grouped by model, most-used
-// first, from the always-on llm_usage ledger. taskID is the task registry id.
+// first, from the always-on llm_usage ledger. taskID is the task registry id;
+// explorationID is the task's exploration id (0 = unknown).
+//
+// task_id 是 TEXT 而任务注册 id 是 bigint，两者本来就不可互换（R19 序 4 前置）：
+// 任务主链路（planner/worker）的调用现在由引擎显式挂 llmrec.WithTaskID(注册 id)，
+// 但历史行（及任何漏挂的调用方）回退拿的是会话里的探索 id 字符串——单看 task_id
+// 会把那部分报成空。exploration_id 列两代行都恒有值且与任务一一对应，按它兜底
+// 与归档侧的口径一致（task_archives.go 同一谓词）。
+// 谓词里不写 `$2 > 0` 之类的裸比较：参数会因此被推断成 int4，探索 id 一大就在
+// 编码侧报「greater than maximum value for int4」（实测）；$2=0 时
+// exploration_id=0 匹配不到任何真实行（judge 行该列为 NULL），语义不变。
 // Accurate even with per-agent model bindings, pool rotation/failover, and
 // interrupted runs, since every call (success or error) is metered.
-func (d *DB) TokenByModel(taskID string) ([]ModelTokenStat, error) {
+func (d *DB) TokenByModel(taskID string, explorationID int64) ([]ModelTokenStat, error) {
 	rows, err := d.Query(`
 SELECT COALESCE(NULLIF(model,''),'(unknown)') AS model, COUNT(*) AS calls,
        COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
        COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0)
 FROM llm_usage
-WHERE COALESCE(task_id,'') = $1
+WHERE COALESCE(task_id,'') = $1 OR exploration_id = $2
 GROUP BY model
-ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC, model`, taskID)
+ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC, model`, taskID, explorationID)
 	if err != nil {
 		return nil, err
 	}

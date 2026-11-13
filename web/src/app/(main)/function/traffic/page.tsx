@@ -740,6 +740,22 @@ export default function TrafficPage() {
                 </div>
                 <SheetTitle className="break-all font-mono">{selected.host}</SheetTitle>
                 <SheetDescription className="break-all font-mono">{selected.url}</SheetDescription>
+                {detail?.req_base64 && (
+                  <div className="px-5 pb-3">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        // R17：二进制正文按原始字节交接给重发（base64 → sessionStorage），
+                        // 避开文本通道的 UTF-8 强制转换。键名与重发页 RAW_B64_KEY 一致。
+                        sessionStorage.setItem("jingwei.repeater.raw_b64", detail.req_base64!);
+                        window.location.assign("/function/repeater");
+                      }}
+                    >
+                      按原始字节发到重发（二进制正文）
+                    </Button>
+                  </div>
+                )}
               </SheetHeader>
               <Tabs defaultValue="request" className="min-h-0 flex-1 gap-0">
                 <TabsList className="mx-5 mt-4 grid w-auto grid-cols-2">

@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -191,11 +193,133 @@ func (p *guardTargetPolicy) Check(taskID int64, urls, hosts []string) (guard.Sco
 			out = append(out, h)
 		}
 	}
-	if len(out) == 0 {
-		return guard.ScopeIn, ""
+	if len(out) > 0 {
+		return p.deny(taskID, pgdb.GuardDenialOutOfScope, fmt.Sprintf("目标 %s 不在本任务已登记范围内（登记范围: %s）",
+			strings.Join(dedupeStrings(out), ", "), scopeRuleSummary(rules)))
 	}
-	return p.deny(taskID, pgdb.GuardDenialOutOfScope, fmt.Sprintf("目标 %s 不在本任务已登记范围内（登记范围: %s）",
-		strings.Join(dedupeStrings(out), ", "), scopeRuleSummary(rules)))
+	// R19 序 5：授权粒度硬约束。ip_port（严格按清单）要求 (host, port) 落在任务清单
+	// 登记对内——上一轮实机就是在未列出的端口（:808/:805/:32000 等）上出了
+	// critical/high，host 级范围挡不住端口扩散。粒度读不到按拒绝处理（失败关闭，
+	// 与范围读取同一口径）；by_ip 或存量空值维持原行为。
+	gran, gerr := p.pg.TaskScopeGranularity(taskID)
+	if gerr != nil {
+		log.Printf("[guard][target] 读取任务 %d 授权粒度失败(拒绝): %v", taskID, gerr)
+		return p.deny(taskID, pgdb.GuardDenialScopeReadFailed,
+			fmt.Sprintf("无法读取任务 %d 的授权粒度，请稍后重试（%v）", taskID, gerr))
+	}
+	if gran == pgdb.ScopeGranularityIPPort {
+		if v := checkIPPortGranularity(taskID, p.pg, urls, hosts); v != "" {
+			return p.deny(taskID, pgdb.GuardDenialOutOfScope, v)
+		}
+	}
+	return guard.ScopeIn, ""
+}
+
+// checkIPPortGranularity 校验探测目标是否都落在任务清单登记的 (host, port) 对内
+// （R19 序 5）。hosts 条目可带可不带端口；urls 一并解析出 host:port 参与校验。
+// 返回空串 = 全部合规；否则返回可直接给模型看的拒绝原因。登记对来自
+// task_scope(kind='target')，由 seed 写入（source='manual'）。
+func checkIPPortGranularity(taskID int64, pg *pgdb.DB, urls, hosts []string) string {
+	pairs, err := pg.Assets().ListTaskTargetPairs(taskID)
+	if err != nil {
+		log.Printf("[guard][target] 读取任务 %d 目标授权对失败(拒绝): %v", taskID, err)
+		return fmt.Sprintf("无法读取任务 %d 的目标授权清单，请稍后重试（%v）", taskID, err)
+	}
+	set := buildTargetPairSet(pairs)
+	if len(set) == 0 {
+		return "授权粒度为 ip_port（严格按清单 host:port），但任务没有登记任何目标对；请在任务描述的目标清单里写明 host:port 后重建任务"
+	}
+	var out []string
+	for _, h := range hosts {
+		if v := targetPairViolation(h, set); v != "" {
+			out = append(out, v)
+		}
+	}
+	for _, u := range urls {
+		if pu, perr := url.Parse(u); perr == nil && pu.Hostname() != "" {
+			hp := pu.Hostname()
+			if pu.Port() != "" {
+				hp += ":" + pu.Port()
+			}
+			if v := targetPairViolation(hp, set); v != "" {
+				out = append(out, v)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("授权粒度为 ip_port（严格按清单 host:port）：目标 %s 不在清单登记对内（登记对: %s）；要测未列出的端口，请把端口补进任务目标清单或改用 by_ip 粒度",
+		strings.Join(dedupeStrings(out), ", "), targetPairSummary(set))
+}
+
+// buildTargetPairSet 归并授权对：host（小写、去尾点）→ 端口集合。
+func buildTargetPairSet(pairs []pgdb.TaskTargetPair) map[string][]int {
+	set := map[string][]int{}
+	for _, p := range pairs {
+		h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(p.Host), "."))
+		if h == "" || p.Port <= 0 {
+			continue
+		}
+		set[h] = append(set[h], p.Port)
+	}
+	return set
+}
+
+// targetPairViolation 检查一条探测目标（host 或 host:port）是否在授权对内，违规返回
+// 原文、合规返回空串。带端口的探测严格对 (host, port)；不带端口的探测（ICMP、裸
+// 主机名，拿不到端口）只要求主机在清单里——具体端口命中会在带端口的调用处被拦。
+func targetPairViolation(target string, set map[string][]int) string {
+	t := strings.ToLower(strings.TrimSpace(target))
+	if t == "" {
+		return ""
+	}
+	host, portStr, err := net.SplitHostPort(t)
+	if err != nil {
+		if _, ok := set[strings.TrimSuffix(t, ".")]; !ok {
+			return t
+		}
+		return ""
+	}
+	ports, ok := set[strings.TrimSuffix(host, ".")]
+	if !ok {
+		return t
+	}
+	p, perr := strconv.Atoi(portStr)
+	if perr != nil || p <= 0 {
+		return ""
+	}
+	for _, ap := range ports {
+		if ap == p {
+			return ""
+		}
+	}
+	return t
+}
+
+// targetPairSummary 生成可读的登记对清单（拒绝原因里给操作员看「授权的到底是什么」）。
+func targetPairSummary(set map[string][]int) string {
+	type pair struct {
+		host string
+		port int
+	}
+	var all []pair
+	for h, ports := range set {
+		for _, p := range ports {
+			all = append(all, pair{h, p})
+		}
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].host != all[j].host {
+			return all[i].host < all[j].host
+		}
+		return all[i].port < all[j].port
+	})
+	parts := make([]string, 0, len(all))
+	for _, p := range all {
+		parts = append(parts, fmt.Sprintf("%s:%d", p.host, p.port))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // activeAuthorizations 读取有效授权清单，缓存 30 秒（授权改动很少，而每个

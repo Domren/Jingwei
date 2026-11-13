@@ -22,6 +22,8 @@ import { api } from "@/lib/api";
 // 目标地址默认从请求行的 Host 头推出来，允许手改——同一个包换站重发是常态。
 
 const CLOCK_PREF_KEY = "jingwei.repeater.clock";
+// R17：流量页「按原始字节发到重发」的交接键（base64 的完整原始报文）。
+const RAW_B64_KEY = "jingwei.repeater.raw_b64";
 
 /** 公历带秒的时刻，例：2026年11月03日 13:45:09。 */
 function formatCivilClock(d: Date): string {
@@ -58,13 +60,20 @@ type SendResult = {
   error?: string;
 };
 
-/** 把一段原始报文拆成方法、路径、头与正文（宽容解析，不追求协议严谨）。 */
+/** 把一段原始报文拆成方法、路径、头与正文（宽容解析，不追求协议严谨）。
+ *  R17：不再全局把 CRLF 折成 LF——multipart 正文要求 CRLF，折叠会让重发正文
+ *  与原报文不等价（yakit 能过而重发失败的第二个根因）。头部按 \r?\n 切，
+ *  正文从首个空行（\r\n\r\n 优先）原样截取。 */
 function parseRaw(raw: string): ParsedRequest | null {
-  const text = raw.replace(/\r\n/g, "\n");
-  const sep = text.indexOf("\n\n");
-  const head = sep >= 0 ? text.slice(0, sep) : text;
-  const body = sep >= 0 ? text.slice(sep + 2) : "";
-  const lines = head.split("\n").filter((line, i) => i === 0 || line.trim() !== "");
+  let sep = raw.indexOf("\r\n\r\n");
+  let sepLen = 4;
+  if (sep < 0) {
+    sep = raw.indexOf("\n\n");
+    sepLen = 2;
+  }
+  const head = sep >= 0 ? raw.slice(0, sep) : raw;
+  const body = sep >= 0 ? raw.slice(sep + sepLen) : "";
+  const lines = head.split(/\r?\n/).filter((line, i) => i === 0 || line.trim() !== "");
   if (lines.length === 0) return null;
   const first = lines[0].trim().split(/\s+/);
   if (first.length < 2) return null;
@@ -128,6 +137,23 @@ export default function RepeaterPage() {
     localStorage.setItem(CLOCK_PREF_KEY, JSON.stringify({ offset: clockOffset }));
   }, [clockOffset]);
 
+  // R17：从流量页「按原始字节发到重发」带入的报文——base64 解成字节字符串；
+  // 二进制正文在编辑器里显示为乱码，但按原字节发送。
+  React.useEffect(() => {
+    const b64 = sessionStorage.getItem(RAW_B64_KEY);
+    if (!b64) return;
+    sessionStorage.removeItem(RAW_B64_KEY);
+    try {
+      const bin = atob(b64);
+      setRaw(bin);
+      const req = parseRaw(bin);
+      if (req?.host) setTarget(`${/:(443)$/.test(req.host) ? "https" : "http"}://${req.host}`);
+      toast.success("已按原始字节载入流量报文；二进制正文按原字节发送");
+    } catch {
+      toast.error("原始报文 base64 解码失败");
+    }
+  }, []);
+
   const clampClockOffset = (px: number, room: number) => Math.max(-room, Math.min(room, px));
 
   function onClockPointerDown(e: React.PointerEvent<HTMLSpanElement>) {
@@ -172,14 +198,25 @@ export default function RepeaterPage() {
     const url = req.path.startsWith("http://") || req.path.startsWith("https://") ? req.path : `${base}${req.path}`;
     setSending(true);
     try {
-      const res = await api.repeaterSend({
+      // R17：正文按字节发——latin1 可表示（含二进制与 CRLF）时走 base64 无损通道；
+      // 手改出非 latin1 字符（如直接输入中文）时退回文本通道（此时正文已是文本语义）。
+      let latin1 = true;
+      for (let i = 0; i < req.body.length; i++) {
+        if (req.body.charCodeAt(i) > 0xff) {
+          latin1 = false;
+          break;
+        }
+      }
+      const payload: Parameters<typeof api.repeaterSend>[0] = {
         method: req.method,
         url,
         headers: req.headers,
-        body: req.body,
         insecure_skip_verify: insecure,
         use_recording_proxy: viaProxy,
-      });
+      };
+      if (req.body && latin1) payload.body_base64 = btoa(req.body);
+      else payload.body = req.body;
+      const res = await api.repeaterSend(payload);
       setResult(res);
       if (res.error) toast.error(res.error);
     } catch (e) {

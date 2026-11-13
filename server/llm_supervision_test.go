@@ -135,8 +135,27 @@ type llmrecStub struct {
 func (s *llmrecStub) InsertLLMRound(r *db.LLMRound) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for i := range s.rows {
+		if s.rows[i].RoundID == r.RoundID {
+			s.rows[i] = *r
+			return nil
+		}
+	}
 	s.rows = append(s.rows, *r)
 	return nil
+}
+
+// UpdateLLMRound 与真实库同语义：按 round_id 原地更新，没有则报不存在。
+func (s *llmrecStub) UpdateLLMRound(r *db.LLMRound) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.rows {
+		if s.rows[i].RoundID == r.RoundID {
+			s.rows[i] = *r
+			return nil
+		}
+	}
+	return db.ErrLLMRoundNotFound
 }
 
 func (s *llmrecStub) snapshot() []db.LLMRound {

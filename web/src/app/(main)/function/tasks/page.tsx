@@ -240,6 +240,7 @@ const STATUS_OPTIONS: { value: TaskStatus; label: string }[] = [
   { value: "done", label: "已完成" },
   { value: "failed", label: "失败" },
   { value: "timeout", label: "已超时" },
+  { value: "budget", label: "预算到限" },
 ];
 
 // Select 不接受空字符串 value,所以「无分类」在筛选器、新建表单和批量移动里
@@ -3169,6 +3170,9 @@ function CreateTaskSheet({
   const [llmProfileIDs, setLLMProfileIDs] = React.useState<string[]>([]);
   const [creating, setCreating] = React.useState(false);
   const [timeoutMin, setTimeoutMin] = React.useState(""); // 任务级超时(分钟);空/0 = 不限时
+  const [maxRoundsInput, setMaxRoundsInput] = React.useState(""); // R19 序 4：规划轮数上限;空 = 不限
+  const [maxTokensInput, setMaxTokensInput] = React.useState(""); // R19 序 4：累计输入 token 上限;空 = 不限
+  const [scopeGranularity, setScopeGranularity] = React.useState(""); // R19 序 5：授权粒度（必选）
   const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner 心跳(分钟);默认10,下限10(与后端一致)
   const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // 创建时下发种子意图,worker 免等首轮 planner 直接开跑;默认关闭,走标准先规划再执行
   const [coverageEnabled, setCoverageEnabled] = React.useState(true); // 资产覆盖度功能;默认开。关闭=不计算/展示覆盖度、不累积范围、隐藏范围类工具(company 关联不受影响)
@@ -3235,10 +3239,17 @@ function CreateTaskSheet({
       toast.error(`最多关联 ${MAX_SOURCE_TASKS} 个来源任务`);
       return;
     }
+    // R19 序 5：授权粒度必选——粒度决定范围硬约束的口径，不默认。
+    if (!scopeGranularity) {
+      toast.error("请选择授权粒度：ip_port = 严格按清单 host:port；by_ip = 按 IP 授权全部端口");
+      return;
+    }
     setCreating(true);
     try {
       const timeoutSec = Math.max(0, Math.floor(Number(timeoutMin) || 0)) * 60;
       const heartbeatSec = Math.max(10, Math.floor(Number(heartbeatMin) || 10)) * 60; // 下限 10min，与后端归一一致
+      const maxRounds = Math.max(0, Math.floor(Number(maxRoundsInput) || 0));
+      const maxInputTokens = Math.max(0, Math.floor(Number(maxTokensInput) || 0));
       await api.createTask({
         name: name.trim(),
         categoryId: categoryID,
@@ -3248,6 +3259,9 @@ function CreateTaskSheet({
         sourceTaskIds: sourceTaskIDs,
         companyIds: companyIDs,
         timeoutSeconds: timeoutSec,
+        maxRounds,
+        maxInputTokens,
+        scopeGranularity,
         seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
         coverageEnabled,
@@ -3266,6 +3280,9 @@ function CreateTaskSheet({
       setCompanyIDs([]);
       setLLMProfileIDs([]);
       setTimeoutMin("");
+      setMaxRoundsInput("");
+      setMaxTokensInput("");
+      setScopeGranularity("");
       setHeartbeatMin("10");
       setSeedFirstIntent(false);
       setCoverageEnabled(true);
@@ -3556,12 +3573,43 @@ function CreateTaskSheet({
               <FieldDescription>按列表顺序故障转移；第一项为当前配置，仅在额度不足或配置不可用（401/403/404）时切换下一项。</FieldDescription>
             </Field>
 
+            {/* R19 序 5：授权粒度必选，不折叠——它决定范围硬约束的口径。 */}
+            <div className="grid gap-2">
+              <Label>授权粒度（必选）</Label>
+              <div className="flex flex-col gap-2">
+                <label className="flex items-start gap-2 text-sm">
+                  <input
+                    type="radio"
+                    name="scope-granularity"
+                    value="ip_port"
+                    checked={scopeGranularity === "ip_port"}
+                    onChange={() => setScopeGranularity("ip_port")}
+                    className="mt-1"
+                  />
+                  <span><span className="font-medium">ip_port 严格</span> —— 只有任务目标清单登记的 host:port 可测，未列出的端口一律拒绝</span>
+                </label>
+                <label className="flex items-start gap-2 text-sm">
+                  <input
+                    type="radio"
+                    name="scope-granularity"
+                    value="by_ip"
+                    checked={scopeGranularity === "by_ip"}
+                    onChange={() => setScopeGranularity("by_ip")}
+                    className="mt-1"
+                  />
+                  <span><span className="font-medium">按 IP 授权</span> —— 目标 IP 的全部端口可测（需授权书覆盖整台主机）</span>
+                </label>
+              </div>
+              <p className="text-muted-foreground text-xs">
+                决定范围硬约束的口径：guard 按所选粒度拒绝范围外目标与端口。粒度随任务落库，审计时可回答「这个端口为什么在范围内」。
+              </p>
+            </div>
             {/* 高级参数默认折叠:超时/心跳/首个意图,展开才占空间,常用路径保持清爽。 */}
             <Collapsible>
               <CollapsibleTrigger className="group flex w-full items-center gap-2 border-t pt-4 text-sm font-medium">
                 <ChevronRightIcon className="text-muted-foreground size-4 transition-transform group-data-[state=open]:rotate-90" />
                 高级设置
-                <span className="text-muted-foreground ml-auto text-xs font-normal">超时 · 心跳 · 首个意图</span>
+                <span className="text-muted-foreground ml-auto text-xs font-normal">超时 · 预算 · 心跳 · 首个意图</span>
               </CollapsibleTrigger>
               <CollapsibleContent className="grid gap-5 pt-5">
                 <div className="grid gap-2">
@@ -3577,6 +3625,36 @@ function CreateTaskSheet({
                   />
                   <p className="text-muted-foreground text-xs">
                     到点后触发优雅收尾（各 agent 写回 + planner 终局判定），任务进入 timeout 终态。
+                  </p>
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="task-max-rounds">规划轮数上限（可选）</Label>
+                  <Input
+                    id="task-max-rounds"
+                    type="number"
+                    min={0}
+                    className="w-40"
+                    placeholder="留空 = 不限"
+                    value={maxRoundsInput}
+                    onChange={(e) => setMaxRoundsInput(e.target.value)}
+                  />
+                  <p className="text-muted-foreground text-xs">
+                    任务级预算闸门：planner 规划轮数达到上限即触发优雅收尾，任务进入 budget 终态，停止原因写进台账。
+                  </p>
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="task-max-tokens">输入 token 上限（可选）</Label>
+                  <Input
+                    id="task-max-tokens"
+                    type="number"
+                    min={0}
+                    className="w-40"
+                    placeholder="留空 = 不限"
+                    value={maxTokensInput}
+                    onChange={(e) => setMaxTokensInput(e.target.value)}
+                  />
+                  <p className="text-muted-foreground text-xs">
+                    累计输入 token 达到上限即触发优雅收尾。按 token 计而不是只看轮数——轮数正常时钱照样可能烧穿。
                   </p>
                 </div>
                 <div className="grid gap-2">

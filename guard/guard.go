@@ -131,7 +131,7 @@ func egressCheckTool(name string) bool {
 		return true
 	}
 	switch name {
-	case "web_fetch", "http_request", "http_post",
+	case "web_fetch", "http_request", "http_post", "http_send",
 		"verify_vulnerability", "exploit_vulnerability", "test_waf_bypass", "inject_webshell",
 		// webshell_register 会用会话把载荷写到目标、并对给定地址做存活探测，
 		// 两者都是把调用方内容送到远端。

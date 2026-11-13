@@ -405,7 +405,12 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 目标判定、不产新意图。
 	tc := taskClockFrom(ctx)
 	if tc.Final {
-		situational += "\n\n【任务终局收尾（本轮特殊指令，覆盖上面的常规规划流程）】：" + resolveTaskTimeoutWrapup("planner")
+		// R19 序 4：终局词按收尾原因挑——预算到限用预算词（钱烧完了），否则超时词。
+		finalWords := resolveTaskTimeoutWrapup("planner")
+		if tc.Settle == "budget" {
+			finalWords = resolveTaskBudgetWrapup("planner")
+		}
+		situational += "\n\n【任务终局收尾（本轮特殊指令，覆盖上面的常规规划流程）】：" + finalWords
 	}
 	// 本任务的工作目录 <workDir>/tasks/<taskID>，先建好。
 	taskDir := ensureRunDir(p.workDir, taskID, 0)
@@ -419,8 +424,8 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 任务到点时进收尾(因超时→任务超时词,因步数→per-run 词)。
 	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, 0)
 	settle := wrapupSettlement("planner", nil)
-	if tc.DeadlineUnix > 0 {
-		settle = wrapupSettlementForTask("planner", nil, clamped)
+	if tc.DeadlineUnix > 0 || tc.Settle != "" {
+		settle = wrapupSettlementForTask("planner", nil, clamped, tc.Settle)
 	}
 	opts := agentcore.Options{
 		Provider:        p.prov,

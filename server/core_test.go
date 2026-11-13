@@ -61,7 +61,10 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 	}
 
 	// create a task → 201, returns PG task (string id + exploration_id)
-	code, out := doRetry("POST", "/api/tasks", map[string]string{"description": "smoke", "goal": "测试 SQLi/XSS"})
+	// R19 序 5：授权粒度是创建必选项（HTTP 路径 400 强制二选一），测试也要显式给。
+	code, out := doRetry("POST", "/api/tasks", map[string]string{
+		"description": "smoke", "goal": "测试 SQLi/XSS", "scope_granularity": "by_ip",
+	})
 	if code != 201 {
 		t.Fatalf("create task: %d (%v)", code, out)
 	}

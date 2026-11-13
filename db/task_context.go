@@ -8,8 +8,6 @@ import (
 	"unicode/utf8"
 )
 
-const IntentBlockedLLMQuota = "llm_quota_exhausted"
-
 // Task-level LLM chain entry statuses. 'unavailable' covers configuration-class
 // rejections (bad key, missing subscription, wrong endpoint/model) that will keep
 // failing until a human fixes the profile, just like quota exhaustion.
@@ -579,9 +577,22 @@ func truncateUTF8(value string, maxBytes int) string {
 	return value[:end]
 }
 
+// SetIntentBlockedReason 把意图明确置为 blocked 并记原因。
+//
+// 1.6.2 第 3 步：空原因不再写成 NULL，而是降级为 unknown——空值会被读成
+// 「这条没有原因」，unknown 才如实表达「原因丢了」。
+//
+// 非空值**原样保留**，不强求落在枚举内：这是「明确指定原因」的入口，调用方
+// 比这里更清楚当时的成因（例如 network_unavailable），强行归一化会把信息洗掉，
+// 而这个入口的价值恰恰是「把真实原因记下来」。枚举的作用是给前端筛选提供
+// 标签、给统计提供已知分类；遇到未登记的值，统计按原文展示，不丢。
 func (s *ExplorationStore) SetIntentBlockedReason(id int64, reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = IntentBlockedUnknown
+	}
 	_, err := s.db.Exec(`UPDATE exploration_nodes
-SET state='blocked', blocked_reason=NULLIF($1,''), completed_at=now()
+SET state='blocked', blocked_reason=$1, completed_at=now()
 WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, reason, id, s.expID)
 	return err
 }

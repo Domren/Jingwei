@@ -256,6 +256,22 @@ const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 // Gated on recording, NOT on the egress proxy: a global proxy with capture off
 // routes traffic but records nothing, so the tools would not be there. Not stored,
 // not editable.
+// workerCompactionWindowCap caps the worker's compaction window regardless of the
+// model's real context window (R19 序 4「worker 上下文增量化」; WHY 见 execute 内注释).
+const workerCompactionWindowCap = 100000
+
+// workerCompactionWindow resolves the effective worker compaction window: 未配置
+// (0)先回落默认 200K，再压到 worker 上限——直接对原始值判上限会让「未配置」漏网。
+func workerCompactionWindow(raw int) int {
+	if raw <= 0 {
+		raw = defaultWindowK * 1000
+	}
+	if raw > workerCompactionWindowCap {
+		return workerCompactionWindowCap
+	}
+	return raw
+}
+
 func workerTrafficBlock(recording bool) string {
 	if !recording {
 		return ""
@@ -406,6 +422,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)
+	// R20 序 5：http_send 经记录代理出站（流量进 MITM 录制、可作证据）。
+	tsx.SetHTTPProxy(w.proxyAddr, w.proxyCACert)
 	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
 	tsx.SetCoverageEnabled(coverageEnabled)
 	if as != nil {
@@ -469,8 +487,20 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tc := taskClockFrom(ctx)
 	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)
 	settle := wrapupSettlement("worker", []string{"Bash"})
-	if tc.DeadlineUnix > 0 {
-		settle = wrapupSettlementForTask("worker", []string{"Bash"}, clamped)
+	if tc.DeadlineUnix > 0 || tc.Settle != "" {
+		settle = wrapupSettlementForTask("worker", []string{"Bash"}, clamped, tc.Settle)
+	}
+	// R19 序 4「worker 上下文增量化」：把 worker 的 compaction 窗口压到 100K，让裁剪
+	// 远早于模型真实窗口（默认 200K）发生。worker 的历史是「工具输出为主、可重读」
+	// 的形态：MicroCompact 在有效窗口 60%（100K 下 ≈54K）就清旧工具结果、AutoCompact
+	// 在 ≈71K 就总结旧轮；被清/被总结的历史不丢——结果可重读、大输出原文在
+	// cmd-output/ 落盘（head+pointer），换来的就是单次调用输入 token 显著下降。
+	window := workerCompactionWindow(w.compactionWindow())
+	// R20 序 5：把 .curlrc 写进本次 run 目录并用 CURL_HOME 指向它——模型自调 curl
+	// 的默认 UA 收口到平台口径。写失败则不注入（curl 退回默认），纵深防御的一层。
+	var curlEnv []string
+	if writeCurlRC(runDir) {
+		curlEnv = []string{"CURL_HOME=" + runDir}
 	}
 	opts := agentcore.Options{
 		Provider:        w.prov,
@@ -495,8 +525,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		DeepSeekSearchAPIKey:  w.webSearch.DeepSeekAPIKey,
 		DeepSeekSearchModel:   w.webSearch.DeepSeekModel,
 		WebSearchProxy:        w.webSearch.Proxy,
-		// Bash 子命令的 HTTP 默认走记录代理 + 信任其 CA（工具无需 -x/-k）。
-		BashEnv:    proxyEnv(w.proxyAddr, w.proxyCACert),
+		// Bash 子命令的 HTTP 默认走记录代理 + 信任其 CA（工具无需 -x/-k）；
+		// CURL_HOME 兑底收口 curl 默认 UA（R20 序 5）。
+		BashEnv:    append(proxyEnv(w.proxyAddr, w.proxyCACert), curlEnv...),
 		WorkingDir: runDir,
 		MaxTurns:   w.maxTurns, // 0 = unlimited (configurable in agent management)
 		// 墙钟预算,轮边界判,不打断半路;0 = 不限。有任务级 deadline 时夹逼到 min(自身预算,
@@ -509,10 +540,10 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		// large tool output spills to cmd-output/ with a head + pointer (SDK tool.Capture);
 		// full output preserved on disk. 截断上限用 SDK 默认(30000 字符)。
 		ToolOutputDir: cmdOutDir(runDir),
-		Compaction:    compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
-		Todos:         actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
-		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
+		Compaction:    compactionConfig(window), // R19 序 4：worker 窗口压到 100K,早裁早省(见上)
+		Todos:         actool.NewTodoStore(),    // 会话级临时待办（TodoWrite），纯规划用，退出即丢
+		NonStreaming:  w.nonStreaming(),         // 该 profile 选非流式时走 Provider.Complete
+		MaxTokens:     w.maxTokens(),            // 0 = 不发上限,由服务端默认值决定
 	}
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks

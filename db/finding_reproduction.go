@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"regexp"
 	"strings"
@@ -40,6 +41,24 @@ type Reproduction struct {
 	Prerequisites []string    `json:"prerequisites,omitempty"`
 	Steps         []ReproStep `json:"steps,omitempty"`
 	Provenance    string      `json:"provenance,omitempty"`
+	// ParamSources 记录 POC 里每个参数的来源（R16）：来源请求/页面的 URL 与字段
+	// 位置；给不出来源的必须显式标 inferred（无来源，模型推断）。操作员逐个复核，
+	// 编造来源等同伪造证据。
+	ParamSources []ParamSource `json:"param_sources,omitempty"`
+}
+
+// ParamSource is one POC parameter's provenance. Source marks WHERE the value
+// came from (form field / JSON key / JS variable / path param / query / cookie /
+// header); URL points at the request or page it was read from. Inferred=true
+// means no source exists and the value is the model's guess — rendered as
+// 「无来源（模型推断）」 everywhere.
+type ParamSource struct {
+	Name     string `json:"name"`
+	Value    string `json:"value,omitempty"`
+	Source   string `json:"source"`           // form|json|js|path|query|cookie|header
+	URL      string `json:"url,omitempty"`    // 来源请求或页面的 URL
+	Detail   string `json:"detail,omitempty"` // 位置补充：如「POST /api/login 响应 JSON 的 data.token」
+	Inferred bool   `json:"inferred,omitempty"`
 }
 
 // Empty reports whether the reproduction carries nothing worth rendering.
@@ -87,6 +106,53 @@ func (r *Reproduction) Normalize() {
 		steps = append(steps, st)
 	}
 	r.Steps = steps
+	ps := make([]ParamSource, 0, len(r.ParamSources))
+	for _, p := range r.ParamSources {
+		p.Name = strings.TrimSpace(p.Name)
+		p.Value = strings.TrimSpace(p.Value)
+		p.URL = strings.TrimSpace(p.URL)
+		p.Detail = strings.TrimSpace(p.Detail)
+		p.Source = strings.ToLower(strings.TrimSpace(p.Source))
+		if p.Name == "" && p.Value == "" {
+			continue // 全空条目直接丢，不给报告留空行
+		}
+		ps = append(ps, p)
+	}
+	r.ParamSources = ps
+}
+
+// NormalizeParamSources 校验并归一参数来源（R16）。name 必填、source 限枚举；
+// 非推断条目必须给出 url 或 detail（操作员要能点到来源），推断条目清空 url——
+// 「无来源（模型推断）」是台账语义，不留半个像来源的字段。
+func (r *Reproduction) NormalizeParamSources() error {
+	if r == nil {
+		return nil
+	}
+	for i := range r.ParamSources {
+		p := &r.ParamSources[i]
+		// 归一在验证点自含：调用方可能没先走 Normalize（如直接校验来自 JSON 的入参）。
+		p.Name = strings.TrimSpace(p.Name)
+		p.Value = strings.TrimSpace(p.Value)
+		p.URL = strings.TrimSpace(p.URL)
+		p.Detail = strings.TrimSpace(p.Detail)
+		p.Source = strings.ToLower(strings.TrimSpace(p.Source))
+		if p.Name == "" {
+			return fmt.Errorf("param_sources[%d].name 必填", i)
+		}
+		switch p.Source {
+		case "form", "json", "js", "path", "query", "cookie", "header":
+		default:
+			return fmt.Errorf("param_sources[%d]（%s）.source 无效：%q（可选 form/json/js/path/query/cookie/header）", i, p.Name, p.Source)
+		}
+		if p.Inferred {
+			p.URL = ""
+			continue
+		}
+		if p.URL == "" && p.Detail == "" {
+			return fmt.Errorf("param_sources[%d]（%s）未给出来源：请补 url/detail，或置 inferred=true 标注为模型推断", i, p.Name)
+		}
+	}
+	return nil
 }
 
 // ParseReproduction decodes a findings.reproduction column value. Empty input,

@@ -9,12 +9,63 @@
 - **LLM 活性监督与中断恢复**：planner 每轮开一条监督 context——建连后
   `JINGWEI_LLM_FIRST_EVENT_TIMEOUT`（默认 45s，可配）内不见首个流事件就主动 cancel
   并记为 `stalled`，不再等 15 分钟墙钟；每轮无论成败都落 `llm_rounds` 一行
-  （status / error_class / attempts / trigger_src / 首帧时刻），错误分五类
-  （`transport_reset` / `stalled` / `rate_limited` / `account_invalid` / `empty_response`），
-  不再只靠日志。触发语义改为 **peek-commit**：失败轮只读不清，触发留在 pending
+  （status / error_class / attempts / trigger_src / 首帧时刻），错误分十类
+  （`transport_reset` / `stalled` / `rate_limited` / `account_invalid` / `unreachable` /
+  `upstream_5xx` / `model_not_found` / `empty_response` / `timeout` / `other`），
+  不再只靠日志。2026-11-12 补强：失败轮按序退避（不再空转轰击坏端点）、同一轮去重记账
+  （`llm_rounds` 行数 = 唯一轮数）、逐发错误随轮汇总（`attempt_classes`）、轮级 token 与
+  model/profile 落账、进行中的轮可见、废轮告警首轮即响、L3「连续零进展」判据接上；
+  默认首帧超时放宽（实测恢复期首帧到过 43s，45s 阈值压线），`JINGWEI_LLM_FIRST_EVENT_TIMEOUT`
+  两侧解析口径统一（纯数字按秒）。触发语义改为 **peek-commit**：失败轮只读不清，触发留在 pending
   等下一次唤醒重新读取（不再丢「worker 完成了但 planner 从没看到」）；成功轮才 commit。
   新增 `GET /api/tasks/{id}/llm-health`（按轮统计 + 按类别分布 + 废轮率告警，
   废轮率超 30% 提示「该中转端不可用」）。
+- **发现归属与去重改为服务端确定性推导**：`asset_ids` 由 POC 全部请求的 `host:port`
+  集合反查（含链式证据里的第二个主机）；`dedupe_key` 无条件生成，缺参数时退化为
+  「类+主机+接口族」；展示与导出按「类+主机+接口族」合并、**取最高严重度**、原始条目
+  可展开。顺带修掉按字节截断中文 slug 产生非法 UTF-8、导致整条漏洞写入回滚的问题
+  （改按 rune 截断）。
+- **blocked 意图必须带原因**：泛型状态写入口不再把 `blocked_reason` 置 NULL，未给原因时
+  以 `unknown` 占位（明确给出的原因原样保留，不做归一化——归一化会打破重试准入失败后
+  恢复原原因的语义）；启动时幂等回填历史空原因行（首次约 40 行，之后恒 0）；
+  `ReopenIntentsByBlockedReason` 恢复有效。
+- **任务级预算闸门（R19）**：创建任务可设「规划轮数上限」与「累计输入 token 上限」，
+  二者任一命中即触发与超时同一套优雅收尾（在跑 worker 写回 → planner 终局判定 →
+  落终态）；新增 budget 终态（旧库自动重建 status CHECK 约束）与 tasks.stop_reason
+  台账（「为什么停」可读可查）；预算必须按输入 token 计，不能只看轮数——轮数正常时
+  钱照样可能烧穿。编排 spawn_task 同步开放 max_rounds / max_input_tokens 参数。
+- **worker 上下文增量化（R19）**：worker 的 compaction 窗口压到 100K——MicroCompact
+  约 54K 起清旧工具结果、AutoCompact 约 71K 起总结旧轮，裁剪远早于模型真实窗口
+  （默认 200K）发生；被清/被总结的历史不丢（结果可重读、大输出原文在 cmd-output/
+  落盘 head+pointer），换来单次调用输入 token 显著下降。
+- **每任务 token 报表口径修复（R19 前置）**：planner/worker 的 LLM 调用此前从未显式
+  挂任务注册 id，`llm_usage.task_id` 落的是会话解析出的探索 id 字符串，按注册 id 查
+  每任务 token 报表会静默返空。现在引擎显式挂注册 id，TokenByModel 按「注册 id OR
+  exploration_id」双谓词兼容两代行；谓词不含裸比较（参数会被推断成 int4，探索 id
+  一大就编码失败）。
+- **出站 HTTP 收口到 http_send 工具（R20 序 5）**：worker 新增 http_send 工具——UA 强制
+  `scanner.BrowserUA()`（调用方给的 User-Agent 被覆盖，不合并）、默认经记录代理出站
+  （流量自动留痕可作漏洞证据）、不跟随重定向（重定向目标同样要过范围检查）、响应封顶；
+  并把 http_send 纳入 guard 敏感外发检查名单。Bash 自调 curl 的兕底：运行时把 .curlrc
+  写进 run 目录并用 CURL_HOME 指向它，curl 默认 UA 同步收口，无需重建镜像。工具描述
+  明确告知模型不要用 curl 造 HTTP 请求。
+- **任务级授权粒度（R19 序 5，创建必选）**：创建任务强制二选一——ip_port（严格按清单
+  host:port）/ by_ip（按 IP 授权全部端口）；guard 按所选粒度对 (host, port) 硬约束，
+  未登记端口一律拒绝并给出登记对清单；目标清单由 seed 落 task_scope(kind='target')
+  供审计（「这个端口为什么在范围内」可回答）；编排 spawn 显式 > 继承父任务 > by_ip；
+  存量任务缺省 by_ip 保持原行为。
+- **POC 参数来源（R16）**：report_finding 的 reproduction 新增 param_sources——POC
+  里每个参数登记「来源请求/页面的 URL + 字段位置」（form/json/js/path/query/cookie/
+  header），给不出来源的必须显式 inferred=true 标注「无来源（模型推断）」；落库前
+  校验（source 枚举外、非推断却无来源的条目直接退回，编造来源等同伪造证据）。
+  发现详情与 HTML/DOCX 报告渲染参数来源表（含推断标记）；markdown 导出沿用报告
+  正文文本（结构化复现本就不进 markdown，维持现状）。
+- **请求重发支持二进制正文（R17 修复）**：带 JWT 的 multipart 文件上传此前必失败——
+  正文走 JSON 文本通道被 UTF-8 强制转换（复现实测 486→742 bytes），且报文解析把 CRLF
+  折成 LF（multipart 边界要求 CRLF）。修复三件：重发载荷新增 body_base64 无损通道
+  （解码失败 400，不静默降级）；报文解析保留 CRLF（头部按 \r?\n 切、正文从首个空行
+  原样截取）；流量详情对二进制正文附带 req_base64/resp_base64，详情面板新增
+  「按原始字节发到重发」交接（base64 → sessionStorage → 重发页解码）。
 - **出站报文不再带自研品牌与工具签名**：`User-Agent: Jingwei-CredScan` /
   `Jingwei-DirScan` 两行从 HTTP 凭据探测与目录枚举里移除，改为统一走
   `scanner.BrowserUA()`；默认一串与深度利用同口径的 Chrome UA，可用
@@ -59,8 +110,40 @@
   `TestGroupTargetsByPortSpec`、`TestMergeDiscoverResultsDedupes`、`TestSeedRegistersEveryTarget`、
   `TestStampFirstRunPersistsWithoutTimeout`、`TestStampFirstRunStillComputesDeadline`、
   `TestAssetDSLAllowsSpacesAroundOperator`、`TestAssetDSLErrorNamesOffendingWord`。
+- 夹具（新增，2026-11-12 第 1–3 序）：`llmrec/r21_patches_test.go`（`unreachable` /
+  `upstream_5xx` / `model_not_found` 分类不再落 `other`、纯数字超时按秒解析、T1 默认放宽）、
+  `server/r21_alarm_backoff_test.go`（首轮即告警、退避间隔递增、零进展判据不误报）、
+  `db/finding_traffic_dedupe_test.go` 与 `report/finding_merge_test.go`（资产并集反查、
+  合并取最高严重度）、`db/intent_blocked_test.go`（泛型写入必带原因、回填幂等、
+  回填后「blocked 且原因为空」= 0）；每条均做反向验证（退掉改动即复现原缺陷）。
+  包级验证：`db` 全量通过（含真实 PG）；`llmrec` + `report` 共 89 条 PASS；`server` 剩 5 条
+  与本次改动无关的既有红灯（详见进度手册 §5.2.1/§5.2.2）。
+- 夹具（新增，2026-11-12 第 4 序）：`db/llm_usage_test.go`（TokenByModel 双谓词含历史
+  口径行，反向验证=旧口径漏行即缺陷本身）、`db/llm_rounds_test.go`（TaskBudgetUsage
+  两代口径行都计入）、`db/tasks_budget_test.go`（预算字段落库回读 + budget 终态判定）、
+  `agent/r19_settle_test.go`（预算收尾词 / 超时词回归护栏 / compaction 窗口上限含未配置
+  回落漏网点）、`server/r19_budget_test.go`（settleCause 映射 / TaskClock.Settle 口径 /
+  协调器守卫）。验证现状：`go build`、`go vet ./db ./agent ./server` 全绿；`go test ./agent`
+  与 `./llmrec` 全量 PASS；`go test ./server` 失败清单 = 既有 5 条红灯（无新增）；
+  新增夹具单跑全 PASS；前端 `tsc --noEmit` 通过。
+- 夹具（新增，2026-11-12 第 5 序）：`agent/http_send_test.go`（调用方 UA 强制覆盖 +
+  httptest 端到端断言服务端看到的 UA）、`server/r20_granularity_test.go`（授权对判定，
+  含 :35888 越权形态反向验证）、`db/tasks_granularity_test.go`（粒度校验/回读/缺省兕底）。
+  验证现状：build/vet 全绿；db/agent 全量 PASS；server 全量失败 = 既有 5 条红灯（无新增）；
+  tsc 通过。实机复跑的出站 UA 断言（含模型自调 curl 路径）与 ip_port 越权端口拒绝断言未跑。
+- 夹具（新增，2026-11-12 第 6 序）：`server/repeater_multipart_test.go`——文本通道损坏
+  定性（486→742 bytes，钉住 R17 根因）+ base64 通道验收（出站字节与直接发送逐字节
+  归零，direct=486/via=486；反向验证 = 退掉 body_base64 解码分支，正文变空、比对
+  立即失败）。
+- 夹具（新增，2026-11-12 第 7 序）：`db/finding_param_sources_test.go`（来源校验：
+  source 枚举外/非推断无来源/name 缺失拒绝；推断条目清空 url；大小写归一）+
+  `report/param_sources_test.go`（HTML/DOCX 渲染参数来源表含推断标记；反向验证：
+  无 param_sources 不渲染该段）。
 - 实机：本机实例上的真实多目标任务（12 条授权目标）暴露出上述问题；修复前后的同任务对比
-  （登记目标数、开局预扫覆盖、首条漏洞时间点）在重跑后回填本节。
+  （登记目标数、开局预扫覆盖、首条漏洞时间点）在重跑后回填本节。四个可数指标
+  （`dedupe_key` 空 0、`asset_ids` 空 0、`llm_rounds` 行数=唯一轮数、blocked 无原因 0）与
+  R19 的两个判据（每问题输入 token 降到 150 万以下、设上限后任务能自己落到终态并给出
+  停止原因）的实机复跑未跑，跑完后回填本节。
 
 ## [1.6.1] - 2026-11-10
 

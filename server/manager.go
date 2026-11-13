@@ -56,16 +56,23 @@ type Task struct {
 	CompanyIDs         []int64 `json:"company_ids,omitempty"`
 	Status             string  `json:"status"` // persisted lifecycle status (done/failed/timeout 为终态；空/其它则由运行态推导)
 	// 任务级超时(见 docs/任务级超时与收尾设计.md)。DeadlineAt/FirstRunAt 为 unix 秒,0=未设/未运行。
-	TimeoutSeconds       int                    `json:"timeout_seconds"`
-	PlanHeartbeatSeconds int                    `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
-	CoverageEnabled      bool                   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
-	FirstRunAt           int64                  `json:"first_run_at,omitempty"`
-	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
-	Store                *pgdb.ExplorationStore `json:"-"`
-	Guard                *guard.Guard           `json:"-"`
-	notify               chan struct{}
-	lifecycleMu          sync.RWMutex
-	llmMu                sync.RWMutex
+	TimeoutSeconds       int `json:"timeout_seconds"`
+	PlanHeartbeatSeconds int `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
+	// R19 序 4：任务级预算闸门（轮数 + 输入 token 双上限）。0=不限；到限走收尾时序，
+	// 终态 budget，停止原因在 StopReason。
+	MaxRounds      int    `json:"max_rounds"`
+	MaxInputTokens int64  `json:"max_input_tokens"`
+	StopReason     string `json:"stop_reason,omitempty"`
+	// R19 序 5：授权粒度（创建必选；空=存量任务旧行为，等同 by_ip）。
+	ScopeGranularity string                 `json:"scope_granularity,omitempty"`
+	CoverageEnabled  bool                   `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定,默认开)
+	FirstRunAt       int64                  `json:"first_run_at,omitempty"`
+	DeadlineAt       int64                  `json:"deadline_at,omitempty"`
+	Store            *pgdb.ExplorationStore `json:"-"`
+	Guard            *guard.Guard           `json:"-"`
+	notify           chan struct{}
+	lifecycleMu      sync.RWMutex
+	llmMu            sync.RWMutex
 
 	// pendingTriggers accumulates the concrete changes (worker done / finding) that
 	// fired planning rounds since the last one consumed them. The debounce coalesces
@@ -90,6 +97,7 @@ type taskLifecycleState struct {
 	CompletedAt   int64
 	FirstRunAt    int64
 	DeadlineAt    int64
+	StopReason    string
 	SourceTaskIDs []int64
 	CompanyIDs    []int64
 	CategoryID    *int64
@@ -118,6 +126,7 @@ func (t *Task) lifecycleSnapshotLocked() taskLifecycleState {
 		CompletedAt:   t.CompletedAt,
 		FirstRunAt:    t.FirstRunAt,
 		DeadlineAt:    t.DeadlineAt,
+		StopReason:    t.StopReason,
 		SourceTaskIDs: append([]int64(nil), t.SourceTaskIDs...),
 		CompanyIDs:    append([]int64(nil), t.CompanyIDs...),
 		CategoryID:    cloneInt64Ptr(t.CategoryID),
@@ -143,6 +152,7 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 	t.CompletedAt = state.CompletedAt
 	t.FirstRunAt = state.FirstRunAt
 	t.DeadlineAt = state.DeadlineAt
+	t.StopReason = state.StopReason
 	t.SourceTaskIDs = append(t.SourceTaskIDs[:0], state.SourceTaskIDs...)
 	t.CompanyIDs = append(t.CompanyIDs[:0], state.CompanyIDs...)
 	t.CategoryID = cloneInt64Ptr(state.CategoryID)
@@ -388,6 +398,14 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	}
 	if err := pg.EnsureLLMRoundsTable(); err != nil {
 		log.Printf("[llmround] create table: %v", err)
+	}
+	// 1.6.2 第 3 步：把历史上「blocked 但原因为空」的意图标成 unknown。
+	// 幂等（只动 COALESCE(blocked_reason,'')='' 的行），首次执行会回填存量，
+	// 之后恒为 0——不为 0 就说明还有别的写入口在绕过枚举。
+	if n, err := pg.BackfillIntentBlockedReasons(); err != nil {
+		log.Printf("[intent] 回填 blocked 原因失败: %v", err)
+	} else if n > 0 {
+		log.Printf("[intent] 回填 %d 条历史 blocked 意图的原因为 unknown（原因当时未记录）", n)
 	}
 	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
 	m.egress = guard.NewEgressGuard()
@@ -866,8 +884,10 @@ func (m *Manager) taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore) *Task 
 		SourceTaskIDs:  append([]int64(nil), pt.SourceTaskIDs...),
 		CompanyIDs:     append([]int64(nil), pt.CompanyIDs...),
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
-		CoverageEnabled: pt.CoverageEnabled,
-		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
+		MaxRounds: pt.MaxRounds, MaxInputTokens: pt.MaxInputTokens, StopReason: pt.StopReason,
+		ScopeGranularity: pt.ScopeGranularity,
+		CoverageEnabled:  pt.CoverageEnabled,
+		FirstRunAt:       unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		Store: store, Guard: g, notify: make(chan struct{}, 1),
 	}
 }
