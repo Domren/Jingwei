@@ -23,12 +23,22 @@ func intranetCmdExistsProbeCmd(target string) string {
 }
 
 // intranetCmdUploadChunkCmd 分块写入 base64 文本；first 为真时覆盖，否则追加。
+//
+// 用 `<nul set /p="chunk">>` 而不是 `echo chunk>>`：cmd 对紧邻 `>>` 的尾随
+// 数字有句柄重定向语义，真机（Win11 22631，2026-11-14 R3 批 B）实测
+// `echo QUJDR4>>f` 落盘 9 字节「QUJDR4 +空格+CRLF」——echo 与重定向之间被
+// cmd 插入空格，4KiB 块 ×256 块里必有块尾数字，base64 流从此错位，解码后
+// 大小校验必炸（1MB 上传全 400 的根因）。set /p 的提示符无尾随换行也无
+// 空格，且 chunk 被引号括住，尾数字与 `>>` 之间隔着引号，句柄语义不触发。
+// 代价：`<nul` 喂空输入时 set /p 置 ERRORLEVEL=1，会把整个 `(cmd) & call
+// echo __JW_EC__%^ERRORLEVEL%` trailer 误标为失败——所以末尾显式
+// `cmd /c exit 0` 归零（与 wmi 撤销命令同一处理）。
 func intranetCmdUploadChunkCmd(chunk, b64Temp string, first bool) string {
 	op := ">>"
 	if first {
 		op = ">"
 	}
-	return "echo " + chunk + op + b64Temp
+	return `(<nul set /p="` + chunk + `"` + op + b64Temp + `) & cmd /c exit 0`
 }
 
 // intranetCmdDecodeCmd certutil 解码 base64 文本为二进制。

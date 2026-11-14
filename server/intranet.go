@@ -19,6 +19,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
 
 	"github.com/Autumn-27/jingwei/db"
 	"github.com/Autumn-27/jingwei/guard"
@@ -527,6 +530,69 @@ func (s *Server) intranetSendScript(ctx context.Context, pg *db.DB, sess *db.Int
 	return scanner.RunShellCommand(cctx, client, shell.URL, payload, script)
 }
 
+// intranetValidUTF8Text 清洗目标回显里无效的 UTF-8 序列，让产出可以直接进
+// PostgreSQL（utf8 编码库拒收无效字节序列，SQLSTATE 22021——真机实测：中文
+// Windows 的 net localgroup 在 chcp 65001 前缀下仍按 OEM 代码页 936 吐中文段，
+// `win-admins` 整条脚本 500，2026-11-14 R3 批 B）。
+//
+// 两档策略，按「无效字节占非 ASCII 字节的比例」分流：
+//   - 无效占多数 → 整串按 GBK 解码（OEM 代码页输出，ASCII 部分恒等不受影响）。
+//     注意 GBK 字节流里会出现恰好合法的 UTF-8 组合（如「功」的尾字节+「完」的首
+//     字节 = U+00E9），逐段切分会切错，必须整串转。
+//   - 否则（UTF-8 主体夹个别坏字节）→ 只把无效字节换成 U+FFFD，不碰合法部分，
+//     免得把好好的 UTF-8 中文整段毁成 GBK 乱码。
+func intranetValidUTF8Text(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	inv, nonASCII := 0, 0
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r != utf8.RuneError || size > 1 {
+			if r >= utf8.RuneSelf {
+				nonASCII += size
+			}
+			i += size
+			continue
+		}
+		inv += size
+		nonASCII += size
+		i += size
+	}
+	if inv*2 > nonASCII {
+		// GBK 解码输出必是合法 UTF-8（无效序列换 FFFD），真机 GBK 场景整串还原。
+		if dec, err := simplifiedchinese.GBK.NewDecoder().String(s); err == nil && utf8.ValidString(dec) {
+			return dec
+		}
+	}
+	var b strings.Builder
+	for len(s) > 0 {
+		r, size := utf8.DecodeRuneInString(s)
+		if r != utf8.RuneError || size > 1 {
+			b.WriteString(s[:size])
+			s = s[size:]
+			continue
+		}
+		b.WriteString(strings.Repeat("\uFFFD", size))
+		s = s[size:]
+	}
+	return b.String()
+}
+
+// intranetMarkerIndex 在一行里定位标记：优先行首（TrimSpace 后即标记），
+// 其次行中。CLIXML 等无换行结尾的 PS 输出会把 trailer 黏在上一条输出尾部
+// （真机实测 `</Objs>__JW_EC__0` 整行以 `<Objs` 开头），按行首匹配会整体
+// 失配、退出码永远解析不出来；行中匹配救回这种形态。
+func intranetMarkerIndex(line, marker string) (int, bool) {
+	if strings.HasPrefix(line, marker) {
+		return 0, true
+	}
+	if i := strings.Index(line, marker); i >= 0 {
+		return i, true
+	}
+	return -1, false
+}
+
 // parseIntranetOutput splits the cwd/exit-code markers off the command output.
 // POSIX prints the values on the marker line; the cmd.exe trailer prints them
 // on the following line. ok=false means the wrapper trailer never ran.
@@ -536,16 +602,16 @@ func parseIntranetOutput(raw string) (output, cwd string, exitCode int, ok bool)
 	cwdIdx, ecIdx := -1, -1
 	for i, line := range lines {
 		t := strings.TrimSpace(line)
-		if strings.HasPrefix(t, intranetCwdMarker) {
+		if idx, hit := intranetMarkerIndex(t, intranetCwdMarker); hit {
 			cwdIdx = i
-			cwd = strings.TrimSpace(strings.TrimPrefix(t, intranetCwdMarker))
+			cwd = strings.TrimSpace(t[idx+len(intranetCwdMarker):])
 			if cwd == "" && i+1 < len(lines) {
 				cwd = strings.TrimSpace(lines[i+1])
 			}
 		}
-		if strings.HasPrefix(t, intranetEcMarker) {
+		if idx, hit := intranetMarkerIndex(t, intranetEcMarker); hit {
 			ecIdx = i
-			val := strings.TrimSpace(strings.TrimPrefix(t, intranetEcMarker))
+			val := strings.TrimSpace(t[idx+len(intranetEcMarker):])
 			if val == "" && i+1 < len(lines) {
 				val = strings.TrimSpace(lines[i+1])
 			}

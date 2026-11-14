@@ -313,12 +313,15 @@ func (s *Server) runIntranetScript(w http.ResponseWriter, r *http.Request) {
 	if v, ok := sess.Metadata["task_id"].(float64); ok {
 		taskID = int64(v)
 	}
+	// 中文 Windows 的工具在 chcp 65001 下仍可能按 OEM 代码页输出中文段，
+	// 直接入库会被 PostgreSQL 拒收（SQLSTATE 22021）：先清洗再截断/解析。
+	cleanOutput := intranetValidUTF8Text(out.Output)
 	code := out.ExitCode
 	run, err := pg.CreateIntranetScriptRun(db.IntranetScriptRunInput{
 		SessionID: sess.ID, TaskID: taskID, ScriptID: script.ID, Name: script.Name,
 		OS: script.OS, Command: script.Command, ExitCode: &code, Status: status,
-		Output: truncateIntranetOutput(out.Output, 64<<10),
-		Parsed: parseIntranetScriptOutput(script.Parser, script.OS, out.Output),
+		Output: truncateIntranetOutput(cleanOutput, 64<<10),
+		Parsed: parseIntranetScriptOutput(script.Parser, script.OS, cleanOutput),
 	})
 	if err != nil {
 		writeErr(w, 500, "保存脚本结果失败："+err.Error())

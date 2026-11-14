@@ -661,7 +661,16 @@ func intranetPSQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", 
 
 // intranetWindowsPSScript runs a PowerShell script through -EncodedCommand, so
 // service/WMI/startup modules never have to survive cmd.exe quote mangling.
+//
+// 前置 $ProgressPreference='SilentlyContinue'：PS 5.1 在 stdout 被重定向
+// （SSH exec 通道）时会把 progress 流按 CLIXML 序列化到输出尾部，且
+// `</Objs>` 无换行结尾——真机实测（2026-11-14 R3 批 B）它把 cmd 包装的
+// trailer 黏成一行 `</Objs>__JW_EC__0`，parseIntranetOutput 按行 HasPrefix
+// 找不到退出码标记，startup 等 PS 模块的 deploy/verify/revoke 全部被误判
+// 「未解析到命令结束标记」。关掉进度流就没有 CLIXML 尾巴；parse 侧另留
+// Contains 兜底（见 parseIntranetOutput）。
 func intranetWindowsPSScript(script string) string {
+	script = "$ProgressPreference='SilentlyContinue'\n" + script
 	units := utf16.Encode([]rune(script))
 	raw := make([]byte, len(units)*2)
 	for i, u := range units {
