@@ -53,6 +53,50 @@ func TestCmdUploadChunkAvoidsTrailingDigitSpace(t *testing.T) {
 	}
 }
 
+// ── W2b：分块大小必须是 3 的倍数（拼接流不允许出现中间 padding）────────────
+//
+// 真机复现（Win11 22631，2026-11-14 宿主本机）：4096 字节/块时每块独立
+// StdEncoding 编码，4096 % 3 == 1 → 每块尾部有 '=' padding；多块拼接后
+// 第一块的 '=' 落在流中间，certutil 报 0x8007000d 数据无效、PS 的
+// FromBase64String 同拒。4 KiB 单块永远成功（padding 在末尾合法）、多块
+// 永远失败，正是「单块对照通过、1MB 全 400」怪象的完整解释。
+func TestWindowsUploadChunkSizeKeepsConcatenatedBase64Valid(t *testing.T) {
+	if intranetWindowsUploadChunk%3 != 0 {
+		t.Fatalf("intranetWindowsUploadChunk=%d 不是 3 的倍数：非末块的 padding 会落在拼接流中间，certutil/FromBase64String 都会拒绝", intranetWindowsUploadChunk)
+	}
+	// 端到端语义：按当前块大小把 1 MiB 内容分块编码后拼接，整流必须能被
+	// StdEncoding 一次解码，且还原字节与原内容完全一致（与 certutil 的行为等价）。
+	content := make([]byte, 1024*1024)
+	for i := range content {
+		content[i] = byte(i * 7)
+	}
+	var b strings.Builder
+	for offset := 0; offset < len(content); offset += intranetWindowsUploadChunk {
+		end := offset + intranetWindowsUploadChunk
+		if end > len(content) {
+			end = len(content)
+		}
+		b.WriteString(base64.StdEncoding.EncodeToString(content[offset:end]))
+	}
+	decoded, err := base64.StdEncoding.DecodeString(b.String())
+	if err != nil {
+		t.Fatalf("拼接流解码失败（存在中间 padding）：%v", err)
+	}
+	if len(decoded) != len(content) {
+		t.Fatalf("解码长度 %d != 原始 %d", len(decoded), len(content))
+	}
+	for i := range content {
+		if decoded[i] != content[i] {
+			t.Fatalf("解码内容在 %d 处不一致", i)
+		}
+	}
+	// cmd 命令行预算：块 base64 后 ~5.5 KiB，加上探测/包装仍远低于 8191。
+	encodedLen := (intranetWindowsUploadChunk + 2) / 3 * 4
+	if encodedLen > 7000 {
+		t.Fatalf("块 base64 后 %d 字符，逼近 cmd 8191 命令行上限", encodedLen)
+	}
+}
+
 // ── W3：parseIntranetOutput 要能解析被 CLIXML 黏住的 trailer ────────────────
 
 func TestParseIntranetOutputCLIXMLGluedTrailer(t *testing.T) {

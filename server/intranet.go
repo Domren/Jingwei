@@ -91,7 +91,14 @@ for b in socat nc ncat ssh chisel python3 python busybox; do command -v "$b" >/d
 	intranetUploadChunk = 24 * 1024
 	// cmd.exe caps a command line at 8191 characters; 4 KiB of content becomes
 	// ~5.5 KiB of base64 and leaves room for the cwd/chcp/trailer wrapper.
-	intranetWindowsUploadChunk = 4 * 1024
+	// 4095 is a multiple of 3 on purpose: base64 is a 3→4 byte mapping, so a
+	// chunk whose length is a multiple of 3 encodes WITHOUT padding. Chunked
+	// writes concatenate the encoded text into one .b64 stream — with any other
+	// size each chunk's trailing '=' lands in the middle of that stream, which
+	// certutil and [Convert]::FromBase64String both reject (0x8007000d). That
+	// was the real root cause of 1 MB multi-chunk uploads failing with all
+	// chunks 400; the echo-trailing-digit space was only a companion bug.
+	intranetWindowsUploadChunk = 4095
 	intranetDownloadChunk      = 96 * 1024
 	intranetUploadLimit        = 4 << 20
 	// Downloads used to be one shell command capped at 512 KiB. The chunked
