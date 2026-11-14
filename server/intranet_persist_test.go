@@ -363,8 +363,10 @@ func TestBuildAdvancedWindowsPersistPlans(t *testing.T) {
 	for part, script := range map[string]string{
 		"New-Service": svcDeploy, "BinaryPathName": svcDeploy, "-StartupType Automatic": svcDeploy,
 		"Start-Service": svcDeploy, "'cmd.exe /c echo jw-svc'": svcDeploy, intranetArtifactOK: svcDeploy,
-		"Stop-Service": svcRevoke, ".Delete()": svcRevoke,
-		"Get-Service": svcVerify, intranetArtifactPresent: svcVerify, intranetArtifactGone: svcVerify,
+		"Stop-Service": svcRevoke, ".Delete()": svcRevoke, "Dispose()": svcRevoke,
+		"sc.exe query": svcRevoke, "1060": svcRevoke,
+		"Get-Service": svcVerify, "1072": svcVerify,
+		intranetArtifactPresent: svcVerify, intranetArtifactGone: svcVerify,
 	} {
 		if !strings.Contains(script, part) {
 			t.Errorf("service script lacks %q:\n%s", part, script)
@@ -373,10 +375,11 @@ func TestBuildAdvancedWindowsPersistPlans(t *testing.T) {
 	if !strings.Contains(svcRevoke, intranetArtifactOK) {
 		t.Errorf("service revoke lacks OK:\n%s", svcRevoke)
 	}
-	// 反向：sc.exe 语法与 cmd 尾部归零不得残留（PS 5.1 没有 Remove-Service，
-	// 撤销走 ServiceController.Delete()）。
+	// 反向：cmd 时代的 sc create/start/delete 与 cmd 尾部归零不得残留
+	// （PS 5.1 没有 Remove-Service，撤销走 ServiceController.Delete()；
+	// sc.exe query 仅用于存在性/标记删除判定，不属于 cmd 语法残留）。
 	for label, script := range map[string]string{"deploy": svcDeploy, "revoke": svcRevoke, "verify": svcVerify} {
-		for _, bad := range []string{"sc create", "sc start", "sc delete", "sc query", ">nul", "cmd /c exit 0"} {
+		for _, bad := range []string{"sc create", "sc start", "sc delete", ">nul", "cmd /c exit 0"} {
 			if strings.Contains(script, bad) {
 				t.Errorf("service %s script still contains cmd syntax %q:\n%s", label, bad, script)
 			}

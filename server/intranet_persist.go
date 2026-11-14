@@ -745,7 +745,10 @@ func buildServicePersistPlan(in intranetPersistInput) (intranetPersistPlan, erro
 	// PS 原生 cmdlet 版（统一 PS 包装，双会话成立；见 buildSchtasksPersistPlan 注释）。
 	// Start-Service 失败不阻断 deploy——cmd 版 sc start 也是失败不影响 OK 语义。
 	// 撤销：PS 5.1 没有 Remove-Service（PS 6+ 才有），走 ServiceController.Delete()；
-	// 删除前必须先停服务（运行中的服务 Delete 会报错）。
+	// 删除前必须先停服务（运行中的服务 Delete 会报错）。Delete() 只打「标记删除」：
+	// SCM 要等所有句柄关闭才真正移除，期间 Get-Service 仍枚举得到——删完 Dispose 放句柄，
+	// 再用 sc.exe query 退出码轮询（1060=已移除）；verify 同口径（1072=标记删除中），
+	// 与 cmd 时代「sc query 非零即 GONE」的语义一致，避免标记删除窗口误报 PRESENT。
 	deployScript := "$ErrorActionPreference='Stop'\n" +
 		"$n=" + intranetPSQuote(service) + "\n" +
 		"New-Service -Name $n -BinaryPathName " + intranetPSQuote(binPath) + " -StartupType Automatic | Out-Null\n" +
@@ -755,12 +758,28 @@ func buildServicePersistPlan(in intranetPersistInput) (intranetPersistPlan, erro
 	revokeScript := "$ErrorActionPreference='SilentlyContinue'\n" +
 		"$n=" + intranetPSQuote(service) + "\n" +
 		"$s=Get-Service -Name $n\n" +
-		"if ($s) { if ($s.Status -ne 'Stopped') { Stop-Service -Name $n -Force }; $s.Delete() }\n" +
+		"if ($s) {\n" +
+		"  if ($s.Status -ne 'Stopped') { Stop-Service -Name $n -Force }\n" +
+		"  $s.Delete(); $s.Dispose()\n" +
+		"  for ($i=0; $i -lt 10; $i++) {\n" +
+		"    sc.exe query $n | Out-Null\n" +
+		"    if ($LASTEXITCODE -eq 1060) { break }\n" +
+		"    Start-Sleep -Milliseconds 500\n" +
+		"  }\n" +
+		"}\n" +
 		"Write-Output " + intranetPSQuote(intranetArtifactOK) + "\n"
 	verifyScript := "$ErrorActionPreference='SilentlyContinue'\n" +
 		"$n=" + intranetPSQuote(service) + "\n" +
-		"if (Get-Service -Name $n) { Write-Output " + intranetPSQuote(intranetArtifactPresent) +
-		" } else { Write-Output " + intranetPSQuote(intranetArtifactGone) + " }\n"
+		"if (-not (Get-Service -Name $n)) {\n" +
+		"  Write-Output " + intranetPSQuote(intranetArtifactGone) + "\n" +
+		"} else {\n" +
+		"  sc.exe query $n | Out-Null\n" +
+		"  if ($LASTEXITCODE -eq 1060 -or $LASTEXITCODE -eq 1072) {\n" +
+		"    Write-Output " + intranetPSQuote(intranetArtifactGone) + "\n" +
+		"  } else {\n" +
+		"    Write-Output " + intranetPSQuote(intranetArtifactPresent) + "\n" +
+		"  }\n" +
+		"}\n"
 	return intranetPersistPlan{
 		Kind:        db.IntranetArtifactService,
 		Name:        name,
