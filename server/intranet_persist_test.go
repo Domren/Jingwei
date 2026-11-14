@@ -160,9 +160,9 @@ func TestBuildSchtasksPersistPlan(t *testing.T) {
 	for part, script := range map[string]string{
 		"Register-ScheduledTask": deploy, "New-ScheduledTaskAction": deploy,
 		"New-ScheduledTaskTrigger -AtLogOn": deploy, "'/c echo jw-beacon'": deploy,
-		intranetArtifactOK: deploy,
+		intranetArtifactOK:         deploy,
 		"Unregister-ScheduledTask": revoke,
-		"Get-ScheduledTask": verify, intranetArtifactPresent: verify, intranetArtifactGone: verify,
+		"Get-ScheduledTask":        verify, intranetArtifactPresent: verify, intranetArtifactGone: verify,
 	} {
 		if !strings.Contains(script, part) {
 			t.Errorf("schtasks script lacks %q:\n%s", part, script)
@@ -232,7 +232,7 @@ func TestBuildRegistryPersistPlan(t *testing.T) {
 		"New-ItemProperty": deploy, `HKCU:\Software\Microsoft\Windows\CurrentVersion\Run`: deploy,
 		"-PropertyType String": deploy, "'cmd.exe /c echo jw-run'": deploy, intranetArtifactOK: deploy,
 		"Remove-ItemProperty": revoke,
-		"Get-ItemProperty": verify, intranetArtifactPresent: verify, intranetArtifactGone: verify,
+		"Get-ItemProperty":    verify, intranetArtifactPresent: verify, intranetArtifactGone: verify,
 	} {
 		if !strings.Contains(script, part) {
 			t.Errorf("registry script lacks %q:\n%s", part, script)
@@ -363,8 +363,8 @@ func TestBuildAdvancedWindowsPersistPlans(t *testing.T) {
 	for part, script := range map[string]string{
 		"New-Service": svcDeploy, "BinaryPathName": svcDeploy, "-StartupType Automatic": svcDeploy,
 		"Start-Service": svcDeploy, "'cmd.exe /c echo jw-svc'": svcDeploy, intranetArtifactOK: svcDeploy,
-		"Stop-Service": svcRevoke, ".Delete()": svcRevoke, "Dispose()": svcRevoke,
-		"sc.exe query": svcRevoke, "1060": svcRevoke,
+		"Stop-Service": svcRevoke, "sc.exe delete": svcRevoke, "sc.exe query": svcRevoke,
+		"1060":        svcRevoke,
 		"Get-Service": svcVerify, "1072": svcVerify,
 		intranetArtifactPresent: svcVerify, intranetArtifactGone: svcVerify,
 	} {
@@ -376,8 +376,9 @@ func TestBuildAdvancedWindowsPersistPlans(t *testing.T) {
 		t.Errorf("service revoke lacks OK:\n%s", svcRevoke)
 	}
 	// 反向：cmd 时代的 sc create/start/delete 与 cmd 尾部归零不得残留
-	// （PS 5.1 没有 Remove-Service，撤销走 ServiceController.Delete()；
-	// sc.exe query 仅用于存在性/标记删除判定，不属于 cmd 语法残留）。
+	// （PS 5.1 没有 Remove-Service，撤销走 sc.exe delete；
+	// sc.exe delete/query 是撤销与存在性判定通道，不属于 cmd 语法残留。
+	// 注意反向列表的 "sc delete" 不含 .exe，不会误伤 sc.exe delete。）
 	for label, script := range map[string]string{"deploy": svcDeploy, "revoke": svcRevoke, "verify": svcVerify} {
 		for _, bad := range []string{"sc create", "sc start", "sc delete", ">nul", "cmd /c exit 0"} {
 			if strings.Contains(script, bad) {

@@ -635,7 +635,7 @@ func buildSchtasksPersistPlan(in intranetPersistInput) (intranetPersistPlan, err
 		Deploy:      intranetWindowsPSScript(deployScript),
 		Revoke:      intranetWindowsPSScript(revokeScript),
 		Verify:      intranetWindowsPSScript(verifyScript),
-		Metadata: map[string]any{"token": token, "task_name": taskName, "schedule": trigger, "command": command},
+		Metadata:    map[string]any{"token": token, "task_name": taskName, "schedule": trigger, "command": command},
 	}, nil
 }
 
@@ -690,7 +690,7 @@ func buildRegistryPersistPlan(in intranetPersistInput) (intranetPersistPlan, err
 		Deploy:      intranetWindowsPSScript(deployScript),
 		Revoke:      intranetWindowsPSScript(revokeScript),
 		Verify:      intranetWindowsPSScript(verifyScript),
-		Metadata: map[string]any{"token": token, "key": intranetWindowsRunKey, "value": valueName, "command": command},
+		Metadata:    map[string]any{"token": token, "key": intranetWindowsRunKey, "value": valueName, "command": command},
 	}, nil
 }
 
@@ -744,11 +744,12 @@ func buildServicePersistPlan(in intranetPersistInput) (intranetPersistPlan, erro
 	binPath := "cmd.exe /c " + command
 	// PS 原生 cmdlet 版（统一 PS 包装，双会话成立；见 buildSchtasksPersistPlan 注释）。
 	// Start-Service 失败不阻断 deploy——cmd 版 sc start 也是失败不影响 OK 语义。
-	// 撤销：PS 5.1 没有 Remove-Service（PS 6+ 才有），走 ServiceController.Delete()；
-	// 删除前必须先停服务（运行中的服务 Delete 会报错）。Delete() 只打「标记删除」：
-	// SCM 要等所有句柄关闭才真正移除，期间 Get-Service 仍枚举得到——删完 Dispose 放句柄，
-	// 再用 sc.exe query 退出码轮询（1060=已移除）；verify 同口径（1072=标记删除中），
-	// 与 cmd 时代「sc query 非零即 GONE」的语义一致，避免标记删除窗口误报 PRESENT。
+	// 撤销：PS 5.1 没有 Remove-Service（PS 6+ 才有）；ServiceController 在 .NET Framework
+	// 上也没有 Delete 方法（diag 实证抛「没有名为 Delete 的方法」），撤销唯一可靠通道是
+	// sc.exe delete（SSH cmd 直连实测秒级生效）。删除前先停服务；sc delete 对运行中服务
+	// 也接受（标记删除），query 退出码轮询确认：1060=已移除、1072=标记删除中（句柄滞留
+	// 时的终态，同样视为撤销完成）；verify 同口径，与 cmd 时代「sc query 非零即 GONE」
+	// 的语义一致，避免标记删除窗口误报 PRESENT。
 	deployScript := "$ErrorActionPreference='Stop'\n" +
 		"$n=" + intranetPSQuote(service) + "\n" +
 		"New-Service -Name $n -BinaryPathName " + intranetPSQuote(binPath) + " -StartupType Automatic | Out-Null\n" +
@@ -760,10 +761,10 @@ func buildServicePersistPlan(in intranetPersistInput) (intranetPersistPlan, erro
 		"$s=Get-Service -Name $n\n" +
 		"if ($s) {\n" +
 		"  if ($s.Status -ne 'Stopped') { Stop-Service -Name $n -Force }\n" +
-		"  $s.Delete(); $s.Dispose()\n" +
+		"  sc.exe delete $n\n" +
 		"  for ($i=0; $i -lt 10; $i++) {\n" +
 		"    sc.exe query $n | Out-Null\n" +
-		"    if ($LASTEXITCODE -eq 1060) { break }\n" +
+		"    if ($LASTEXITCODE -eq 1060 -or $LASTEXITCODE -eq 1072) { break }\n" +
 		"    Start-Sleep -Milliseconds 500\n" +
 		"  }\n" +
 		"}\n" +
@@ -788,7 +789,7 @@ func buildServicePersistPlan(in intranetPersistInput) (intranetPersistPlan, erro
 		Deploy:      intranetWindowsPSScript(deployScript),
 		Revoke:      intranetWindowsPSScript(revokeScript),
 		Verify:      intranetWindowsPSScript(verifyScript),
-		Metadata: map[string]any{"token": token, "service_name": service, "command": command},
+		Metadata:    map[string]any{"token": token, "service_name": service, "command": command},
 	}, nil
 }
 
