@@ -592,27 +592,49 @@ func buildSchtasksPersistPlan(in intranetPersistInput) (intranetPersistPlan, err
 	if desc == "" {
 		desc = "计划任务 " + taskName + "（" + trigger + "）：" + truncateText(command, 200)
 	}
-	sc, mo := trigger, ""
-	if strings.HasPrefix(trigger, "minute:") {
-		sc, mo = "minute", strings.TrimPrefix(trigger, "minute:")
+	// 2026-11-14（R3 批 B 收口）：三个 Windows 维持模块统一走 PS 原生 cmdlet，
+	// 经 intranetWindowsPSScript 包装成单行 `-EncodedCommand`（wmi/startup 同模式）。
+	// 这样一套命令在 cmd 与 PowerShell 两种会话 wrapper 里都成立：cmd wrapper 的
+	// `( ... ) &` 与 PS wrapper 的 `& { ... }` 对「调用一个外部 exe」都是合法语法。
+	// 旧 cmd 语法（`2>&1 && echo`、`>nul`、`cmd /c exit 0`）在 PS 5.1 上是直接的
+	// 语法错误（PS 5.1 没有 && 管道链），PS 会话上三模块整链废——真机实测记录见
+	// intranet_script_family_test.go 的翻转注释。附带收益：Register-ScheduledTask
+	// 的 Action 没有 schtasks /tr 的 261 字符上限。
+	// 触发映射：onlogon→-AtLogOn、onstart→-AtStartup、minute:N→-Once + RepetitionInterval
+	//（RepetitionDuration 缺省为无限重复）。
+	var triggerLine string
+	switch {
+	case trigger == "onlogon":
+		triggerLine = "$t=New-ScheduledTaskTrigger -AtLogOn"
+	case trigger == "onstart":
+		triggerLine = "$t=New-ScheduledTaskTrigger -AtStartup"
+	default:
+		triggerLine = "$t=New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes " +
+			strings.TrimPrefix(trigger, "minute:") + ")"
 	}
-	create := fmt.Sprintf("schtasks /create /f /tn %s /tr %s /sc %s",
-		winQuote(taskName), winQuote("cmd.exe /c "+command), sc)
-	if mo != "" {
-		create += " /mo " + mo
-	}
+	deployScript := "$ErrorActionPreference='Stop'\n" +
+		"$n=" + intranetPSQuote(taskName) + "\n" +
+		triggerLine + "\n" +
+		"$a=New-ScheduledTaskAction -Execute 'cmd.exe' -Argument " + intranetPSQuote("/c "+command) + "\n" +
+		"Register-ScheduledTask -TaskName $n -Action $a -Trigger $t -Force | Out-Null\n" +
+		"if (-not (Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue)) { throw 'scheduled task missing after register' }\n" +
+		"Write-Output " + intranetPSQuote(intranetArtifactOK) + "\n"
+	revokeScript := "$ErrorActionPreference='SilentlyContinue'\n" +
+		"$n=" + intranetPSQuote(taskName) + "\n" +
+		"Unregister-ScheduledTask -TaskName $n -Confirm:$false\n" +
+		"Write-Output " + intranetPSQuote(intranetArtifactOK) + "\n"
+	verifyScript := "$ErrorActionPreference='SilentlyContinue'\n" +
+		"$n=" + intranetPSQuote(taskName) + "\n" +
+		"if (Get-ScheduledTask -TaskName $n) { Write-Output " + intranetPSQuote(intranetArtifactPresent) +
+		" } else { Write-Output " + intranetPSQuote(intranetArtifactGone) + " }\n"
 	return intranetPersistPlan{
 		Kind:        db.IntranetArtifactSchtasks,
 		Name:        name,
 		Path:        "schtasks:" + taskName,
 		Description: desc,
-		Deploy:      create + " 2>&1 && echo " + intranetArtifactOK,
-		// cmd 内建命令（echo）不会重置 ERRORLEVEL，末尾显式归零，
-		// 否则“对象不存在”的正常分支会被当成命令失败。
-		Revoke: fmt.Sprintf("schtasks /delete /f /tn %s >nul 2>&1 & echo %s & cmd /c exit 0",
-			winQuote(taskName), intranetArtifactOK),
-		Verify: fmt.Sprintf("schtasks /query /tn %s >nul 2>&1 && echo %s || echo %s & cmd /c exit 0",
-			winQuote(taskName), intranetArtifactPresent, intranetArtifactGone),
+		Deploy:      intranetWindowsPSScript(deployScript),
+		Revoke:      intranetWindowsPSScript(revokeScript),
+		Verify:      intranetWindowsPSScript(verifyScript),
 		Metadata: map[string]any{"token": token, "task_name": taskName, "schedule": trigger, "command": command},
 	}, nil
 }
@@ -641,17 +663,33 @@ func buildRegistryPersistPlan(in intranetPersistInput) (intranetPersistPlan, err
 	if desc == "" {
 		desc = "注册表 Run 启动项 " + valueName + "：" + truncateText(command, 200)
 	}
+	// PS 原生 cmdlet 版（统一 PS 包装，双会话成立；见 buildSchtasksPersistPlan 注释）。
+	// reg.exe 的 `HKCU\Software\...` 在 PS 里要写成 `HKCU:\Software\...` 提供盘形式。
+	psKey := `HKCU:\` + strings.TrimPrefix(intranetWindowsRunKey, `HKCU\`)
+	deployScript := "$ErrorActionPreference='Stop'\n" +
+		"$k=" + intranetPSQuote(psKey) + "\n" +
+		"$v=" + intranetPSQuote(valueName) + "\n" +
+		"New-ItemProperty -Path $k -Name $v -Value " + intranetPSQuote("cmd.exe /c "+command) + " -PropertyType String -Force | Out-Null\n" +
+		"if (-not (Get-ItemProperty -Path $k -Name $v -ErrorAction SilentlyContinue)) { throw 'registry value missing after create' }\n" +
+		"Write-Output " + intranetPSQuote(intranetArtifactOK) + "\n"
+	revokeScript := "$ErrorActionPreference='SilentlyContinue'\n" +
+		"$k=" + intranetPSQuote(psKey) + "\n" +
+		"$v=" + intranetPSQuote(valueName) + "\n" +
+		"Remove-ItemProperty -Path $k -Name $v\n" +
+		"Write-Output " + intranetPSQuote(intranetArtifactOK) + "\n"
+	verifyScript := "$ErrorActionPreference='SilentlyContinue'\n" +
+		"$k=" + intranetPSQuote(psKey) + "\n" +
+		"$v=" + intranetPSQuote(valueName) + "\n" +
+		"if (Get-ItemProperty -Path $k -Name $v) { Write-Output " + intranetPSQuote(intranetArtifactPresent) +
+		" } else { Write-Output " + intranetPSQuote(intranetArtifactGone) + " }\n"
 	return intranetPersistPlan{
 		Kind:        db.IntranetArtifactRegistry,
 		Name:        name,
 		Path:        intranetWindowsRunKey + `\` + valueName,
 		Description: desc,
-		Deploy: fmt.Sprintf("reg add %s /v %s /t REG_SZ /d %s /f 2>&1 && echo %s",
-			winQuote(intranetWindowsRunKey), winQuote(valueName), winQuote("cmd.exe /c "+command), intranetArtifactOK),
-		Revoke: fmt.Sprintf("reg delete %s /v %s /f >nul 2>&1 & echo %s & cmd /c exit 0",
-			winQuote(intranetWindowsRunKey), winQuote(valueName), intranetArtifactOK),
-		Verify: fmt.Sprintf("reg query %s /v %s >nul 2>&1 && echo %s || echo %s & cmd /c exit 0",
-			winQuote(intranetWindowsRunKey), winQuote(valueName), intranetArtifactPresent, intranetArtifactGone),
+		Deploy:      intranetWindowsPSScript(deployScript),
+		Revoke:      intranetWindowsPSScript(revokeScript),
+		Verify:      intranetWindowsPSScript(verifyScript),
 		Metadata: map[string]any{"token": token, "key": intranetWindowsRunKey, "value": valueName, "command": command},
 	}, nil
 }
@@ -704,17 +742,33 @@ func buildServicePersistPlan(in intranetPersistInput) (intranetPersistPlan, erro
 		desc = "Windows 服务 " + service + "（自动启动，需要管理员权限）：" + truncateText(command, 200)
 	}
 	binPath := "cmd.exe /c " + command
+	// PS 原生 cmdlet 版（统一 PS 包装，双会话成立；见 buildSchtasksPersistPlan 注释）。
+	// Start-Service 失败不阻断 deploy——cmd 版 sc start 也是失败不影响 OK 语义。
+	// 撤销：PS 5.1 没有 Remove-Service（PS 6+ 才有），走 ServiceController.Delete()；
+	// 删除前必须先停服务（运行中的服务 Delete 会报错）。
+	deployScript := "$ErrorActionPreference='Stop'\n" +
+		"$n=" + intranetPSQuote(service) + "\n" +
+		"New-Service -Name $n -BinaryPathName " + intranetPSQuote(binPath) + " -StartupType Automatic | Out-Null\n" +
+		"Start-Service -Name $n -ErrorAction SilentlyContinue\n" +
+		"if (-not (Get-Service -Name $n -ErrorAction SilentlyContinue)) { throw 'service missing after create' }\n" +
+		"Write-Output " + intranetPSQuote(intranetArtifactOK) + "\n"
+	revokeScript := "$ErrorActionPreference='SilentlyContinue'\n" +
+		"$n=" + intranetPSQuote(service) + "\n" +
+		"$s=Get-Service -Name $n\n" +
+		"if ($s) { if ($s.Status -ne 'Stopped') { Stop-Service -Name $n -Force }; $s.Delete() }\n" +
+		"Write-Output " + intranetPSQuote(intranetArtifactOK) + "\n"
+	verifyScript := "$ErrorActionPreference='SilentlyContinue'\n" +
+		"$n=" + intranetPSQuote(service) + "\n" +
+		"if (Get-Service -Name $n) { Write-Output " + intranetPSQuote(intranetArtifactPresent) +
+		" } else { Write-Output " + intranetPSQuote(intranetArtifactGone) + " }\n"
 	return intranetPersistPlan{
 		Kind:        db.IntranetArtifactService,
 		Name:        name,
 		Path:        "service:" + service,
 		Description: desc,
-		Deploy: "sc create " + winQuote(service) + " binPath= " + winQuote(binPath) + " start= auto 2>&1 & " +
-			"sc start " + winQuote(service) + " >nul 2>&1 & echo " + intranetArtifactOK,
-		Revoke: "sc stop " + winQuote(service) + " >nul 2>&1 & sc delete " + winQuote(service) +
-			" >nul 2>&1 & echo " + intranetArtifactOK + " & cmd /c exit 0",
-		Verify: "sc query " + winQuote(service) + " >nul 2>&1 && echo " + intranetArtifactPresent +
-			" || echo " + intranetArtifactGone + " & cmd /c exit 0",
+		Deploy:      intranetWindowsPSScript(deployScript),
+		Revoke:      intranetWindowsPSScript(revokeScript),
+		Verify:      intranetWindowsPSScript(verifyScript),
 		Metadata: map[string]any{"token": token, "service_name": service, "command": command},
 	}, nil
 }

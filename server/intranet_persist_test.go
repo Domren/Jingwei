@@ -151,31 +151,51 @@ func TestBuildSchtasksPersistPlan(t *testing.T) {
 		t.Fatalf("plan = %+v", plan)
 	}
 	task, _ := plan.Metadata["task_name"].(string)
-	if task == "" || !strings.Contains(plan.Deploy, winQuote(task)) || !strings.Contains(plan.Verify, winQuote(task)) || !strings.Contains(plan.Revoke, winQuote(task)) {
-		t.Fatalf("task %q missing from commands: %+v", task, plan)
+	deploy := decodeWindowsPSScript(t, plan.Deploy)
+	revoke := decodeWindowsPSScript(t, plan.Revoke)
+	verify := decodeWindowsPSScript(t, plan.Verify)
+	if task == "" || !strings.Contains(deploy, task) || !strings.Contains(verify, task) || !strings.Contains(revoke, task) {
+		t.Fatalf("task %q missing from scripts: %+v", task, plan)
 	}
-	for name, cmd := range map[string]string{"deploy": plan.Deploy, "revoke": plan.Revoke, "verify": plan.Verify} {
-		wantPart := map[string]string{"deploy": "schtasks /create /f /tn", "revoke": "schtasks /delete /f /tn", "verify": "schtasks /query /tn"}[name]
-		if !strings.Contains(cmd, wantPart) {
-			t.Errorf("%s command = %q", name, cmd)
+	for part, script := range map[string]string{
+		"Register-ScheduledTask": deploy, "New-ScheduledTaskAction": deploy,
+		"New-ScheduledTaskTrigger -AtLogOn": deploy, "'/c echo jw-beacon'": deploy,
+		intranetArtifactOK: deploy,
+		"Unregister-ScheduledTask": revoke,
+		"Get-ScheduledTask": verify, intranetArtifactPresent: verify, intranetArtifactGone: verify,
+	} {
+		if !strings.Contains(script, part) {
+			t.Errorf("schtasks script lacks %q:\n%s", part, script)
 		}
 	}
-	if !strings.Contains(plan.Deploy, "/sc onlogon") || !strings.Contains(plan.Deploy, "cmd.exe /c echo jw-beacon") {
-		t.Errorf("deploy = %q", plan.Deploy)
+	if !strings.Contains(revoke, intranetArtifactOK) {
+		t.Errorf("schtasks revoke lacks OK:\n%s", revoke)
 	}
-	if !strings.Contains(plan.Deploy, intranetArtifactOK) || !strings.Contains(plan.Verify, intranetArtifactPresent) || !strings.Contains(plan.Verify, intranetArtifactGone) {
-		t.Errorf("artifact markers missing: %+v", plan)
+	// 反向：旧 cmd 语法不得残留——PS 5.1 没有 && 管道链，>nul 是 PS 语法错误，
+	// 这正是三模块在 PS 会话整链废掉的根因（R3 批 B 收口）。
+	for label, script := range map[string]string{"deploy": deploy, "revoke": revoke, "verify": verify} {
+		for _, bad := range []string{"schtasks /create", "schtasks /delete", "schtasks /query", ">nul", "cmd /c exit 0", "&& echo"} {
+			if strings.Contains(script, bad) {
+				t.Errorf("%s script still contains cmd syntax %q:\n%s", label, bad, script)
+			}
+		}
 	}
-	if !strings.HasSuffix(plan.Revoke, "cmd /c exit 0") || !strings.HasSuffix(plan.Verify, "cmd /c exit 0") {
-		t.Errorf("windows revoke/verify must reset ERRORLEVEL: %q / %q", plan.Revoke, plan.Verify)
+	// 双会话形态：命令本体必须是单行 powershell -EncodedCommand 调用——
+	// cmd wrapper 的 `( ... ) &` 与 PS wrapper 的 `& { ... }` 都吃得下。
+	for label, cmd := range map[string]string{"deploy": plan.Deploy, "revoke": plan.Revoke, "verify": plan.Verify} {
+		if !strings.Contains(cmd, "-EncodedCommand ") || strings.ContainsAny(cmd, "\n") {
+			t.Errorf("%s command must be a single-line -EncodedCommand invocation: %q", label, cmd)
+		}
 	}
 
 	minute, err := buildSchtasksPersistPlan(intranetPersistInput{Command: "echo hi", Schedule: "minute:15"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(minute.Deploy, "/sc minute /mo 15") {
-		t.Errorf("minute deploy = %q", minute.Deploy)
+	minuteDeploy := decodeWindowsPSScript(t, minute.Deploy)
+	if !strings.Contains(minuteDeploy, "New-ScheduledTaskTrigger -Once") ||
+		!strings.Contains(minuteDeploy, "RepetitionInterval (New-TimeSpan -Minutes 15)") {
+		t.Errorf("minute deploy script = %s", minuteDeploy)
 	}
 	if _, err := buildSchtasksPersistPlan(intranetPersistInput{Command: "echo hi", Schedule: "everyday"}); err == nil {
 		t.Fatal("invalid schedule must be rejected")
@@ -202,19 +222,31 @@ func TestBuildRegistryPersistPlan(t *testing.T) {
 		t.Fatalf("plan = %+v", plan)
 	}
 	value, _ := plan.Metadata["value"].(string)
-	if value == "" || !strings.Contains(plan.Deploy, winQuote(value)) || !strings.Contains(plan.Verify, winQuote(value)) || !strings.Contains(plan.Revoke, winQuote(value)) {
-		t.Fatalf("value %q missing from commands: %+v", value, plan)
+	deploy := decodeWindowsPSScript(t, plan.Deploy)
+	revoke := decodeWindowsPSScript(t, plan.Revoke)
+	verify := decodeWindowsPSScript(t, plan.Verify)
+	if value == "" || !strings.Contains(deploy, value) || !strings.Contains(verify, value) || !strings.Contains(revoke, value) {
+		t.Fatalf("value %q missing from scripts: %+v", value, plan)
 	}
-	if !strings.Contains(plan.Deploy, "reg add "+winQuote(intranetWindowsRunKey)) ||
-		!strings.Contains(plan.Deploy, "/t REG_SZ") || !strings.Contains(plan.Deploy, "cmd.exe /c echo jw-run") {
-		t.Errorf("deploy = %q", plan.Deploy)
+	for part, script := range map[string]string{
+		"New-ItemProperty": deploy, `HKCU:\Software\Microsoft\Windows\CurrentVersion\Run`: deploy,
+		"-PropertyType String": deploy, "'cmd.exe /c echo jw-run'": deploy, intranetArtifactOK: deploy,
+		"Remove-ItemProperty": revoke,
+		"Get-ItemProperty": verify, intranetArtifactPresent: verify, intranetArtifactGone: verify,
+	} {
+		if !strings.Contains(script, part) {
+			t.Errorf("registry script lacks %q:\n%s", part, script)
+		}
 	}
-	if !strings.Contains(plan.Verify, "reg query "+winQuote(intranetWindowsRunKey)) ||
-		!strings.Contains(plan.Revoke, "reg delete "+winQuote(intranetWindowsRunKey)) {
-		t.Errorf("verify/revoke = %q / %q", plan.Verify, plan.Revoke)
+	if !strings.Contains(revoke, intranetArtifactOK) {
+		t.Errorf("registry revoke lacks OK:\n%s", revoke)
 	}
-	if !strings.HasSuffix(plan.Revoke, "cmd /c exit 0") || !strings.HasSuffix(plan.Verify, "cmd /c exit 0") {
-		t.Errorf("windows revoke/verify must reset ERRORLEVEL: %q / %q", plan.Revoke, plan.Verify)
+	for label, script := range map[string]string{"deploy": deploy, "revoke": revoke, "verify": verify} {
+		for _, bad := range []string{"reg add", "reg delete", "reg query", "/t REG_SZ", ">nul", "cmd /c exit 0", "&& echo"} {
+			if strings.Contains(script, bad) {
+				t.Errorf("%s script still contains cmd syntax %q:\n%s", label, bad, script)
+			}
+		}
 	}
 	if _, err := buildRegistryPersistPlan(intranetPersistInput{Command: "echo hi", Name: "bad/name"}); err == nil {
 		t.Fatal("invalid name must be rejected")
@@ -321,14 +353,34 @@ func TestBuildAdvancedWindowsPersistPlans(t *testing.T) {
 	if svc.Kind != db.IntranetArtifactService || !strings.HasPrefix(svc.Path, "service:keeper-") {
 		t.Fatalf("service plan = %+v", svc)
 	}
-	for label, cmd := range map[string]string{"deploy": svc.Deploy, "revoke": svc.Revoke, "verify": svc.Verify} {
-		if serviceName == "" || !strings.Contains(cmd, winQuote(serviceName)) {
-			t.Errorf("service %s lacks name %q: %q", label, serviceName, cmd)
+	svcDeploy := decodeWindowsPSScript(t, svc.Deploy)
+	svcRevoke := decodeWindowsPSScript(t, svc.Revoke)
+	svcVerify := decodeWindowsPSScript(t, svc.Verify)
+	if serviceName == "" || !strings.Contains(svcDeploy, serviceName) ||
+		!strings.Contains(svcVerify, serviceName) || !strings.Contains(svcRevoke, serviceName) {
+		t.Errorf("service name %q missing from scripts", serviceName)
+	}
+	for part, script := range map[string]string{
+		"New-Service": svcDeploy, "BinaryPathName": svcDeploy, "-StartupType Automatic": svcDeploy,
+		"Start-Service": svcDeploy, "'cmd.exe /c echo jw-svc'": svcDeploy, intranetArtifactOK: svcDeploy,
+		"Stop-Service": svcRevoke, ".Delete()": svcRevoke,
+		"Get-Service": svcVerify, intranetArtifactPresent: svcVerify, intranetArtifactGone: svcVerify,
+	} {
+		if !strings.Contains(script, part) {
+			t.Errorf("service script lacks %q:\n%s", part, script)
 		}
 	}
-	if !strings.Contains(svc.Deploy, "sc create") || !strings.Contains(svc.Deploy, "binPath= ") ||
-		!strings.Contains(svc.Deploy, "start= auto") || !strings.Contains(svc.Revoke, "sc delete") {
-		t.Errorf("service deploy/revoke = %q / %q", svc.Deploy, svc.Revoke)
+	if !strings.Contains(svcRevoke, intranetArtifactOK) {
+		t.Errorf("service revoke lacks OK:\n%s", svcRevoke)
+	}
+	// 反向：sc.exe 语法与 cmd 尾部归零不得残留（PS 5.1 没有 Remove-Service，
+	// 撤销走 ServiceController.Delete()）。
+	for label, script := range map[string]string{"deploy": svcDeploy, "revoke": svcRevoke, "verify": svcVerify} {
+		for _, bad := range []string{"sc create", "sc start", "sc delete", "sc query", ">nul", "cmd /c exit 0"} {
+			if strings.Contains(script, bad) {
+				t.Errorf("service %s script still contains cmd syntax %q:\n%s", label, bad, script)
+			}
+		}
 	}
 
 	wmi, err := buildWMIPersistPlan(intranetPersistInput{Command: "echo jw-wmi", Name: "wmi-keeper"})

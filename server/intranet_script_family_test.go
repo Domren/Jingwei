@@ -204,37 +204,26 @@ func TestPowerShellDownloadNeverProbesWithCmdSyntax(t *testing.T) {
 	}
 }
 
-// 权限维持的 Windows 五模块，按当前实现分成两族：
+// 权限维持的 Windows 五模块，2026-11-14（R3 批 B 收口）起统一为一族：
 //
-//   - wmi / startup 用 intranetWindowsPSScript（-EncodedCommand），是合法 PS 脚本，
-//     在 PS 会话上必须能投递——2026-11-12 之前它们被守卫误判成 cmd 语法而全数拒掉。
-//   - schtasks / registry / service 的 deploy/revoke/verify **仍是 cmd 语法**
-//     （schtasks /create、reg add、sc create）。这意味着 PS 会话上这三个模块
-//     目前不可用，只能改用 cmd 会话。
+//   - 全部经 intranetWindowsPSScript（-EncodedCommand）投递——schtasks/registry/service
+//     从 cmd 语法（schtasks /create、reg add、sc create）翻转为 PS 原生 cmdlet
+//     （Register-ScheduledTask / New-ItemProperty / New-Service）。
+//   - 旧 cmd 语法在 PS 5.1 上是语法错误（无 && 管道链、>nul 不合法），PS 会话上
+//     整链废——这是批 B 真机实测钉住的缺口，本次翻转把它关掉。
+//   - 统一后的命令形态对 cmd 会话同样成立：-EncodedCommand 是单行外部 exe 调用，
+//     cmd wrapper 的 `( ... ) &` 与 PS wrapper 的 `& { ... }` 都吃得下；
+//     wmi/startup 2026-11-12 起就是这一形态（当时被守卫误判成 cmd 语法而全数拒掉）。
 //
-// 第二族是**已知缺口**，不是期望行为：补 PS 版需要一台 Windows 主机把
-// Register-ScheduledTask / New-ItemProperty / New-Service 三条路真机跑通，
-// 按手册口径「不用桩或推断替代真机结论」，条件不到就先钉住现状。
-// 真机补齐后，把这一族的断言从「必须被拒」改成「必须不被拒」，测试会提醒你。
+// 断言口径：五个模块的 deploy/revoke/verify 都必须被守卫放行，且都是单行
+// -EncodedCommand 形态；退化回 cmd 语法会被 decode 后的 cmd 碎片断言抓住。
 func TestWindowsPersistModulesScriptFamily(t *testing.T) {
-	cmdKinds := []string{db.IntranetArtifactSchtasks, db.IntranetArtifactRegistry, db.IntranetArtifactService}
-	psKinds := []string{db.IntranetArtifactWMI, db.IntranetArtifactStartup}
-
-	for _, kind := range cmdKinds {
-		plan, err := buildIntranetPersistPlan(intranetPersistInput{
-			Kind: kind, Command: "whoami", Schedule: "onlogon", Name: "r3",
-		})
-		if err != nil {
-			t.Fatalf("%s 构造失败: %v", kind, err)
-		}
-		for label, cmd := range map[string]string{"deploy": plan.Deploy, "revoke": plan.Revoke, "verify": plan.Verify} {
-			if powershellCmdScriptReason(cmd) == "" {
-				t.Errorf("%s/%s 是 cmd 语法却未被守卫识别，会漏进 PS 会话: %s", kind, label, cmd)
-			}
-		}
+	allKinds := []string{
+		db.IntranetArtifactSchtasks, db.IntranetArtifactRegistry, db.IntranetArtifactService,
+		db.IntranetArtifactWMI, db.IntranetArtifactStartup,
 	}
 
-	for _, kind := range psKinds {
+	for _, kind := range allKinds {
 		plan, err := buildIntranetPersistPlan(intranetPersistInput{
 			Kind: kind, Command: "whoami", Schedule: "onlogon", Name: "r3",
 		})
@@ -244,6 +233,9 @@ func TestWindowsPersistModulesScriptFamily(t *testing.T) {
 		for label, cmd := range map[string]string{"deploy": plan.Deploy, "revoke": plan.Revoke, "verify": plan.Verify} {
 			if reason := powershellCmdScriptReason(cmd); reason != "" {
 				t.Errorf("%s/%s 是合法 PS 脚本却被守卫拒掉（功能不可用）: %s", kind, label, reason)
+			}
+			if !strings.Contains(cmd, "-EncodedCommand ") || strings.ContainsAny(cmd, "\n") {
+				t.Errorf("%s/%s 必须是单行 -EncodedCommand 形态（双会话通吃）: %s", kind, label, cmd)
 			}
 		}
 	}

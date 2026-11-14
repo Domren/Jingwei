@@ -1,9 +1,7 @@
 package server
 
 import (
-	"bytes"
 	"context"
-	"log"
 	"strings"
 	"testing"
 	"time"
@@ -56,12 +54,6 @@ func TestPowerShellSessionRefusesCmdTransferAndPersist(t *testing.T) {
 	s, pg, sess, shell := newPowerShellGuardFixture(t)
 	ctx := context.Background()
 
-	// 下游会把 outcome.Note 改写成泛化文案；守卫日志必须留下点名原因。
-	var buf bytes.Buffer
-	old := log.Writer()
-	log.SetOutput(&buf)
-	defer log.SetOutput(old)
-
 	before := len(shell.all())
 
 	// 上传/下载已按 PS 语法移植（R3）：这里不再断言「必须失败」，而是断言
@@ -82,21 +74,22 @@ func TestPowerShellSessionRefusesCmdTransferAndPersist(t *testing.T) {
 		t.Fatalf("PS 下载仍被自己的守卫拦下，说明脚本没移植干净: %q", dlOut.Note)
 	}
 
-	// 权限维持：入口直接点名拒绝，不生成、不投递、不落库。
+	// 权限维持（2026-11-14 R3 收口翻转）：五模块统一 PS 形态后，PS 会话上不再
+	// 入口拒绝——deploy 会真实投递（-EncodedCommand 单行），在进程内假靶机上
+	// 因没有真实 cmdlet 而以「部署未通过验证」结束，属预期失败；翻转后要钉住
+	// 的是**失败路径干净**：不是守卫拒绝，且全程没有 cmd 语法落进靶机。
+	mid := len(shell.all())
 	_, _, _, _, pErr := s.intranetPersist(ctx, pg, intranetPersistInput{
 		SessionID: sess.ID, Kind: db.IntranetArtifactSchtasks,
 		Command: "whoami", Schedule: "onlogon",
 	})
 	if pErr == nil {
-		t.Fatal("PowerShell 会话的权限维持必须明确失败")
-	}
-	for _, want := range []string{"PowerShell", "cmd.exe", "未静默成功"} {
-		if !strings.Contains(pErr.Error(), want) {
-			t.Fatalf("维持拒绝原因要点名 %q，实得 %q", want, pErr.Error())
-		}
+		t.Log("PS 会话维持 deploy 放行（假靶机上失败属预期，放行即达标）")
+	} else if strings.Contains(pErr.Error(), "PowerShell 会话拒绝执行") {
+		t.Fatalf("PS 会话维持仍被守卫入口拒绝，PS 版模块没移植干净: %q", pErr.Error())
 	}
 
-	// 核心断言：守卫之后靶机一条 cmd 语法脚本都没收到。
+	// 核心断言：靶机一条 cmd 语法脚本都没收到（含 persist 失败后的尽力撤销）。
 	sent := shell.all()
 	if len(sent) < before {
 		t.Fatal("靶机命令记录异常")
@@ -112,10 +105,12 @@ func TestPowerShellSessionRefusesCmdTransferAndPersist(t *testing.T) {
 			}
 		}
 	}
-
-	logged := buf.String()
-	if !strings.Contains(logged, "PowerShell") || !strings.Contains(logged, "cmd.exe") {
-		t.Fatalf("守卫的点名原因没有写明到服务端日志: %q", logged)
+	// persist 之后的每一条（deploy/verify/revoke）都是单行 -EncodedCommand 形态
+	//（双会话通吃的前提）；上传/下载投递的是 PS wrapper 原生语法，不在此列。
+	for _, sc := range sent[mid:] {
+		if !strings.Contains(sc, "-EncodedCommand ") {
+			t.Fatalf("persist 投递的脚本不是 -EncodedCommand 形态: %s", sc)
+		}
 	}
 }
 
