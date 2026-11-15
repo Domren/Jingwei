@@ -123,3 +123,41 @@ func TestReportFindingAtomicContract(t *testing.T) {
 		t.Fatal("failed tool triggered reporter")
 	}
 }
+
+func TestReportFindingParamSourcesRequired(t *testing.T) {
+	d := testDB(t)
+	defer d.Close()
+	task, err := d.CreateTask("param sources", "fixture", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deleteTaskFixture(t, d, task.ID)
+	ts := NewToolSet(nil, "")
+	ts.ts, ts.taskID = d.Exploration(task.ExplorationID), task.ID
+	ts.SetFindingRecorder(evidence.New(d, nil, t.TempDir()))
+
+	// 带 query 参数的步骤 + param_sources 缺失 → 拒绝并要求补（R16 复跑缺口：
+	// 此前 NormalizeParamSources 对缺失静默放行，复跑 12/12 全空）。
+	missing := `{"vulnclass":"SQL Injection","severity":"high","summary":"fixture sqli","evidence":"response proves the injection","reproduction":{"entry_point":"GET /product.php","steps":[{"request":"GET /product.php?id=1 HTTP/1.1\r\nHost: 192.0.2.10\r\n\r\n","response":"HTTP/1.1 200 OK","expected":"union rows","proves":"sqli"}]}}`
+	res, err := ts.addFinding().Call(t.Context(), json.RawMessage(missing), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Flatten(), "param_sources") {
+		t.Fatalf("带参数步骤缺 param_sources 应被拒绝并提示，实际：%s", res.Flatten())
+	}
+
+	// 显式登记 param_sources（query 来源）→ 通过。
+	provided := `{"vulnclass":"SQL Injection","severity":"high","summary":"fixture sqli","evidence":"response proves the injection","reproduction":{"entry_point":"GET /product.php","steps":[{"request":"GET /product.php?id=1 HTTP/1.1\r\nHost: 192.0.2.10\r\n\r\n","response":"HTTP/1.1 200 OK","expected":"union rows","proves":"sqli"}],"param_sources":[{"name":"id","value":"1 UNION SELECT","source":"query","url":"http://192.0.2.10/product.php"}]}}`
+	res, err = ts.addFinding().Call(t.Context(), json.RawMessage(provided), nil)
+	if err != nil || !strings.HasPrefix(res.Flatten(), "finding recorded: ") {
+		t.Fatalf("显式登记 param_sources 后应通过：%v %s", err, res.Flatten())
+	}
+
+	// 无参数步骤（无 query 无 body）不受影响：不带 param_sources 也放行。
+	plain := `{"vulnclass":"Information Disclosure","severity":"low","summary":"fixture info","evidence":"response proves the env file is fully readable","reproduction":{"entry_point":"GET /.env","steps":[{"request":"GET /.env HTTP/1.1\r\nHost: 192.0.2.10\r\n\r\n","response":"HTTP/1.1 200 OK","expected":"env dumped","proves":"disclosure"}]}}`
+	res, err = ts.addFinding().Call(t.Context(), json.RawMessage(plain), nil)
+	if err != nil || !strings.HasPrefix(res.Flatten(), "finding recorded: ") {
+		t.Fatalf("无参数步骤不应被 param_sources 校验拦截：%v %s", err, res.Flatten())
+	}
+}

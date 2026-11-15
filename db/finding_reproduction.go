@@ -155,6 +155,31 @@ func (r *Reproduction) NormalizeParamSources() error {
 	return nil
 }
 
+// HasParameterizedHTTPStep 判断 steps 里是否出现带参数的请求：URL 带 query 串
+// （"?"），或请求头之后还有 body（表单/JSON）。R16 的硬校验用它判定
+// param_sources 是否必须登记：有参数的 POC，操作员要能逐个复核来源；给不出来源
+// 的参数显式 inferred=true。报文分隔按 CRLF 口径识别（原始 HTTP 是 \r\n）。
+func (r *Reproduction) HasParameterizedHTTPStep() bool {
+	if r == nil {
+		return false
+	}
+	for _, s := range r.Steps {
+		req := s.Request
+		if req == "" {
+			continue
+		}
+		if strings.Contains(req, "?") {
+			return true
+		}
+		for _, sep := range []string{"\r\n\r\n", "\n\n"} {
+			if k := strings.Index(req, sep); k >= 0 && strings.TrimSpace(req[k+len(sep):]) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ParseReproduction decodes a findings.reproduction column value. Empty input,
 // "null" and "{}" all mean "not recorded" and return nil so callers fall back to
 // the legacy reconstructed verification steps.

@@ -642,7 +642,13 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	// 这里把每次调用包成一轮，与 planner 共用同一个监督者（T1 口径一致）。
 	if sup := s.engine.llmSup; sup != nil {
 		wk.SetCallSupervisor(func(base llm.Provider, taskID int64, worker, baseID string) llm.Provider {
-			return llmrec.NewPerCallProvider(sup, base, taskID, worker, baseID)
+			// 缺口③ worker 侧：轮记录带上当前激活 profile 的 model 与名字
+			//（CompletionRequest 不带模型名，与 planner 同源 taskLLMTarget 解析）。
+			model, profileName := "", ""
+			if t, ok := s.m.Task(strconv.FormatInt(taskID, 10)); ok {
+				model, profileName = s.taskLLMTarget(t)
+			}
+			return llmrec.NewPerCallProvider(sup, base, taskID, worker, baseID, model, profileName)
 		})
 	}
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))

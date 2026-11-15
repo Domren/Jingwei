@@ -1204,3 +1204,28 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 		t.Fatalf("taskID<=0 should fall back to global and include out-of-scope asset %d", outIDs[0])
 	}
 }
+
+func TestUpsertEndpointAutoFillsIPFromURLHost(t *testing.T) {
+	d, av2, _ := testSetup(t)
+	t.Cleanup(func() { _ = d.Close() })
+
+	// R18 复跑缺口：调用方只带 URL（HTTP 探测路径）时，host 是 IP 字面量
+	// 必须自动回填 ip 列（此前 endpoint 类 ip 空值率回到 100%）。
+	id, err := av2.UpsertEndpoint(UpsertEndpointReq{
+		URL:    "http://192.0.2.50:8080/app/page.php",
+		Method: "GET",
+		TaskID: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM assets WHERE url LIKE '%192.0.2.50%' OR ip = '192.0.2.50'`)
+
+	var ip string
+	if err := d.QueryRow(`SELECT ip FROM assets WHERE id=$1`, id).Scan(&ip); err != nil {
+		t.Fatal(err)
+	}
+	if ip != "192.0.2.50" {
+		t.Fatalf("URL host 是 IP 字面量时应自动回填 ip，实得 %q", ip)
+	}
+}

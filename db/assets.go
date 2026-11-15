@@ -996,6 +996,13 @@ func (s *AssetStore) UpsertEndpoint(req UpsertEndpointReq) (int64, error) {
 		rootDomain = domain
 	}
 
+	// R18 复跑缺口（2026-11-15）：URL host 是 IP 字面量时自动回填 ip。此前只信
+	// 调用方传的 req.IP，HTTP 探测路径只带 URL（ip 空），endpoint 类资产 ip
+	// 空值率回到 100%（复跑 17/17 全空实锤）。与验收口径一致：URL 带 IP 的
+	// 必须解析出来填上；host 是域名时保持原行为（落 domain，可反查）。
+	if req.IP == "" && domain != "" && net.ParseIP(domain) != nil {
+		req.IP = domain
+	}
 	cseg := calcCSegment(req.IP)
 	companyID, err := s.resolveCompanyWithICP(rootDomain, req.IP, "")
 	if err != nil {

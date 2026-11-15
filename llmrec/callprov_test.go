@@ -81,7 +81,7 @@ func TestPerCallProviderRecordsUsageRound(t *testing.T) {
 	sup := NewSupervisor(nil, stub)
 	sup.firstEventTimeout = time.Second
 
-	p := NewPerCallProvider(sup, &fakeProv{events: usageEvents()}, 7, "worker", "7-w42")
+	p := NewPerCallProvider(sup, &fakeProv{events: usageEvents()}, 7, "worker", "7-w42", "", "")
 	ctx := context.Background()
 	for _, err := range p.Stream(ctx, llm.CompletionRequest{}) {
 		_ = err
@@ -109,7 +109,7 @@ func TestPerCallProviderRecordsErrorRound(t *testing.T) {
 	sup := NewSupervisor(nil, stub)
 
 	p := NewPerCallProvider(sup, &fakeProv{events: usageEvents(),
-		err: errors.New(`status 429: rate limit exceeded`)}, 7, "worker", "7-w1")
+		err: errors.New(`status 429: rate limit exceeded`)}, 7, "worker", "7-w1", "", "")
 	for _, err := range p.Stream(context.Background(), llm.CompletionRequest{}) {
 		_ = err
 	}
@@ -135,7 +135,7 @@ func TestPerCallProviderStallCancels(t *testing.T) {
 
 	// 一直不给首帧：T1 一过监督层应 cancel，调用方看到 stream error，
 	// 轮记录落 stalled。
-	p := NewPerCallProvider(sup, &fakeProv{delay: 5 * time.Second}, 7, "worker", "7-w9")
+	p := NewPerCallProvider(sup, &fakeProv{delay: 5 * time.Second}, 7, "worker", "7-w9", "", "")
 	sawErr := false
 	for _, err := range p.Stream(context.Background(), llm.CompletionRequest{}) {
 		if err != nil {
@@ -158,7 +158,7 @@ func TestPerCallProviderCompleteRecords(t *testing.T) {
 	stub := &stubDB{}
 	sup := NewSupervisor(nil, stub)
 
-	p := NewPerCallProvider(sup, &fakeProv{events: usageEvents()}, 9, "mainagent", "9-m1")
+	p := NewPerCallProvider(sup, &fakeProv{events: usageEvents()}, 9, "mainagent", "9-m1", "", "")
 	_, _, u, err := p.Complete(context.Background(), llm.CompletionRequest{})
 	if err != nil {
 		t.Fatalf("Complete 不应出错：%v", err)
@@ -173,5 +173,29 @@ func TestPerCallProviderCompleteRecords(t *testing.T) {
 	}
 	if rows[0].InputTokens != 1500 || rows[0].OutputTokens != 100 {
 		t.Fatalf("非流式轮级 token 应为 1500/100，实得 %d/%d", rows[0].InputTokens, rows[0].OutputTokens)
+	}
+}
+
+func TestPerCallProviderRecordsModelAndProfile(t *testing.T) {
+	stub := &stubDB{}
+	sup := NewSupervisor(nil, stub)
+	sup.firstEventTimeout = time.Second
+
+	// 缺口③ worker 侧：轮记录必须带上 model 与 profile 名，事后才能回答
+	// 「是哪个端点废的这一轮」。model 来自本次调用的 req.Model，profile
+	// 来自构造参数。
+	p := NewPerCallProvider(sup, &fakeProv{events: usageEvents()}, 7, "worker", "7-w42", "deepseek-v4.1-flash", "profile-中转站")
+	for _, err := range p.Stream(context.Background(), llm.CompletionRequest{}) {
+		_ = err
+	}
+
+	rows := waitFor(t, stub, func(rows []db.LLMRound) bool {
+		return len(rows) == 1 && rows[0].Status == "ok"
+	})
+	if len(rows) != 1 {
+		t.Fatalf("应落一条轮记录，实际 %d 条", len(rows))
+	}
+	if rows[0].Model != "deepseek-v4.1-flash" || rows[0].ProfileName != "profile-中转站" {
+		t.Fatalf("轮记录应带 model/profile，实得 %q/%q", rows[0].Model, rows[0].ProfileName)
 	}
 }

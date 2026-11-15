@@ -21,24 +21,30 @@ import (
 // usage 折算口径与 Recorder 相同：message_start 只带输入侧、message_delta 只带
 // 输出侧，两侧相加（Add 折叠），与 llm_usage 行一致。
 type PerCallProvider struct {
-	sup    *Supervisor
-	base   llm.Provider
-	taskID int64
-	worker string
-	baseID string
-	seq    atomic.Int64
+	sup         *Supervisor
+	base        llm.Provider
+	taskID      int64
+	worker      string
+	baseID      string
+	model       string
+	profileName string
+	seq         atomic.Int64
 }
 
 // NewPerCallProvider 构造。baseID 是轮号前缀（建议 taskID+"-w-"+intentID），
-// worker 是轮记录的 lane 标签（"worker" / "mainagent"）。
-func NewPerCallProvider(sup *Supervisor, base llm.Provider, taskID int64, worker, baseID string) *PerCallProvider {
-	return &PerCallProvider{sup: sup, base: base, taskID: taskID, worker: worker, baseID: baseID}
+// worker 是轮记录的 lane 标签（"worker" / "mainagent"）。model 与 profileName
+// 进轮记录的两列（缺口③ worker 侧：事后要答得出「哪个端点废的这一轮」）。
+// CompletionRequest 不带模型名（模型绑定在 provider 实例上），两者由调用方
+// 在构造时按当前激活 profile 解析传入。
+func NewPerCallProvider(sup *Supervisor, base llm.Provider, taskID int64, worker, baseID, model, profileName string) *PerCallProvider {
+	return &PerCallProvider{sup: sup, base: base, taskID: taskID, worker: worker, baseID: baseID, model: model, profileName: profileName}
 }
 
 func (p *PerCallProvider) begin(ctx context.Context) (*Round, context.Context, llm.Provider) {
 	id := fmt.Sprintf("%s-%d", p.baseID, p.seq.Add(1))
 	r, rctx := p.sup.Begin(ctx, RoundMeta{
 		RoundID: id, TaskID: p.taskID, Worker: p.worker,
+		Model: p.model, ProfileName: p.profileName,
 	})
 	return r, rctx, r.WrapProvider(p.base)
 }

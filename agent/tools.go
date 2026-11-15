@@ -1415,6 +1415,13 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if a.Reproduction.Empty() {
 			return actool.Errorf("report_finding 必须提供结构化复现过程（reproduction 字段）：entry_point（入口接口）、prerequisites（前置条件，需要账号就写清怎么注册）、steps（至少 1 步，每步 request=你真实发过的请求原文、response=真实响应片段、expected/proves 各一句话）、provenance（攻击链来源）。这份过程会直接进报告，决定别人能否照着复现；你刚执行完，只有你能准确还原。请保持 vulnclass/name/severity/summary/evidence/traffic_refs 不变，重新调用并补上 reproduction。本次调用未登记漏洞，不会产生重复记录。"), nil
 		}
+		// R16 复跑缺口（2026-11-15）：NormalizeParamSources 只校验已有条目的格式，
+		// 条目缺失时静默放行——复跑 12/12 findings 的 param_sources 全空，操作员
+		// 无从复核。按验收口径补硬校验：steps 里出现带参数的请求（query 串或带
+		// body）时 param_sources 必须非空；给不出来源的参数显式 inferred=true。
+		if len(a.Reproduction.ParamSources) == 0 && a.Reproduction.HasParameterizedHTTPStep() {
+			return actool.Errorf("report_finding 的 reproduction.param_sources 缺失（R16）：POC 里每个参数必须登记来源——来源请求/页面的 URL 与字段位置，source 取 form/json/js/path/query/cookie/header；给不出来源的参数传 inferred=true 显式标注「无来源（模型推断）」。请保持漏洞内容不变，重新调用 report_finding 并补上 param_sources。本次调用未登记漏洞，不会产生重复记录。"), nil
+		}
 		// 证据必须是实质内容：截图是事后可补的产物，evidence 本身才是判定依据。
 		if err := validateFindingEvidence(a.Evidence); err != nil {
 			return actool.Errorf(err.Error()), nil
