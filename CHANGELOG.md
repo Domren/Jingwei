@@ -2,6 +2,88 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.6.4] - 2026-11-17
+
+### 新增
+
+- **Kerberoasting 从预留桩变为进程内真实实现**：此前 `scanner/kerberos.go` 只有接口与
+  stub（`GetTGS`/`DomainSPNs` 一律返回 `ErrKerberosSidecarNotConfigured`），能力名义上
+  存在但没有任何调用方能拿到真票据。现在 `scanner/kerberos_real.go` 进程内实现替换桩：
+  `DomainSPNs` 走 go-ldap 枚举带 SPN 的账户，`GetTGS` 走 gokrb5 申请服务票据，支持
+  **明文口令**与 **NT hash** 两条预认证路径；破解原语落在 `scanner/krbcrypt`（RFC 4757，
+  与 gokrb5 实现逐行对齐）。`cmd/jingwei` 启动时 `RegisterKerberoaster` 接线，credscan /
+  topology 及后续调用方拿到 `DefaultKerberoaster()` 时直接可用。
+  工程细节：NT hash 路径只能构造 RC4 key，须 `forceRC4Only` 钉死 etype 23；手工 keytab
+  必须带尾部 32-bit kvno 且覆盖多个 kvno（1..8），否则 AS_REP 回带 kvno 无法精确匹配；
+  x/crypto 新版已移除 `rc4` 包，破解端内置教科书实现。
+  附带 `cmd/kerberoast-e2e` 端到端验收入口。
+
+### 修复
+
+- **Windows 通道 · 脚本输出入库 500（非 UTF-8 代码页）**：`net localgroup` 一类命令的
+  输出含 GBK 字节（0xb9），直插 UTF8 库报 `SQLSTATE 22021`，整条信息收集失败。
+  新增 `intranetValidUTF8Text`：按「无效字节占非 ASCII 的比例」分流（>50% 整串按 GBK
+  解码，否则逐无效字节换 U+FFFD）。注意 GBK 字节流里存在恰好合法的 UTF-8 组合
+  （如「功」尾字节 +「完」首字节拼出 U+00E9），**逐段切分会切错，必须整串转**。
+- **Windows 通道 · 大文件上传多块全 400**：主根因是分块常量 4096 不是 3 的倍数——每块
+  独立 base64 编码，非 3 倍数长度的块尾必有 `=` padding，多块拼接后首块的 padding 落在
+  流中间，`certutil` / `FromBase64String` 一律拒（`0x8007000d`）。单块（含 gzip 后仅 1 块）
+  padding 在末尾合法，所以此前的「64KB/256KB 对照全过、1MB 必败」看起来像大小问题。
+  修复：分块改 4095（3 的倍数，块 base64 后 5460 字符仍远低于 cmd 8191 命令行上限），
+  cmd 与 PS 两个上传分支共用该常量。顺带修掉 `echo <chunk>>>file` 在块尾为数字时被 cmd
+  解析引入空格的伴生问题（改 `<nul set /p="chunk">>file` + `cmd /c exit 0` 归零）。
+- **Windows 通道 · PowerShell 部署被判「未通过验证」**：`-EncodedCommand` 的 CLIXML
+  进度流写在 stderr，`</Objs>` 无换行结尾，把 cmd 结束标记黏成 `</Objs>__JW_EC__0`，
+  按行首 `HasPrefix` 解析不到。双保险修复：PS 部署脚本前置
+  `$ProgressPreference='SilentlyContinue'`（消进度流）+ 标记匹配改「行首优先、行中
+  `Contains` 兜底」并保留 last-marker-wins。
+- **Windows 维持 · 服务撤销永远等不到删除**：revoke 脚本里 `$s.Delete()` 抛
+  「ServiceController 没有名为 Delete 的方法」——.NET Framework 的 `ServiceController`
+  类根本没有 `Delete()`，服务从未被删，轮询 1060 永远等不到（6.6s 放弃）→ 撤销返回失败。
+  改为 `sc.exe delete` 并识别 `1072`（标记删除）语义后重试即可通过。
+- **endpoint 资产 `ip` 列为空（归并缺口回弹）**：归并层的服务端推导补齐后，
+  `UpsertEndpoint` 自身仍不解析 URL host 的 IP 字面量，HTTP 探测路径只带 URL 落库，
+  `endpoint` 类资产的 `ip` 空值率回弹 100%（17/17）。现在 `parseURL` 后 host 是 IP
+  字面量即自动回填 `ip` 列（域名行为不变，最小变更）。
+- **POC 参数来源可全缺（校验静默放行）**：`NormalizeParamSources` 只校验已有条目的格式，
+  对「带参数步骤但完全没给来源」静默放行，工具描述管不住模型，实测 12/12 findings
+  全缺。`report_finding` 加硬校验：reproduction 非空且 steps 出现带参数请求（query 串或
+  带 body；报文分隔按 CRLF 口径识别，`\n\n` 永不匹配原始报文）而 `param_sources` 缺失时
+  直接 `Errorf` 要求重调——复用既有原子性机制，不产生半条记录；无参数步骤不受影响。
+- **worker 轮留痕缺 model / profile**：`PerCallProvider` 的 `RoundMeta` 只带
+  RoundID / TaskID / Worker，`llm_rounds` 的 model 与 profile 两列全空，事后答不出
+  「这一轮是哪个端点废的」（实测 94/94 全空）。`CompletionRequest` 本身不带模型名
+  （模型绑定在 provider 实例上），改由构造方按当前激活 profile 解析后传入，
+  与 planner 同源。
+
+### 验证
+
+- 夹具（新增）：`scanner/kerberos_real_test.go`、`scanner/krbcrypt/krbcrypt_test.go`
+  （SPN 枚举 / 双预认证路径 / RFC 4757 破解）；`server/intranet_r3_batchb_test.go`、
+  `TestWindowsUploadChunkSizeKeepsConcatenatedBase64Valid`（1 MiB 分块拼接整流解码后
+  逐字节比对）、`TestParseIntranetOutputCLIXMLGluedTrailer`（用真机实拍的黏着形态钉住）、
+  `TestBuildAdvancedWindowsPersistPlans`（PS 版三件套走 `sc.exe delete`）；
+  `TestUpsertEndpointAutoFillsIPFromURLHost`、`TestReportFindingParamSourcesRequired`（三态）、
+  `TestPerCallProviderRecordsModelAndProfile`。
+- 实机（Windows，本机宿主 OpenSSH 双端口）：四组双会话跑通——信息收集 9 脚本 × 2 会话
+  全 200（中文完整还原）；上传 cmd / PS 1 MB raw 均 200 且落盘 1,048,576 字节；下载
+  4/4 字节级一致；维持 schtasks 与 startup 部署 → 验证 → 撤销全链 200，撤销幂等。
+  PS 版维持模块三件套（计划任务 / 注册表 / 服务）deploy/verify/revoke 6/6 通过。
+- 实机（Kerberoasting，Samba AD DC）：LDAP 枚举到带 SPN 的服务账户 → 明文口令路径拿到
+  RC4 服务票据（984 B）→ 字典破解命中 → NT hash 造 keytab 路径同命中，四步全 PASS。
+- 实机（Linux 三机，干净复跑）：100 轮仅 1 轮 `transport_reset` 自愈，12 findings
+  （critical 3 / high 7 / medium 2），单位成本 **36.2 万输入 token/问题**（判据 ≤150 万）。
+  三缺口实机复验：worker 轮 15/15 与 32/32 全带 model/profile；`POST /api/assets` 不带 ip
+  → 自动回填；新登记 finding 带三条结构化 `param_sources`（可逐条点到来源 URL 与字段）。
+- 全量：`go vet ./...` 零告警；`go test ./...` 全通过（含真实 PG 测试库）。
+
+### 升级
+
+- `docker compose pull && docker compose up -d` 即可，无数据库迁移手工步骤
+  （`budget` 终态的 CHECK 约束在启动时幂等重建）。
+- Kerberoasting 需要能出网访问目标域的 LDAP/KDC；未配置时该能力保持「明确报错」，
+  不会退化成「尽力尝试」。
+
 ## [1.6.3] - 2026-11-13
 
 ### 修复
@@ -45,38 +127,38 @@
   以 `unknown` 占位（明确给出的原因原样保留，不做归一化——归一化会打破重试准入失败后
   恢复原原因的语义）；启动时幂等回填历史空原因行（首次约 40 行，之后恒 0）；
   `ReopenIntentsByBlockedReason` 恢复有效。
-- **任务级预算闸门（R19）**：创建任务可设「规划轮数上限」与「累计输入 token 上限」，
+- **任务级预算闸门**：创建任务可设「规划轮数上限」与「累计输入 token 上限」，
   二者任一命中即触发与超时同一套优雅收尾（在跑 worker 写回 → planner 终局判定 →
   落终态）；新增 budget 终态（旧库自动重建 status CHECK 约束）与 tasks.stop_reason
   台账（「为什么停」可读可查）；预算必须按输入 token 计，不能只看轮数——轮数正常时
   钱照样可能烧穿。编排 spawn_task 同步开放 max_rounds / max_input_tokens 参数。
-- **worker 上下文增量化（R19）**：worker 的 compaction 窗口压到 100K——MicroCompact
+- **worker 上下文增量化**：worker 的 compaction 窗口压到 100K——MicroCompact
   约 54K 起清旧工具结果、AutoCompact 约 71K 起总结旧轮，裁剪远早于模型真实窗口
   （默认 200K）发生；被清/被总结的历史不丢（结果可重读、大输出原文在 cmd-output/
   落盘 head+pointer），换来单次调用输入 token 显著下降。
-- **每任务 token 报表口径修复（R19 前置）**：planner/worker 的 LLM 调用此前从未显式
+- **每任务 token 报表口径修复**：planner/worker 的 LLM 调用此前从未显式
   挂任务注册 id，`llm_usage.task_id` 落的是会话解析出的探索 id 字符串，按注册 id 查
   每任务 token 报表会静默返空。现在引擎显式挂注册 id，TokenByModel 按「注册 id OR
   exploration_id」双谓词兼容两代行；谓词不含裸比较（参数会被推断成 int4，探索 id
   一大就编码失败）。
-- **出站 HTTP 收口到 http_send 工具（R20 序 5）**：worker 新增 http_send 工具——UA 强制
+- **出站 HTTP 收口到 http_send 工具**：worker 新增 http_send 工具——UA 强制
   `scanner.BrowserUA()`（调用方给的 User-Agent 被覆盖，不合并）、默认经记录代理出站
   （流量自动留痕可作漏洞证据）、不跟随重定向（重定向目标同样要过范围检查）、响应封顶；
   并把 http_send 纳入 guard 敏感外发检查名单。Bash 自调 curl 的兕底：运行时把 .curlrc
   写进 run 目录并用 CURL_HOME 指向它，curl 默认 UA 同步收口，无需重建镜像。工具描述
   明确告知模型不要用 curl 造 HTTP 请求。
-- **任务级授权粒度（R19 序 5，创建必选）**：创建任务强制二选一——ip_port（严格按清单
+- **任务级授权粒度（创建必选）**：创建任务强制二选一——ip_port（严格按清单
   host:port）/ by_ip（按 IP 授权全部端口）；guard 按所选粒度对 (host, port) 硬约束，
   未登记端口一律拒绝并给出登记对清单；目标清单由 seed 落 task_scope(kind='target')
   供审计（「这个端口为什么在范围内」可回答）；编排 spawn 显式 > 继承父任务 > by_ip；
   存量任务缺省 by_ip 保持原行为。
-- **POC 参数来源（R16）**：report_finding 的 reproduction 新增 param_sources——POC
+- **POC 参数来源**：report_finding 的 reproduction 新增 param_sources——POC
   里每个参数登记「来源请求/页面的 URL + 字段位置」（form/json/js/path/query/cookie/
   header），给不出来源的必须显式 inferred=true 标注「无来源（模型推断）」；落库前
   校验（source 枚举外、非推断却无来源的条目直接退回，编造来源等同伪造证据）。
   发现详情与 HTML/DOCX 报告渲染参数来源表（含推断标记）；markdown 导出沿用报告
   正文文本（结构化复现本就不进 markdown，维持现状）。
-- **请求重发支持二进制正文（R17 修复）**：带 JWT 的 multipart 文件上传此前必失败——
+- **请求重发支持二进制正文**：带 JWT 的 multipart 文件上传此前必失败——
   正文走 JSON 文本通道被 UTF-8 强制转换（复现实测 486→742 bytes），且报文解析把 CRLF
   折成 LF（multipart 边界要求 CRLF）。修复三件：重发载荷新增 body_base64 无损通道
   （解码失败 400，不静默降级）；报文解析保留 CRLF（头部按 \r?\n 切、正文从首个空行
@@ -148,7 +230,7 @@
   验证现状：build/vet 全绿；db/agent 全量 PASS；server 全量失败 = 既有 5 条红灯（无新增）；
   tsc 通过。实机复跑的出站 UA 断言（含模型自调 curl 路径）与 ip_port 越权端口拒绝断言未跑。
 - 夹具（新增，2026-11-12 第 6 序）：`server/repeater_multipart_test.go`——文本通道损坏
-  定性（486→742 bytes，钉住 R17 根因）+ base64 通道验收（出站字节与直接发送逐字节
+  定性（486→742 bytes，钉住根因）+ base64 通道验收（出站字节与直接发送逐字节
   归零，direct=486/via=486；反向验证 = 退掉 body_base64 解码分支，正文变空、比对
   立即失败）。
 - 夹具（新增，2026-11-12 第 7 序）：`db/finding_param_sources_test.go`（来源校验：

@@ -15,15 +15,14 @@
 
 ---
 
-## Jingwei 1.6.3
+## Jingwei 1.6.4
 
-> 1.6.3 是可靠性版本：**LLM 活性监督补齐到 worker 侧**——worker 的每次模型调用都留轮
-> （`llm_rounds`）并参与首帧超时，端点卡死从「等 27 分钟意图墙钟」变成 T1 内主动斩掉；
-> 轮级 token 折算修复（流式 usage 分片折叠，失败轮也不再丢 token）；出站 HTTP 收口到
-> `http_send` 工具（强制浏览器 UA、经记录代理、不跟重定向）、任务级授权粒度（ip_port /
-> by_ip）与预算闸门（轮数 + 输入 token 双上限）落地；请求重发支持二进制正文（multipart
-> 文件上传不再损坏）。三靶机实机复跑：数据质量四判据全过、预算/超时收尾时序实测有效。
-> 无破坏性迁移，原地升级。
+> 1.6.4 是**能力补齐 + Windows 通道收敛**版本：Kerberoasting 从预留桩变成进程内真实实现
+> （LDAP 枚举 SPN、gokrb5 申请 TGS，明文口令与 NT hash 两条预认证路径，破解原语对齐
+> RFC 4757），内网渗透不再有「名义能力」；Windows 通道四处实机缺陷一次收口（GBK 输出
+> 入库 500、1 MB 分块上传全 400、PowerShell 部署误判失败、服务撤销永远等不到删除）；
+> 归并与留痕两处缺口回填（endpoint `ip` 空值率、worker 轮 model/profile 全空）。
+> 三靶机干净复跑单位成本 36.2 万输入 token/问题。无破坏性迁移，原地升级。
 
 ### 功能一览
 
@@ -32,6 +31,7 @@
 | 自动化漏扫 | 不配 LLM 也能跑：端口探测 + 25,136 条 FLUX 指纹 + nuclei 模板命中即出发现；SQL/XSS 由镜像内置 sqlmap / dalfox 专项复核 |
 | POC 模板库 | nuclei 模板的搜索、筛选、统计、上传、启停与批量执行；镜像内置 nuclei 3.11.1 |
 | 弱口令检测 | 31 个协议、全部有真实服务端用例；六态结论 + 逐字节原始报文，只产出事实，不自动登录、不复用 |
+| Kerberoasting | LDAP 枚举带 SPN 的服务账户 → 申请 TGS → 离线破解；支持明文口令与 NT hash 两条预认证路径，不依赖外部工具链 |
 | 固定渗透基线 | 弱口令（内置 WebCrack 引擎 + 滑块验证码求解）与 SQL/XSS 参数枚举作为必跑步骤，不依赖 nuclei 命中 |
 | 深度利用 | exploit / verify / waf-bypass / webshell / resources / intranet 六个子页；请求重发、跨任务凭据库、内网拓扑 |
 | WebShell 与内存马 | 加密 v2 协议（AEAD + 防重放 + 载荷多态）、大马文件管理、Java 五类内存马、PHP 半持久化、Shell 工作台（终端 / 文件 / 系统信息） |
@@ -51,6 +51,21 @@
 > 对话、任务执行与 Agent 自动规划需要先在「系统 → LLM」配置模型。
 
 ## 版本历史
+
+### 1.6.4 — 2026-11-17
+
+- **Kerberoasting 真实实现**：`scanner/kerberos_real.go` 进程内实现替换预留桩——LDAP
+  枚举带 SPN 的服务账户、gokrb5 申请 TGS，支持明文口令与 NT hash 两条预认证路径；
+  破解原语 `scanner/krbcrypt` 对齐 RFC 4757；`cmd/jingwei` 启动时接线，credscan /
+  topology 及后续调用方直接可用。附带 `cmd/kerberoast-e2e` 端到端验收入口。
+- **Windows 通道四处实机缺陷收口**：GBK 输出入库 500（按无效字节占比整串转码，逐段
+  切分会切错）、1 MB 多块上传全 400（分块 4096→4095，base64 padding 不再落在流中间）、
+  PowerShell 部署被误判失败（CLIXML 结束标记被黏连）、服务撤销永远等不到删除
+  （`ServiceController` 没有 `Delete()`，改走 `sc.exe delete`）。
+- **归并与留痕回填**：`UpsertEndpoint` 从 URL host 自动回填 `ip`；`report_finding` 对
+  「带参数步骤但无参数来源」改硬校验；worker 轮记录补齐 model 与 profile。
+- **实机验收**：Windows 四组双会话全 200、Samba AD 上 Kerberoasting 四步全 PASS、
+  三 Linux 靶机 100 轮干净复跑（12 findings，36.2 万输入 token/问题）；`go test ./...` 全绿。
 
 ### 1.6.3 — 2026-11-13
 
@@ -304,7 +319,7 @@
 ### 方式一：使用仓库内 Compose（推荐）
 
 ```bash
-git clone --depth 1 --branch v1.6.3 https://github.com/Domren/Jingwei.git
+git clone --depth 1 --branch v1.6.4 https://github.com/Domren/Jingwei.git
 cd Jingwei/deploy
 cp .env.example .env
 # 编辑 .env：至少修改 POSTGRES_PASSWORD
@@ -316,8 +331,8 @@ docker compose up -d
 
 ```bash
 mkdir jingwei && cd jingwei
-curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.6.3/docker-compose.yml
-curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.6.3/deploy/.env.example
+curl -fsSLO https://github.com/Domren/Jingwei/releases/download/v1.6.4/docker-compose.yml
+curl -fsSLo .env https://raw.githubusercontent.com/Domren/Jingwei/v1.6.4/deploy/.env.example
 # 编辑 .env 后启动
 docker compose pull
 docker compose up -d
@@ -331,7 +346,7 @@ docker compose up -d
 镜像发布在 GitHub Container Registry：
 
 ```bash
-docker pull ghcr.io/domren/jingwei:1.6.3
+docker pull ghcr.io/domren/jingwei:1.6.4
 ```
 
 仓库维护者将 Package 设为公开后可直接拉取。若镜像仍为私有，请使用具备
@@ -349,7 +364,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u Domren --password-stdin
 | --- | :---: | --- |
 | `POSTGRES_PASSWORD` | 是 | 数据库密码，建议使用字母数字强随机值 |
 | `POSTGRES_USER` / `POSTGRES_DB` | 否 | 默认均为 `jingwei` |
-| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.6.3` |
+| `JINGWEI_IMAGE` | 否 | 默认 `ghcr.io/domren/jingwei:1.6.4` |
 | `JINGWEI_WEB_PORT` | 否 | Web/API 宿主端口，默认 `9790` |
 | `JINGWEI_PROXY_PORT` | 否 | 流量代理宿主端口，默认 `9791`，仅绑定 `127.0.0.1` |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | 否 | 也可启动后在 UI 配置 |
@@ -424,11 +439,11 @@ cd web && npm ci && npm run build:static && cd ..
 # 2. 嵌入前端并编译 Linux 二进制
 rm -rf server/webui/dist && cp -r web/out server/webui/dist
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
-  -ldflags "-s -w -X main.version=1.6.3" -o dist/amd64/jingwei ./cmd/jingwei
+  -ldflags "-s -w -X main.version=1.6.4" -o dist/amd64/jingwei ./cmd/jingwei
 
 # 3. 构建运行镜像
 docker build --network=host --build-arg TARGETARCH=amd64 \
-  -t jingwei:1.6.3 .
+  -t jingwei:1.6.4 .
 ```
 
 本地开发运行后端与前端的方法见 [DEPLOY.md](DEPLOY.md#从源码开发)。

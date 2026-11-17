@@ -65,10 +65,10 @@ func run() int {
 	// to the frontend top bar.
 	server.BuildVersion = version
 
-	// Kerberoasting 生产实现接线（§9 拍板项 9）：把 scanner 里默认的
-	// stubKerberoaster 换成进程内真实实现（LDAP 枚举 SPN + gokrb5 申请
-	// TGS），credscan/topology 及后续调用方拿到 DefaultKerberoaster() 时
-	// 直接可用，不再报 ErrKerberosSidecarNotConfigured。
+	// Kerberoasting 生产实现接线：把 scanner 里默认的 stubKerberoaster
+	// 换成进程内真实实现（LDAP 枚举 SPN + gokrb5 申请 TGS），
+	// credscan/topology 及后续调用方拿到 DefaultKerberoaster() 时直接
+	// 可用，不再报 ErrKerberosSidecarNotConfigured。
 	scanner.RegisterKerberoaster(scanner.NewRealKerberoaster())
 
 	printBanner(*addr)

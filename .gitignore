@@ -67,8 +67,8 @@ Thumbs.db
 /Dockerfile.bench.v2
 
 # 本地靶场验收证据（含目标地址/会话细节，仅保留在开发机）
-/evidence/local-linux-p3p4/
-/evidence/zkaq-d54f/
+/evidence/local-linux-lab/
+/evidence/online-lab-d54f/
 
 # tools/e2e 的截图与本地依赖
 tools/e2e/shots/
@@ -77,3 +77,6 @@ tools/e2e/node_modules/
 /ui-shots/
 /selfcheck/
 ui-visual.md
+
+# agent scratch（临时草稿，不提交）
+/.box-agent-scratch/
