@@ -2,11 +2,14 @@ Jingwei（精卫）
 Copyright (C) 2026 Jingwei contributors
 
 This product is a derivative work based on ARTEX
-(https://github.com/RuoJi6/ARTEX), which is licensed under the
+(https://github.com/RuoJi6/ARTEX, the community-maintained open-source
+version), which is licensed under the
 GNU Affero General Public License v3.0 (AGPL-3.0).
 
 ARTEX is Copyright (C) Autumn-27 and contributors.
-Upstream project: https://github.com/Autumn-27/ARTEX
+The original upstream repository (https://github.com/Autumn-27/ARTEX)
+has been taken offline and is no longer publicly available; the
+community-maintained fork is hosted at https://github.com/RuoJi6/ARTEX.
 
 The original copyright notices, the LICENSE file and the AGPL-3.0
 obligations are retained. Any distribution or network use of this

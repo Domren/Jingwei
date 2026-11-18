@@ -2,6 +2,22 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.6.5] - 2026-11-18
+
+### 变更
+
+- **Go 模块路径更正**：`github.com/Autumn-27/jingwei` → `github.com/Domren/jingwei`。
+  原路径指向一个不存在的仓库（第三方 `go get` / `go install` 必然失败），且语义上
+  误导项目归属。全部 import 已同步替换，`go build ./...` 验证通过。
+- **上游署名与链接修正**：ARTEX 原仓库 `Autumn-27/ARTEX` 已下架闭源。`NOTICE` 的
+  upstream 链接改为可点验的社区维护版 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)
+  并注明原仓库状态，消除「based on RuoJi6/ARTEX」与「Upstream = Autumn-27/ARTEX」的
+  自相矛盾；`README` / `DEPLOY` / `docs/开发手册` 同步补充下架说明；`CHANGELOG` 中
+  指向已下架仓库的历史版本对比链接迁移至 RuoJi6/ARTEX 并加注（v0.3.15 之前的 tag
+  未被社区版保留，对应链接不可访问）。
+
+> 本次发版仅含工程与署名治理，无功能性代码变更，无数据库迁移，原地升级。
+
 ## [1.6.4] - 2026-11-17
 
 ### 新增
@@ -1410,7 +1426,7 @@ SQL/XSS 注入基线；LLM 任务在规划前先做资产探测与 POC 初筛；
 
 ### 工程与构建
 
-- 模块与产物更名：`github.com/Autumn-27/artex` → `github.com/Autumn-27/jingwei`；
+- 模块与产物更名：`github.com/Autumn-27/artex` → `github.com/Domren/jingwei`；
   二进制 `artex` → `jingwei`（`cmd/jingwei`），镜像入口 `/app/jingwei`。
 - 环境变量统一为 `JINGWEI_*`（`JINGWEI_PG_DSN` / `JINGWEI_CONFIG` / `JINGWEI_SKILL_DIR` /
   `JINGWEI_LLM_*` / `JINGWEI_NOTIFY_ALLOW_LOCAL` / `JINGWEI_REPEATER_ALLOW_LOCAL`）；
@@ -2430,13 +2446,17 @@ SQL/XSS 注入基线；LLM 任务在规划前先做资产探测与 POC 初筛；
 - [@Autumn-27](https://github.com/Autumn-27)
 - [@neouks](https://github.com/neouks)
 
-[Unreleased]: https://github.com/Autumn-27/ARTEX/compare/v0.3.10...HEAD
-[0.3.10]: https://github.com/Autumn-27/ARTEX/compare/v0.3.9...v0.3.10
-[0.3.9]: https://github.com/Autumn-27/ARTEX/compare/v0.3.8...v0.3.9
-[0.3.8]: https://github.com/Autumn-27/ARTEX/compare/v0.3.7...v0.3.8
-[0.3.7]: https://github.com/Autumn-27/ARTEX/compare/v0.3.6...v0.3.7
-[0.3.6]: https://github.com/Autumn-27/ARTEX/compare/v0.3.5...v0.3.6
-[0.3.5]: https://github.com/Autumn-27/ARTEX/compare/v0.3.4...v0.3.5
-[0.3.4]: https://github.com/Autumn-27/ARTEX/compare/v0.3.3...v0.3.4
-[0.3.3]: https://github.com/Autumn-27/ARTEX/compare/v0.3.2...v0.3.3
-[0.3.2]: https://github.com/Autumn-27/ARTEX/compare/v0.3.1...v0.3.2
+> 注：原上游仓库 `Autumn-27/ARTEX` 已于 2026-10 下架；社区维护版
+> [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX) 保留了 v0.3.15 起的 tag，
+> 以下 v0.3.15 之前的版本对比链接无法访问，仅作历史记录保留。
+
+[Unreleased]: https://github.com/RuoJi6/ARTEX/compare/v0.3.10...HEAD
+[0.3.10]: https://github.com/RuoJi6/ARTEX/compare/v0.3.9...v0.3.10
+[0.3.9]: https://github.com/RuoJi6/ARTEX/compare/v0.3.8...v0.3.9
+[0.3.8]: https://github.com/RuoJi6/ARTEX/compare/v0.3.7...v0.3.8
+[0.3.7]: https://github.com/RuoJi6/ARTEX/compare/v0.3.6...v0.3.7
+[0.3.6]: https://github.com/RuoJi6/ARTEX/compare/v0.3.5...v0.3.6
+[0.3.5]: https://github.com/RuoJi6/ARTEX/compare/v0.3.4...v0.3.5
+[0.3.4]: https://github.com/RuoJi6/ARTEX/compare/v0.3.3...v0.3.4
+[0.3.3]: https://github.com/RuoJi6/ARTEX/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/RuoJi6/ARTEX/compare/v0.3.1...v0.3.2

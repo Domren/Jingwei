@@ -8,21 +8,20 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Docker](https://img.shields.io/badge/ghcr.io-domren%2Fjingwei-2496ED?logo=docker&logoColor=white)](https://github.com/Domren/Jingwei/pkgs/container/jingwei)
 
-> 本项目基于 **Autumn-27/ARTEX** 二次开发，保留原始提交历史、版权声明与 AGPL-3.0 许可证；
-> 上游现由 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX) 持续维护，完整署名见 [NOTICE](NOTICE)。
+> 本项目基于 **Autumn-27/ARTEX** 二次开发（原仓库已下架闭源），保留原始提交历史、版权声明与 AGPL-3.0 许可证；
+> 上游开源维护版为 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)，完整署名见 [NOTICE](NOTICE)。
 
 </div>
 
 ---
 
-## Jingwei 1.6.4
+## Jingwei 1.6.5
 
-> 1.6.4 是**能力补齐 + Windows 通道收敛**版本：Kerberoasting 从预留桩变成进程内真实实现
-> （LDAP 枚举 SPN、gokrb5 申请 TGS，明文口令与 NT hash 两条预认证路径，破解原语对齐
-> RFC 4757），内网渗透不再有「名义能力」；Windows 通道四处实机缺陷一次收口（GBK 输出
-> 入库 500、1 MB 分块上传全 400、PowerShell 部署误判失败、服务撤销永远等不到删除）；
-> 归并与留痕两处缺口回填（endpoint `ip` 空值率、worker 轮 model/profile 全空）。
-> 三靶机干净复跑单位成本 36.2 万输入 token/问题。无破坏性迁移，原地升级。
+> 1.6.5 是**工程与署名治理**版本：Go 模块路径从 `github.com/Autumn-27/jingwei` 更正为
+> `github.com/Domren/jingwei`（原路径指向已不存在的仓库，第三方无法 `go get`）；
+> NOTICE / README / DEPLOY 的上游链接改为可点验的社区维护版 RuoJi6/ARTEX，并注明
+> 原仓库 Autumn-27/ARTEX 已下架闭源；CHANGELOG 历史链接同步迁移并加注。
+> 纯工程修正，无功能变更，无数据库迁移，原地升级。
 
 ### 功能一览
 
@@ -51,6 +50,13 @@
 > 对话、任务执行与 Agent 自动规划需要先在「系统 → LLM」配置模型。
 
 ## 版本历史
+
+### 1.6.5 — 2026-11-18
+
+- **工程与署名治理**：Go 模块路径更正为 `github.com/Domren/jingwei`（原路径指向已不存在
+  的仓库，第三方无法 `go get`）；NOTICE / README / DEPLOY 上游链接改为可点验的
+  RuoJi6/ARTEX 并注明原仓库已下架闭源；CHANGELOG 历史链接迁移并加注。
+  纯工程修正，无功能变更，无数据库迁移。
 
 ### 1.6.4 — 2026-11-17
 
@@ -460,7 +466,7 @@ docker build --network=host --build-arg TARGETARCH=amd64 \
 - **流量**：内置 MITM 代理录制请求/响应，供发现证据与报告引用。
 
 更细的引擎生命周期、意图状态机与多轮规划说明见上游 ARTEX 仓库
-（[RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)，即 Autumn-27/ARTEX 的持续维护版）。
+（[RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)；原 Autumn-27/ARTEX 仓库已下架，此为社区持续维护版）。
 
 ## 发布流程
 
@@ -492,8 +498,8 @@ AGPL-3.0 开源；若修改后通过网络向用户提供服务，必须向这�
 
 本项目基于 ARTEX 二次开发：
 
-- 上游作者与源头：**Autumn-27/ARTEX**（AGPL-3.0）
-- 现由 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX) 持续维护
+- 上游作者与源头：**Autumn-27/ARTEX**（AGPL-3.0；原仓库已下架闭源）
+- 开源维护版：[RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)
 - Jingwei 新增与修改：Copyright (C) 2026 Jingwei contributors
 
 ### 允许使用范围
