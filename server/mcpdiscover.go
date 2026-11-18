@@ -6,8 +6,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/mcphttp"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/mcphttp"
 	"github.com/Autumn-27/norma/mcp"
 	actool "github.com/Autumn-27/norma/tool"
 )

@@ -3,8 +3,8 @@ package server
 import (
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/scanner"
 )
 
 func TestFindingDedupeKey(t *testing.T) {

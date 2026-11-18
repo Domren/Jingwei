@@ -8,9 +8,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Autumn-27/jingwei/agent"
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/llmrec"
+	"github.com/Domren/jingwei/agent"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/llmrec"
 )
 
 // 任务级超时协调器(见 docs/任务级超时与收尾设计.md §4/§8.5)。

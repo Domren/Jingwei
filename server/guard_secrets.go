@@ -4,7 +4,7 @@ import (
 	"os"
 	"strings"
 
-	pgdb "github.com/Autumn-27/jingwei/db"
+	pgdb "github.com/Domren/jingwei/db"
 )
 
 // refreshGuardSecrets (re)registers platform secret fingerprints on the

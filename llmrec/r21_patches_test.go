@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // R21 十条补丁的夹具（2026-11-12）。

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/scanner"
 )
 
 func TestGroupAutoResults(t *testing.T) {

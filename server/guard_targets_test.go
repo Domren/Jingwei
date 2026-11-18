@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // 确定性任务（界面直接建的漏扫与弱口令检测）必须问目标策略。

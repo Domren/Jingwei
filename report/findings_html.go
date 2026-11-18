@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // FindingsHTMLOptions controls the print-ready HTML report.

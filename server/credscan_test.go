@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // credFakeServerAdapter 用「口令 root 即命中」的假协议把「任务框架 → 引擎 → 落库 →

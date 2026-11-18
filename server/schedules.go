@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Autumn-27/jingwei/agent"
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/agent"
+	"github.com/Domren/jingwei/db"
 )
 
 type scheduleRequest struct {

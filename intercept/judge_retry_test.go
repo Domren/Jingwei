@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 func retryTestInterceptor(t *testing.T, settings map[string]string) *Interceptor {

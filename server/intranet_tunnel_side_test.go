@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // A chisel client listener lives on the control end: the target's `ss` cannot see

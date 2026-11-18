@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // 隧道把内网服务映射到平台自己的监听口上。扫描与范围审批看到的因此是

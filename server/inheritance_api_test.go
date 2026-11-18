@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {

@@ -16,7 +16,7 @@ import (
 
 	actool "github.com/Autumn-27/norma/tool"
 
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // http_send：把「向目标发一条 HTTP 请求」收口到平台的强制 UA 工具（欠账 R20 序 5，

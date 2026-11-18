@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/notify"
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/notify"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // 密钥轮换后的补救流程（G3）。

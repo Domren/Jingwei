@@ -17,8 +17,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/jingwei/honeydetect"
-	"github.com/Autumn-27/jingwei/intercept"
+	"github.com/Domren/jingwei/honeydetect"
+	"github.com/Domren/jingwei/intercept"
 	"github.com/Autumn-27/norma/hook"
 )
 

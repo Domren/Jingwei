@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // 实机回归（2026-11-10）：贴进来的目标清单是一行一条，seed 与预扫却只取第一条，

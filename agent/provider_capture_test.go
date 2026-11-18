@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/llmrec"
+	"github.com/Domren/jingwei/llmrec"
 )
 
 // The transport is the only layer that still sees the wire bodies: norma builds

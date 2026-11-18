@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/jingwei/captcha"
+	"github.com/Domren/jingwei/captcha"
 )
 
 const (

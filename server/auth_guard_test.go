@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/jingwei/captcha"
+	"github.com/Domren/jingwei/captcha"
 )
 
 func TestGeneratedSliderPuzzleIsSolvable(t *testing.T) {

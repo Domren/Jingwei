@@ -16,11 +16,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/evidence"
-	"github.com/Autumn-27/jingwei/report"
-	"github.com/Autumn-27/jingwei/scanner"
-	"github.com/Autumn-27/jingwei/verdict"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/evidence"
+	"github.com/Domren/jingwei/report"
+	"github.com/Domren/jingwei/scanner"
+	"github.com/Domren/jingwei/verdict"
 )
 
 // deepManager runs the deep-exploitation tasks (verification, exploitation,

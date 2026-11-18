@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/scanner"
 )
 
 func TestScanTargetBlockReason(t *testing.T) {

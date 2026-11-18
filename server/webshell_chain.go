@@ -3,7 +3,7 @@ package server
 import (
 	"strings"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // 弱口令到 Webshell 的自动链：WebCrack 证明凭据可登录之后，用这次登录拿到的

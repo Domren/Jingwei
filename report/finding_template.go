@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // FindingReportInput is everything the deterministic vulnerability report needs.

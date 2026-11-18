@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // G3 的验收是「一条可执行的补救流程」，所以这里的断言重点是两件事：平台该做的那一半真的

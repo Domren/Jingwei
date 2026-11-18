@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Autumn-27/jingwei/intercept"
+	"github.com/Domren/jingwei/intercept"
 	actool "github.com/Autumn-27/norma/tool"
 )
 

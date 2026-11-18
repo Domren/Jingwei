@@ -12,8 +12,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/Autumn-27/jingwei/scanner"
-	"github.com/Autumn-27/jingwei/scanner/krbcrypt"
+	"github.com/Domren/jingwei/scanner"
+	"github.com/Domren/jingwei/scanner/krbcrypt"
 )
 
 func main() {

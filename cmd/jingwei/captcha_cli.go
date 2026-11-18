@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/Autumn-27/jingwei/captcha"
+	"github.com/Domren/jingwei/captcha"
 )
 
 // captchaSolveRequest is the JSON envelope the WebCrack bridge (and any local

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // 隧道身份必须把「同一个通道的不同写法」认成一个：代理串里带不带端口、带不带凭据，

@@ -18,9 +18,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/report"
-	"github.com/Autumn-27/jingwei/traffic"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/report"
+	"github.com/Domren/jingwei/traffic"
 )
 
 type Store struct {

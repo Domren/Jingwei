@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // 工作台上的「exec() 语境形式」走的就是这个接口。它只做静态换算，所以断言里最要紧的一条是

@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // execForm 把一条命令行编成 shell / argv / 单串三种语境各自的形式（E4）。

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/jingwei/llmrec"
+	"github.com/Domren/jingwei/llmrec"
 )
 
 // R21 缺口②⑤ 在 server 层的夹具：告警判据与退避序列。

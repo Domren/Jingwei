@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/intercept"
+	"github.com/Domren/jingwei/intercept"
 )
 
 type fakePolicy struct {

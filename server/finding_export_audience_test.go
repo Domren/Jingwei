@@ -3,7 +3,7 @@ package server
 import (
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // H2：对外版只含已确认项。抽查一批混合状态的发现，未确认与被撤销的必须被排除且计数可查。

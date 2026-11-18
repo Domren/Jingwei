@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // R3 的缺口是「平台在 PowerShell 会话上生成的脚本到底是不是 PS 语法」没有夹具。

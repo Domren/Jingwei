@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // reproFinding 造一条带结构化复现 + 已绑定报文的发现：第 1 步上传、第 2 步访问 shell。

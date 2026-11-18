@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/jingwei/notify"
+	"github.com/Domren/jingwei/notify"
 )
 
 const FindingRetestAgentKey = "retester"

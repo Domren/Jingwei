@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/jingwei/agent"
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/traffic"
+	"github.com/Domren/jingwei/agent"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/traffic"
 )
 
 // newTestServer 造一个只活到用例结束的 Server（参数次序与 New 一致）。

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/llmrec"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/llmrec"
 )
 
 // R21 §5.4 ⑦ 判据反向验证：人造三种故障，断言系统能检出、按类处置、留痕、不丢触发。

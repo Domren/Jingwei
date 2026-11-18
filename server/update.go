@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/jingwei/selfupdate"
+	"github.com/Domren/jingwei/selfupdate"
 )
 
 // 页面一键更新的 HTTP 面。真正的下载/校验/换装逻辑全在 selfupdate 包里，

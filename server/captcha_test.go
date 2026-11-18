@@ -14,7 +14,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/captcha"
+	"github.com/Domren/jingwei/captcha"
 )
 
 func testSliderBackground(t *testing.T) (bg, piece []byte, gapX, gapY int) {

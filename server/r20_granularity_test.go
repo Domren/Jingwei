@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	pgdb "github.com/Autumn-27/jingwei/db"
+	pgdb "github.com/Domren/jingwei/db"
 )
 
 // R19 序 5：ip_port 严格粒度的授权对判定（纯函数，不连库）。

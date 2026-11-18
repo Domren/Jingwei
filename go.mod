@@ -1,4 +1,4 @@
-module github.com/Autumn-27/jingwei
+module github.com/Domren/jingwei
 
 go 1.26.3
 

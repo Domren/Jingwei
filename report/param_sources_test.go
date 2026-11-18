@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // R16：参数来源在报告里的渲染（HTML/DOCX）与「无来源（模型推断）」标记。

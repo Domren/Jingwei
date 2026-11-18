@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	pgdb "github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/guard"
+	pgdb "github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/guard"
 )
 
 // A3：1.4.1 把范围管控与资产禁令改成失败关闭后，「数据库抖一下」和「目标真的越界」

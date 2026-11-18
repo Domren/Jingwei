@@ -3,8 +3,8 @@ package server
 import (
 	"time"
 
-	"github.com/Autumn-27/jingwei/agent"
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/agent"
+	"github.com/Domren/jingwei/db"
 )
 
 // 重试策略的服务端解析，见 docs/LLM重试设计.md。五层里：

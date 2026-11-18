@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/scanner"
-	"github.com/Autumn-27/jingwei/verdict"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/scanner"
+	"github.com/Domren/jingwei/verdict"
 )
 
 // dalfox 与 url.Values.Encode 都会把 <>\" 百分号编码。按原文 contains 会把

@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/scanner"
-	"github.com/Autumn-27/jingwei/verdict"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/scanner"
+	"github.com/Domren/jingwei/verdict"
 )
 
 // assessNucleiHit applies the anti-false-positive rules to one nuclei hit. The

@@ -23,9 +23,9 @@ import (
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/guard"
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/guard"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // ---------------------------------------------------------------------------

@@ -4,8 +4,8 @@ import (
 	"database/sql"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/guard"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/guard"
 )
 
 func TestGuardTargetPolicyFailsClosedWithoutDatabase(t *testing.T) {

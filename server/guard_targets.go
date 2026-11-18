@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Autumn-27/jingwei/guard"
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/guard"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // 把目标策略这道闸用到**界面直接建的确定性任务**上（漏扫、弱口令检测）。

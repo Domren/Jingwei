@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/report"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/report"
 )
 
 // 矩阵是撤离报告的一部分，所以这里的重点是：结论必须由「有没有独立验证命令」决定，

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // 客户授权清单（F4）。规则语法与范围匹配保持最小一致：

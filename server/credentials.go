@@ -12,10 +12,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/jingwei/agent"
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/llmrec"
-	"github.com/Autumn-27/jingwei/traffic"
+	"github.com/Domren/jingwei/agent"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/llmrec"
+	"github.com/Domren/jingwei/traffic"
 	"github.com/Autumn-27/norma/transcript"
 )
 

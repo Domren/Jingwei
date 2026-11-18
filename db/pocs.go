@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/jingwei/pocparse"
+	"github.com/Domren/jingwei/pocparse"
 )
 
 var (

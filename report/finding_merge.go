@@ -4,7 +4,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // R18 · 导出侧的归并：按「类 + 主机 + 接口族」把同一根因的多条 finding

@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/pocparse"
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/pocparse"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // D5 的分片布局必须只由计划决定：同一个计划算两遍要得到逐格一致的结果，否则续扫时

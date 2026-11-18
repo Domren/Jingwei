@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // 子域名枚举（C3）：任务、执行与资产落库。

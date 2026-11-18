@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/jingwei/llmrec"
+	"github.com/Domren/jingwei/llmrec"
 )
 
 // GET /api/tasks/{id}/llm-health（R21 §5.4 ⑥）

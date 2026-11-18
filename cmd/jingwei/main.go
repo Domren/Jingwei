@@ -16,11 +16,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Autumn-27/jingwei/agent"
-	"github.com/Autumn-27/jingwei/config"
-	"github.com/Autumn-27/jingwei/scanner"
-	"github.com/Autumn-27/jingwei/selfupdate"
-	"github.com/Autumn-27/jingwei/server"
+	"github.com/Domren/jingwei/agent"
+	"github.com/Domren/jingwei/config"
+	"github.com/Domren/jingwei/scanner"
+	"github.com/Domren/jingwei/selfupdate"
+	"github.com/Domren/jingwei/server"
 )
 
 // version is the build version, injected at release time via

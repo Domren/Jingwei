@@ -15,10 +15,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/jingwei/agent"
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/llmrec"
-	"github.com/Autumn-27/jingwei/sidequestion"
+	"github.com/Domren/jingwei/agent"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/llmrec"
+	"github.com/Domren/jingwei/sidequestion"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
 )

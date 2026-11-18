@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // R21 §5.4 ⑦ 判据反向验证：夹具必须能人造三种故障，并断言「被检出 → 按类处置 →

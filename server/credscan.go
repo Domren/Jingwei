@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/report"
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/report"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // 弱口令检测（界面名）的任务框架与 API。内部标识保持 credscan。

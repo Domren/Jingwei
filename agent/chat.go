@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/guard"
-	"github.com/Autumn-27/jingwei/intercept"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/guard"
+	"github.com/Domren/jingwei/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"

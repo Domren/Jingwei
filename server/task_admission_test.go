@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/jingwei/agent"
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/agent"
+	"github.com/Domren/jingwei/db"
 )
 
 func newAdmissionTestServer(m *Manager, available func(*Task) bool) *Server {

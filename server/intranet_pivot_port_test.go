@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // SSH 变体必须用 JINGWEI_PIVOT_SSH_PORT，而不是 JINGWEI_PIVOT_SERVER 的端口：

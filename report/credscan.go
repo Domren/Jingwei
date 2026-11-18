@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // 弱口令检测报告：内部版与对外版是两份不同的叙事，不是同一份加个水印。

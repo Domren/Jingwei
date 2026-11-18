@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/jingwei/llmrec"
+	"github.com/Domren/jingwei/llmrec"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"

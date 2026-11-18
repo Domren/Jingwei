@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/intercept"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/intercept"
 	"github.com/Autumn-27/norma/llm"
 )
 

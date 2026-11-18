@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // resourceManager owns the lifecycle of resources the platform creates on its

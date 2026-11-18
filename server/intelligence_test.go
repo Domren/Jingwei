@@ -3,7 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 	"strings"
 	"testing"
 )

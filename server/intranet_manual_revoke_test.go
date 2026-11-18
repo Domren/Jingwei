@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // 人工处置路径的账目要求：状态变成 revoked，但证据必须能区分「平台验证」与「人说的」。

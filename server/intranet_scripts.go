@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // 内网信息收集脚本库（F3）。每条脚本的 stdout 与**结构化提取结果**一起入库：

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/pocparse"
+	"github.com/Domren/jingwei/pocparse"
 )
 
 // TestListEnabledPOCContentsSeverityFirst pins the full-scan template pick: the

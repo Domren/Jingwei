@@ -3,7 +3,7 @@ package server
 import (
 	"sync"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // Broadcaster is a per-task in-process pub/sub for live activity events. The

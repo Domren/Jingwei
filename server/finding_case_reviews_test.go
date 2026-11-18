@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/Autumn-27/jingwei/intercept"
+	"github.com/Domren/jingwei/intercept"
 	"strings"
 	"testing"
 )

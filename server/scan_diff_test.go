@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // C5：两轮扫描的增量。重点是「消失」的原因：目标不可达不能算已修复。

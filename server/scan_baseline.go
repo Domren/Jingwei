@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/jingwei/db"
-	"github.com/Autumn-27/jingwei/evidence"
-	"github.com/Autumn-27/jingwei/report"
-	"github.com/Autumn-27/jingwei/scanner"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/evidence"
+	"github.com/Domren/jingwei/report"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // Fixed penetration baseline: every scan must try web-login weak credentials,

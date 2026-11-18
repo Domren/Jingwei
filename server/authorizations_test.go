@@ -3,7 +3,7 @@ package server
 import (
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 )
 
 // F4：授权清单的匹配语义。记错任何一个（例如 .corp.com 当成也匹配 corp.com）

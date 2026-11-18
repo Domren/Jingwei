@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/jingwei/sidequestion"
+	"github.com/Domren/jingwei/sidequestion"
 	"github.com/Autumn-27/norma/llm"
 )
 

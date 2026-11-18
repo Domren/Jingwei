@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Autumn-27/jingwei/captcha"
+	"github.com/Domren/jingwei/captcha"
 	actool "github.com/Autumn-27/norma/tool"
 )
 

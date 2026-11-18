@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/Autumn-27/jingwei/db"
+	"github.com/Domren/jingwei/db"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
