@@ -20,6 +20,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Autumn-27/norma/llm"
+	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/norma/transcript"
 	"github.com/Domren/jingwei/agent"
 	"github.com/Domren/jingwei/db"
 	"github.com/Domren/jingwei/intercept"
@@ -27,9 +30,6 @@ import (
 	"github.com/Domren/jingwei/llmrec"
 	"github.com/Domren/jingwei/report"
 	"github.com/Domren/jingwei/traffic"
-	"github.com/Autumn-27/norma/llm"
-	actool "github.com/Autumn-27/norma/tool"
-	"github.com/Autumn-27/norma/transcript"
 )
 
 // BuildVersion is the backend application version, injected from cmd/jingwei at
@@ -924,6 +924,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tokens/usage", s.pgUsageStats) // 全局 llm_usage 聚合（仪表盘新版视图）
 
 	mux.HandleFunc("GET /api/audit", s.getAudit)
+	// P1 操作审计一键导出（含授权书引用与操作者）；?format=md 出 Markdown。
+	mux.HandleFunc("GET /api/audit/export", s.exportOperationAudit)
 	mux.HandleFunc("POST /api/gc", s.gc)
 	mux.HandleFunc("GET /api/traffic", s.getTraffic)
 	mux.HandleFunc("GET /api/traffic/hosts", s.getTrafficHosts)
@@ -4050,14 +4052,20 @@ func (s *Server) settingsPayload() map[string]any {
 		db.SettingCredentialTraffic: s.m.pg.GetBool(db.SettingCredentialAgent, false) && s.m.pg.GetBool(db.SettingCredentialTraffic, false),
 		"llm_record":                s.m.LLMRecordEnabled(),
 		// 自动标题（默认关）：会话/任务建好后用一次 LLM 调用起个可读名字。
-		db.SettingTaskAutoTitle:    s.m.pg.GetBool(db.SettingTaskAutoTitle, false),
-		db.SettingChatAutoTitle:    s.m.pg.GetBool(db.SettingChatAutoTitle, false),
-		"web_search_enabled":       on,
-		"web_search_backend":       backend,
-		"brave_key_set":            strings.TrimSpace(braveKey) != "",
-		"tavily_key_set":           strings.TrimSpace(tavilyKey) != "",
-		"web_search_proxy":         proxy,                       // 独立出口代理(http/https/socks5)，空=直连
-		"global_proxy":             s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
+		db.SettingTaskAutoTitle: s.m.pg.GetBool(db.SettingTaskAutoTitle, false),
+		db.SettingChatAutoTitle: s.m.pg.GetBool(db.SettingChatAutoTitle, false),
+		"web_search_enabled":    on,
+		"web_search_backend":    backend,
+		"brave_key_set":         strings.TrimSpace(braveKey) != "",
+		"tavily_key_set":        strings.TrimSpace(tavilyKey) != "",
+		"web_search_proxy":      proxy,             // 独立出口代理(http/https/socks5)，空=直连
+		"global_proxy":          s.m.GlobalProxy(), // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
+		// P1 操作端反溯源：操作会话独立代理链 + 会话隔离 + 审计引用。
+		"operation_proxy_chain":      s.m.OperationProxyChain(),      // 操作会话代理链，空=直连
+		"operator_session_isolation": s.m.OperatorSessionIsolation(), // 操作会话与任务执行环境隔离，默认开
+		"audit_authorization_ref":    s.m.AuditAuthorizationRef(),    // 审计导出引用的授权书编号
+		// P8 被动线索入口（默认关）：CT 日志 / DNS 历史，域名走固定 API。
+		"passive_leads_enabled":    s.m.PassiveLeadsEnabled(),
 		"python_interpreter":       strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
 		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
 		"task_concurrency_enabled": concOn,                      // 任务并发上限开关(默认关)
@@ -4152,10 +4160,15 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		WebSearchBackend *string `json:"web_search_backend"`
 		BraveKey         *string `json:"brave_search_api_key"`
 		TavilyKey        *string `json:"tavily_search_api_key"`
-		WebSearchProxy   *string `json:"web_search_proxy"`   // 独立出口代理(http/https/socks5)；null=不改，""=清空
-		GlobalProxy      *string `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
-		PythonInterp     *string `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
-		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
+		WebSearchProxy   *string `json:"web_search_proxy"` // 独立出口代理(http/https/socks5)；null=不改，""=清空
+		GlobalProxy      *string `json:"global_proxy"`     // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
+		// P1 操作端反溯源。OperationProxyChain 沿用 null=不改/""=清空语义。
+		OperationProxyChain      *string `json:"operation_proxy_chain"`
+		OperatorSessionIsolation *bool   `json:"operator_session_isolation"`
+		AuditAuthorizationRef    *string `json:"audit_authorization_ref"`
+		PassiveLeadsEnabled      *bool   `json:"passive_leads_enabled"` // P8：被动线索默认关
+		PythonInterp             *string `json:"python_interpreter"`    // 自定义脚本工具的 python 解释器路径
+		Workers                  *int    `json:"workers"`               // 并发工作 agent 数(>0)；对之后启动的任务生效
 		// 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
 		ConcurrencyEnabled *bool `json:"task_concurrency_enabled"`
 		ConcurrencyLimit   *int  `json:"task_concurrency_limit"`
@@ -4353,6 +4366,31 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		changed = true // capture-off egress is baked into agents at build time → rebuild
+	}
+	// P1：操作端代理链 / 会话隔离 / 审计引用。立即生效，无需重建 agent。
+	if req.OperationProxyChain != nil {
+		if err := s.m.SetOperationProxyChain(*req.OperationProxyChain); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+	}
+	if req.OperatorSessionIsolation != nil {
+		if err := s.m.SetOperatorSessionIsolation(*req.OperatorSessionIsolation); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.AuditAuthorizationRef != nil {
+		if err := s.m.SetAuditAuthorizationRef(*req.AuditAuthorizationRef); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.PassiveLeadsEnabled != nil {
+		if err := s.m.SetPassiveLeadsEnabled(*req.PassiveLeadsEnabled); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
 	}
 	if req.WebSearchEnabled != nil || req.WebSearchBackend != nil || req.BraveKey != nil || req.TavilyKey != nil || req.WebSearchProxy != nil {
 		// Fill unspecified fields from current state so a partial PUT doesn't reset them.

@@ -11,7 +11,9 @@ package honeydetect
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Score ranges from 0.0 (no honeypot indicators) to 1.0 (strong honeypot signal).
@@ -19,6 +21,9 @@ type Score struct {
 	Value   float64  `json:"value"`
 	Signals []Signal `json:"signals"`
 	Verdict string   `json:"verdict"` // clean | suspicious | likely_honeypot
+	// ForceRecheck 表示命中了行为判据，必须强制二次验证后再写 finding。
+	// 只影响「是否复核」的提示，不改变工具闸门允许/阻断的判定。
+	ForceRecheck bool `json:"force_recheck,omitempty"`
 }
 
 // Signal is one detection hit.
@@ -199,4 +204,156 @@ func Summary(s Score) string {
 		parts = append(parts, sig.Detail)
 	}
 	return strings.Join(parts, "; ")
+}
+
+// =====================================================================
+// P5 · 行为判据（静态签名之外）
+//
+// 静态签名抓的是「蜜罐长什么样」；行为判据抓的是「蜜罐怎么回应」。
+// 两类蜜罐静态签名漏检：① 过度完美——每个 payload 都 success、零噪声，
+// 真实服务在枚举中必然有 404/报错/随机噪声；② 时间反常——响应恒定极快且
+// 抖动趋近于零，真实服务有网络与业务抖动。命中后打 ForceRecheck 标记，
+// 要求 agent 二次验证，但不改变工具闸门与 finding 判定。
+// =====================================================================
+
+// TimingSample 是一次 payload 探针的观测值。
+type TimingSample struct {
+	Payload string        `json:"payload,omitempty"`
+	Success bool          `json:"success"`
+	Elapsed time.Duration `json:"elapsed"`
+	Noise   string        `json:"noise,omitempty"` // 非空表示该次有报错/噪声
+}
+
+const (
+	behaviorMinSamples      = 3
+	behaviorFastThreshold   = 2 * time.Millisecond // 恒定低于此值视为脚本桩
+	behaviorJitterTolerance = 500 * time.Microsecond
+)
+
+// DetectBehavior 用行为样本补充静态检测。timing 为空时返回 clean。
+func DetectBehavior(in Input, timing ...TimingSample) Score {
+	// 静态信号也带进来：行为命中 + 静态命中时 Confidence 更高。
+	_ = in // 预留给未来与静态信号交叉验证；当前行为判据只看样本本身。
+	var signals []Signal
+	if tooPerfect(timing) {
+		signals = append(signals, Signal{
+			Source: "behavior", Rule: "behavior-too-perfect", Severity: "high", Weight: 0.6,
+			Detail: "过度完美：所有 payload 均 success 且无噪声，疑似脚本桩蜜罐",
+		})
+	}
+	if constantFast(timing) {
+		signals = append(signals, Signal{
+			Source: "behavior", Rule: "behavior-constant-fast", Severity: "high", Weight: 0.5,
+			Detail: "时间反常：响应恒定极快且抖动趋近于零，疑似预置应答蜜罐",
+		})
+	}
+	if len(signals) == 0 {
+		return Score{Verdict: "clean"}
+	}
+	value := 0.0
+	for _, sig := range signals {
+		value += sig.Weight
+	}
+	if len(signals) >= 2 {
+		value *= 1.2 // 两个独立行为信号叠加，提高置信度
+	}
+	if value > 1.0 {
+		value = 1.0
+	}
+	verdict := "suspicious"
+	if value >= 0.6 {
+		verdict = "likely_honeypot"
+	}
+	return Score{Value: value, Signals: signals, Verdict: verdict, ForceRecheck: true}
+}
+
+// tooPerfect：至少 3 个样本，全部 success、全部无噪声。
+func tooPerfect(samples []TimingSample) bool {
+	if len(samples) < behaviorMinSamples {
+		return false
+	}
+	for _, s := range samples {
+		if !s.Success || strings.TrimSpace(s.Noise) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// constantFast：至少 3 个样本，全部 >0 且 <=阈值，且最大-最小抖动在容差内。
+func constantFast(samples []TimingSample) bool {
+	if len(samples) < behaviorMinSamples {
+		return false
+	}
+	min, max := time.Duration(0), time.Duration(0)
+	for i, s := range samples {
+		if s.Elapsed <= 0 || s.Elapsed > behaviorFastThreshold {
+			return false
+		}
+		if i == 0 || s.Elapsed < min {
+			min = s.Elapsed
+		}
+		if i == 0 || s.Elapsed > max {
+			max = s.Elapsed
+		}
+	}
+	return max-min <= behaviorJitterTolerance
+}
+
+// MergeScores 合并静态与行为评分。Verdict 重新按合并值计算；任一命中行为判据
+// 都必须保留 ForceRecheck 标记。
+func MergeScores(a, b Score) Score {
+	out := Score{}
+	out.Signals = append(append([]Signal{}, a.Signals...), b.Signals...)
+	out.Value = a.Value + b.Value
+	if out.Value > 1.0 {
+		out.Value = 1.0
+	}
+	out.ForceRecheck = a.ForceRecheck || b.ForceRecheck
+	switch {
+	case out.Value >= 0.6:
+		out.Verdict = "likely_honeypot"
+	case out.Value >= 0.3:
+		out.Verdict = "suspicious"
+	default:
+		out.Verdict = "clean"
+	}
+	return out
+}
+
+// NeedsRecheck 报告是否应强制二次验证。
+func NeedsRecheck(s Score) bool { return s.ForceRecheck }
+
+// ParseTimingSamples 从工具输出里解析行为样本行，格式（每行一个样本）：
+//
+//	payload=/api/a success=1 elapsed_ms=0.35
+//	payload=/api/b success=true elapsed_ms=0.31 noise="404"
+//
+// 这是给 agent / 深挖模块回灌观测值的轻量约定；解析不到就返回 nil，
+// 行为判据静默跳过，不影响静态检测。
+var (
+	reSampleElapsed = regexp.MustCompile(`(?i)elapsed_ms\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)`)
+	reSampleSuccess = regexp.MustCompile(`(?i)\bsuccess\s*[:=]\s*(true|yes|ok|1)\b`)
+	reSampleNoise   = regexp.MustCompile(`(?i)\bnoise\s*[:=]\s*"([^"]*)"`)
+)
+
+func ParseTimingSamples(output string) []TimingSample {
+	var out []TimingSample
+	for _, line := range strings.Split(output, "\n") {
+		m := reSampleElapsed.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		ms, err := strconv.ParseFloat(m[1], 64)
+		if err != nil || ms < 0 {
+			continue
+		}
+		s := TimingSample{Elapsed: time.Duration(ms * float64(time.Millisecond))}
+		s.Success = reSampleSuccess.MatchString(line)
+		if n := reSampleNoise.FindStringSubmatch(line); n != nil {
+			s.Noise = n[1]
+		}
+		out = append(out, s)
+	}
+	return out
 }

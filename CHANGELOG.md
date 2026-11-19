@@ -2,6 +2,42 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 新增
+
+- **P1 · 操作端反溯源**：设置页新增 `operation_proxy_chain`（操作会话独立代理链，空=直连）、
+  `operator_session_isolation`（操作会话与任务执行环境隔离，默认开）、
+  `audit_authorization_ref`（授权书引用）。新增 `GET /api/audit/export?format=md`
+  一键导出操作审计，回答「测了什么 / 谁批的 / 谁在操作」；导出前把代理口令与
+  Authorization 头统一脱敏。不要求真实搭建代理链，代码侧留出配置与隔离口径。
+- **P2 · 多出口代理池**：`db/schema.sql` 幂等新增 `egress_endpoints` 与
+  `task_egress_bindings`；`scanner/deepuse.go` 的 `DeepClient.WithEgressPool` 在
+  `Do()` 前按任务选出出口，健康探测失败/连接失败自动轮换并留痕，跨任务绑定被拒绝；
+  原始代理 URL 与口令不进事件、响应与日志。
+- **P3 · 站群资产聚类**：`db/assets.go` 新增证书指纹 / 页面结构 hash / 聚类键字段，
+  `ClusterAssets` 按 cert > page > favicon > dedupe 族归并同源站点，原始条目可展开，
+  一族只算一个独立目标（镜像站不重复打）；`BuildDomainTimeline` 给出域名/IP 变更时间线。
+  schema 以 `ADD COLUMN IF NOT EXISTS` 幂等加列。
+- **P4 · 请求节奏自适应**：`scanner/pacing.go` 的 `AdaptivePacer` 复用 `BlockRateLimit`
+  与挑战分类，区分放行 / 限速 / 挑战页三形态并按目标指数退避、标记切出口；节奏按目标
+  隔离，`Wait` 在锁外执行，一个目标降速不拖垮别的任务。
+- **P5 · 蜜罐行为识别**：`honeydetect.DetectBehavior` 补静态签名之外的行为判据
+  （过度完美：所有 payload 都 success 且无噪声；时间反常：响应恒定极快且抖动趋近于零），
+  命中打 `ForceRecheck`；`guard/guard.go` 调用处产出「强制二次验证」提示，只提示不阻断，
+  不影响 normal finding 判定。
+- **P6 · api-recon 自动化升级**：`skills/api-recon/scripts/js_denoise_extract.py`
+  做 JS 去噪、批量端点/参数提取与权限树线索还原，与 1.5.0 目录枚举 / JS-URL 结果按
+  归一化路径去重；SKILL.md 补自动化触发说明；`server/orchestration.go` 新增
+  `auto_api_recon` host 工具，复用 `skill.LoadDir` 加载器，手动与自动两路产出一致。
+- **P7 · 批量任务工作流**：`server/orchestration.go` 新增 `batch_spawn`，同配置一键派生
+  N 任务（复用 `spawn_task` 的 seed 绑定流程）；`report/batch_aggregate.go` 提供跨任务
+  归并导出，按 1.6.3/R18 口径剥掉任务号后合并同根因，不同类 / 不同主机不误合。
+- **P8 · 被动线索入口（可选、默认关）**：`enrich/enrich.go` 新增 CT 日志 / DNS 历史
+  被动 jobKind，域名走固定 API、只进 query、不接受任意 URL；`guard/egress.go` 注册
+  出网审计（固定 API host + 查询字段名）；跨主机重定向按子域名枚举口径拒绝。
+  默认关，只做被动线索不做测绘。
+
 ## [1.6.5] - 2026-11-18
 
 ### 变更

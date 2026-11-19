@@ -423,3 +423,21 @@ stub 检查：外层 `response_code` 与拦截器门一致；flat codes 与 tree
 
 - Grep 配方、`config.json` 模板、排障、Hook、参数逆向 J 节、site_map 模板：**[reference.md](reference.md)**
 - 参考脚本路径见 [脚本与门禁](#脚本与门禁) 表
+
+---
+
+## 自动化触发（P6 · 扫描后自动执行，无需手动加载本 skill）
+
+平台在扫描完成后会**自动**触发本 skill 的静态收尾，不必等 agent 手动声明「调用 api-recon」。
+复用平台既有的 skill 加载器（`skill.LoadDir`）确认本 skill 可见后，按固定顺序跑：
+
+1. `scripts/js_denoise_extract.py <JSDIR|JSFILE...> --existing <1.5.0 结果> --out api_auto.json`
+   —— JS 去噪、批量端点/参数提取、权限树线索还原；
+2. 把 `api_auto.json` 的 `endpoints_auto` 与 1.5.0 的**目录枚举**、**JS-URL 提取**结果按归一化路径去重；
+3. 结果与手动加载本 skill 的产物一致（同一份确定性脚本，只是触发方式不同）。
+
+自动化只覆盖**静态层**（去噪/端点/参数/权限树线索）；动态层（depth/coverage、进壳、触发矩阵）仍按上面的流程硬门禁执行，
+不因自动触发而跳过。脚本夹具：`scripts/test_js_denoise.py`（`python3 -m unittest discover -s scripts -p test_js_denoise.py`）。
+
+Go 侧入口：`server/orchestration.go` 的 `auto_api_recon` host 工具复用 `skill.LoadDir(s.skillDir)`，
+返回自动化执行计划（含去重后的端点），供编排 agent 或扫描完成钩子直接消费。

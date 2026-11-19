@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Domren/jingwei/agent"
-	"github.com/Domren/jingwei/db"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Domren/jingwei/agent"
+	"github.com/Domren/jingwei/db"
 )
 
 // jsonResult marshals v to a JSON tool result.
@@ -68,6 +68,8 @@ func (s *Server) orchestrationTools() []actool.CoreTool {
 		s.toolListTasks(),
 		s.toolListLLMProfiles(),
 		s.toolSpawnTask(),
+		s.toolAutoAPIRecon(), // P6：扫描后自动触发 api-recon 静态收尾
+		s.toolBatchSpawn(),   // P7：同配置一键派生 N 任务
 		s.toolPauseTask(),
 		s.toolGetTaskGraph(),
 		s.toolListTaskFindings(),
