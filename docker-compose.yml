@@ -34,6 +34,14 @@ services:
       JINGWEI_LLM_MODEL: ${JINGWEI_LLM_MODEL:-}
       JINGWEI_LLM_BASE_URL: ${JINGWEI_LLM_BASE_URL:-}
       JINGWEI_LLM_PROXY: ${JINGWEI_LLM_PROXY:-}
+      # 构建期代理不得进入运行时：Dockerfile 已不再 ENV 固化，这里再显式置空兜底，
+      # 避免用旧镜像起服务时容器内 127.0.0.1:7890 无人监听、所有出网请求 0ms 失败。
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      NO_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      no_proxy: ""
       JAVA_CHAINS_URL: ${JAVA_CHAINS_URL:-http://java-chains:8011}
       JAVA_CHAINS_PASS: ${JAVA_CHAINS_PASS:-}
       JAVA_CHAINS_MCP_TOKEN: ${JAVA_CHAINS_MCP_TOKEN:-}

@@ -18,10 +18,15 @@ FROM python:3.12-slim-bookworm
 ARG TARGETARCH
 # 可选代理：构建时传 --build-arg HTTP_PROXY=http://<host>:7890 让 curl/npm/apt 走代理加速外网下载。
 # 不传时为空（等价直连）；NO_PROXY 排除国内镜像源，避免绕路变慢。
+#
+# 注意：这里**只声明 ARG，不要写成 ENV**。Docker 会把 HTTP_PROXY/HTTPS_PROXY/NO_PROXY
+# 这类预定义 build-arg 自动注入到每条 RUN 的构建环境里，构建期加速照样生效；一旦写成
+# ENV 就会被固化进运行时镜像——容器里 127.0.0.1:7890 并没有代理在听，模型调用、nuclei
+# 模板下载、目标侧回连等所有出网请求会立刻 connection refused（0ms 失败，极难排查）。
+# 运行时代理只能由 docker-compose 的 JINGWEI_LLM_PROXY 或宿主机环境提供。
 ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""
 ARG NO_PROXY=""
-ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY
 # 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
 # Node 22.x：从 npmmirror 国内镜像下载二进制（避免 nodesource 外网直连）。
 RUN apt-get update && apt-get install -y --no-install-recommends \
