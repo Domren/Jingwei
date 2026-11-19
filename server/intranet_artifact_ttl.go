@@ -13,6 +13,10 @@ const (
 	intranetArtifactExpiryInterval = time.Minute
 	intranetArtifactExpiryRetry    = 10 * time.Minute
 	intranetArtifactExpiryBatch    = 20
+
+	// SettingIntranetTTLAutoRevoke 是「到期自动撤销并验证」的总开关，默认关。
+	// 不设置或值不是 true/1 时，扫描循环只做出期提醒，绝不自动下发撤销命令。
+	SettingIntranetTTLAutoRevoke = "intranet_ttl_auto_revoke_enabled"
 )
 
 // runIntranetArtifactExpiry revokes ledger entries whose TTL elapsed. Failed
@@ -31,7 +35,11 @@ func (s *Server) runIntranetArtifactExpiry(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.intranetArtifactExpirySweep(ctx, lastAttempt, reported)
+			// P13：默认关。只有设置里显式打开才执行自动撤销；到期提醒不依赖该开关，
+			// 否则「没开自动回收」就变成「连提醒都收不到」，反而更容易漏掉到期项。
+			if s.m.pg.GetBool(SettingIntranetTTLAutoRevoke, false) {
+				s.intranetArtifactExpirySweep(ctx, lastAttempt, reported)
+			}
 			s.intranetArtifactExpiryNoticeSweep(ctx)
 		}
 	}
@@ -108,6 +116,12 @@ func (s *Server) intranetArtifactExpirySweep(ctx context.Context, lastAttempt ma
 				if !reported[art.ID] {
 					log.Printf("[intranet][ttl] 落地物 #%d 已到期但没有可用会话或 webshell，无法自动撤销：%v", art.ID, rerr)
 					reported[art.ID] = true
+					// P13：连命令都发不出去也是失败，转人工队列单列，不能假装仍在重试。
+					if _, merr := pg.MarkIntranetArtifactTTLFailedManual(art.ID,
+						"TTL 到期但无可用会话/webshell，无法自动撤销："+truncateIntranetOutput(rerr.Error(), 500),
+						"ttl-worker"); merr != nil {
+						log.Printf("[intranet][ttl] 落地物 #%d 转人工队列失败: %v", art.ID, merr)
+					}
 				}
 				continue
 			}
@@ -116,6 +130,10 @@ func (s *Server) intranetArtifactExpirySweep(ctx context.Context, lastAttempt ma
 		if revoked {
 			delete(lastAttempt, art.ID)
 			delete(reported, art.ID)
+			// P13：留下「到期撤销 + 验证通过」的结构化结果，不能只把 status 改成 revoked——
+			// 报告需要能区分「平台验过的清除」和「人工声明的清除」。
+			_, _ = pg.MarkIntranetArtifactTTLRevoked(art.ID,
+				fmt.Sprintf("TTL 到期自动撤销并通过验证 #%d", art.ID))
 			if art.SessionID != nil && *art.SessionID > 0 {
 				_ = pg.AddIntranetSessionEvent(*art.SessionID, "artifact",
 					fmt.Sprintf("TTL 到期自动撤销落地物 #%d", art.ID),
@@ -130,6 +148,12 @@ func (s *Server) intranetArtifactExpirySweep(ctx context.Context, lastAttempt ma
 		}
 		if !reported[art.ID] {
 			reported[art.ID] = true
+			// P13：撤销或验证失败即转人工队列，单列展示；不再无限重试——
+			// 到期项留在 active 里反复尝试，只会让台账看起来"仍在自动管理"。
+			if _, merr := pg.MarkIntranetArtifactTTLFailedManual(art.ID,
+				"TTL 到期自动撤销失败："+truncateIntranetOutput(detail, 500), "ttl-worker"); merr != nil {
+				log.Printf("[intranet][ttl] 落地物 #%d 转人工队列失败: %v", art.ID, merr)
+			}
 			if art.SessionID != nil && *art.SessionID > 0 {
 				_ = pg.AddIntranetSessionEvent(*art.SessionID, "artifact",
 					fmt.Sprintf("TTL 到期自动撤销失败 #%d", art.ID), truncateIntranetOutput(detail, 2000), true)

@@ -2228,6 +2228,13 @@ CREATE TABLE IF NOT EXISTS cred_dicts (
 -- 重复推送同一条；落地物撤销/删除后该行随之消失。
 ALTER TABLE intranet_artifacts ADD COLUMN IF NOT EXISTS expiry_notified_at TIMESTAMPTZ;
 
+-- P13 TTL 自动回收：记录「到期撤销 + 验证」的结果。
+-- verified：平台执行撤销并通过验证，痕迹确认消失。
+-- failed_manual：撤销或验证失败，已转人工队列，报告单列；绝不混进「平台已验证清除」。
+ALTER TABLE intranet_artifacts ADD COLUMN IF NOT EXISTS ttl_revoke_status TEXT NOT NULL DEFAULT '';
+ALTER TABLE intranet_artifacts ADD COLUMN IF NOT EXISTS ttl_revoked_at TIMESTAMPTZ;
+ALTER TABLE intranet_artifacts ADD COLUMN IF NOT EXISTS ttl_verify_evidence TEXT NOT NULL DEFAULT '';
+
 -- F3：内网信息收集脚本的运行台账。每条脚本一次执行一行，stdout 与结构化
 -- 提取结果都落库——报告与横向决策要用的是结构化的端口/账号/计划任务，
 -- 而不是一大段需要人肉阅读的终端输出。

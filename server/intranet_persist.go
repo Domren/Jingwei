@@ -52,6 +52,8 @@ type intranetPersistInput struct {
 	User        string `json:"user"`
 	Description string `json:"description"`
 	TTLSeconds  int64  `json:"ttl_seconds"`
+	// Env 是部署前的环境探测结果。由 intranetPersist 填充；纯函数测试可直接构造。
+	Env intranetPersistEnv `json:"-"`
 }
 
 type intranetArtifactRegisterInput struct {
@@ -73,6 +75,9 @@ type intranetPersistPlan struct {
 	Kind, Name, Path, Description string
 	Deploy, Revoke, Verify        string
 	Metadata                      map[string]any
+	// NotApplicable 非空表示环境探测判定该手段在当前目标不适用，此时 Deploy 为空，
+	// 调用方不得下发任何部署命令。空字符串表示适用（或调用方未提供探测结果）。
+	NotApplicable string
 }
 
 func intranetArtifactToken() (string, error) {
@@ -912,31 +917,44 @@ func intranetLoginShellWarn(user string) string {
 }
 
 func buildIntranetPersistPlan(in intranetPersistInput) (intranetPersistPlan, error) {
+	var plan intranetPersistPlan
+	var err error
 	switch strings.ToLower(strings.TrimSpace(in.Kind)) {
 	case db.IntranetArtifactCron:
-		return buildCronPersistPlan(in)
+		plan, err = buildCronPersistPlan(in)
 	case db.IntranetArtifactSystemd:
-		return buildSystemdPersistPlan(in)
+		plan, err = buildSystemdPersistPlan(in)
 	case db.IntranetArtifactUserSystemd:
-		return buildUserSystemdPersistPlan(in)
+		plan, err = buildUserSystemdPersistPlan(in)
 	case db.IntranetArtifactAt:
-		return buildAtPersistPlan(in)
+		plan, err = buildAtPersistPlan(in)
 	case db.IntranetArtifactProfile:
-		return buildProfilePersistPlan(in)
+		plan, err = buildProfilePersistPlan(in)
 	case db.IntranetArtifactSSHKey:
-		return buildSSHKeyPersistPlan(in)
+		plan, err = buildSSHKeyPersistPlan(in)
 	case db.IntranetArtifactSchtasks:
-		return buildSchtasksPersistPlan(in)
+		plan, err = buildSchtasksPersistPlan(in)
 	case db.IntranetArtifactRegistry:
-		return buildRegistryPersistPlan(in)
+		plan, err = buildRegistryPersistPlan(in)
 	case db.IntranetArtifactService:
-		return buildServicePersistPlan(in)
+		plan, err = buildServicePersistPlan(in)
 	case db.IntranetArtifactWMI:
-		return buildWMIPersistPlan(in)
+		plan, err = buildWMIPersistPlan(in)
 	case db.IntranetArtifactStartup:
-		return buildStartupPersistPlan(in)
+		plan, err = buildStartupPersistPlan(in)
+	default:
+		return intranetPersistPlan{}, errors.New("kind 必须是 cron/systemd/user_systemd/at/profile/ssh_key（POSIX）或 schtasks/registry/service/wmi/startup（Windows）")
 	}
-	return intranetPersistPlan{}, errors.New("kind 必须是 cron/systemd/user_systemd/at/profile/ssh_key（POSIX）或 schtasks/registry/service/wmi/startup（Windows）")
+	if err != nil {
+		return intranetPersistPlan{}, err
+	}
+	// P12：部署前的统一适配探测。判定不适用时把部署命令清空，调用方看到
+	// NotApplicable 就必须拒绝下发，绝不能只靠前端提示——命令根本不该被生成。
+	if ok, reason := persistKindApplicable(plan.Kind, in.Env); !ok {
+		plan.NotApplicable = reason
+		plan.Deploy, plan.Revoke, plan.Verify = "", "", ""
+	}
+	return plan, nil
 }
 
 // intranetPersistKindForOS rejects modules that cannot work on the target
@@ -1048,9 +1066,18 @@ func (s *Server) intranetPersist(ctx context.Context, pg *db.DB, in intranetPers
 	if err := intranetPersistKindForOS(in.Kind, osKind); err != nil {
 		return nil, deployOut, verifyOut, false, err
 	}
+	// P12：部署前只读探测目标环境（systemd/容器/crontab/HOME/EDR）。判定不适用
+	// 时 build 会把部署命令清空并写出原因，这里据此拒绝下发，台账也不登记。
+	// 调用方已显式给出探测结果时不重复探测（便于夹具与上层复用）。
+	if !in.Env.Probed {
+		in.Env = s.intranetProbePersistEnv(ctx, pg, sess, osKind)
+	}
 	plan, err := buildIntranetPersistPlan(in)
 	if err != nil {
 		return nil, deployOut, verifyOut, false, err
+	}
+	if plan.NotApplicable != "" {
+		return nil, deployOut, verifyOut, false, fmt.Errorf("目标环境不适用 %s：%s；未生成部署命令", in.Kind, plan.NotApplicable)
 	}
 	taskID := intranetArtifactSessionTask(sess, in.TaskID)
 	if msg := intranetTaskGuard(pg, taskID); msg != "" {

@@ -2,6 +2,25 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 新增
+
+- **P12 · 维持手段环境适配探测**：部署前先对目标做只读探测（systemd 是否可用、是否运行在容器、
+  crontab 是否可写、HOME 是否可写、EDR 是否拦截），按手段判定适用/不适用；探测不到一律判「不适用」。
+  不适用时构建层根本不生成部署/撤销/验证命令，`intranetPersist` 也拒绝下发、不登记台账，
+  避免操作者以为种下了一个根本不会运行的 foothold。新增 5 类环境夹具单测（systemd 可用、
+  容器无 systemd、crontab 只读、EDR 拦截、未知）覆盖判定与「不适用不生成命令」。
+- **P13 · TTL 自动回收（默认关）**：新增 settings 开关 `intranet_ttl_auto_revoke_enabled`，默认 false，
+  不设置即不自动撤销。打开后到期落地物自动执行撤销并验证：平台验证通过的记
+  `ttl_revoke_status=verified`；撤销/验证失败或无可用通道的转人工队列（`failed_manual`，
+  沿用 `manual_revoke` 证据口径），撤离报告 `ttl_manual_revoked` 单列展示，
+  绝不混进「平台已验证清除」。schema 新增三列幂等迁移。
+- **P14 · 痕迹矩阵动态更新**：撤离时在关闭会话之前动态采集 cron / systemd / ssh-key / 近期文件的
+  可观测痕迹，与本次已登记手段的静态档案关键词比对；档案外的真实痕迹写进报告
+  「档案外痕迹（动态采集发现，静态档案未覆盖）」一节显式列出，不再静默略过。
+  「本轮未执行动态采集」与「采集了但未发现差异」在报告中分开表述。
+
 ## [1.6.5] - 2026-11-18
 
 ### 变更

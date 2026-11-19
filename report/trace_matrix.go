@@ -48,7 +48,12 @@ type TraceMatrixInput struct {
 	// LedgerExternal 是账外残留扫描发现的东西：不在台账里、但目标上确实存在。
 	LedgerExternal []string
 	// Unknown 是扫描没能做完的部分（没有会话、Windows 侧未覆盖、台账读取失败）。
-	Unknown     []string
+	Unknown []string
+	// Observed 是撤离时动态采集到的可观测痕迹原文（P14）。
+	Observed []string
+	// ProfileDiff 是动态采集到、但静态档案没有描述的真实痕迹。
+	// 「没有差异」与「根本没采集」是两件事，报告里分开写，不能静默略过。
+	ProfileDiff []string
 	Hostname    string
 	GeneratedAt time.Time
 }
@@ -134,6 +139,19 @@ func TraceMatrixMarkdown(in TraceMatrixInput) string {
 		}
 		b.WriteString("\n这些条目不在本轮台账里：平台没有部署它们，也就无法声称已经清除。" +
 			"要么它们属于别的操作，要么是台账漏记——两种都必须人工确认后再交付报告。\n\n")
+	}
+
+	b.WriteString("### 档案外痕迹（动态采集发现，静态档案未覆盖）\n\n")
+	if len(in.ProfileDiff) > 0 {
+		for _, d := range in.ProfileDiff {
+			fmt.Fprintf(&b, "- %s\n", strings.TrimSpace(d))
+		}
+		b.WriteString("\n上述痕迹在本次登记的静态档案里没有对应描述，不能套用已知手段的清除结论；" +
+			"它们的来历与处置必须人工确认，不能因为「没写进报告」就被当成不存在。\n\n")
+	} else if len(in.Observed) > 0 {
+		b.WriteString("动态采集未发现静态档案之外的痕迹（仅代表已执行采集命令的覆盖范围）。\n\n")
+	} else {
+		b.WriteString("本轮未执行动态痕迹采集，无法判断是否存在档案外痕迹。\n\n")
 	}
 
 	b.WriteString("### 这一节怎么读\n\n")
