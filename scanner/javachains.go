@@ -435,6 +435,86 @@ func JavaDeserializationKeyword(templateID, name string, tags []string, content 
 	return "java deserialization"
 }
 
+// JavaChainProbeStatus 是「无 sidecar 依赖存在性最小探测」的结构化结论。
+// 它不是漏洞确认，也不生成 payload——只回答「在已有证据里看没看到依赖特征」。
+type JavaChainProbeStatus string
+
+const (
+	// JavaChainDependencyPresent 在已有证据里观察到该链的依赖特征串：依赖存在（线索），
+	// 但链仍未验证——没有 sidecar 就没有回连/命令执行级确认。
+	JavaChainDependencyPresent JavaChainProbeStatus = "dependency_present"
+	// JavaChainChainUnverified 识别到 Java 反序列化链，但已有证据里没有依赖特征串：
+	// 链未验证。既不宣称目标有该链，也不宣称目标无该链。
+	JavaChainChainUnverified JavaChainProbeStatus = "chain_unverified"
+	// JavaChainNoChain 候选 POC 根本不是 Java 反序列化：本次候选里目标无该链。
+	JavaChainNoChain JavaChainProbeStatus = "no_java_chain"
+)
+
+// JavaChainDependency 是一次最小探测的结果。所有字段都来自已有文本，不含任何生成的
+// payload，可直接落进 deep task 的 summary 供报告/审批页区分「没装 sidecar」与
+// 「目标无该链」。
+type JavaChainDependency struct {
+	Family string               `json:"family"` // JavaDeserializationKeyword 识别出的家族
+	Status JavaChainProbeStatus `json:"status"`
+	Signal string               `json:"signal"` // 命中的依赖特征串；未命中为空
+	Note   string               `json:"note"`   // 中文结论，绝不用笼统的「待复核」
+}
+
+// javaDependencyMarkers 是每个家族的可观察特征串。只做字符串存在性判断，绝不据此
+// 拼装或生成任何利用载荷——这是无 sidecar 时唯一诚实能做的事。
+var javaDependencyMarkers = map[string][]string{
+	"fastjson2":            {"com.alibaba.fastjson2", "fastjson2"},
+	"fastjson":             {"com.alibaba.fastjson", "@type", "fastjson"},
+	"jackson":              {"com.fasterxml.jackson", "jackson.databind"},
+	"shiro":                {"org.apache.shiro", "rememberme", "shiro"},
+	"xstream":              {"com.thoughtworks.xstream", "xstream"},
+	"weblogic":             {"weblogic", "wlstype"},
+	"jboss":                {"org.jboss", "jboss"},
+	"websphere":            {"com.ibm.websphere", "websphere"},
+	"log4j2":               {"org.apache.logging.log4j", "log4j2"},
+	"log4j":                {"org.apache.log4j", "log4j"},
+	"java deserialization": {"java.lang.runtime", "java.io.objectinputstream", "org.apache.commons.collections", "cwe-502"},
+}
+
+// genericJavaDeserializationMarkers 是任何 Java 反序列化链通用的依赖特征，家族未命中时兜底。
+var genericJavaDeserializationMarkers = []string{
+	"java.lang.runtime", "java.io.objectinputstream", "org.apache.commons.collections", "cwe-502",
+	"invokertransformer", "commons-collections",
+}
+
+// ProbeJavaChainDependency 在已有证据文本（POC 模板内容、已观察到的响应片段）上做最小
+// 探测，判断依赖是否存在。family 来自 JavaDeserializationKeyword——为空表示这次候选
+// 不是 Java 反序列化链，结论为 no_java_chain（目标无该链）。
+//
+// 注意：本函数不访问网络、不生成 payload、不宣称链已验证；它只把「看到/没看到依赖
+// 特征串」这一事实结构化，让无 sidecar 场景的结论区别于笼统的「待复核」。
+func ProbeJavaChainDependency(family, evidence string) JavaChainDependency {
+	if strings.TrimSpace(family) == "" {
+		return JavaChainDependency{
+			Status: JavaChainNoChain,
+			Note:   "未识别到 Java 反序列化链特征，本次候选中目标无该链（不是「待复核」）。",
+		}
+	}
+	lower := strings.ToLower(evidence)
+	markers := append([]string(nil), javaDependencyMarkers[family]...)
+	markers = append(markers, genericJavaDeserializationMarkers...)
+	for _, marker := range markers {
+		if marker != "" && strings.Contains(lower, marker) {
+			return JavaChainDependency{
+				Family: family,
+				Status: JavaChainDependencyPresent,
+				Signal: marker,
+				Note:   "在已有证据中观察到 " + family + " 依赖特征串「" + marker + "」：依赖存在（线索），但无 sidecar，链未验证。",
+			}
+		}
+	}
+	return JavaChainDependency{
+		Family: family,
+		Status: JavaChainChainUnverified,
+		Note:   "识别到 " + family + " 链，但已有证据中未见依赖特征串：链未验证（不等于目标无该链）。",
+	}
+}
+
 // nucleiRawTemplate is the subset of a nuclei template needed for replay.
 type nucleiRawTemplate struct {
 	HTTP []struct {

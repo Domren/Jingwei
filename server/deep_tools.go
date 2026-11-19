@@ -8,9 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Domren/jingwei/db"
-	"github.com/Domren/jingwei/scanner"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Domren/jingwei/db"
+	"github.com/Domren/jingwei/guard"
+	"github.com/Domren/jingwei/intercept"
+	"github.com/Domren/jingwei/scanner"
 )
 
 // deepTools exposes the automatic verification/exploitation capabilities to
@@ -23,6 +25,7 @@ func (s *Server) deepTools() []actool.CoreTool {
 		s.toolVerifySQLI(),
 		s.toolVerifyXSS(),
 		s.toolWAFBypass(),
+		s.toolVerifyRCE(),
 		s.toolInjectWebshell(),
 		s.toolWebshellRegister(),
 		s.toolGetDeepTask(),
@@ -78,6 +81,17 @@ type deepToolInput struct {
 	FileName  string `json:"file_name"`
 
 	TaskID int64 `json:"task_id"`
+
+	// RCE 验证阶梯参数（P9）。rce_level 为本次请求级别（1 回连证明 / 2 无害命令 /
+	// 3 读文件 / 4 写文件），rce_achieved 为当前已达级别；rce_* 开关为 false 时
+	// 对应级别被独立关闭。这些参数会写进 deep task 的 params，由 guard.RCEGate
+	// 在入队前做代码级裁决——模型提示词自律不替代闸门。
+	RCELevel    int   `json:"rce_level"`
+	RCEAchieved int   `json:"rce_achieved"`
+	RCECallback *bool `json:"rce_callback"`
+	RCEHarmless *bool `json:"rce_harmless"`
+	RCERead     *bool `json:"rce_read"`
+	RCEWrite    *bool `json:"rce_write"`
 }
 
 func (s *Server) toolVerifyVulnerability() actool.CoreTool {
@@ -166,6 +180,39 @@ func (s *Server) toolVerifyXSS() actool.CoreTool {
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			return s.runDeepTool(ctx, in, db.DeepTaskXSSProbe)
 		})
+}
+
+// toolVerifyRCE exposes the code-gated RCE verification ladder. The four levels are
+// 回连证明(1) → 无害命令(2) → 读文件(3) → 写文件(4). Each level can be switched off
+// independently; requesting a level above achieved+1 is a jump that MUST be approved
+// by a human through the intercept ask/decide path before the task is even queued.
+// Prompt-level self-discipline in the sidecar is never the enforcement point: the
+// guard.RCEGate code gate is.
+func (s *Server) toolVerifyRCE() actool.CoreTool {
+	return wrTool("verify_rce",
+		"对已授权目标做 RCE 验证阶梯：回连证明(1) → 无害命令(2) → 读文件(3) → 写文件(4)，逐级授权。跳级（请求的级别超过当前已达级别+1）必须由操作员人工审批，审批拒绝会进入审批记录；四级各自可用 rce_* 开关独立关闭，关闭后连跳级审批也不放行。本工具在入队前由代码闸门裁决，模型提示词自律不替代闸门。",
+		objSchema(map[string]any{
+			"target":       strParam("任务归属的目标 URL / 主机"),
+			"rce_level":    intArgSchema("本次请求的级别：1 回连证明 / 2 无害命令 / 3 读文件 / 4 写文件，默认 1"),
+			"rce_achieved": intArgSchema("当前已达级别（0 表示尚未验证），默认 0"),
+			"rce_callback": map[string]any{"type": "boolean", "description": "允许第 1 级回连证明，默认 true；false 独立关闭该级"},
+			"rce_harmless": map[string]any{"type": "boolean", "description": "允许第 2 级无害命令，默认 true"},
+			"rce_read":     map[string]any{"type": "boolean", "description": "允许第 3 级读文件，默认 true"},
+			"rce_write":    map[string]any{"type": "boolean", "description": "允许第 4 级写文件，默认 true"},
+			"wait_seconds": intArgSchema("等待任务完成的秒数，默认 180，最大 600"),
+			"queue_only":   map[string]any{"type": "boolean", "description": "true=只排队不等结果（默认省略=等待）"},
+		}, "target"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			return s.runDeepTool(ctx, in, db.DeepTaskRCE)
+		})
+}
+
+// rceSwitch turns an optional JSON bool into a switch value; unset means enabled.
+func rceSwitch(v *bool) bool {
+	if v == nil {
+		return true
+	}
+	return *v
 }
 
 func probePointSchema() map[string]any {
@@ -545,6 +592,22 @@ func (s *Server) runDeepTool(ctx context.Context, in json.RawMessage, kind strin
 		if len(a.Keywords) > 0 {
 			params["keywords"] = a.Keywords
 		}
+	case db.DeepTaskRCE:
+		if target == "" {
+			return actool.Errorf("target 必填"), nil
+		}
+		level := a.RCELevel
+		if level == 0 { // 0 = 未传，取默认第 1 级
+			level = 1
+		}
+		// 阶梯参数写进 deep task 的 params，入队前交 guard.RCEGate 代码闸门裁决；
+		// 执行侧 runVerifyRCE 还会用同一纯函数复核一次，防止排队期间被改参绕过。
+		params["rce_level"] = level
+		params["rce_achieved"] = a.RCEAchieved
+		params["rce_callback"] = rceSwitch(a.RCECallback)
+		params["rce_harmless"] = rceSwitch(a.RCEHarmless)
+		params["rce_read"] = rceSwitch(a.RCERead)
+		params["rce_write"] = rceSwitch(a.RCEWrite)
 	case db.DeepTaskWebshellInject:
 		upload := strings.TrimSpace(a.UploadURL)
 		if upload == "" {
@@ -577,6 +640,23 @@ func (s *Server) runDeepTool(ctx context.Context, in json.RawMessage, kind strin
 		}
 	default:
 		return actool.Errorf("未知的深度任务类型"), nil
+	}
+
+	// RCE 阶梯的代码闸门：入队前裁决级别。ask 复用 intercept 的 HandleAsk/Decide
+	// 人工审批链路，跳级被拒会落审批记录；sidecar 提示词自律不参与裁决。
+	if kind == db.DeepTaskRCE {
+		var gate *guard.RCEGate
+		if s.m != nil && s.m.interceptor != nil {
+			gate = guard.NewRCEGate(s.m.interceptor)
+		} else {
+			gate = guard.NewRCEGate(nil) // 无拦截器时跳级一律不放行
+		}
+		gctx := intercept.WithCall(ctx, "verify_rce", in)
+		res := gate.Evaluate(gctx, intercept.ConvIDFromContext(gctx), "verify_rce", params, in)
+		if !res.Allowed {
+			return actool.Errorf("RCE 验证阶梯未放行：" + res.Reason), nil
+		}
+		params["rce_achieved"] = res.Achieved // 把放行后的新已达级别写回任务，供后续逐级推进
 	}
 
 	name := deepTaskLabel(kind) + " · " + target

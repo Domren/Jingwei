@@ -274,6 +274,8 @@ func (r *deepRun) execute() (status, stage, errMsg string, summary map[string]an
 		return r.runSQLiProbe(summary)
 	case db.DeepTaskXSSProbe:
 		return r.runXSSProbe(summary)
+	case db.DeepTaskRCE:
+		return r.runVerifyRCE(summary)
 	default:
 		return "failed", "failed", "未知的深度利用任务类型: " + r.task.Kind, summary
 	}
@@ -1219,6 +1221,14 @@ func (r *deepRun) runWAFBypass(summary map[string]any) (string, string, string, 
 	summary["final_verdict"] = run.FinalVerdict
 	summary["bypass_mode"] = run.Mode
 	summary["bypass_review"] = verdict.BypassReview().Checks
+	// 置信度旁路（P10）：WAF 绕过回显即使包含关键词，也只是推断证据而非亲眼观测，
+	// 不进正式报告正文。Assess 的 confirmed/needs_review 二值语义不受影响。
+	summary["bypass_confidence"] = verdict.AssessConfidence(verdict.Observation{
+		TemplateID: "waf-bypass",
+		Name:       "waf_bypass",
+		Type:       "http",
+		StatusCode: 200,
+	})
 	r.setProgress("waf", map[string]any{"bypassed": bypassed, "blocked": blocked})
 	r.logf("waf", "绕过测试完成：%d 种变形可绕过，%d 种被拦截，%d 种无法安放载荷；尝试 %d 次，停止原因 %q",
 		bypassed, blocked, unsupported, run.Attempts, run.StopReason)
@@ -1471,9 +1481,9 @@ func (s *Server) createDeepTask(w http.ResponseWriter, r *http.Request) {
 	req.Kind = strings.ToLower(strings.TrimSpace(req.Kind))
 	switch req.Kind {
 	case db.DeepTaskVerify, db.DeepTaskExploit, db.DeepTaskWAFBypass, db.DeepTaskWebshellInject,
-		db.DeepTaskSQLiProbe, db.DeepTaskXSSProbe:
+		db.DeepTaskSQLiProbe, db.DeepTaskXSSProbe, db.DeepTaskRCE:
 	default:
-		writeErr(w, 400, "任务类型必须是 verify、exploit、waf_bypass、webshell_inject、sqli_probe 或 xss_probe")
+		writeErr(w, 400, "任务类型必须是 verify、exploit、waf_bypass、webshell_inject、sqli_probe、xss_probe 或 rce_verify")
 		return
 	}
 	req.Target = strings.TrimSpace(req.Target)
@@ -1527,6 +1537,8 @@ func deepTaskLabel(kind string) string {
 		return "SQL 注入专项验证"
 	case db.DeepTaskXSSProbe:
 		return "XSS 专项验证"
+	case db.DeepTaskRCE:
+		return "RCE 阶梯验证"
 	default:
 		return "深度利用"
 	}

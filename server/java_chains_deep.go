@@ -25,6 +25,40 @@ type javaChainAttempt struct {
 	callback  string
 }
 
+// javaChainCandidate 是一个被识别为 Java 反序列化的 POC 候选。
+// 提到包级是为了让无 sidecar 的探测结论能在纯函数里生成与测试。
+type javaChainCandidate struct {
+	tpl    db.POCTemplate
+	family string
+}
+
+// javaChainsProbeSummary 生成「没装 sidecar」时的结构化结论，不访问 sidecar、不生成
+// payload。结论明确区分 dependency_present（观察到依赖特征串）与 chain_unverified
+// （识别到链但无特征串），绝不退化成笼统的「待复核」。
+func javaChainsProbeSummary(candidates []javaChainCandidate) map[string]any {
+	probes := make([]map[string]any, 0, len(candidates))
+	counts := map[string]int{}
+	for _, c := range candidates {
+		p := scanner.ProbeJavaChainDependency(c.family, c.tpl.Content)
+		counts[string(p.Status)]++
+		probes = append(probes, map[string]any{
+			"template_id": c.tpl.TemplateID,
+			"family":      p.Family,
+			"status":      string(p.Status),
+			"signal":      p.Signal,
+			"note":        p.Note,
+		})
+	}
+	return map[string]any{
+		"java_chains_no_sidecar":   true,
+		"java_chains_probe_status": string(scanner.JavaChainChainUnverified), // 无 sidecar 时链一律未验证
+		"java_chains_probe":        probes,
+		"java_chains_probe_counts": counts,
+		"java_chains_note": "没装 java-chains sidecar：仅做依赖存在性最小探测（不生成 payload、不做回连）；" +
+			"依赖存在只表示观察到特征串，链未验证，需安装 sidecar 后才能确认。",
+	}
+}
+
 // runJavaChains auto-invokes the java-chains sidecar for Java deserialization
 // POCs: it picks a preset from the template family, publishes a JNDI payload,
 // rewrites the template's OAST address and delivers the request. It returns the
@@ -35,11 +69,7 @@ func (r *deepRun) runJavaChains(templates []db.POCTemplate, target, mode string,
 		return nil
 	}
 	cfg := scanner.JavaChainsConfigFromEnv()
-	type candidate struct {
-		tpl    db.POCTemplate
-		family string
-	}
-	var candidates []candidate
+	var candidates []javaChainCandidate
 	for _, tpl := range templates {
 		if strings.TrimSpace(tpl.Content) == "" || tpl.Protocol == "workflow" {
 			continue
@@ -48,14 +78,21 @@ func (r *deepRun) runJavaChains(templates []db.POCTemplate, target, mode string,
 		if family == "" {
 			continue
 		}
-		candidates = append(candidates, candidate{tpl: tpl, family: family})
+		candidates = append(candidates, javaChainCandidate{tpl: tpl, family: family})
 	}
 	if len(candidates) == 0 {
+		// 没有 Java 反序列化候选：这是「目标无该链」，与「没装 sidecar」是两种结论。
+		summary["java_chains_probe_status"] = string(scanner.JavaChainNoChain)
+		summary["java_chains_no_sidecar"] = !cfg.Configured()
+		summary["java_chains_note"] = "未识别到 Java 反序列化链 POC；本次候选中目标无该链（不是「待复核」，也不是「没装 sidecar」）。"
 		return nil
 	}
 	if !cfg.Configured() {
-		summary["java_chains_note"] = "检测到 Java 反序列化 POC，但未配置 JAVA_CHAINS_MCP_TOKEN"
-		r.logf(mode, "检测到 %d 个 Java 反序列化 POC，java-chains 未配置，跳过自动利用", len(candidates))
+		// 没装 sidecar：不伪造生成结果，只把依赖存在性最小探测结论结构化落库。
+		for k, v := range javaChainsProbeSummary(candidates) {
+			summary[k] = v
+		}
+		r.logf(mode, "检测到 %d 个 Java 反序列化 POC，但未装 java-chains sidecar：仅做依赖存在性最小探测，链未验证", len(candidates))
 		return nil
 	}
 	client := scanner.NewJavaChainsClient(cfg, 20*time.Second)

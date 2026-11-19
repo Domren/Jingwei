@@ -40,13 +40,16 @@ type DBFinding struct {
 	Status    string
 	// DedupeKey 是服务端推导的身份（R18：类+主机+接口族）。导出归并层用它
 	// 判断「哪些条目是同一根因」；为空表示存量数据、按标题兜底。
-	DedupeKey       string
-	CVSS            *float64      // CVSS v3.1 基础分,0.0-10.0
-	Reproduction    *Reproduction // 结构化复现过程(agent 记录时就地落库);nil=未记录,报告回退到重构的验证步骤
-	Report          string        // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
-	HTTPRequest     string        // 原始 HTTP 请求报文;扫描/深度利用/自定义请求产生
-	HTTPResponse    string        // 原始 HTTP 响应报文
-	CreatedAt       time.Time
+	DedupeKey    string
+	CVSS         *float64      // CVSS v3.1 基础分,0.0-10.0
+	Reproduction *Reproduction // 结构化复现过程(agent 记录时就地落库);nil=未记录,报告回退到重构的验证步骤
+	Report       string        // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
+	HTTPRequest  string        // 原始 HTTP 请求报文;扫描/深度利用/自定义请求产生
+	HTTPResponse string        // 原始 HTTP 响应报文
+	CreatedAt    time.Time
+	// Confidence 是执行结果的置信度：observed 亲眼观测到（默认）/ inferred 由回显推断
+	// （例如 WAF 改写后的回显）/ failed 执行失败无结果。报告正文只引用 observed。
+	Confidence      string
 	TaskDescription string // populated via LEFT JOIN on tasks
 	// ScanTaskID/ScanTaskName 是无 LLM 漏扫来源(f.task_id 为空时按最早一轮归属);
 	// 导出报告时用于按漏扫任务分组,而不是落到「未关联任务」。
@@ -79,6 +82,27 @@ const AutoReportMarker = "<!-- jingwei:auto-report -->"
 // IsAutoReport reports whether a report was produced by the deterministic
 // template rather than by an LLM or a human.
 func IsAutoReport(report string) bool { return strings.Contains(report, AutoReportMarker) }
+
+// 执行结果置信度（findings.confidence）。默认值 observed 保证存量 finding 与既有
+// confirmed 判定不受影响；只有亲眼观测到的证据才进正式报告正文。
+const (
+	FindingConfidenceObserved = "observed"
+	FindingConfidenceInferred = "inferred"
+	FindingConfidenceFailed   = "failed"
+)
+
+// NormalizeFindingConfidence 把任意输入收敛到合法置信度：空值/未知值一律回退到 observed。
+// 这样老 finding（无该列或空值）与既有 confirmed 判定保持原语义。
+func NormalizeFindingConfidence(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case FindingConfidenceInferred:
+		return FindingConfidenceInferred
+	case FindingConfidenceFailed:
+		return FindingConfidenceFailed
+	default:
+		return FindingConfidenceObserved
+	}
+}
 
 // Finding triage states (findings.status).
 const (
@@ -224,7 +248,8 @@ const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.n
 	       f.evidence, f.worker, f.asset_ids, COALESCE(f.status, 'pending'), f.created_at,
 	       COALESCE(t.description, '') AS task_description, f.evidence_version, f.report_evidence_version, f.cvss,
  (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id),
- COALESCE(f.reproduction::text, ''), COALESCE(f.dedupe_key, '')`
+ COALESCE(f.reproduction::text, ''), COALESCE(f.dedupe_key, ''),
+ COALESCE(f.confidence, 'observed')`
 
 // scanFindings materializes rows selected via findingSelectCols.
 func scanFindings(rows interface {
@@ -239,7 +264,7 @@ func scanFindings(rows interface {
 		var cvss sql.NullFloat64
 		var reproText string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
-			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &cvss, &f.TrafficCount, &reproText, &f.DedupeKey); err != nil {
+			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &cvss, &f.TrafficCount, &reproText, &f.DedupeKey, &f.Confidence); err != nil {
 			return nil, err
 		}
 		if cvss.Valid {
@@ -744,7 +769,7 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		var reproText string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &cvss, &f.TrafficCount, &reproText, &f.DedupeKey,
+			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &cvss, &f.TrafficCount, &reproText, &f.DedupeKey, &f.Confidence,
 			&f.Report, &f.HTTPRequest, &f.HTTPResponse, &f.ScanTaskID, &f.ScanTaskName); err != nil {
 			return nil, err
 		}
@@ -881,7 +906,7 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &cvss, &f.TrafficCount, &reproText, &f.DedupeKey,
+		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &cvss, &f.TrafficCount, &reproText, &f.DedupeKey, &f.Confidence,
 		&f.Report, &f.HTTPRequest, &f.HTTPResponse)
 	if cvss.Valid {
 		f.CVSS = &cvss.Float64
