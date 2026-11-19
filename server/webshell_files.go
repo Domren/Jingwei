@@ -112,9 +112,8 @@ func (s *Server) readWebshellFile(w http.ResponseWriter, r *http.Request) {
 		}
 		length = n
 	}
-	if length > scanner.ShellFileMaxRead {
-		length = scanner.ShellFileMaxRead
-	}
+	// 与 scanner.ReadShellFile 共用同一处封顶定义，避免两层上限不一致。
+	length = scanner.ClampShellFileReadLength(length)
 	client := scanner.NewDeepClient(20 * time.Second)
 	chunk, err := scanner.ReadShellFile(s.ctx, client, shell.URL, payload, path, offset, length)
 	if err != nil {
@@ -158,8 +157,8 @@ func (s *Server) writeWebshellFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "文件内容不是有效的 base64")
 		return
 	}
-	if len(raw) > scanner.ShellFileChunkSize {
-		writeErr(w, 400, "单次写入不能超过 256 KiB")
+	if verr := scanner.ValidateShellFileWriteChunk(len(raw)); verr != nil {
+		writeErr(w, 400, verr.Error())
 		return
 	}
 	client := scanner.NewDeepClient(30 * time.Second)

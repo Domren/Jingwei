@@ -62,8 +62,10 @@ type IntranetSession struct {
 	Transport    string         `json:"transport"`
 	LastSeen     *time.Time     `json:"last_seen,omitempty"`
 	Metadata     map[string]any `json:"metadata"`
-	Note         string         `json:"note"`
-	CreatedAt    time.Time      `json:"created_at"`
+	// Labels 是会话的多标签，按任务/主机分组用。JSONB 存储，批量执行按标签选中会话。
+	Labels    []string  `json:"labels"`
+	Note      string    `json:"note"`
+	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt    time.Time      `json:"updated_at"`
 	WebshellName string         `json:"webshell_name,omitempty"`
 	WebshellURL  string         `json:"webshell_url,omitempty"`
@@ -86,6 +88,7 @@ type IntranetSessionInput struct {
 	Cwd        string
 	Note       string
 	Metadata   map[string]any
+	Labels     []string
 
 	Transport       string
 	SSHPort         int
@@ -103,6 +106,10 @@ type IntranetSessionEvent struct {
 	Output    string    `json:"output"`
 	IsError   bool      `json:"is_error"`
 	CreatedAt time.Time `json:"created_at"`
+	// Operator 是执行者，Host/SessionName 由导出查询联表补出，不落冗余列。
+	Operator    string `json:"operator"`
+	Host        string `json:"host,omitempty"`
+	SessionName string `json:"session_name,omitempty"`
 }
 
 type IntranetTunnel struct {
@@ -167,27 +174,35 @@ type IntranetScopeRequestInput struct {
 const intranetSessionCols = `s.id, s.name, s.webshell_id, s.task_id, s.host, s.cwd, s.status,
 	s.last_seen, s.metadata, s.note, s.created_at, s.updated_at,
 	COALESCE(w.name,''), COALESCE(w.url,''), COALESCE(w.shell_type,''),
-	s.transport, s.ssh_port, s.ssh_user, s.ssh_credential_id, s.ssh_dial_host, s.ssh_dial_port`
+	s.transport, s.ssh_port, s.ssh_user, s.ssh_credential_id, s.ssh_dial_host, s.ssh_dial_port,
+	COALESCE(s.labels,'[]'::jsonb)`
 
 // intranetSessionReturningCols is the same projection minus the webshells join,
 // for INSERT/UPDATE ... RETURNING where alias w is unavailable.
 const intranetSessionReturningCols = `id, name, webshell_id, task_id, host, cwd, status,
 	last_seen, metadata, note, created_at, updated_at, '', '', '',
-	transport, ssh_port, ssh_user, ssh_credential_id, ssh_dial_host, ssh_dial_port`
+	transport, ssh_port, ssh_user, ssh_credential_id, ssh_dial_host, ssh_dial_port,
+	COALESCE(labels,'[]'::jsonb)`
 
 func scanIntranetSession(row interface{ Scan(...any) error }) (*IntranetSession, error) {
 	var s IntranetSession
 	var raw []byte
+	var rawLabels []byte
 	if err := row.Scan(&s.ID, &s.Name, &s.WebshellID, &s.TaskID, &s.Host, &s.Cwd, &s.Status,
 		&s.LastSeen, &raw, &s.Note, &s.CreatedAt, &s.UpdatedAt,
 		&s.WebshellName, &s.WebshellURL, &s.ShellType,
-		&s.Transport, &s.SSHPort, &s.SSHUser, &s.SSHCredentialID, &s.SSHDialHost, &s.SSHDialPort); err != nil {
+		&s.Transport, &s.SSHPort, &s.SSHUser, &s.SSHCredentialID, &s.SSHDialHost, &s.SSHDialPort,
+		&rawLabels); err != nil {
 		return nil, err
 	}
 	s.Transport = NormalizeIntranetTransport(s.Transport)
 	s.Metadata = map[string]any{}
 	if len(raw) > 0 {
 		_ = json.Unmarshal(raw, &s.Metadata)
+	}
+	s.Labels = []string{}
+	if len(rawLabels) > 0 {
+		_ = json.Unmarshal(rawLabels, &s.Labels)
 	}
 	return &s, nil
 }
@@ -239,6 +254,10 @@ func (d *DB) CreateIntranetSession(in IntranetSessionInput) (*IntranetSession, e
 	if in.Metadata == nil {
 		meta = []byte("{}")
 	}
+	labels, _ := json.Marshal(in.Labels)
+	if len(in.Labels) == 0 {
+		labels = []byte("[]")
+	}
 	var taskID any
 	if in.TaskID > 0 {
 		taskID = in.TaskID
@@ -253,13 +272,13 @@ func (d *DB) CreateIntranetSession(in IntranetSessionInput) (*IntranetSession, e
 	}
 	return scanIntranetSession(d.QueryRow(`
 INSERT INTO intranet_sessions(name, webshell_id, task_id, host, cwd, note, metadata, last_seen,
-                              transport, ssh_port, ssh_user, ssh_credential_id, ssh_dial_host, ssh_dial_port)
-VALUES ($1,$2,$3,$4,$5,$6,$7,now(),$8,$9,$10,$11,$12,$13)
+                              transport, ssh_port, ssh_user, ssh_credential_id, ssh_dial_host, ssh_dial_port, labels)
+VALUES ($1,$2,$3,$4,$5,$6,$7,now(),$8,$9,$10,$11,$12,$13,$14)
 RETURNING `+intranetSessionReturningCols+``,
 		strings.TrimSpace(in.Name), webshell, taskID, strings.TrimSpace(in.Host),
 		cwd, strings.TrimSpace(in.Note), string(meta),
 		transport, sshPort, strings.TrimSpace(in.SSHUser), in.SSHCredentialID,
-		strings.TrimSpace(in.SSHDialHost), in.SSHDialPort))
+		strings.TrimSpace(in.SSHDialHost), in.SSHDialPort, string(labels)))
 }
 
 // ListIntranetSessions returns sessions newest-first.
@@ -315,6 +334,90 @@ func (d *DB) GetIntranetSession(id int64) (*IntranetSession, error) {
 FROM intranet_sessions s LEFT JOIN webshells w ON w.id=s.webshell_id WHERE s.id=$1`, id))
 }
 
+// normalizeIntranetLabels 去掉空白与重复标签，避免按标签选择时同一个会话被算两次。
+func normalizeIntranetLabels(labels []string) []string {
+	out := make([]string, 0, len(labels))
+	seen := map[string]bool{}
+	for _, label := range labels {
+		v := strings.TrimSpace(label)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+// SetIntranetSessionLabels 覆盖会话标签。传空切片等价于清空分组。
+func (d *DB) SetIntranetSessionLabels(id int64, labels []string) (*IntranetSession, error) {
+	if id <= 0 {
+		return nil, errors.New("无效的会话 ID")
+	}
+	raw, _ := json.Marshal(normalizeIntranetLabels(labels))
+	return scanIntranetSession(d.QueryRow(`
+UPDATE intranet_sessions SET labels=$2::jsonb WHERE id=$1
+RETURNING `+intranetSessionReturningCols+``, id, string(raw)))
+}
+
+// ListIntranetSessionsByLabels 返回命中任一给定标签的会话，可再按状态/任务收窄。
+// 多个标签取并集，便于「按任务分组」一次选中整组会话做批量只读执行。
+func (d *DB) ListIntranetSessionsByLabels(labels []string, status string, taskID int64, limit int) ([]*IntranetSession, error) {
+	wanted := normalizeIntranetLabels(labels)
+	if len(wanted) == 0 {
+		return []*IntranetSession{}, nil
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	where := []string{}
+	args := []any{}
+	for _, label := range wanted {
+		args = append(args, label)
+		where = append(where, "s.labels ? $"+strconv.Itoa(len(args)))
+	}
+	clause := "(" + strings.Join(where, " OR ") + ")"
+	if v := strings.ToLower(strings.TrimSpace(status)); v != "" {
+		args = append(args, v)
+		clause += " AND s.status=$" + strconv.Itoa(len(args))
+	}
+	if taskID > 0 {
+		args = append(args, taskID)
+		clause += " AND s.task_id=$" + strconv.Itoa(len(args))
+	}
+	args = append(args, limit)
+	rows, err := d.Query(`SELECT `+intranetSessionCols+`
+FROM intranet_sessions s LEFT JOIN webshells w ON w.id=s.webshell_id
+WHERE `+clause+` ORDER BY s.id DESC LIMIT $`+strconv.Itoa(len(args)), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*IntranetSession{}
+	for rows.Next() {
+		sess, err := scanIntranetSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sess)
+	}
+	return out, rows.Err()
+}
+
+// GetIntranetSessionByWebshellID 找到绑定到某个 webshell 的会话。直连 webshell 的
+// 命令执行靠它把回写审计事件关联到会话，从而审计导出能给出「在哪台主机上」。
+func (d *DB) GetIntranetSessionByWebshellID(webshellID int64) (*IntranetSession, error) {
+	if webshellID <= 0 {
+		return nil, sql.ErrNoRows
+	}
+	return scanIntranetSession(d.QueryRow(`SELECT `+intranetSessionCols+`
+FROM intranet_sessions s LEFT JOIN webshells w ON w.id=s.webshell_id
+WHERE s.webshell_id=$1 ORDER BY s.id DESC LIMIT 1`, webshellID))
+}
+
 func (d *DB) UpdateIntranetSessionState(id int64, cwd, status, note string) (*IntranetSession, error) {
 	return scanIntranetSession(d.QueryRow(`
 UPDATE intranet_sessions SET
@@ -336,6 +439,12 @@ func (d *DB) TouchIntranetSession(id int64) error {
 // heartbeat cannot overwrite each other's count. Success advances last_seen,
 // failure leaves it untouched so stale-session scans keep selecting the row.
 func (d *DB) RecordIntranetSessionHealth(id int64, ok bool, latencyMS int, errMsg string, lostAfter int) (*IntranetSession, error) {
+	return d.RecordIntranetSessionHealthWithReason(id, ok, latencyMS, errMsg, lostAfter, "")
+}
+
+// RecordIntranetSessionHealthWithReason 在健康快照里额外落失效原因分类 key。
+// 成功时清空原因，失败时写入分类，前端据此给出指名原因与补救建议。
+func (d *DB) RecordIntranetSessionHealthWithReason(id int64, ok bool, latencyMS int, errMsg string, lostAfter int, failureReason string) (*IntranetSession, error) {
 	if id <= 0 {
 		return nil, errors.New("无效的会话 ID")
 	}
@@ -346,6 +455,10 @@ func (d *DB) RecordIntranetSessionHealth(id int64, ok bool, latencyMS int, errMs
 	if ok {
 		state = "ok"
 	}
+	reason := ""
+	if !ok {
+		reason = strings.TrimSpace(failureReason)
+	}
 	return scanIntranetSession(d.QueryRow(`
 UPDATE intranet_sessions SET
     metadata = metadata || jsonb_build_object(
@@ -355,10 +468,11 @@ UPDATE intranet_sessions SET
         'health_failures', CASE WHEN $2='ok' THEN 0 ELSE COALESCE((metadata->>'health_failures')::int,0)+1 END,
         'health_checked_at', to_jsonb(now()),
         'health_latency_ms', $3::int,
-        'health_error', $4::text),
+        'health_error', $4::text,
+        'health_failure_reason', $6::text),
     last_seen = CASE WHEN $2='ok' THEN now() ELSE last_seen END
 WHERE id=$1
-RETURNING `+intranetSessionReturningCols+``, id, state, latencyMS, strings.TrimSpace(errMsg), lostAfter))
+RETURNING `+intranetSessionReturningCols+``, id, state, latencyMS, strings.TrimSpace(errMsg), lostAfter, reason))
 }
 
 // ListIntranetSessionsForHeartbeat returns active sessions whose last successful
@@ -463,13 +577,29 @@ func (d *DB) DeleteIntranetSession(id int64) (bool, error) {
 	return n > 0, nil
 }
 
-func (d *DB) AddIntranetSessionEvent(sessionID int64, kind, command, output string, isErr bool) error {
+// AddIntranetSessionEventAs 记录带操作者的命令事件。who/when/where/what 里的 who
+// 由本方法落库，不靠调用方在命令文本里自己拼。
+func (d *DB) AddIntranetSessionEventAs(sessionID int64, kind, command, output, operator string, isErr bool) error {
 	if sessionID <= 0 {
 		return nil
 	}
-	_, err := d.Exec(`INSERT INTO intranet_session_events(session_id, kind, command, output, is_error)
-VALUES ($1,$2,$3,$4,$5)`, sessionID, strings.TrimSpace(kind), command, output, isErr)
+	_, err := d.Exec(`INSERT INTO intranet_session_events(session_id, kind, command, output, is_error, operator)
+VALUES ($1,$2,$3,$4,$5,$6)`, sessionID, strings.TrimSpace(kind), command, output, isErr, strings.TrimSpace(operator))
 	return err
+}
+
+func (d *DB) AddIntranetSessionEvent(sessionID int64, kind, command, output string, isErr bool) error {
+	return d.AddIntranetSessionEventAs(sessionID, kind, command, output, "", isErr)
+}
+
+const intranetEventCols = `id, session_id, kind, command, output, is_error, created_at, COALESCE(operator,'')`
+
+func scanIntranetEvent(row interface{ Scan(...any) error }) (*IntranetSessionEvent, error) {
+	var e IntranetSessionEvent
+	if err := row.Scan(&e.ID, &e.SessionID, &e.Kind, &e.Command, &e.Output, &e.IsError, &e.CreatedAt, &e.Operator); err != nil {
+		return nil, err
+	}
+	return &e, nil
 }
 
 func (d *DB) ListIntranetSessionEvents(sessionID int64, limit int) ([]*IntranetSessionEvent, error) {
@@ -479,7 +609,7 @@ func (d *DB) ListIntranetSessionEvents(sessionID int64, limit int) ([]*IntranetS
 	if limit > 500 {
 		limit = 500
 	}
-	rows, err := d.Query(`SELECT id, session_id, kind, command, output, is_error, created_at
+	rows, err := d.Query(`SELECT `+intranetEventCols+`
 FROM intranet_session_events WHERE session_id=$1 ORDER BY id DESC LIMIT $2`, sessionID, limit)
 	if err != nil {
 		return nil, err
@@ -487,14 +617,45 @@ FROM intranet_session_events WHERE session_id=$1 ORDER BY id DESC LIMIT $2`, ses
 	defer rows.Close()
 	out := []*IntranetSessionEvent{}
 	for rows.Next() {
+		e, err := scanIntranetEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ListIntranetSessionEventsForExport 提供审计导出的全量视图：联表补出主机与会话名，
+// 这样每条记录都带齐 who(operator)/when(created_at)/where(host)/what(command)。
+func (d *DB) ListIntranetSessionEventsForExport(since time.Time, limit int) ([]*IntranetSessionEvent, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	if limit > 5000 {
+		limit = 5000
+	}
+	args := []any{since, limit}
+	rows, err := d.Query(`SELECT e.id, e.session_id, e.kind, e.command, e.output, e.is_error,
+	e.created_at, COALESCE(e.operator,''), COALESCE(s.host,''), COALESCE(s.name,'')
+FROM intranet_session_events e LEFT JOIN intranet_sessions s ON s.id=e.session_id
+WHERE e.created_at >= $1 ORDER BY e.id DESC LIMIT $2`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*IntranetSessionEvent{}
+	for rows.Next() {
 		var e IntranetSessionEvent
-		if err := rows.Scan(&e.ID, &e.SessionID, &e.Kind, &e.Command, &e.Output, &e.IsError, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.SessionID, &e.Kind, &e.Command, &e.Output, &e.IsError,
+			&e.CreatedAt, &e.Operator, &e.Host, &e.SessionName); err != nil {
 			return nil, err
 		}
 		out = append(out, &e)
 	}
 	return out, rows.Err()
 }
+
 
 const intranetTunnelCols = `id, name, session_id, task_id, kind, listen_host, listen_port,
 	listen_side, remote_host, remote_port, status, deploy_command, verify_command, teardown_command,
