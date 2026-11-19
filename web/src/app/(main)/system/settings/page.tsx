@@ -395,7 +395,8 @@ export default function SystemSettingsPage() {
               Agent 自动绑定流量
             </CardTitle>
             <CardDescription id="agent-traffic-binding-description">
-              默认开启。开启后，漏洞入库时触发的报告 Agent 会核对已有 HTTP 请求/响应，关联对应流量后再编写报告，导出的报告因此带有真实报文。
+              默认开启。开启后，漏洞入库时触发的报告 Agent 会核对已有 HTTP
+              请求/响应，关联对应流量后再编写报告，导出的报告因此带有真实报文。
               <b>查阅数据包及额外的工具调用会增加 Token 消耗。</b>
               <br />
               TCP、未抓包或没有匹配流量时仍可正常上报。此开关不影响流量捕获、人工绑定及已保存证据的查看。 对下一轮 Agent
@@ -529,7 +530,8 @@ export default function SystemSettingsPage() {
               />
             </div>
             <p className="text-muted-foreground text-xs">
-              开启后域名走固定 API，不接受任意 URL（防 SSRF）；每次出网的目标与查询字段写审计，跨主机重定向拒绝。仅做被动线索，不做测绘。
+              开启后域名走固定 API，不接受任意 URL（防
+              SSRF）；每次出网的目标与查询字段写审计，跨主机重定向拒绝。仅做被动线索，不做测绘。
             </p>
           </CardContent>
         </Card>
@@ -680,8 +682,8 @@ export default function SystemSettingsPage() {
               自动标题
             </CardTitle>
             <CardDescription>
-              默认关闭。开启后，会话与任务在建好后各调用一次模型，用第一段输入生成
-              10–30 字的标题，替代「新对话」「未命名任务」。生成失败或超时不影响会话与任务本身，
+              默认关闭。开启后，会话与任务在建好后各调用一次模型，用第一段输入生成 10–30
+              字的标题，替代「新对话」「未命名任务」。生成失败或超时不影响会话与任务本身，
               异步补写；这期间你手动改过的名字不会被覆盖。每次约多花一次短调用。
             </CardDescription>
           </CardHeader>
