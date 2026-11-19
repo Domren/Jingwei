@@ -893,10 +893,14 @@ func joinProbeURL(base, path string) string {
 // a payload may be logged or returned by an API by accident, and the secret must
 // not travel with it.
 type ShellPayload struct {
-	Type       string `json:"type"`
-	Protocol   string `json:"protocol"`
-	Password   string `json:"-"`
-	Key        []byte `json:"-"`
+	Type     string `json:"type"`
+	Protocol string `json:"protocol"`
+	Password string `json:"-"`
+	Key      []byte `json:"-"`
+	// PrevKey 是密钥轮换过渡期内仍可解封响应的旧通信密钥。新请求一律用 Key
+	// 加密；只有解码响应时才把它作为候选一起试，避免轮换瞬间在途的旧密钥
+	// 回执被误判为认证失败。退出过渡期后调用方清空它，旧密钥随即失效。
+	PrevKey    []byte `json:"-"`
 	Carrier    string `json:"carrier"`
 	KeyVersion int    `json:"key_version"`
 	Filename   string `json:"filename"`

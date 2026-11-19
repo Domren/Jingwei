@@ -1,7 +1,9 @@
 package db
 
 import (
+	"crypto/md5"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -460,6 +462,7 @@ type Webshell struct {
 	HasSecret     bool            `json:"has_secret"`
 	Carrier       string          `json:"carrier"`
 	PayloadSHA256 string          `json:"payload_sha256"`
+	FamilyID      string          `json:"family_id"`
 	KeyVersion    int             `json:"key_version"`
 	Target        string          `json:"target"`
 	Source        string          `json:"source"`
@@ -529,13 +532,13 @@ RETURNING `+webshellCols,
 }
 
 const webshellCols = `id, name, url, shell_type, protocol, password, secret, carrier,
-	payload_sha256, key_version, target, source, task_id, status, note,
+	payload_sha256, family_id, key_version, target, source, task_id, status, note,
 	last_checked, last_output, os_kind, php_env, created_at, updated_at`
 
 func (d *DB) oneWebshell(row interface{ Scan(...any) error }) (*Webshell, error) {
 	var w Webshell
 	if err := row.Scan(&w.ID, &w.Name, &w.URL, &w.ShellType, &w.Protocol, &w.Password, &w.Secret,
-		&w.Carrier, &w.PayloadSHA256, &w.KeyVersion, &w.Target, &w.Source,
+		&w.Carrier, &w.PayloadSHA256, &w.FamilyID, &w.KeyVersion, &w.Target, &w.Source,
 		&w.TaskID, &w.Status, &w.Note, &w.LastChecked, &w.LastOutput, &w.OSKind,
 		&w.PHPEnv, &w.CreatedAt, &w.UpdatedAt); err != nil {
 		return nil, err
@@ -716,6 +719,81 @@ func (d *DB) DeleteWebshell(id int64) (bool, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// WebshellFamilyID returns the stable grouping key for a payload template at a
+// given key version. It mirrors the SQL trigger webshell_family_id() exactly:
+// normalize shell_type/protocol/source with lower(trim()), join with '|', append
+// the key version, take md5, keep the first 16 hex chars under a "fam_" prefix.
+// This is a grouping hash, not a security digest — it only answers "which shells
+// were deployed from the same template/key generation so they rotate together".
+func WebshellFamilyID(shellType, protocol, source string, keyVersion int) string {
+	canonical := strings.ToLower(strings.TrimSpace(shellType)) + "|" +
+		strings.ToLower(strings.TrimSpace(protocol)) + "|" +
+		strings.ToLower(strings.TrimSpace(source)) + "|" +
+		strconv.Itoa(keyVersion)
+	sum := md5.Sum([]byte(canonical))
+	return "fam_" + hex.EncodeToString(sum[:])[:16]
+}
+
+// ListWebshellsByFamily returns every shell in one family, newest first. Families
+// group identical templates at one key version so a batch rotate/evacuate can act
+// on all of them together. An empty familyID matches nothing (legacy rows that
+// predate the column), never everything.
+func (d *DB) ListWebshellsByFamily(familyID string) ([]*Webshell, error) {
+	if strings.TrimSpace(familyID) == "" {
+		return []*Webshell{}, nil
+	}
+	rows, err := d.Query(`SELECT `+webshellCols+` FROM webshells WHERE family_id=$1 ORDER BY id DESC`, familyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*Webshell{}
+	for rows.Next() {
+		w, err := d.oneWebshell(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+// UpdateWebshellsSecretByFamily rotates every shell in a family onto one new
+// sealed v2 secret/carrier/fingerprint and bumps the key version in a single
+// statement. The trigger recomputes each row's family_id from the new key version,
+// so the whole family moves to its next generation atomically. Returns how many
+// rows were updated — a rotate that silently hit zero rows is reported, never
+// mistaken for success.
+func (d *DB) UpdateWebshellsSecretByFamily(familyID, secret, carrier, payloadSHA256 string, keyVersion int) (int64, error) {
+	if strings.TrimSpace(familyID) == "" {
+		return 0, errors.New("族 ID 为空，拒绝批量更新")
+	}
+	if keyVersion <= 0 {
+		keyVersion = 1
+	}
+	res, err := d.Exec(`UPDATE webshells
+	SET secret=$2, carrier=$3, payload_sha256=$4, key_version=$5
+	WHERE family_id=$1`, familyID, secret, strings.TrimSpace(carrier), strings.TrimSpace(payloadSHA256), keyVersion)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// DeleteWebshellsByFamily removes every record in a family in one statement and
+// returns the count. Evacuation verifies removal on the target first; this only
+// clears the ledger rows for shells already confirmed gone.
+func (d *DB) DeleteWebshellsByFamily(familyID string) (int64, error) {
+	if strings.TrimSpace(familyID) == "" {
+		return 0, errors.New("族 ID 为空，拒绝批量删除")
+	}
+	res, err := d.Exec(`DELETE FROM webshells WHERE family_id=$1`, familyID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // JavaMemshell is one in-memory endpoint injected through a v2 webshell. The

@@ -101,7 +101,9 @@ func DSN() (dsn, source string, err error) {
 // which is what the isolated test harnesses run with.
 type DB struct {
 	*sql.DB
-	sealKey []byte
+	sealKey       []byte
+	sealKeyPrev   []byte    // 根密钥轮换过渡期内仍可解封存量的旧根密钥
+	sealRotatedAt time.Time // 轮换时刻，决定过渡窗口何时结束
 }
 
 // ensureDatabase connects to the postgres system database and creates the target

@@ -22,7 +22,7 @@ func (s *Server) memshellPayloadFor(ms *db.JavaMemshell) (scanner.ShellPayload, 
 	if strings.TrimSpace(ms.Secret) == "" {
 		return scanner.ShellPayload{}, errors.New("内存马缺少密钥封装")
 	}
-	plain, err := openShellSecret(s.jwtKey, ms.Secret)
+	plain, err := s.openShellSecretFor(ms.Secret)
 	if err != nil {
 		return scanner.ShellPayload{}, err
 	}

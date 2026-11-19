@@ -1282,6 +1282,28 @@ func (r *deepRun) runWebshellInject(summary map[string]any) (string, string, str
 	summary["protocol"] = payload.Protocol
 	summary["payload_sha256"] = payload.SHA256
 	client := r.newDeepClient(20 * time.Second)
+
+	// P18：注入前探测落地路径，发现已有文件/可疑内容就不覆盖——那是授权方
+	// 可能已有的资产，覆盖后无法自动恢复。明确 404 才判为可安全投放；其余
+	// 一律保守当作占用，报出并落一条待人工冲突记录（审批/台账闭环，不替代 guard）。
+	if strings.TrimSpace(landURL) != "" {
+		marker, occupied, detail := scanner.ProbeWebshellLanding(r.ctx, client, landURL, headers)
+		summary["land_probe_marker"] = marker
+		summary["land_probe_detail"] = detail
+		if occupied {
+			taskID := r.task.ID
+			conflictID, cerr := r.pg.AddWebshellDeployConflict(&taskID, landURL, uploadURL, marker, detail)
+			if cerr != nil {
+				r.logf("inject", "落地冲突记录失败（仍不覆盖）: %v", cerr)
+			}
+			summary["deploy_conflict_id"] = conflictID
+			summary["deploy_conflict"] = true
+			msg := "落地路径 " + landURL + " 探测命中已有文件/可疑内容（" + marker + "），未覆盖，已转人工核对授权方资产"
+			r.logf("inject", "%s（冲突记录 #%d）", msg, conflictID)
+			return "blocked", "blocked", msg, summary
+		}
+	}
+
 	fieldName, extra = r.probeUploadFormFields(client, uploadURL, fieldName, extra, headers, summary)
 	r.logf("inject", "上传 webshell 到 %s（协议 %s，类型 %s，文件 %s，字段 %q）", uploadURL, payload.Protocol, payload.Type, payload.Filename, displayOr(fieldName, "raw"))
 	res := scanner.UploadWebshell(r.ctx, client, uploadURL, fieldName, payload.Filename, []byte(payload.Content), extra, headers)

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Domren/jingwei/db"
 	"github.com/Domren/jingwei/scanner"
@@ -29,13 +30,29 @@ func sealShellSecret(jwtKey []byte, plain string) (string, error) {
 // secret is not in seal form is a legacy row, and handing its (possibly empty or
 // password-shaped) column back as an AES key would fail deeper in the stack.
 func openShellSecret(jwtKey []byte, sealed string) (string, error) {
+	return openShellSecretTransition(jwtKey, nil, time.Time{}, sealed)
+}
+
+// openShellSecretTransition 是签名根密钥轮换过渡期内的解封：先试当前根密钥，
+// 只在「用当前根解不开且处于过渡窗口」时回退到旧根密钥。存量 shell 的密钥是用
+// 旧根密封的，轮换后到重投载荷之间若不解封，就会整批报「请重新投放载荷」——
+// 过渡期让新旧两种密文都能打开，窗口结束后旧密钥自然失效（1.6.0 自检口径）。
+func openShellSecretTransition(jwtKey, prevKey []byte, rotatedAt time.Time, sealed string) (string, error) {
 	if !db.IsSealed(sealed) {
 		return "", errors.New("webshell 密钥不是受支持的封装格式")
 	}
 	plain, err := db.OpenSealed(jwtKey, db.SealPurposeShell, sealed)
-	switch {
-	case err == nil:
+	if err == nil {
 		return plain, nil
+	}
+	// 只有「当前根密钥解不开（可能已轮换）」才值得回退；格式损坏在所有密钥下
+	// 都损坏，不能借过渡期把它伪装成密钥问题。
+	if len(prevKey) >= 32 && errors.Is(err, db.ErrSealKey) && db.SealTransitionActive(rotatedAt, time.Now()) {
+		if prevPlain, prevErr := db.OpenSealed(prevKey, db.SealPurposeShell, sealed); prevErr == nil {
+			return prevPlain, nil
+		}
+	}
+	switch {
 	case errors.Is(err, db.ErrSealKey):
 		return "", errors.New("webshell 密钥解封失败（JWT 密钥可能已更换，请重新投放载荷）")
 	default:
@@ -69,6 +86,11 @@ func (s *Server) newV2ShellMaterial(shellType string, keyVersion int) (scanner.S
 	return payload, sealed, nil
 }
 
+// openShellSecretFor 用进程启动时装入的新旧两根密钥解封 webshell 密钥。
+func (s *Server) openShellSecretFor(sealed string) (string, error) {
+	return openShellSecretTransition(s.jwtKey, s.jwtKeyPrev, s.jwtRotatedAt, sealed)
+}
+
 // shellPayloadFor rebuilds the client-side payload from a stored shell. The
 // secret is only decrypted in memory for the duration of a request.
 func (s *Server) shellPayloadFor(shell *db.Webshell) (scanner.ShellPayload, error) {
@@ -76,7 +98,7 @@ func (s *Server) shellPayloadFor(shell *db.Webshell) (scanner.ShellPayload, erro
 		return scanner.ShellPayload{}, errors.New("webshell 不存在")
 	}
 	if strings.EqualFold(shell.Protocol, scanner.ShellProtocolV2) {
-		plain, err := openShellSecret(s.jwtKey, shell.Secret)
+		plain, err := s.openShellSecretFor(shell.Secret)
 		if err != nil {
 			return scanner.ShellPayload{}, err
 		}

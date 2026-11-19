@@ -372,6 +372,14 @@ CREATE TABLE IF NOT EXISTS platform_secret (
     jwt_key    TEXT NOT NULL CHECK (char_length(jwt_key) >= 32),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- 1.6.5（P16）：签名根密钥轮换的双密钥过渡期。轮换时旧根密钥搬到 jwt_key_prev
+-- 并记下 rotated_at：过渡期内新密钥负责加密，旧密钥仍可解封存量（webshell 密钥、
+-- 内存马密钥、凭据、模型密钥），避免「轮换完还没重投载荷」那段时间里存量壳变砖。
+-- 过渡期结束后启动侧不再装入 jwt_key_prev，自检按 1.6.0 既有口径把仍用旧密钥
+-- 封装的行报为不可读、走重新投放/重新登记流程——过渡期不是永久豁免。两列都可为空/
+-- 为空串，老库升级后读到的就是「没有过渡期」，行为与 1.6.0 完全一致。
+ALTER TABLE platform_secret ADD COLUMN IF NOT EXISTS jwt_key_prev TEXT NOT NULL DEFAULT '';
+ALTER TABLE platform_secret ADD COLUMN IF NOT EXISTS rotated_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS llm_profiles (
     id               BIGSERIAL PRIMARY KEY,
@@ -1888,6 +1896,49 @@ ALTER TABLE webshells ADD COLUMN IF NOT EXISTS os_kind TEXT NOT NULL DEFAULT '';
 -- open_basedir）。选路与「这个壳能不能执行命令」都靠它当证据，探测失败时显式
 -- 存 probe_error，而不是留空让人误以为环境干净。
 ALTER TABLE webshells ADD COLUMN IF NOT EXISTS php_env JSONB NOT NULL DEFAULT '{}';
+-- P15（载荷族归并）：family_id 是「同一载荷模板 + 同一密钥版本」的稳定分组键，
+-- 让 N 个同模板壳能一次轮换/撤离。它只是分组用的 hash，不是安全摘要；用 PG 内置
+-- md5 而非 pgcrypto，避免为了一个分组键引入扩展依赖。触发器保证任何写入路径
+-- （创建、重投、批量轮换）算出的族 ID 都一致，Go 侧 WebshellFamilyID 用同一套
+-- 规范化规则镜像这个值，便于按族查询与夹具比对。
+ALTER TABLE webshells ADD COLUMN IF NOT EXISTS family_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_webshells_family ON webshells(family_id);
+-- P18（部署前冲突检测）：注入前探测落地路径发现已有文件/可疑文件时，不覆盖、
+-- 落一条待人工处置的拦截记录。status=manual 表示等人核对授权方资产后再决定；
+-- resolved 由人工处置时回写。它是审批/台账闭环的一部分，不替代 guard。
+CREATE TABLE IF NOT EXISTS webshell_deploy_conflicts (
+    id           BIGSERIAL PRIMARY KEY,
+    task_id      BIGINT REFERENCES deep_tasks(id) ON DELETE SET NULL,
+    land_url     TEXT NOT NULL DEFAULT '',
+    upload_url   TEXT NOT NULL DEFAULT '',
+    marker       TEXT NOT NULL DEFAULT '',
+    detail       TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'manual',
+    resolved     BOOLEAN NOT NULL DEFAULT false,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_webshell_deploy_conflicts_status ON webshell_deploy_conflicts(status, resolved, id DESC);
+CREATE OR REPLACE FUNCTION webshell_family_id() RETURNS TRIGGER AS $$
+BEGIN
+    NEW.family_id := 'fam_' || substr(md5(
+        lower(trim(NEW.shell_type)) || '|' ||
+        lower(trim(NEW.protocol))   || '|' ||
+        lower(trim(NEW.source))     || '|' ||
+        NEW.key_version::text), 1, 16);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_webshells_family ON webshells;
+CREATE TRIGGER trg_webshells_family BEFORE INSERT OR UPDATE ON webshells
+    FOR EACH ROW EXECUTE FUNCTION webshell_family_id();
+-- 存量行（加列之前创建的）回填一次，让旧壳也能按族查询。公式与触发器和
+-- WebshellFamilyID 完全一致；重复执行幂等，不对已填的行造成变化。
+UPDATE webshells SET family_id = 'fam_' || substr(md5(
+    lower(trim(shell_type)) || '|' ||
+    lower(trim(protocol))   || '|' ||
+    lower(trim(source))     || '|' ||
+    key_version::text), 1, 16)
+WHERE family_id = '';
 DROP TRIGGER IF EXISTS trg_webshells_upd ON webshells;
 CREATE TRIGGER trg_webshells_upd BEFORE UPDATE ON webshells
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();

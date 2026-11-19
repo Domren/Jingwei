@@ -29,6 +29,18 @@ func intranetHeartbeatCommand(osKind string) string {
 	return "printf " + intranetHeartbeatMark
 }
 
+// intranetHeartbeatProbesOnWire reports whether the periodic background sweep
+// should actively probe a session. Only SSH sessions qualify: their heartbeat
+// travels over the SSH channel, not the webshell wire. Webshell-backed sessions
+// are deliberately excluded — a scheduled probe would put a request on the
+// webshell channel every minute even when nobody is using the session, which is
+// exactly the idle traffic P17 forbids. Their liveness is piggybacked onto real
+// commands in intranetSendScript, and an operator can always trigger an on-demand
+// heartbeat through the manual endpoint.
+func intranetHeartbeatProbesOnWire(sess *db.IntranetSession) bool {
+	return intranetIsSSH(sess)
+}
+
 func intranetProbeLiveness(run intranetCommandRunner, osKind string, timeout time.Duration) (bool, time.Duration, intranetExecOutcome) {
 	started := time.Now()
 	out := run(intranetHeartbeatCommand(osKind), timeout)
@@ -144,6 +156,12 @@ func (s *Server) intranetHeartbeatSweep(ctx context.Context, lastProbe map[int64
 	for _, sess := range sessions {
 		if ctx.Err() != nil {
 			return
+		}
+		// P17：webshell 通道零自发心跳。webshell 会话不在这里定时探测——
+		// 那会每分钟往壳上打一条请求。它的存活改由真实业务命令 piggyback
+		// （见 intranetSendScript），需要时由人工心跳端点按需触发。
+		if !intranetHeartbeatProbesOnWire(sess) {
+			continue
 		}
 		if last, ok := lastProbe[sess.ID]; ok && now.Sub(last) < intranetHeartbeatRetryAfter {
 			continue

