@@ -15,6 +15,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"sync"
+	"time"
 )
 
 // egressMinSecretLen is the shortest secret that may be registered. Shorter
@@ -39,10 +40,52 @@ type EgressGuard struct {
 	fps   []egressFingerprint
 	byLen map[int][]int // secret length → indices into fps
 	pow   map[int]uint64
+	// P8 被动线索：出网目标与字段的审计台账（默认关时也会记一次「拒绝」）。
+	passiveAudit []PassiveAuditEntry
+}
+
+// PassiveAuditEntry 是一条被动线索出网审计。只记固定 API 的主机与查询字段，
+// 不记任意 URL、不记凭据。
+type PassiveAuditEntry struct {
+	TS      int64    `json:"ts"`
+	Kind    string   `json:"kind"`    // ct_log | dns_history
+	Target  string   `json:"target"`  // 固定 API 的 host
+	Fields  []string `json:"fields"`  // 查询字段名（如 domain），不是值
+	Allowed bool     `json:"allowed"` // false = 默认关或 SSRF 校验未通过
+	Reason  string   `json:"reason,omitempty"`
 }
 
 func NewEgressGuard() *EgressGuard {
 	return &EgressGuard{byLen: map[int][]int{}, pow: map[int]uint64{}}
+}
+
+// AuditPassive 登记一次被动线索查询（P8）。调用方必须先校验域名合法、API 固定，
+// 本函数不再接受任意 URL——字段只是名字列表，避免把查询值/凭据写进审计。
+func (e *EgressGuard) AuditPassive(kind, target string, fields []string, allowed bool, reason string) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.passiveAudit = append(e.passiveAudit, PassiveAuditEntry{
+		TS: time.Now().Unix(), Kind: kind, Target: target,
+		Fields: append([]string{}, fields...), Allowed: allowed, Reason: reason,
+	})
+	if len(e.passiveAudit) > 2000 {
+		e.passiveAudit = e.passiveAudit[len(e.passiveAudit)-2000:]
+	}
+}
+
+// PassiveAudit 返回被动线索审计快照（副本）。
+func (e *EgressGuard) PassiveAudit() []PassiveAuditEntry {
+	if e == nil {
+		return nil
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]PassiveAuditEntry, len(e.passiveAudit))
+	copy(out, e.passiveAudit)
+	return out
 }
 
 // AddFingerprint registers one secret. Empty or too-short values are ignored;

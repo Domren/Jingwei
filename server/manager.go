@@ -14,13 +14,13 @@ import (
 	"sync"
 	"time"
 
+	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Domren/jingwei/agent"
 	pgdb "github.com/Domren/jingwei/db"
 	"github.com/Domren/jingwei/enrich"
 	"github.com/Domren/jingwei/guard"
 	"github.com/Domren/jingwei/intercept"
 	"github.com/Domren/jingwei/traffic"
-	actool "github.com/Autumn-27/norma/tool"
 )
 
 // Task is one engagement: a description + goal + its own exploration store,
@@ -261,6 +261,16 @@ type Manager struct {
 	// capture is on it becomes the MITM's upstream; when capture is off it is
 	// injected into agent bash env / WebFetch directly. See ProxyAddr.
 	globalProxy string
+	// P1 操作端反溯源：操作会话（平台自身/管理面出网）走的代理链，与 globalProxy
+	// （任务目标流量出口）刻意分开，避免操作指纹与渗透流量混在同一出口。空=直连。
+	operationProxyChain string
+	// P1 操作会话与任务执行环境隔离开关（默认开）：开启时操作会话的 env/UA/代理
+	// 不继承任务执行环境的配置，二者互不污染。
+	operatorSessionIsolation bool
+	// P1 操作审计导出引用的授权书编号/说明（自由文本，仅作报告封面引用，不做路径）。
+	auditAuthorizationRef string
+	// P8 被动线索入口开关（默认关）：只接固定 API 的证书透明日志 / DNS 历史。
+	passiveLeadsEnabled bool
 }
 
 // Settings keys the UI toggles at runtime.
@@ -276,8 +286,16 @@ const (
 	// (http/https/socks5). Empty = direct. Distinct from web_search_proxy (which
 	// only routes the search backend) and the per-profile LLM proxy.
 	settingGlobalProxy = "global_proxy"
-	settingWorkers     = "workers"
-	settingLLMRecord   = "llm_record"
+	// P1：操作端反溯源。operation_proxy_chain 沿用 global_proxy 的
+	// null=不改 / ""=清空(直连) 语义；operator_session_isolation 默认开；
+	// audit_authorization_ref 是审计导出引用的授权书编号（普通文本）。
+	settingOperationProxyChain      = "operation_proxy_chain"
+	settingOperatorSessionIsolation = "operator_session_isolation"
+	settingAuditAuthorizationRef    = "audit_authorization_ref"
+	// P8 被动线索入口：默认关。只做证书透明日志 / DNS 历史等被动渠道，不做测绘。
+	settingPassiveLeadsEnabled = "passive_leads_enabled"
+	settingWorkers             = "workers"
+	settingLLMRecord           = "llm_record"
 	// LLM 轮询(故障转移)。默认关闭——开启后走「全局激活配置」的 agent 在当前配置
 	// 不可用(余额不足/key 失效/限流/服务异常)时自动切到下一个配置。
 	// settingLLMPoolBindFallback 仅在轮询开启时有意义:默认关闭,即 agent/任务显式
@@ -470,12 +488,34 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if v, ok, _ := pg.GetSetting(settingGlobalProxy); ok {
 		m.globalProxy = strings.TrimSpace(v)
 	}
+	// P1：操作端代理链 / 会话隔离 / 审计授权书引用。
+	if v, ok, _ := pg.GetSetting(settingOperationProxyChain); ok {
+		m.operationProxyChain = strings.TrimSpace(v)
+	}
+	m.operatorSessionIsolation = true // 默认开：只有显式存 false 才关
+	if v, ok, _ := pg.GetSetting(settingOperatorSessionIsolation); ok {
+		m.operatorSessionIsolation = strings.TrimSpace(v) != "false"
+	}
+	if v, ok, _ := pg.GetSetting(settingAuditAuthorizationRef); ok {
+		m.auditAuthorizationRef = strings.TrimSpace(v)
+	}
+	m.passiveLeadsEnabled = pg.GetBool(settingPassiveLeadsEnabled, false)
 	if m.traffic != nil {
 		if err := m.traffic.SetUpstreamProxy(m.globalProxy); err != nil {
 			log.Printf("[proxy] 全局代理 %q 无效，已忽略: %v", m.globalProxy, err)
 		}
 	}
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
+	// P8：被动线索默认关。开关即时读取；每次出网都经 egress guard 记审计
+	// （固定 API 的 host + 查询字段名，不记任意 URL/凭据）。
+	m.enrich.SetPassiveGate(
+		func() bool { return m.PassiveLeadsEnabled() },
+		func(kind, target string, fields []string, allowed bool, reason string) {
+			if m.egress != nil {
+				m.egress.AuditPassive(kind, target, fields, allowed, reason)
+			}
+		},
+	)
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
 	// restart with capture already on keeps Playwright routed through the proxy.
 	m.syncBrowserMCPProxy()
@@ -833,6 +873,89 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 	}
 	// Keep the browser MCP's egress in sync with the new global proxy too.
 	m.syncBrowserMCPProxy()
+	return nil
+}
+
+// OperationProxyChain returns the operator-session egress proxy (empty = direct).
+// 与 GlobalProxy 分开存放，操作会话的指纹不掺进任务目标流量出口。
+func (m *Manager) OperationProxyChain() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.operationProxyChain
+}
+
+// SetOperationProxyChain validates and persists the operator-session proxy.
+// 空串=清空(直连)，沿用 global_proxy 的校验口径；不触碰任务流量出口。
+func (m *Manager) SetOperationProxyChain(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw != "" {
+		if _, err := traffic.ValidateProxyURL(raw); err != nil {
+			return err
+		}
+	}
+	if err := m.pg.SetSetting(settingOperationProxyChain, raw); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.operationProxyChain = raw
+	m.mu.Unlock()
+	return nil
+}
+
+// OperatorSessionIsolation reports whether operator sessions are isolated from
+// task execution env (default true).
+func (m *Manager) OperatorSessionIsolation() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.operatorSessionIsolation
+}
+
+// SetOperatorSessionIsolation persists the isolation toggle.
+func (m *Manager) SetOperatorSessionIsolation(on bool) error {
+	if err := m.pg.SetSetting(settingOperatorSessionIsolation, strconv.FormatBool(on)); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.operatorSessionIsolation = on
+	m.mu.Unlock()
+	return nil
+}
+
+// AuditAuthorizationRef returns the authorization reference shown on audit exports.
+func (m *Manager) AuditAuthorizationRef() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.auditAuthorizationRef
+}
+
+// SetAuditAuthorizationRef persists the authorization reference (plain text).
+func (m *Manager) SetAuditAuthorizationRef(ref string) error {
+	ref = strings.TrimSpace(ref)
+	if err := m.pg.SetSetting(settingAuditAuthorizationRef, ref); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.auditAuthorizationRef = ref
+	m.mu.Unlock()
+	return nil
+}
+
+// PassiveLeadsEnabled reports whether passive leads (CT log / DNS history) are on.
+// 默认 false；只接固定 API，不做主动测绘（§6）。
+func (m *Manager) PassiveLeadsEnabled() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.passiveLeadsEnabled
+}
+
+// SetPassiveLeadsEnabled persists the passive-leads switch (immediate effect).
+func (m *Manager) SetPassiveLeadsEnabled(on bool) error {
+	if err := m.pg.SetSetting(settingPassiveLeadsEnabled, strconv.FormatBool(on)); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.passiveLeadsEnabled = on
+	m.mu.Unlock()
 	return nil
 }
 

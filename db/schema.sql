@@ -2324,3 +2324,42 @@ CREATE TABLE IF NOT EXISTS subdomain_results (
 );
 CREATE INDEX IF NOT EXISTS idx_subdomain_results_task ON subdomain_results(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_subdomain_results_asset ON subdomain_results(asset_id);
+
+-- =====================================================================
+-- P2 · 多出口代理池：出口清单 + 任务-出口绑定（幂等）
+-- proxy_url 在库里保留原值（可能含 user:pass 凭据）；任何读路径都不得把它
+-- 原样回显到响应/日志/导出的事件里，只对外暴露 id 与脱敏主机。
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS egress_endpoints (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL DEFAULT 0, -- 0 = 共享出口，任何任务可用；>0 = 专属出口
+    name        TEXT NOT NULL DEFAULT '',
+    proxy_url   TEXT NOT NULL DEFAULT '',  -- 空串 = 直连出口
+    healthy     BOOLEAN NOT NULL DEFAULT true,
+    failures    INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT NOT NULL DEFAULT '',  -- 写入前已脱敏
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_egress_endpoints_task ON egress_endpoints(task_id, healthy);
+DROP TRIGGER IF EXISTS trg_egress_endpoints_upd ON egress_endpoints;
+CREATE TRIGGER trg_egress_endpoints_upd BEFORE UPDATE ON egress_endpoints
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE IF NOT EXISTS task_egress_bindings (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL,
+    endpoint_id BIGINT NOT NULL REFERENCES egress_endpoints(id) ON DELETE CASCADE,
+    reason      TEXT NOT NULL DEFAULT '',  -- 绑定/轮换原因，留痕可审计
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_egress_bindings_endpoint ON task_egress_bindings(endpoint_id);
+
+-- =====================================================================
+-- P3 · 站群聚类：在 assets 上加幂等列（证书指纹 / 页面结构 hash / 聚类键）
+-- =====================================================================
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS cert_fingerprint TEXT NOT NULL DEFAULT '';
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS page_struct_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS cluster_key       TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_assets_cluster_key ON assets(cluster_key) WHERE cluster_key <> '';

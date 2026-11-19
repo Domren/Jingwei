@@ -17,9 +17,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Autumn-27/norma/hook"
 	"github.com/Domren/jingwei/honeydetect"
 	"github.com/Domren/jingwei/intercept"
-	"github.com/Autumn-27/norma/hook"
 )
 
 // AuditEntry records one gated tool call.
@@ -343,12 +343,21 @@ func (g *Guard) Attributions() map[string]int {
 // honeypotDetect scans tool output for honeypot indicators and returns a
 // warning message if any are found. Returns empty string when clean.
 func honeypotDetect(output string) string {
-	score := honeydetect.Detect(honeydetect.Input{Body: output})
+	in := honeydetect.Input{Body: output}
+	// P5：静态签名 + 行为判据（过度完美 / 时间反常）。行为命中只产出复核提示，
+	// 不改 postToolUse 的 Decision——normal finding 的判定不受影响。
+	static := honeydetect.Detect(in)
+	behavior := honeydetect.DetectBehavior(in, honeydetect.ParseTimingSamples(output)...)
+	score := honeydetect.MergeScores(static, behavior)
 	if score.Verdict == "clean" {
 		return ""
 	}
-	return fmt.Sprintf("[蜜罐检测] %s (置信度 %.0f%%)：%s。若确认是蜜罐，请用 record_fact 记录「疑似蜜罐」并停止深挖。",
+	msg := fmt.Sprintf("[蜜罐检测] %s (置信度 %.0f%%)：%s。若确认是蜜罐，请用 record_fact 记录「疑似蜜罐」并停止深挖。",
 		score.Verdict, score.Value*100, honeydetect.Summary(score))
+	if score.ForceRecheck {
+		msg += "【强制二次验证】行为判据命中，写 finding 前必须换路径复核；本提示不阻断工具，也不改变既有 finding 判定。"
+	}
+	return msg
 }
 
 func (g *Guard) block(tool, reason, cmd string) hook.Result {

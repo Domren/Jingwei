@@ -40,15 +40,19 @@ type Asset struct {
 	AppDescription string `json:"app_description,omitempty"`
 	AppICP         string `json:"app_icp,omitempty"`
 	// service fields
-	URL           string           `json:"url,omitempty"`
-	ServiceType   string           `json:"service_type,omitempty"`
-	ServiceName   string           `json:"service_name,omitempty"`
-	FaviconMMH3   string           `json:"favicon_mmh3,omitempty"`
-	StatusCode    *int             `json:"status_code,omitempty"`
-	ContentLength *int64           `json:"content_length,omitempty"`
-	PageTitle     string           `json:"page_title,omitempty"`
-	Technologies  []string         `json:"technologies,omitempty"`
-	Auth          []map[string]any `json:"auth,omitempty"`
+	URL         string `json:"url,omitempty"`
+	ServiceType string `json:"service_type,omitempty"`
+	ServiceName string `json:"service_name,omitempty"`
+	FaviconMMH3 string `json:"favicon_mmh3,omitempty"`
+	// P3 站群聚类：证书指纹 / 页面结构 hash / 聚类键（与 finding dedupe_key 的族口径兼容）。
+	CertFingerprint string           `json:"cert_fingerprint,omitempty"`
+	PageStructHash  string           `json:"page_struct_hash,omitempty"`
+	ClusterKey      string           `json:"cluster_key,omitempty"`
+	StatusCode      *int             `json:"status_code,omitempty"`
+	ContentLength   *int64           `json:"content_length,omitempty"`
+	PageTitle       string           `json:"page_title,omitempty"`
+	Technologies    []string         `json:"technologies,omitempty"`
+	Auth            []map[string]any `json:"auth,omitempty"`
 	// endpoint fields
 	Method string           `json:"method,omitempty"`
 	Params []map[string]any `json:"params,omitempty"`
@@ -676,6 +680,9 @@ type UpsertHTTPServiceReq struct {
 	Auth          []map[string]any
 	IP            string // optional, from async DNS
 	TaskID        int64
+	// P3：站点聚类信号，写入后由 ComputeClusterKey 派生 cluster_key。
+	CertFingerprint string
+	PageStructHash  string
 }
 
 // UpsertHTTPService inserts or merges an HTTP service asset. Domain, port,
@@ -780,6 +787,12 @@ RETURNING id`,
 	if err != nil {
 		return 0, err
 	}
+	// P3：聚类信号单独更新（避免把主 INSERT 的占位符顺序改乱）。
+	if req.CertFingerprint != "" || req.PageStructHash != "" {
+		if err := s.SetClusterSignals(id, req.CertFingerprint, req.PageStructHash); err != nil {
+			return 0, err
+		}
+	}
 
 	// side effects: register root_domain + subdomain as their own assets too
 	s.linkHostAssets(domain, rootDomain, req.TaskID)
@@ -800,6 +813,71 @@ RETURNING id`,
 		})
 	}
 	return id, nil
+}
+
+// SetClusterSignals 写入站点聚类信号并派生 cluster_key（按 P3 的优先级）。
+// 需要在 schema 已应用（cluster_key 列存在）的库上调用；无 DB 的纯函数夹具不需要它。
+func (s *AssetStore) SetClusterSignals(id int64, certFingerprint, pageStructHash string) error {
+	key := ClusterKeyFor(ClusterableAsset{
+		ID:              id,
+		CertFingerprint: certFingerprint,
+		PageStructHash:  pageStructHash,
+	})
+	var certVal, pageVal, keyVal any
+	if certFingerprint != "" {
+		certVal = certFingerprint
+	}
+	if pageStructHash != "" {
+		pageVal = pageStructHash
+	}
+	if key != "" {
+		keyVal = key
+	}
+	exec := func(q string) error {
+		if s.tx != nil {
+			_, err := s.tx.Exec(q, certVal, pageVal, keyVal, id)
+			return err
+		}
+		_, err := s.db.Exec(q, certVal, pageVal, keyVal, id)
+		return err
+	}
+	return exec(`UPDATE assets SET cert_fingerprint = COALESCE($1, cert_fingerprint),
+page_struct_hash = COALESCE($2, page_struct_hash),
+cluster_key = COALESCE($3, cluster_key), last_seen = now()
+WHERE id = $4`)
+}
+
+// ExpandCluster 查询某聚类键下的全部原始条目（镜像站可展开，不丢原始数据）。
+// 只取聚类相关列，不改通用 scanAssets 的列顺序——后者被所有资产查询共用。
+func (s *AssetStore) ExpandCluster(clusterKey string) ([]*Asset, error) {
+	if strings.TrimSpace(clusterKey) == "" {
+		return nil, nil
+	}
+	q := `SELECT id, COALESCE(url,''), COALESCE(domain,''),
+COALESCE(cert_fingerprint,''), COALESCE(page_struct_hash,''),
+COALESCE(favicon_mmh3,''), COALESCE(cluster_key,'')
+FROM assets WHERE cluster_key = $1 ORDER BY id`
+	var rows *sql.Rows
+	var err error
+	if s.tx != nil {
+		rows, err = s.tx.Query(q, clusterKey)
+	} else {
+		rows, err = s.db.Query(q, clusterKey)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*Asset{}
+	for rows.Next() {
+		a := &Asset{}
+		if err := rows.Scan(&a.ID, &a.URL, &a.Domain, &a.CertFingerprint,
+			&a.PageStructHash, &a.FaviconMMH3, &a.ClusterKey); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // =====================================================================

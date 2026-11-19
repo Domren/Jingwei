@@ -47,6 +47,14 @@ export default function SystemSettingsPage() {
   const [savingProxy, setSavingProxy] = React.useState(false);
   const [globalProxyInput, setGlobalProxyInput] = React.useState("");
   const [savingGlobalProxy, setSavingGlobalProxy] = React.useState(false);
+  // P1 操作端反溯源：操作会话代理链 / 会话隔离 / 审计授权书引用。
+  const [operationProxyInput, setOperationProxyInput] = React.useState("");
+  const [savingOperationProxy, setSavingOperationProxy] = React.useState(false);
+  const [operatorIsolation, setOperatorIsolation] = React.useState(true);
+  const [auditAuthRef, setAuditAuthRef] = React.useState("");
+  const [savingAuditRef, setSavingAuditRef] = React.useState(false);
+  // P8 被动线索入口（默认关）：CT 日志 / DNS 历史。
+  const [passiveLeads, setPassiveLeads] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
@@ -80,6 +88,10 @@ export default function SystemSettingsPage() {
     setTavilyKeySet(!!s.tavily_key_set);
     setProxyInput(s.web_search_proxy ?? "");
     setGlobalProxyInput(s.global_proxy ?? "");
+    setOperationProxyInput(s.operation_proxy_chain ?? "");
+    setOperatorIsolation(s.operator_session_isolation !== false);
+    setAuditAuthRef(s.audit_authorization_ref ?? "");
+    setPassiveLeads(!!s.passive_leads_enabled);
     setPyInterp(s.python_interpreter ?? "");
     setWorkers(String(s.workers ?? 3));
     setInjectPlanner(s.constraints_inject_planner !== false);
@@ -257,6 +269,45 @@ export default function SystemSettingsPage() {
       .finally(() => setSavingGlobalProxy(false));
   };
 
+  // P1：操作会话代理链、隔离开关、审计引用各自独立保存。
+  const saveOperationProxy = () => {
+    setSavingOperationProxy(true);
+    api
+      .setSettings({ operation_proxy_chain: operationProxyInput.trim() })
+      .then((s) => {
+        apply(s);
+        toast.success(operationProxyInput.trim() ? "已保存操作会话代理链" : "已清除操作会话代理链（改为直连）");
+      })
+      .catch((e) => toast.error("保存失败：" + (e as Error).message))
+      .finally(() => setSavingOperationProxy(false));
+  };
+
+  const toggleOperatorIsolation = (v: boolean) => {
+    api
+      .setSettings({ operator_session_isolation: v })
+      .then(apply)
+      .catch((e) => toast.error("保存失败：" + (e as Error).message));
+  };
+
+  const saveAuditRef = () => {
+    setSavingAuditRef(true);
+    api
+      .setSettings({ audit_authorization_ref: auditAuthRef.trim() })
+      .then((s) => {
+        apply(s);
+        toast.success("已保存审计授权书引用");
+      })
+      .catch((e) => toast.error("保存失败：" + (e as Error).message))
+      .finally(() => setSavingAuditRef(false));
+  };
+
+  const togglePassiveLeads = (v: boolean) => {
+    api
+      .setSettings({ passive_leads_enabled: v })
+      .then(apply)
+      .catch((e) => toast.error("保存失败：" + (e as Error).message));
+  };
+
   // Run a real "test" search ("test") against the CURRENT form values (backend +
   // proxy + entered key), falling back to saved values server-side. Toasts result.
   const runTest = () => {
@@ -402,6 +453,83 @@ export default function SystemSettingsPage() {
             </div>
             <p className="text-muted-foreground text-xs">
               {globalProxyInput.trim() ? "已配置 · 所有目标流量经此代理出网" : "未配置 · 目标流量直连出网"}
+            </p>
+          </CardContent>
+        </Card>
+
+        {/* P1 操作端反溯源：操作会话与任务流量分出口，并可一键导出审计 */}
+        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <ShieldAlertIcon className="size-4" />
+              操作端反溯源
+            </CardTitle>
+            <CardDescription>
+              操作会话（平台管理面自身出网）走<b>独立代理链</b>，与上面「全局出口代理」的任务目标流量分开，
+              避免操作指纹混入渗透流量。此项<b>不要求真实搭建代理链</b>：无代理时直连，配置后仅留出隔离口径。
+              审计导出回答「测了什么 / 谁批的 / 谁在操作」，<code>GET /api/audit/export?format=md</code> 可一键下载。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3">
+            <Label htmlFor="operation-proxy" className="text-sm font-normal text-muted-foreground">
+              操作会话代理链
+            </Label>
+            <div className="flex items-center gap-2">
+              <Input
+                id="operation-proxy"
+                autoComplete="off"
+                placeholder="socks5://user:pass@host:1080 或 http://host:port（留空=直连）"
+                value={operationProxyInput}
+                disabled={!loaded || savingOperationProxy}
+                onChange={(e) => setOperationProxyInput(e.target.value)}
+              />
+              <Button type="button" onClick={saveOperationProxy} disabled={!loaded || savingOperationProxy}>
+                保存
+              </Button>
+            </div>
+            <div className="flex items-center justify-between gap-4">
+              <Label htmlFor="operator-isolation" className="text-sm font-normal text-muted-foreground">
+                操作会话与任务执行环境隔离（默认开）
+              </Label>
+              <Switch
+                id="operator-isolation"
+                checked={operatorIsolation}
+                disabled={!loaded}
+                onCheckedChange={toggleOperatorIsolation}
+              />
+            </div>
+            <Label htmlFor="audit-auth-ref" className="text-sm font-normal text-muted-foreground">
+              审计授权书引用（编号/说明，导出的报告封面会显示）
+            </Label>
+            <div className="flex items-center gap-2">
+              <Input
+                id="audit-auth-ref"
+                autoComplete="off"
+                placeholder="例如：授权书 JW-2026-0011"
+                value={auditAuthRef}
+                disabled={!loaded || savingAuditRef}
+                onChange={(e) => setAuditAuthRef(e.target.value)}
+              />
+              <Button type="button" onClick={saveAuditRef} disabled={!loaded || savingAuditRef}>
+                保存
+              </Button>
+            </div>
+            <p className="text-muted-foreground text-xs">
+              审计导出含授权书引用、操作者、各任务工具调用流水；命令中的口令与 Authorization 头已脱敏。
+            </p>
+            <div className="flex items-center justify-between gap-4">
+              <Label htmlFor="passive-leads" className="text-sm font-normal text-muted-foreground">
+                被动线索入口（默认关 · 证书透明日志 / DNS 历史）
+              </Label>
+              <Switch
+                id="passive-leads"
+                checked={passiveLeads}
+                disabled={!loaded}
+                onCheckedChange={togglePassiveLeads}
+              />
+            </div>
+            <p className="text-muted-foreground text-xs">
+              开启后域名走固定 API，不接受任意 URL（防 SSRF）；每次出网的目标与查询字段写审计，跨主机重定向拒绝。仅做被动线索，不做测绘。
             </p>
           </CardContent>
         </Card>

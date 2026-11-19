@@ -24,6 +24,15 @@ import (
 // redirects by default: a 302 is itself a signal (login gate, WAF redirect).
 type DeepClient struct {
 	client *http.Client
+	// timeout 是构造时的超时，供按出口切换底层 client 时复用。
+	timeout time.Duration
+	// P2：按任务绑定的多出口代理池。nil 表示不走池（旧行为，单出口直连/固定代理）。
+	pool   *EgressPool
+	taskID string
+	// P4：按目标独立的自适应节奏器（放行/限速/挑战三形态）。
+	pacer *AdaptivePacer
+	// activeEgress 是最近一次 Do 实际使用的出口 id，供调用方记台账。
+	activeEgress string
 }
 
 // NewDeepClient builds a client that ignores TLS errors (targets are often
@@ -38,6 +47,13 @@ func NewDeepClientWithProxy(timeout time.Duration, proxy string) *DeepClient {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
+	return &DeepClient{client: newDeepHTTPClient(timeout, proxy), timeout: timeout}
+}
+
+// newDeepHTTPClient builds the transport used by DeepClient. Extracted so the
+// egress pool can swap the underlying client per selected endpoint at runtime
+// without changing the request-building logic in Do.
+func newDeepHTTPClient(timeout time.Duration, proxy string) *http.Client {
 	tr := &http.Transport{
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		DisableKeepAlives:   true,
@@ -49,13 +65,47 @@ func NewDeepClientWithProxy(timeout time.Duration, proxy string) *DeepClient {
 			tr.Proxy = http.ProxyURL(u)
 		}
 	}
-	return &DeepClient{client: &http.Client{
+	return &http.Client{
 		Transport: tr,
 		Timeout:   timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-	}}
+	}
+}
+
+// WithEgressPool returns a shallow copy of c bound to an egress pool for one
+// task. The underlying http.Client is shared until Do selects an endpoint;
+// the original client is left untouched so other callers keep their own exit.
+// 任务 A/B 各调一次得到各自的 client，出口互不相通。
+func (c *DeepClient) WithEgressPool(pool *EgressPool, taskID string) *DeepClient {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	cp.pool = pool
+	cp.taskID = strings.TrimSpace(taskID)
+	cp.activeEgress = ""
+	return &cp
+}
+
+// WithPacer returns a shallow copy of c using an adaptive per-target pacer.
+// 多个任务可共享同一个 pacer（按 URL host 区分目标），也可各用各的。
+func (c *DeepClient) WithPacer(p *AdaptivePacer) *DeepClient {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	cp.pacer = p
+	return &cp
+}
+
+// ActiveEgress returns the id of the endpoint used by the most recent Do.
+func (c *DeepClient) ActiveEgress() string {
+	if c == nil {
+		return ""
+	}
+	return c.activeEgress
 }
 
 // DeepRequest is one outbound request built by a deep-exploitation module.
@@ -101,6 +151,30 @@ const deepMaxBody = 1 << 20
 
 // Do sends one request and captures the response.
 func (c *DeepClient) Do(ctx context.Context, req DeepRequest) DeepResponse {
+	// P2：出口在发请求前按任务选出并绑定；A/B 任务各取各的池，绝不串用。
+	// 未挂池的调用方走原路径（单出口），行为保持不变。
+	httpClient := c.client
+	if c.pool != nil {
+		ep, err := c.pool.SelectForTask(c.taskID)
+		if err != nil {
+			return DeepResponse{Error: "egress: " + err.Error()}
+		}
+		timeout := req.Timeout
+		if timeout <= 0 {
+			timeout = c.timeout
+		}
+		httpClient = c.pool.HTTPClientFor(ep, timeout)
+		c.activeEgress = ep.ID
+	}
+
+	// P4：发请求前按目标等待。等待不持有 pacer 锁，慢目标不拖垮别的任务。
+	target := normalizePaceTarget(req.URL)
+	if c.pacer != nil {
+		if err := c.pacer.Wait(ctx, target); err != nil {
+			return DeepResponse{Error: paceWaitErr(err).Error(), Err: err}
+		}
+	}
+
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
 	if method == "" {
 		method = http.MethodGet
@@ -148,8 +222,12 @@ func (c *DeepClient) Do(ctx context.Context, req DeepRequest) DeepResponse {
 		httpReq = httpReq.WithContext(ctx)
 	}
 	started := time.Now()
-	resp, err := c.client.Do(httpReq)
+	resp, err := httpClient.Do(httpReq)
 	if err != nil {
+		// 出口探测/连接失败：记账并让下一次 SelectForTask 自动轮换到健康出口。
+		if c.pool != nil && c.activeEgress != "" {
+			c.pool.ReportFailure(c.taskID, c.activeEgress, err)
+		}
 		return DeepResponse{Elapsed: time.Since(started), Error: err.Error(), Err: err}
 	}
 	defer resp.Body.Close()
@@ -166,6 +244,14 @@ func (c *DeepClient) Do(ctx context.Context, req DeepRequest) DeepResponse {
 		out.Err = readErr
 	}
 	out.Body = string(raw)
+	// P4：用响应特征更新目标节奏；限速/挑战时若挂了出口池则主动切出口。
+	// 注意顺序：先 Observe 再消费 RotateEgress，避免把标记误留给下一次请求。
+	if c.pacer != nil {
+		c.pacer.Observe(target, out)
+		if c.pool != nil && c.taskID != "" && c.pacer.ShouldRotateEgress(target) {
+			_ = c.pool.RotateForTask(c.taskID, "pacing:"+c.pacer.PaceFor(target).ModeName)
+		}
+	}
 	return out
 }
 
