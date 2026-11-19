@@ -148,15 +148,48 @@ func OpenSealed(rootKey []byte, purpose SealPurpose, stored string) (string, err
 // key stores plaintext, which is what the isolated test harnesses want and what
 // pre-sealing installs did.
 func (d *DB) UseSealKey(key []byte) {
+	d.UseSealKeys(key, nil, time.Time{})
+}
+
+// UseSealKeys installs the current signing root together with the previous one
+// kept for the rotation transition. All sealed columns (webshell/memshell secrets
+// in the server layer, credentials and model keys here) must read through the
+// same current-then-prev fallback or a root rotation silently bricks every value
+// sealed before it. The previous key is only consulted while SealTransitionActive
+// holds; passing a zero rotatedAt means "no previous key", i.e. the 1.6.0 caliber.
+func (d *DB) UseSealKeys(key, prev []byte, rotatedAt time.Time) {
 	if len(key) == 0 {
 		return
 	}
 	d.sealKey = append([]byte{}, key...)
+	d.sealKeyPrev = nil
+	d.sealRotatedAt = time.Time{}
+	if len(prev) >= 32 {
+		d.sealKeyPrev = append([]byte{}, prev...)
+		d.sealRotatedAt = rotatedAt
+	}
 	d.migrateSecretsAtRest()
 	if unreadable := d.auditSealedSecrets(); unreadable > 0 {
 		log.Printf("[seal] 共 %d 条已密封的值用当前签名密钥解不开：平台签名密钥换过，"+
 			"webshell 需重新投放载荷、内存马需重新注入、凭据与模型密钥需重新登记", unreadable)
 	}
+}
+
+// openSealed tries the current root first and the previous root only inside the
+// transition window. A value sealed with the old root therefore stays readable
+// during the window and becomes unreadable once it ends — which is exactly when
+// the self-check must start reporting it again (1.6.0 caliber).
+func (d *DB) openSealed(purpose SealPurpose, stored string) (string, error) {
+	plain, err := OpenSealed(d.sealKey, purpose, stored)
+	if err == nil || len(d.sealKeyPrev) == 0 || !SealTransitionActive(d.sealRotatedAt, time.Now()) {
+		return plain, err
+	}
+	// Only fall back on a key mismatch; a malformed envelope is malformed under
+	// every key and must not be relabelled as a rotation problem.
+	if !errors.Is(err, ErrSealKey) {
+		return plain, err
+	}
+	return OpenSealed(d.sealKeyPrev, purpose, stored)
 }
 
 func (d *DB) seal(purpose SealPurpose, plain string) (string, bool) {
@@ -165,7 +198,9 @@ func (d *DB) seal(purpose SealPurpose, plain string) (string, bool) {
 	}
 	// Opening first makes this idempotent: a value that is already a seal of this
 	// platform's key is re-sealed from its plaintext rather than wrapped twice.
-	if cur, err := OpenSealed(d.sealKey, purpose, plain); err == nil {
+	// The fallback lets the re-seal pass migrate an old-root value onto the new
+	// root instead of double-wrapping it during the transition.
+	if cur, err := d.openSealed(purpose, plain); err == nil {
 		plain = cur
 	}
 	return plain, true
@@ -193,7 +228,7 @@ func (d *DB) openCredential(stored string) (string, error) {
 	if len(d.sealKey) == 0 {
 		return "", ErrSealNoKey
 	}
-	plain, err := OpenSealed(d.sealKey, SealPurposeCredential, stored)
+	plain, err := d.openSealed(SealPurposeCredential, stored)
 	if err != nil {
 		return "", sealError("内网凭据", err)
 	}
@@ -220,7 +255,7 @@ func (d *DB) openLLMKey(stored string) (string, error) {
 	if len(d.sealKey) == 0 {
 		return "", ErrSealNoKey
 	}
-	plain, err := OpenSealed(d.sealKey, SealPurposeLLMKey, stored)
+	plain, err := d.openSealed(SealPurposeLLMKey, stored)
 	if err != nil {
 		return "", sealError("模型 API 密钥", err)
 	}
@@ -441,7 +476,9 @@ func (d *DB) AuditSealedSecrets() SealAudit {
 				continue
 			}
 			row.Total++
-			if _, oerr := OpenSealed(d.sealKey, c.purpose, v); oerr != nil {
+			// 过渡期内旧根密钥仍解封，自检不报这些行；窗口一过 openSealed
+			// 不再回退，同一批行重新变成 unreadable——这正是 1.6.0 自检口径。
+			if _, oerr := d.openSealed(c.purpose, v); oerr != nil {
 				row.Unreadable++
 				row.IDs = append(row.IDs, id)
 				row.Rows = append(row.Rows, SealRow{ID: id, Label: strings.TrimSpace(label)})

@@ -534,7 +534,16 @@ func (s *Server) intranetSendScript(ctx context.Context, pg *db.DB, sess *db.Int
 	client := scanner.NewDeepClient(timeout)
 	cctx, cancel := context.WithTimeout(ctx, timeout+5*time.Second)
 	defer cancel()
-	return scanner.RunShellCommand(cctx, client, shell.URL, payload, script)
+	started := time.Now()
+	raw, runErr := scanner.RunShellCommand(cctx, client, shell.URL, payload, script)
+	// P17：真实业务命令成功即为一次存活证明，顺手 piggyback 到会话健康状态，
+	// 不再需要周期心跳往 webshell 通道发自发请求。失败不在这里记——一次命令
+	// 失败可能是命令本身的问题，会话存活交给人工心跳端点按现有口径判定。
+	if runErr == nil && pg != nil {
+		_, _ = pg.RecordIntranetSessionHealth(sess.ID, true,
+			int(time.Since(started)/time.Millisecond), "", intranetHealthLostAfter)
+	}
+	return raw, runErr
 }
 
 // intranetValidUTF8Text 清洗目标回显里无效的 UTF-8 序列，让产出可以直接进

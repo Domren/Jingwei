@@ -52,9 +52,14 @@ type Server struct {
 	// tunnels 记着「哪条隧道上现在有几个重任务在跑」，是 F6 并发预算的占用表。
 	tunnels *tunnelBudget
 
-	skillDir  string // root directory for skill subdirectories
-	jwtKey    []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
-	basicAuth basicAuthGate
+	skillDir string // root directory for skill subdirectories
+	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
+	// jwtKeyPrev/jwtRotatedAt 是签名根密钥轮换的过渡期材料（见 platform_secret）。
+	// 过渡期内 openShellSecret 先试新根、再试旧根，避免存量壳因根密钥轮换变砖；
+	// 窗口结束后旧根不再参与解封，1.6.0 自检口径原样恢复。
+	jwtKeyPrev   []byte
+	jwtRotatedAt time.Time
+	basicAuth    basicAuthGate
 
 	// apiMux 是 Handler() 造出的 /api 路由表。留着是为了让用例能问「这个路径到底
 	// 注册了没有」——直接调 handler 的测试测不到这一层，功能就可能在界面里点了没反应
@@ -183,8 +188,17 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// Installing it on the database handle is what lets every reader see plaintext
 	// without each call site remembering to unseal — a missed one would dial SSH
 	// with ciphertext or send a garbage Authorization header to a provider.
-	m.pg.UseSealKey(key)
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
+	// If a root rotation is in progress, load the previous root too: new values
+	// seal with `key`, stored values from before the rotation still open via the
+	// prev key until the transition window ends.
+	_, prev, rotatedAt, found, keyErr := m.pg.PlatformJWTKeys()
+	prevKey := []byte{}
+	if keyErr == nil && found && db.SealTransitionActive(rotatedAt, time.Now()) {
+		prevKey = []byte(prev)
+	}
+	m.pg.UseSealKeys(key, prevKey, rotatedAt)
+	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key,
+		jwtKeyPrev: prevKey, jwtRotatedAt: rotatedAt, chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
@@ -1001,6 +1015,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/deep/webshells/{id}/check", s.checkWebshell)
 	mux.HandleFunc("GET /api/deep/webshells/{id}/payload", s.webshellPayload)
 	mux.HandleFunc("POST /api/deep/webshells/{id}/rotate", s.rotateWebshellKey)
+	// 载荷族（P15）：按 family_id 批量轮换 / 撤离同模板同密钥版本的壳。
+	// 用独立路径避开与 /webshells/{id} 的路由模式冲突。
+	mux.HandleFunc("POST /api/deep/webshell-families/{familyID}/rotate", s.rotateWebshellFamily)
+	mux.HandleFunc("POST /api/deep/webshell-families/{familyID}/evacuate", s.evacuateWebshellFamily)
 	// 大马：加密 v2 通道内的文件管理（列目录/读写/删除/重命名/权限）
 	mux.HandleFunc("GET /api/deep/webshells/{id}/files", s.listWebshellFiles)
 	mux.HandleFunc("GET /api/deep/webshells/{id}/file", s.readWebshellFile)

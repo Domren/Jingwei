@@ -6,7 +6,6 @@
 
 ### 新增
 
-<<<<<<< HEAD
 - **P1 · 操作端反溯源**：设置页新增 `operation_proxy_chain`（操作会话独立代理链，空=直连）、
   `operator_session_isolation`（操作会话与任务执行环境隔离，默认开）、
   `audit_authorization_ref`（授权书引用）。新增 `GET /api/audit/export?format=md`
@@ -84,6 +83,27 @@
   可观测痕迹，与本次已登记手段的静态档案关键词比对；档案外的真实痕迹写进报告
   「档案外痕迹（动态采集发现，静态档案未覆盖）」一节显式列出，不再静默略过。
   「本轮未执行动态采集」与「采集了但未发现差异」在报告中分开表述。
+- **木马隐蔽四项能力（P15–P18）**，均只服务已授权测试目标，不改动 guard / 审批 / 台账 / 撤离闭环：
+  - **P15 载荷族归并**：`webshells` 新增 `family_id`（同一载荷模板 + 密钥版本的稳定分组 hash，
+    `db.WebshellFamilyID` 与库侧触发器 `webshell_family_id()` 同公式，存量行自动回填）。
+    新增按族查询（`ListWebshellsByFamily`）与批量轮换/撤离（`UpdateWebshellsSecretByFamily` /
+    `DeleteWebshellsByFamily`），并提供 `POST /api/deep/webshell-families/{familyID}/rotate|evacuate`
+    两个入口：逐壳仍走「旧密钥认证轮换 / 自删除并复核」的同一套原语，汇总批量落库。
+    单壳指纹 `payload_sha256` 与 `family_id` 可同时查询；夹具覆盖同族 N 壳一次轮换、整族迁移到下一代。
+  - **P16 密钥轮换原子性（双密钥过渡期）**：`platform_secret` 新增 `jwt_key_prev` + `rotated_at`（幂等迁移）。
+    轮换时旧根密钥搬到 `jwt_key_prev` 并盖时间戳；过渡期内（72h）webshell / 内存马 / 凭据 / 模型密钥
+    一律「先新根、后旧根」解封，新投用新密钥、存量旧密文仍可解；窗口结束后旧根不再参与解封，
+    1.6.0 既有自检口径原样收口（仍用旧根的行重新报「请重新投放载荷 / 重新登记」，走补救流程）。
+    wire 层 `openShellToken` 支持新+旧通信密钥依次尝试（时间戳 + nonce 校验逐密钥执行，不因试第二把而放宽），
+    `RotateShellKey` 过渡期带上旧密钥确认在途回执。夹具覆盖旧/新密文双向可解、窗口结束旧密钥失效。
+  - **P17 心跳隐蔽性**：webshell 通道零自发心跳——后台周期心跳只走 SSH 会话自己的通道，
+    webshell 会话不再每分钟被定时探测；其存活 piggyback 到真实业务命令（成功即记一次健康），
+    需要时由人工心跳端点按需触发。`shellJitter()` 保留，时间戳 + nonce 防重放在有操作时照旧成立。
+    夹具验证空闲窗口零 wire 请求、按需操作恰好一条请求、过期时间戳/重放 token 仍被拒。
+  - **P18 部署前冲突检测**：注入前对落地地址发一次 GET 探测（沿用 `JW_FILE_EXISTS` / `JW_FILE_NEW`
+    标记口径），明确 404/410 才判为可安全投放；命中已有文件、鉴权墙或服务错误一律不覆盖，
+    落一条 `webshell_deploy_conflicts` 待人工记录（`status=manual`），明确报出并转人工核对授权方资产。
+    夹具覆盖探测分类各分支与桩服务上的真实探测。
 
 ## [1.6.5] - 2026-11-18
 
