@@ -407,6 +407,7 @@ func (s *Store) Record(ctx context.Context, in db.RecordFindingInput, refs []db.
 			Status:       db.FindingPending,
 			Summary:      in.Summary,
 			Evidence:     in.Evidence,
+			Confidence:   in.Confidence, // 非 observed 的证据不进正式报告正文
 			Source:       "Agent 上报（" + in.Worker + "）",
 			HTTPRequest:  reportPacketText(in.RawRequest),
 			HTTPResponse: reportPacketText(in.RawResponse),

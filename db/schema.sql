@@ -1225,6 +1225,10 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS http_response TEXT NOT NULL DEFAUL
 -- scans and deep exploitation. NULL means "do not dedupe" (manual findings).
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_dedupe_key ON findings(dedupe_key);
+-- 执行结果置信度：observed 亲眼观测（默认）/ inferred 由回显推断（如 WAF 改写）/ failed 执行失败。
+-- 默认值 observed 保证存量数据语义不变；报告正文只引用 observed，非 observed 的证据进附录/内部视图。
+-- schema.sql 每次启动都会 Exec，必须用 IF NOT EXISTS 保持幂等。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS confidence TEXT NOT NULL DEFAULT 'observed';
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DESC);

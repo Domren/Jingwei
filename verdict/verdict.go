@@ -16,6 +16,34 @@ const (
 	NeedsReview = "needs_review"
 )
 
+// 证据置信度的旁路口径（P10）。Assess 的 confirmed / needs_review 二值语义保持
+// 不变；这里的置信度只是给报告与台账附加一层「证据是不是亲眼观测到的」标签。
+const (
+	ConfidenceObserved = "observed" // 亲眼观测到，与 findings 默认值一致
+	ConfidenceInferred = "inferred" // 由回显推断（典型：WAF 改写后的回显）
+	ConfidenceFailed   = "failed"   // 执行失败，未拿到任何结果
+)
+
+// wafRewriteIndicators 命中典型拦截/验证码页特征。关键词出现在这类页面里并不能证明
+// 漏洞存在——正是「WAF 改写回显」夹具的形态，因此这类证据只能记 inferred。
+var wafRewriteIndicators = regexp.MustCompile(`(?i)(captcha|human verification|verify you are human|access denied|forbidden|request blocked|waf (?:block|intercept)|人机验证|滑动验证|访问被拒绝|请求被拦截|安全验证)`)
+
+// AssessConfidence 在不改动 Assess 判定语义的前提下，给出这次观测的证据置信度。
+// 它不把任何命中降为误报，只标注证据的可引用级别，供报告/台账决定能否进正文。
+func AssessConfidence(obs Observation) string {
+	if obs.StatusCode >= 500 || (isHTTP(obs.Type) && strings.TrimSpace(obs.Response) == "") {
+		return ConfidenceFailed
+	}
+	haystack := strings.ToLower(obs.TemplateID + " " + obs.Name + " " + strings.Join(obs.Tags, " "))
+	isBypass := Classify(obs.TemplateID, obs.Name, obs.Tags) == ClassWAFBypass ||
+		strings.Contains(haystack, "waf-bypass") || strings.Contains(haystack, "waf_bypass") ||
+		(strings.Contains(haystack, "waf") && strings.Contains(haystack, "bypass"))
+	if isBypass || wafRewriteIndicators.MatchString(obs.Response) {
+		return ConfidenceInferred
+	}
+	return ConfidenceObserved
+}
+
 // Class is the vulnerability family used to pick the review checklist.
 type Class string
 

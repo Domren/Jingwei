@@ -2,6 +2,28 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 新增
+
+- **P9 · RCE 验证阶梯（代码级闸门）**：新增 `verify_rce` 深度工具与 `rce_verify` 深任务类型，
+  按「回连证明 → 无害命令 → 读文件 → 写文件」四级逐级授权。四级可通过 `rce_callback` /
+  `rce_harmless` / `rce_read` / `rce_write` 参数**各自独立关闭**（关闭后连跳级审批也不放行）；
+  请求级别超过「已达级别+1」即为跳级，必须由操作员经 intercept 的 `HandleAsk`/`Decide`
+  人工审批，被拒会落 denied 审批记录（`guard.NewRCEGate`）。阶梯裁决是**代码闸门**，入队前
+  与执行侧各复核一次，sidecar 提示词自律不参与裁决；闸门复用现成的 ask 规则与审批闭环，
+  不拆 guard/审批/台账/撤离链路。
+- **P10 · 执行结果置信度**：`findings.confidence` 新增 `observed`（默认，亲眼观测）/
+  `inferred`（如 WAF 改写回显）/ `failed`（执行失败）三级（schema 幂等加列，老数据默认 observed，
+  既有 confirmed 判定不变）。`DBFinding`/`RecordFindingInput`/`evidence.Store.Record` 全链路落库；
+  `report.BuildFindingReport` 与验证步骤只引用 observed 证据，inferred/failed 的回显不进正式报告
+  正文，仅在附录标注置信度。`verdict.Assess` 二值语义保持不变，另加 `AssessConfidence` 旁路口径。
+- **P11 · java-chains 无 sidecar 覆盖**：没有 `JAVA_CHAINS_MCP_TOKEN` 时不再笼统记「待复核」，
+  改用内置最小探测（`scanner.ProbeJavaChainDependency`）在已有证据上判断依赖特征串存在性，
+  **不生成 payload、不访问 sidecar**。结论结构化落入 summary，区分「依赖存在（但链未验证）」、
+  「链未验证（无特征串）」与「目标无该链（无 Java 反序列化候选）」，并明确标注「没装 sidecar」，
+  复用既有 `JavaDeserializationKeyword` 家族识别。
+
 ## [1.6.5] - 2026-11-18
 
 ### 变更

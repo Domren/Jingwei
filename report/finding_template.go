@@ -37,7 +37,10 @@ type FindingReportInput struct {
 	Extracted       []string
 	HTTPRequest     string
 	HTTPResponse    string
-	GeneratedAt     time.Time
+	// Confidence 为该 finding 的执行结果置信度（observed/inferred/failed），空值按
+	// observed 处理以兼容老数据。非 observed 的回显证据不进正式报告正文。
+	Confidence  string
+	GeneratedAt time.Time
 }
 
 type requestParam struct {
@@ -64,6 +67,10 @@ func BuildFindingReport(in FindingReportInput) string {
 	name := nz(in.Name, nz(in.VulnClass, "未命名漏洞"))
 	target := findingTarget(in)
 	guidance := guidanceFor(in.VulnClass + " " + in.Name)
+	// 置信度闸门：只有 observed 的回显证据进入正文；inferred/failed 的证据在正文里
+	// 一律不引用（附录仅标注级别），避免 WAF 改写后的回显被当成漏洞证明。
+	observed := observedEvidence(in)
+	confidenceLabel := db.NormalizeFindingConfidence(in.Confidence)
 
 	var b strings.Builder
 	b.WriteString(db.AutoReportMarker)
@@ -76,7 +83,7 @@ func BuildFindingReport(in FindingReportInput) string {
 	}
 	b.WriteString("\n\n")
 	fmt.Fprintf(&b, "> 本报告由系统根据现有扫描/利用证据自动生成（无 LLM 模式）。")
-	if in.HTTPRequest != "" || in.HTTPResponse != "" {
+	if observed && (in.HTTPRequest != "" || in.HTTPResponse != "") {
 		if isRawProtocol(in) {
 			b.WriteString(" 原始请求与响应数据已完整放入 PoC 章节。")
 		} else {
@@ -90,6 +97,7 @@ func BuildFindingReport(in FindingReportInput) string {
 	fmt.Fprintf(&b, "| 严重等级 | %s |\n", severityLabel(in.Severity))
 	fmt.Fprintf(&b, "| 漏洞类型 | %s |\n", markdownCell(nz(in.VulnClass, "未分类")))
 	fmt.Fprintf(&b, "| 处理状态 | %s |\n", nz(in.Status, db.FindingPending))
+	fmt.Fprintf(&b, "| 证据置信度 | %s |\n", confidenceLabel)
 	if in.MatchedAt != "" {
 		fmt.Fprintf(&b, "| 命中位置 | %s |\n", markdownCell(in.MatchedAt))
 	}
@@ -157,12 +165,15 @@ func BuildFindingReport(in FindingReportInput) string {
 
 	b.WriteString("## 证据\n\n")
 	evidence := sanitizeEvidence(in.Evidence)
-	if evidence == "" {
+	if !observed {
+		// 非 observed：正文不引用可能被改写的证据/提取结果，只说明原因。
+		evidence = "（证据置信度为 " + confidenceLabel + "，回显类证据不进入正式报告正文；详见附录说明）"
+	} else if evidence == "" {
 		evidence = "（未提供额外文字证据）"
 	}
 	b.WriteString(fenced("text", evidence))
 	b.WriteString("\n\n")
-	if len(in.Extracted) > 0 {
+	if observed && len(in.Extracted) > 0 {
 		b.WriteString("关键提取结果：\n\n")
 		for _, item := range in.Extracted {
 			fmt.Fprintf(&b, "- `%s`\n", strings.TrimSpace(item))
@@ -196,7 +207,12 @@ func BuildFindingReport(in FindingReportInput) string {
 		fmt.Fprintf(&b, "### %s\n\n", reqTitle)
 		b.WriteString(fenced(lang, nz(in.HTTPRequest, "（未采集到请求数据）")))
 		fmt.Fprintf(&b, "\n\n### %s\n\n", respTitle)
-		b.WriteString(fenced(lang, nz(in.HTTPResponse, "（未采集到响应数据）")))
+		// 响应正文可能已被 WAF 改写；非 observed 时只留占位说明，不把改写后的回显写进报告。
+		responseForReport := in.HTTPResponse
+		if !observed {
+			responseForReport = "（证据置信度为 " + confidenceLabel + "，响应回显不进入正式报告正文）"
+		}
+		b.WriteString(fenced(lang, nz(responseForReport, "（未采集到响应数据）")))
 		b.WriteString("\n\n")
 	}
 
@@ -231,6 +247,11 @@ func BuildFindingReport(in FindingReportInput) string {
 	b.WriteString("\n\n")
 
 	b.WriteString("## 附录：原始记录\n\n")
+	confidenceNote := "（observed，证据可用于报告正文）"
+	if !observed {
+		confidenceNote = "（非亲眼观测：回显类证据已从正文移除，仅供内部复核，须人工复验后再引用）"
+	}
+	fmt.Fprintf(&b, "- 证据置信度：%s%s\n", confidenceLabel, confidenceNote)
 	fmt.Fprintf(&b, "- 数据来源：%s\n", nz(in.Source, "平台记录"))
 	if in.TaskDescription != "" {
 		fmt.Fprintf(&b, "- 所属任务：%s\n", in.TaskDescription)
@@ -271,6 +292,7 @@ func BuildFindingReportFromDB(f *db.DBFinding) string {
 		Extracted:       ev.extracted,
 		HTTPRequest:     f.HTTPRequest,
 		HTTPResponse:    f.HTTPResponse,
+		Confidence:      f.Confidence,
 		GeneratedAt:     f.CreatedAt,
 	}
 	if in.TemplateID == "" {

@@ -20,6 +20,10 @@ const (
 	// dedicated verifier (sqlmap / dalfox) instead of trusting a POC template.
 	DeepTaskSQLiProbe = "sqli_probe"
 	DeepTaskXSSProbe  = "xss_probe"
+	// DeepTaskRCE 是 RCE 验证阶梯任务：回连证明 → 无害命令 → 读文件 → 写文件逐级授权，
+	// 跳级必须人工审批。阶梯参数（rce_level / rce_achieved / rce_* 开关）在入队前由
+	// guard.RCEGate 代码闸门裁决，模型提示词自律不替代闸门。
+	DeepTaskRCE = "rce_verify"
 )
 
 // ErrDeepTaskNotFound is returned when a deep task id does not exist.
@@ -88,7 +92,7 @@ func (d *DB) CreateDeepTask(in DeepTaskInput) (*DeepTask, error) {
 	kind := strings.ToLower(strings.TrimSpace(in.Kind))
 	switch kind {
 	case DeepTaskVerify, DeepTaskExploit, DeepTaskWAFBypass, DeepTaskWebshellInject,
-		DeepTaskSQLiProbe, DeepTaskXSSProbe:
+		DeepTaskSQLiProbe, DeepTaskXSSProbe, DeepTaskRCE:
 	default:
 		kind = DeepTaskVerify
 	}

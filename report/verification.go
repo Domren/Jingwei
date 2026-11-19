@@ -7,7 +7,18 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/Domren/jingwei/db"
 )
+
+// observedEvidence reports whether this finding's evidence may be cited in the
+// formal report body. Only observed (亲眼观测) evidence qualifies; inferred /
+// failed evidence is withheld from the body and annotated in the appendix instead.
+// Empty confidence defaults to observed so legacy findings and existing confirmed
+// verdicts keep their behavior.
+func observedEvidence(in FindingReportInput) bool {
+	return db.NormalizeFindingConfidence(in.Confidence) == db.FindingConfidenceObserved
+}
 
 // verificationRow is one labeled fact shown in the report's 验证数据 table.
 type verificationRow struct {
@@ -486,6 +497,14 @@ func isHostHeaderInjection(in FindingReportInput) bool {
 // With raw packets the steps cite the exact request line, host, sizes and status;
 // without packets they explicitly fall back to the evidence text.
 func verificationSteps(in FindingReportInput) ([]string, []verificationRow) {
+	// 置信度闸门：非 observed 的证据不进正式报告正文，只给一条中性说明，不引用任何
+	// 可能由 WAF 改写的回显内容（避免把被篡改的回显当成漏洞证明）。
+	if !observedEvidence(in) {
+		level := db.NormalizeFindingConfidence(in.Confidence)
+		return []string{
+			fmt.Sprintf("该发现的证据置信度为 %s（非亲眼观测）：响应回显类证据不进入正式报告正文，仅供内部复核，需人工复验后再引用。", level),
+		}, nil
+	}
 	f := verificationFor(in)
 	target := findingTarget(in)
 	steps := []string{}

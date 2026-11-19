@@ -331,7 +331,10 @@ type RecordFindingInput struct {
 	TaskID, ExplorationID, IntentID                      int64
 	VulnClass, Name, Severity, Summary, Evidence, Worker string
 	CVSS                                                 *float64 // 提交时强制填写的 CVSS 基础分
-	AssetIDs                                             []int64
+	// Confidence 是本次执行结果的置信度（observed/inferred/failed）。空值按 observed
+	// 处理，保证老调用方与既有 confirmed 判定不受影响。报告正文只引用 observed。
+	Confidence string
+	AssetIDs   []int64
 	// RawRequest/RawResponse carry byte-exact non-HTTP protocol data (RESP,
 	// MySQL, SSH banners…) that the proxy cannot capture; Protocol names it so
 	// reports label the capture as raw data instead of HTTP packets.
@@ -475,8 +478,8 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 		assets = []int64{}
 	}
 	raw, _ := json.Marshal(assets)
-	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,dedupe_key,cvss)
-VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),$11) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw), identity, in.CVSS).Scan(&out.FindingID); err != nil {
+	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,dedupe_key,cvss,confidence)
+VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),$11,$12) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw), identity, in.CVSS, NormalizeFindingConfidence(in.Confidence)).Scan(&out.FindingID); err != nil {
 		return nil, err
 	}
 	if _, err := storeRawPacketsTx(tx, out.FindingID, in); err != nil {
@@ -645,6 +648,14 @@ func mergeAgentFindingTx(ctx context.Context, tx *sql.Tx, findingID, nodeID int6
 	if _, err := tx.ExecContext(ctx, `UPDATE findings SET name=$2, severity=$3, summary=$4, evidence=$5 WHERE id=$1`,
 		findingID, name, severity, summary, evidence); err != nil {
 		return nil, err
+	}
+	// 合并重复上报时更新置信度：空值不覆盖（老调用方保持 observed），非空则按本次
+	// 执行结果落库，使 WAF 改写回显一类的证据被标记为 inferred 而不进正式报告。
+	if strings.TrimSpace(in.Confidence) != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE findings SET confidence=$2 WHERE id=$1`,
+			findingID, NormalizeFindingConfidence(in.Confidence)); err != nil {
+			return nil, err
+		}
 	}
 	stored, err := storeRawPacketsTx(tx, findingID, in)
 	if err != nil {
