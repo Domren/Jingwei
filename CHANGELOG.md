@@ -2,6 +2,26 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 新增
+
+- **Shell 管理 P19 · 多会话标签化 + 批量只读执行**：`IntranetSession` 新增 `Labels []string`
+  （JSONB，幂等迁移 + GIN 索引），会话创建/更新与 `GET /api/intranet/sessions?labels=a,b`
+  支持按任务/主机分组查询。批量执行 `POST /api/intranet/sessions/batch-exec` 与
+  `POST /api/deep/webshells/batch-exec` 支持按标签选中会话，并对同一条只读命令汇总输出。
+  批量命令走默认拒绝白名单守卫：重定向、命令/进程替换、解释器与 `rm`/`sed -i`/
+  `find -delete` 等写操作在投递前被拒，绝不因夹带只读命令而放行；写操作仍逐条审批。
+- **Shell 管理 P20 · 会话管理三项**：
+  1. 失效原因分类：心跳失败按「密钥轮换 / 目标重启 / 被清理 / 网络不通」四类归档，
+     health 快照落 `health_failure_reason`，事件文本点名原因并给出补救方向（未知类给手动复核建议）。
+  2. 命令历史审计导出：直连 webshell 命令补写 `intranet_session_events`（含操作者），
+     新增 `GET /api/intranet/sessions/events/export?format=csv|json&since=&limit=`，
+     导出含操作者、时间、主机、命令四要素（CSV 带 BOM，中文表头不乱码）。
+  3. 大文件分片续传：读长封顶收敛为 `ClampShellFileReadLength` 单一实现（消除
+     scanner 与 HTTP 层 512 KiB / 1 MiB 上限漂移），新增 `PlanShellFileChunks` 规划
+     续传起点；1 MiB 文件中断后从已落盘偏移续传，字节级一致。
+
 ## [1.6.5] - 2026-11-18
 
 ### 变更

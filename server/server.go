@@ -1008,6 +1008,7 @@ func (s *Server) Handler() http.Handler {
 	// 凭据库：全局凭据视图（跨任务）
 	mux.HandleFunc("GET /api/deep/credentials", s.listGlobalCredentials)
 	mux.HandleFunc("POST /api/deep/webshells/{id}/exec", s.execWebshellCommand)
+	mux.HandleFunc("POST /api/deep/webshells/batch-exec", s.batchExecWebshellCommand)
 	mux.HandleFunc("GET /api/deep/webshells/{id}/info", s.webshellInfo)
 	// exec() 语境的命令编码助手：纯静态换算，不接触目标。
 	mux.HandleFunc("POST /api/deep/exec-form", s.execForm)

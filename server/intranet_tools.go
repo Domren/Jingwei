@@ -250,25 +250,30 @@ func (s *Server) toolIntranetDownload() actool.CoreTool {
 
 func (s *Server) toolIntranetBatchExec() actool.CoreTool {
 	return wrTool("intranet_batch_exec",
-		"对多个内网会话批量执行同一条命令（串行，最多 50 个）。不传 session_ids 时按 task_id 取该任务全部活跃会话。每个会话返回独立输出/退出码。",
+		"对多个内网会话批量执行同一条只读命令（串行，最多 50 个）。不传 session_ids 时按 labels 或 task_id 取活跃会话。每个会话返回独立输出/退出码。写命令被守卫拒绝，需逐条审批执行。",
 		objSchema(map[string]any{
 			"session_ids":     map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "会话 ID 列表（可选）"},
+			"labels":          map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "按标签选中会话（命中任一标签，可选）"},
 			"task_id":         intranetIntParam("按任务取活跃会话（可选；任务运行中自动带入当前任务）"),
-			"command":         strParam("要执行的命令（必填）"),
+			"command":         strParam("要执行的只读命令（必填；写命令被拒绝）"),
 			"timeout_seconds": intranetIntParam("单会话超时秒数，默认 60，最大 180"),
 		}, "command"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
-				SessionIDs     []int64 `json:"session_ids"`
-				TaskID         int64   `json:"task_id"`
-				Command        string  `json:"command"`
-				TimeoutSeconds int     `json:"timeout_seconds"`
+				SessionIDs     []int64  `json:"session_ids"`
+				Labels         []string `json:"labels"`
+				TaskID         int64    `json:"task_id"`
+				Command        string   `json:"command"`
+				TimeoutSeconds int      `json:"timeout_seconds"`
 			}
 			if err := json.Unmarshal(in, &a); err != nil {
 				return actool.Errorf("参数格式错误"), nil
 			}
 			if strings.TrimSpace(a.Command) == "" {
 				return actool.Errorf("command 必填"), nil
+			}
+			if reason := batchReadOnlyRejectReason(a.Command); reason != "" {
+				return actool.Errorf("[guard] " + reason), nil
 			}
 			pg, err := s.intranetToolPG()
 			if err != nil {
@@ -281,7 +286,7 @@ func (s *Server) toolIntranetBatchExec() actool.CoreTool {
 			if timeout <= 0 || timeout > 180*time.Second {
 				timeout = intranetExecTimeout
 			}
-			results, err := s.intranetBatchExec(ctx, pg, a.SessionIDs, a.TaskID, a.Command, timeout)
+			results, err := s.intranetBatchExec(ctx, pg, a.SessionIDs, a.Labels, a.TaskID, a.Command, timeout)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}

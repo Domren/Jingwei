@@ -512,6 +512,12 @@ func (s *Server) execWebshellCommand(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	// 直连 webshell 的执行此前完全不写审计，导出里就缺了这类命令。按绑定的
+	// 会话回填事件；只有真正执行过（走到这里）才记，写命令在守卫阶段就被拒了。
+	if sess, serr := pg.GetIntranetSessionByWebshellID(shell.ID); serr == nil && sess != nil {
+		_ = pg.AddIntranetSessionEventAs(sess.ID, "exec", req.Command,
+			truncateIntranetOutput(res.Output, 8000), authUsername, res.IsError)
+	}
 	writeJSON(w, 200, res)
 }
 
@@ -573,4 +579,62 @@ func (s *Server) webshellInfo(w http.ResponseWriter, r *http.Request) {
 		"marker_ok":    res.MarkerOK,
 		"note":         res.Note,
 	})
+}
+
+// batchExecWebshellCommand 对直连 webshell 批量执行同一条只读命令。写命令在
+// 投递前被守卫拒绝，不会落到任何一条通道上；每个壳的结果独立汇总。
+func (s *Server) batchExecWebshellCommand(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		IDs            []int64 `json:"ids"`
+		Command        string  `json:"command"`
+		TimeoutSeconds int     `json:"timeout_seconds"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "请求格式错误")
+		return
+	}
+	if reason := batchReadOnlyRejectReason(req.Command); reason != "" {
+		writeErr(w, 400, "[guard] "+reason)
+		return
+	}
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	targets := make([]batchTarget, 0, len(req.IDs))
+	seen := map[int64]bool{}
+	for _, id := range req.IDs {
+		if id > 0 && !seen[id] {
+			seen[id] = true
+			targets = append(targets, batchTarget{ID: id})
+		}
+	}
+	results, reject := batchReadOnlyRun(targets, req.Command, clampShellTimeout(req.TimeoutSeconds),
+		func(t batchTarget, command string, timeout time.Duration) intranetExecOutcome {
+			shell, err := pg.GetWebshell(t.ID)
+			if err != nil || strings.TrimSpace(shell.URL) == "" {
+				return intranetExecOutcome{ExitCode: -1, IsError: true, Note: "webshell 不存在或没有可用地址"}
+			}
+			if reason, allowed := shellAllowed(pg, shell.URL); !allowed {
+				return intranetExecOutcome{ExitCode: -1, IsError: true, Note: "webshell 命中资产拦截规则：" + reason}
+			}
+			payload, perr := s.shellPayloadFor(shell)
+			if perr != nil {
+				return intranetExecOutcome{ExitCode: -1, IsError: true, Note: perr.Error()}
+			}
+			res := shellExec(r.Context(), httpShellSender(shellChannel{URL: shell.URL, Payload: payload}),
+				"", shell.OSKind, "", command, timeout)
+			// 直连 webshell 的命令此前完全不写审计；补上后导出才有 who/when/where/what。
+			if sess, serr := pg.GetIntranetSessionByWebshellID(shell.ID); serr == nil && sess != nil {
+				_ = pg.AddIntranetSessionEventAs(sess.ID, "exec", command,
+					truncateIntranetOutput(res.Output, 8000), authUsername, res.IsError)
+			}
+			return res
+		})
+	if reject != "" {
+		writeErr(w, 400, "[guard] "+reject)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"results": results, "total": len(results)})
 }

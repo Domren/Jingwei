@@ -2473,6 +2473,7 @@ type intranetSessionDTO struct {
 	Host         string         `json:"host"`
 	Cwd          string         `json:"cwd"`
 	Note         string         `json:"note"`
+	Labels       []string       `json:"labels"`
 	Metadata     map[string]any `json:"metadata"`
 	Status       string         `json:"status"`
 	Transport    string         `json:"transport"`
@@ -2529,6 +2530,7 @@ func (s *Server) registerIntranet(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/intranet/sessions/{id}/upload", s.uploadIntranetFile)
 	mux.HandleFunc("POST /api/intranet/sessions/{id}/download", s.downloadIntranetFile)
 	mux.HandleFunc("GET /api/intranet/sessions/{id}/events", s.listIntranetSessionEvents)
+	mux.HandleFunc("GET /api/intranet/sessions/events/export", s.exportIntranetSessionEvents)
 	mux.HandleFunc("POST /api/intranet/sessions/{id}/recon", s.reconIntranetSession)
 	mux.HandleFunc("POST /api/intranet/sessions/batch-exec", s.batchExecIntranetSessions)
 
@@ -2572,6 +2574,17 @@ func (s *Server) listIntranetSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	taskID, _ := strconv.ParseInt(strings.TrimSpace(q.Get("task_id")), 10, 64)
+	// labels 为逗号分隔的标签集合，命中任一即返回；用于按任务/主机分组查看会话。
+	if raw := strings.TrimSpace(q.Get("labels")); raw != "" {
+		labels := strings.Split(raw, ",")
+		sessions, err := pg.ListIntranetSessionsByLabels(labels, q.Get("status"), taskID, atoiDefault(q.Get("limit"), 100))
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"sessions": sessions, "total": len(sessions)})
+		return
+	}
 	sessions, total, err := pg.ListIntranetSessions(q.Get("status"), taskID, atoiDefault(q.Get("limit"), 100), atoiDefault(q.Get("offset"), 0))
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -2616,6 +2629,11 @@ func (s *Server) createIntranetSession(w http.ResponseWriter, r *http.Request) {
 			DialHost: req.DialHost, DialPort: req.DialPort,
 			Cwd: req.Cwd, Note: req.Note,
 		})
+		if len(req.Labels) > 0 && sess != nil && sess.ID > 0 {
+			if updated, lerr := pg.SetIntranetSessionLabels(sess.ID, req.Labels); lerr == nil && updated != nil {
+				sess = updated
+			}
+		}
 		if err != nil {
 			if sess != nil {
 				// 会话已登记但登录失败：留一行 closed 记录，误配凭据也查得到。
@@ -2658,6 +2676,7 @@ func (s *Server) createIntranetSession(w http.ResponseWriter, r *http.Request) {
 	sess, err := pg.CreateIntranetSession(db.IntranetSessionInput{
 		Name: req.Name, WebshellID: req.WebshellID, TaskID: req.TaskID,
 		Host: host, Cwd: req.Cwd, Note: req.Note, Metadata: req.Metadata,
+		Labels: req.Labels,
 	})
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -2718,6 +2737,11 @@ func (s *Server) updateIntranetSession(w http.ResponseWriter, r *http.Request) {
 	if req.TaskID > 0 {
 		_ = pg.SetIntranetSessionTask(id, req.TaskID)
 		sess.TaskID = &req.TaskID
+	}
+	if req.Labels != nil {
+		if updated, lerr := pg.SetIntranetSessionLabels(id, req.Labels); lerr == nil && updated != nil {
+			sess = updated
+		}
 	}
 	writeJSON(w, 200, map[string]any{"session": sess})
 }
@@ -2890,17 +2914,19 @@ func (s *Server) listIntranetSessionEvents(w http.ResponseWriter, r *http.Reques
 func (s *Server) batchExecIntranetSessions(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
-		SessionIDs     []int64 `json:"session_ids"`
-		TaskID         int64   `json:"task_id"`
-		Command        string  `json:"command"`
-		TimeoutSeconds int     `json:"timeout_seconds"`
+		SessionIDs     []int64  `json:"session_ids"`
+		Labels         []string `json:"labels"`
+		TaskID         int64    `json:"task_id"`
+		Command        string   `json:"command"`
+		TimeoutSeconds int      `json:"timeout_seconds"`
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, "请求格式错误")
 		return
 	}
-	if strings.TrimSpace(req.Command) == "" {
-		writeErr(w, 400, "命令不能为空")
+	// 守卫前置：写命令在查库与投递之前就被拒绝，不会漏到任何一台会话上执行。
+	if reason := batchReadOnlyRejectReason(req.Command); reason != "" {
+		writeErr(w, 400, "[guard] "+reason)
 		return
 	}
 	pg := s.pg(w)
@@ -2911,7 +2937,7 @@ func (s *Server) batchExecIntranetSessions(w http.ResponseWriter, r *http.Reques
 	if timeout <= 0 || timeout > 180*time.Second {
 		timeout = intranetExecTimeout
 	}
-	results, err := s.intranetBatchExec(r.Context(), pg, req.SessionIDs, req.TaskID, req.Command, timeout)
+	results, err := s.intranetBatchExec(r.Context(), pg, req.SessionIDs, req.Labels, req.TaskID, req.Command, timeout)
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
@@ -2926,38 +2952,53 @@ type intranetBatchItem struct {
 	Error     string              `json:"error,omitempty"`
 }
 
-func (s *Server) intranetBatchExec(ctx context.Context, pg *db.DB, sessionIDs []int64, taskID int64, command string, timeout time.Duration) ([]intranetBatchItem, error) {
-	ids := sessionIDs
-	if len(ids) == 0 && taskID > 0 {
+func (s *Server) intranetBatchExec(ctx context.Context, pg *db.DB, sessionIDs []int64, labels []string, taskID int64, command string, timeout time.Duration) ([]intranetBatchItem, error) {
+	// 二次守卫：即使调用方绕过 HTTP handler 直接调本函数，也不会投递写命令。
+	if reason := batchReadOnlyRejectReason(command); reason != "" {
+		return nil, errors.New("[guard] " + reason)
+	}
+	// 三种选择方式取并集：显式 ID + 标签命中 + 任务下全部活跃会话。
+	targets := make([]batchTarget, 0, len(sessionIDs))
+	seen := map[int64]bool{}
+	add := func(id int64, name string) {
+		if id <= 0 || seen[id] {
+			return
+		}
+		seen[id] = true
+		targets = append(targets, batchTarget{ID: id, Name: name})
+	}
+	for _, sid := range sessionIDs {
+		add(sid, "")
+	}
+	if len(labels) > 0 {
+		sessions, err := pg.ListIntranetSessionsByLabels(labels, db.IntranetSessionActive, taskID, 500)
+		if err != nil {
+			return nil, err
+		}
+		for _, sess := range sessions {
+			add(sess.ID, sess.Name)
+		}
+	} else if len(sessionIDs) == 0 && taskID > 0 {
 		sessions, _, err := pg.ListIntranetSessions(db.IntranetSessionActive, taskID, 500, 0)
 		if err != nil {
 			return nil, err
 		}
 		for _, sess := range sessions {
-			ids = append(ids, sess.ID)
+			add(sess.ID, sess.Name)
 		}
 	}
-	if len(ids) == 0 {
-		return nil, errors.New("需要 session_ids 或 task_id")
-	}
-	if len(ids) > intranetBatchLimit {
-		ids = ids[:intranetBatchLimit]
-	}
-	if timeout <= 0 {
-		timeout = intranetExecTimeout
-	}
-	results := make([]intranetBatchItem, 0, len(ids))
-	for _, sid := range ids {
-		item := intranetBatchItem{SessionID: sid}
-		sess, err := s.intranetSession(pg, sid)
+	results, reject := batchReadOnlyRun(targets, command, timeout, func(t batchTarget, cmd string, to time.Duration) intranetExecOutcome {
+		sess, err := s.intranetSession(pg, t.ID)
 		if err != nil {
-			item.Error = err.Error()
-			results = append(results, item)
-			continue
+			return intranetExecOutcome{ExitCode: -1, IsError: true, Note: err.Error()}
 		}
-		item.Name = sess.Name
-		item.Result = s.intranetExec(ctx, pg, sess, command, timeout)
-		results = append(results, item)
+		if t.Name != "" {
+			sess.Name = t.Name
+		}
+		return s.intranetExec(ctx, pg, sess, cmd, to)
+	})
+	if reject != "" {
+		return nil, errors.New(reject)
 	}
 	return results, nil
 }

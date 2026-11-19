@@ -161,6 +161,57 @@ func ListShellFiles(ctx context.Context, c *DeepClient, shellURL string, p Shell
 	return res, nil
 }
 
+// ClampShellFileReadLength 把读取长度收敛到平台允许的分片区间：默认一个写入
+// 分块大小，封顶 ShellFileMaxRead。scanner 与 HTTP 层共用这一处定义，避免两层
+// 各自封顶（512 KiB / 1 MiB）产生「同一请求在不同层读到不同长度」的漂移。
+func ClampShellFileReadLength(length int) int {
+	if length <= 0 {
+		return ShellFileChunkSize
+	}
+	if length > ShellFileMaxRead {
+		return ShellFileMaxRead
+	}
+	return length
+}
+
+// ShellFileChunkRange 是一次读/写的连续区间。
+type ShellFileChunkRange struct {
+	Offset int64
+	Length int
+}
+
+// PlanShellFileChunks 按 chunkSize 把 size 字节切成连续的读写区间。resumeOffset
+// 是中断续传的起点：它之前的区间不再重发，从已落盘的字节接着写，避免重传时
+// 从头覆盖导致中途失败留下半截旧内容。size<=0 或 chunkSize<=0 返回空计划。
+func PlanShellFileChunks(size int64, chunkSize int, resumeOffset int64) []ShellFileChunkRange {
+	if size <= 0 || chunkSize <= 0 {
+		return nil
+	}
+	if resumeOffset < 0 {
+		resumeOffset = 0
+	}
+	if resumeOffset > size {
+		resumeOffset = size
+	}
+	out := []ShellFileChunkRange{}
+	for off := resumeOffset; off < size; off += int64(chunkSize) {
+		length := chunkSize
+		if remain := int(size - off); remain < length {
+			length = remain
+		}
+		out = append(out, ShellFileChunkRange{Offset: off, Length: length})
+	}
+	return out
+}
+
+// ValidateShellFileWriteChunk 校验单块写入是否超过平台封顶。
+func ValidateShellFileWriteChunk(dataLen int) error {
+	if dataLen > ShellFileChunkSize {
+		return fmt.Errorf("单次写入不能超过 %d 字节", ShellFileChunkSize)
+	}
+	return nil
+}
+
 // ReadShellFile reads up to length bytes at offset. The shell caps the block at
 // 1 MiB; callers should use ShellFileChunkSize for streaming.
 func ReadShellFile(ctx context.Context, c *DeepClient, shellURL string, p ShellPayload, path string, offset int64, length int) (*ShellFileChunk, error) {
@@ -170,12 +221,7 @@ func ReadShellFile(ctx context.Context, c *DeepClient, shellURL string, p ShellP
 	if offset < 0 {
 		offset = 0
 	}
-	if length <= 0 {
-		length = ShellFileChunkSize
-	}
-	if length > ShellFileMaxRead {
-		length = ShellFileMaxRead
-	}
+	length = ClampShellFileReadLength(length)
 	out, err := runShellFileOp(ctx, c, shellURL, p, shellFileAction("read",
 		shellFileB64(path), strconv.FormatInt(offset, 10), strconv.Itoa(length)))
 	if err != nil {
@@ -217,8 +263,8 @@ func WriteShellFile(ctx context.Context, c *DeepClient, shellURL string, p Shell
 	if start && offset != 0 {
 		return nil, errors.New("起始分块的偏移量必须为 0")
 	}
-	if len(data) > ShellFileChunkSize {
-		return nil, fmt.Errorf("单次写入不能超过 %d 字节", ShellFileChunkSize)
+	if err := ValidateShellFileWriteChunk(len(data)); err != nil {
+		return nil, err
 	}
 	flag := "0"
 	if start {

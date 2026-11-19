@@ -22,6 +22,106 @@ const (
 	intranetHealthLostAfter     = 3
 )
 
+// 会话失效原因四类：载荷/凭据轮换、目标重启、被清理、网络不通。每类都给出
+// 指名原因与可执行的补救方向，避免操作员只看到「连不上」而不知道下一步做什么。
+const (
+	intranetFailKeyRotation   = "key_rotation"
+	intranetFailTargetReboot  = "target_reboot"
+	intranetFailCleaned       = "cleaned"
+	intranetFailNetworkDead   = "network_unreachable"
+	intranetFailUnknown       = "unknown"
+)
+
+type intranetFailureCategory struct {
+	Key    string
+	Reason string
+	Remedy string
+}
+
+var intranetFailureCategories = map[string]intranetFailureCategory{
+	intranetFailKeyRotation: {
+		Key:    intranetFailKeyRotation,
+		Reason: "载荷密钥或登录凭据已轮换/被吊销，目标拒绝认证",
+		Remedy: "重新投放 v2 webshell 并用 rotate 更新密钥后重绑会话；SSH 会话更新凭据台账后重开",
+	},
+	intranetFailTargetReboot: {
+		Key:    intranetFailTargetReboot,
+		Reason: "目标主机刚重启或 Web 服务尚未恢复，连接被重置",
+		Remedy: "等待目标服务起来后重试心跳；若 cwd 指向临时目录，重开会话再继续",
+	},
+	intranetFailCleaned: {
+		Key:    intranetFailCleaned,
+		Reason: "目标侧的 webshell/落地文件已被清理，端点不再存在",
+		Remedy: "重新投放载荷并注册新 webshell，再把会话切到新壳或重开会话",
+	},
+	intranetFailNetworkDead: {
+		Key:    intranetFailNetworkDead,
+		Reason: "控制端到目标的链路不通（超时、无路由或目标不可达）",
+		Remedy: "检查隧道与出口策略、确认资产审批后重试；必要时用 failover 切同主机备用壳",
+	},
+	intranetFailUnknown: {
+		Key:    intranetFailUnknown,
+		Reason: "心跳失败但错误特征不足，未能归入上述四类",
+		Remedy: "手动执行心跳查看原始回显，再按具体报错选择补救",
+	},
+}
+
+// classifyIntranetFailureReason 从探测回显/错误文本中判定失效分类 key。
+// 匹配顺序即优先级：认证失败与端点被清理比通用的超时更具体。
+func classifyIntranetFailureReason(text string) string {
+	t := strings.ToLower(strings.TrimSpace(text))
+	if t == "" {
+		return intranetFailUnknown
+	}
+	has := func(markers ...string) bool {
+		for _, m := range markers {
+			if strings.Contains(t, m) {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has("401", "403", "unauthorized", "forbidden", "认证失败", "鉴权失败",
+		"密钥", "凭据失效", "口令失效", "replay", "重放", "签名错误", "token"):
+		return intranetFailKeyRotation
+	case has("404", "not found", "no such file", "文件不存在", "已被清理", "已清理",
+		"被删除", "deleted", "removed", "cleanup"):
+		return intranetFailCleaned
+	case has("connection reset", "reset by peer", "broken pipe", "connection aborted",
+		"连接被重置", "重启", "reboot", "restart", "eof"):
+		return intranetFailTargetReboot
+	case has("timeout", "deadline exceeded", "i/o timeout", "no route to host",
+		"network is unreachable", "unreachable", "不可达", "超时", "网络", "dial tcp", "connection refused"):
+		return intranetFailNetworkDead
+	default:
+		return intranetFailUnknown
+	}
+}
+
+func getIntranetFailureCategory(key string) intranetFailureCategory {
+	if c, ok := intranetFailureCategories[key]; ok {
+		return c
+	}
+	return intranetFailureCategories[intranetFailUnknown]
+}
+
+// intranetSessionFailureReason 读取健康快照里持久化的失效分类 key。
+func intranetSessionFailureReason(sess *db.IntranetSession) string {
+	if sess == nil {
+		return ""
+	}
+	key, _ := sess.Metadata["health_failure_reason"].(string)
+	return key
+}
+
+// intranetFailureAdvice 给事件文本补上指名原因与补救方向。unknown 也照样给出
+// 「特征不足、手动复核」的建议，而不是让操作员面对一条没有下一步的空报。
+func intranetFailureAdvice(key string) string {
+	c := getIntranetFailureCategory(key)
+	return fmt.Sprintf("；失效原因：%s（%s）；补救：%s", c.Reason, c.Key, c.Remedy)
+}
+
 func intranetHeartbeatCommand(osKind string) string {
 	if osKind == intranetOSWindows {
 		return "echo " + intranetHeartbeatMark
@@ -80,10 +180,12 @@ func (s *Server) intranetHeartbeatCheck(ctx context.Context, pg *db.DB, sess *db
 	alive, latency, out := intranetProbeLiveness(run, osKind, intranetHeartbeatTimeout)
 	prevHealth, _ := intranetSessionHealth(sess)
 	errMsg := ""
+	failKey := ""
 	if !alive {
 		errMsg = truncateIntranetOutput(strings.TrimSpace(out.Note+"\n"+out.Output), 400)
+		failKey = classifyIntranetFailureReason(errMsg)
 	}
-	updated, err := pg.RecordIntranetSessionHealth(sess.ID, alive, int(latency/time.Millisecond), errMsg, intranetHealthLostAfter)
+	updated, err := pg.RecordIntranetSessionHealthWithReason(sess.ID, alive, int(latency/time.Millisecond), errMsg, intranetHealthLostAfter, failKey)
 	if err != nil {
 		out.IsError = true
 		if strings.TrimSpace(out.Note) == "" {
@@ -97,7 +199,7 @@ func (s *Server) intranetHeartbeatCheck(ctx context.Context, pg *db.DB, sess *db
 	if manual {
 		msg := fmt.Sprintf("存活（%d ms）", latency/time.Millisecond)
 		if !alive {
-			msg = fmt.Sprintf("心跳失败 %d/%d：%s", failures, intranetHealthLostAfter, errMsg)
+			msg = fmt.Sprintf("心跳失败 %d/%d：%s%s", failures, intranetHealthLostAfter, errMsg, intranetFailureAdvice(failKey))
 		}
 		_ = pg.AddIntranetSessionEvent(sess.ID, "heartbeat", "心跳检测", truncateIntranetOutput(msg, 2000), !alive)
 		return alive, out, updated
@@ -106,9 +208,9 @@ func (s *Server) intranetHeartbeatCheck(ctx context.Context, pg *db.DB, sess *db
 	case health == db.IntranetHealthOK && prevHealth != "" && prevHealth != db.IntranetHealthOK:
 		_ = pg.AddIntranetSessionEvent(sess.ID, "health", "心跳恢复", fmt.Sprintf("会话恢复，延迟 %d ms", latency/time.Millisecond), false)
 	case health == db.IntranetHealthDegraded && prevHealth == "":
-		_ = pg.AddIntranetSessionEvent(sess.ID, "health", "心跳降级", truncateIntranetOutput(fmt.Sprintf("连续失败 %d/%d：%s", failures, intranetHealthLostAfter, errMsg), 2000), true)
+		_ = pg.AddIntranetSessionEvent(sess.ID, "health", "心跳降级", truncateIntranetOutput(fmt.Sprintf("连续失败 %d/%d：%s%s", failures, intranetHealthLostAfter, errMsg, intranetFailureAdvice(failKey)), 2000), true)
 	case health == db.IntranetHealthLost && prevHealth != db.IntranetHealthLost:
-		_ = pg.AddIntranetSessionEvent(sess.ID, "health", "心跳丢失", truncateIntranetOutput(fmt.Sprintf("连续失败 %d/%d：%s", failures, intranetHealthLostAfter, errMsg), 2000), true)
+		_ = pg.AddIntranetSessionEvent(sess.ID, "health", "心跳丢失", truncateIntranetOutput(fmt.Sprintf("连续失败 %d/%d：%s%s", failures, intranetHealthLostAfter, errMsg, intranetFailureAdvice(failKey)), 2000), true)
 	}
 	return alive, out, updated
 }
