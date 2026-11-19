@@ -80,11 +80,159 @@ type intranetEvacuationReport struct {
 	// 它们不在撤销循环里（status 已是 revoked），但报告不能把它们混进「平台已验证清除」：
 	// 报告读者看到的是结果，而这里的结果是人说的，不是平台验的。
 	ManualRevoked []string `json:"manual_revoked,omitempty"`
+	// TTLManualRevoked 是 TTL 到期自动撤销/验证失败后转人工的落地物。
+	// 与 ManualRevoked 同口径：都不算「平台已验证清除」，报告里单列一节。
+	TTLManualRevoked []string `json:"ttl_manual_revoked,omitempty"`
 	// Traces / TraceMatrix 是痕迹矩阵（G4）：按手段汇总「本次留下什么、怎么验证、清掉之后
 	// 还剩什么」，以及账外残留。矩阵是撤离报告的一部分，不是界面现编的文案。
 	Traces      []report.TraceMatrixRow `json:"traces,omitempty"`
 	TraceMatrix string                  `json:"trace_matrix,omitempty"`
-	Summary     string                  `json:"summary"`
+	// P14：撤离时动态采集的可观测痕迹，以及与静态档案比对后的差异。
+	TraceObserved []string `json:"trace_observed,omitempty"`
+	TraceDiff     []string `json:"trace_diff,omitempty"`
+	Summary       string   `json:"summary"`
+}
+
+// ---------------------------------------------------------------------------
+// P14 痕迹矩阵动态更新。
+//
+// 静态档案写的是「这种手段通常会留下什么」，但目标上真实存在的东西可能超出档案。
+// 撤离时（关会话之前）采集可观测痕迹，与本次已登记手段的档案关键词比对，
+// 档案外的真实痕迹写进报告差异节——不静默略过，也不假装"扫描过就没问题"。
+// ---------------------------------------------------------------------------
+
+// traceProfileKeywords 从静态档案提取可观测关键词：反引号里的命令/路径，
+// 以及档案反复提到的标记词。动态采集到的行若不命中任何关键词，就属于档案外痕迹。
+func traceProfileKeywords(p db.ArtifactTraceProfile) []string {
+	common := []string{
+		"jw:", "jingwei", "authorized_keys", "crontab", ".service", ".user.ini",
+		".htaccess", "atq", "journald", "prefetch", "srum", "mtime", "auditd",
+		"wtmp", "sidecar", "startup", "run key", "shell history",
+	}
+	texts := append(append([]string{}, p.Traces...), p.Residue...)
+	set := map[string]bool{}
+	out := []string{}
+	add := func(s string) {
+		s = strings.TrimSpace(strings.ToLower(s))
+		if s != "" && !set[s] {
+			set[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, text := range texts {
+		lower := strings.ToLower(text)
+		for {
+			i := strings.IndexByte(lower, '`')
+			if i < 0 {
+				break
+			}
+			j := strings.IndexByte(lower[i+1:], '`')
+			if j < 0 {
+				break
+			}
+			add(lower[i+1 : i+1+j])
+			lower = lower[i+2+j:]
+		}
+		for _, kw := range common {
+			if strings.Contains(lower, kw) {
+				add(kw)
+			}
+		}
+	}
+	return out
+}
+
+// diffTraceAgainstProfile 返回 observed 中未被静态档案覆盖的行。
+// 纯函数：覆盖词由调用方从档案提取，便于在没有真实目标时验证差异判定。
+func diffTraceAgainstProfile(covered, observed []string) []string {
+	out := []string{}
+	for _, line := range observed {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		matched := false
+		for _, kw := range covered {
+			if kw != "" && strings.Contains(lower, strings.ToLower(kw)) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// intranetDynamicTraceScan 在目标上采集可观测痕迹并与静态档案比对。
+// 必须在关闭会话之前调用；采集不到的部分也要写进 diff（带「未采集」前缀），
+// 让报告读者知道这不是「确认没有」，而是「没看到」。
+func (s *Server) intranetDynamicTraceScan(ctx context.Context, pg *db.DB, taskID int64,
+	rep *intranetEvacuationReport, arts []*db.IntranetArtifact) {
+	sessions, _, err := pg.ListIntranetSessions("active", taskID, 1, 0)
+	if err != nil || len(sessions) == 0 {
+		rep.TraceDiff = append(rep.TraceDiff, "（未采集）没有可用会话，无法动态采集痕迹并与静态档案比对")
+		return
+	}
+	sess := sessions[0]
+	needles := []string{"jingwei", "精卫"}
+	for _, a := range arts {
+		for _, v := range []string{a.Path, a.Name} {
+			v = strings.TrimSpace(v)
+			if len(v) >= 4 {
+				needles = append(needles, strings.ToLower(v))
+			}
+		}
+	}
+	commands := []struct{ label, command string }{
+		{"cron", `(crontab -l 2>/dev/null; ls -la /etc/cron.d 2>/dev/null) | head -80`},
+		{"systemd", `systemctl list-unit-files --type=service --no-pager 2>/dev/null | head -120`},
+		{"ssh-key", `cat /root/.ssh/authorized_keys "$HOME/.ssh/authorized_keys" 2>/dev/null | head -80`},
+		{"recent-file", `find /tmp /var/tmp /dev/shm -maxdepth 2 -type f -mmin -1440 2>/dev/null | head -60`},
+	}
+	observed := []string{}
+	for _, c := range commands {
+		out := s.intranetExec(ctx, pg, sess, c.command, 20*time.Second)
+		for _, line := range strings.Split(out.Output, "\n") {
+			line = strings.TrimSpace(strings.TrimRight(line, "\r"))
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			lower := strings.ToLower(line)
+			accounted := false
+			for _, n := range needles {
+				if n != "" && strings.Contains(lower, n) {
+					accounted = true
+					break
+				}
+			}
+			if accounted {
+				continue
+			}
+			observed = append(observed, c.label+": "+truncateIntranetOutput(line, 240))
+			if len(observed) >= 60 {
+				break
+			}
+		}
+		if len(observed) >= 60 {
+			break
+		}
+	}
+	rep.TraceObserved = observed
+
+	covered := []string{}
+	kinds := map[string]bool{}
+	for _, a := range arts {
+		kinds[a.Kind] = true
+	}
+	for k := range kinds {
+		if p, ok := db.ArtifactTraceProfileFor(k); ok {
+			covered = append(covered, traceProfileKeywords(p)...)
+		}
+	}
+	rep.TraceDiff = append(rep.TraceDiff, diffTraceAgainstProfile(covered, observed)...)
 }
 
 // intranetBuildTraceMatrix 把本轮撤离的逐项结果汇总成痕迹矩阵。
@@ -156,6 +304,7 @@ func intranetBuildTraceMatrix(rep *intranetEvacuationReport, verifyKnown map[int
 	rep.Traces = out
 	rep.TraceMatrix = report.TraceMatrixMarkdown(report.TraceMatrixInput{
 		Rows: out, LedgerExternal: rep.LedgerExternal, Unknown: unknown,
+		Observed: rep.TraceObserved, ProfileDiff: rep.TraceDiff,
 		GeneratedAt: rep.FinishedAt,
 	})
 }
@@ -225,6 +374,9 @@ func (r *intranetEvacuationReport) finish(dryRun bool) {
 		if len(r.ManualRevoked) > 0 {
 			r.Summary += fmt.Sprintf("；另有 %d 条此前由人工声明已清理（未经平台验证）", len(r.ManualRevoked))
 		}
+		if len(r.TTLManualRevoked) > 0 {
+			r.Summary += fmt.Sprintf("；另有 %d 条 TTL 撤销失败转人工（见 ttl_manual_revoked）", len(r.TTLManualRevoked))
+		}
 		return
 	}
 	r.Summary = fmt.Sprintf("撤离完成：落地物 %d/%d 已撤销并验证，隧道 %d/%d 已拆除，受管资源 %d/%d 已释放，会话关闭 %d/%d",
@@ -246,6 +398,9 @@ func (r *intranetEvacuationReport) finish(dryRun bool) {
 	}
 	if len(r.ManualRevoked) > 0 {
 		r.Summary += fmt.Sprintf("；另有 %d 条由人工声明已清理（未经平台验证，见 manual_revoked）", len(r.ManualRevoked))
+	}
+	if len(r.TTLManualRevoked) > 0 {
+		r.Summary += fmt.Sprintf("；另有 %d 条 TTL 撤销失败转人工（未经平台验证，见 ttl_manual_revoked）", len(r.TTLManualRevoked))
 	}
 }
 
@@ -342,6 +497,24 @@ func (s *Server) intranetEvacuate(ctx context.Context, pg *db.DB, opts intranetE
 			line := fmt.Sprintf("落地物 #%d（%s %s）由人工声明已清理，平台未验证%s",
 				art.ID, art.Kind, displayOr(art.Name, art.Path), optionalNote(note))
 			rep.ManualRevoked = append(rep.ManualRevoked, line)
+		}
+	}
+
+	// 1b. P13：TTL 到期自动撤销失败转人工的条目。它们 status 已是 revoked，
+	// 不在撤销循环里，但必须单列——否则就会被当成「平台已验证清除」。
+	if ttlFailed, terr := pg.ListTTLManualRevokedIntranetArtifacts(opts.TaskID); terr != nil {
+		rep.Residual = append(rep.Residual, "读取 TTL 撤销失败记录失败："+terr.Error())
+	} else {
+		for _, art := range ttlFailed {
+			note := ""
+			if m, ok := art.Metadata["ttl_revoke"].(map[string]any); ok {
+				if v, ok := m["note"].(string); ok {
+					note = strings.TrimSpace(v)
+				}
+			}
+			line := fmt.Sprintf("落地物 #%d（%s %s）TTL 到期撤销失败已转人工，平台未验证%s",
+				art.ID, art.Kind, displayOr(art.Name, art.Path), optionalNote(note))
+			rep.TTLManualRevoked = append(rep.TTLManualRevoked, line)
 		}
 	}
 
@@ -476,8 +649,10 @@ func (s *Server) intranetEvacuate(ctx context.Context, pg *db.DB, opts intranetE
 	}
 
 	// 3.5 台账外残留扫描（G1）：必须在关闭会话之前跑，否则目标侧就没人执行了。
-	// dry-run 也跑（只读），让预览阶段就能看到可疑痕迹。
 	s.intranetLedgerExternalScan(ctx, pg, opts.TaskID, rep)
+	// P14 动态痕迹采集：同样必须在关会话前，采集目标真实痕迹与静态档案比对；
+	// 档案外的差异写进报告，不静默略过（dry-run 只读，也会采）。
+	s.intranetDynamicTraceScan(ctx, pg, opts.TaskID, rep, artifacts)
 
 	// 4. 会话：最后关闭；已关闭的会话不再列入 active 查询。
 	sessions, _, serr := pg.ListIntranetSessions(db.IntranetSessionActive, opts.TaskID, 500, 0)

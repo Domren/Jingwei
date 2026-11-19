@@ -60,6 +60,10 @@ type IntranetArtifact struct {
 	Metadata      map[string]any `json:"metadata"`
 	ExpiresAt     *time.Time     `json:"expires_at,omitempty"`
 	RevokedAt     *time.Time     `json:"revoked_at,omitempty"`
+	// P13：TTL 到期自动撤销的结果。verified=撤销且验证通过；failed_manual=失败转人工。
+	TTLRevokeStatus   string     `json:"ttl_revoke_status,omitempty"`
+	TTLRevokedAt      *time.Time `json:"ttl_revoked_at,omitempty"`
+	TTLVerifyEvidence string     `json:"ttl_verify_evidence,omitempty"`
 	CreatedAt     time.Time      `json:"created_at"`
 	UpdatedAt     time.Time      `json:"updated_at"`
 }
@@ -93,14 +97,15 @@ type IntranetArtifactFilter struct {
 
 const intranetArtifactCols = `id, task_id, session_id, host, kind, name, path, description,
 	deploy_command, revoke_command, verify_command, status, fingerprint, evidence, metadata,
-	expires_at, revoked_at, created_at, updated_at`
+	expires_at, revoked_at, ttl_revoke_status, ttl_revoked_at, ttl_verify_evidence, created_at, updated_at`
 
 func scanIntranetArtifact(row interface{ Scan(...any) error }) (*IntranetArtifact, error) {
 	var a IntranetArtifact
 	var raw []byte
 	if err := row.Scan(&a.ID, &a.TaskID, &a.SessionID, &a.Host, &a.Kind, &a.Name, &a.Path,
 		&a.Description, &a.DeployCommand, &a.RevokeCommand, &a.VerifyCommand, &a.Status,
-		&a.Fingerprint, &a.Evidence, &raw, &a.ExpiresAt, &a.RevokedAt, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		&a.Fingerprint, &a.Evidence, &raw, &a.ExpiresAt, &a.RevokedAt,
+		&a.TTLRevokeStatus, &a.TTLRevokedAt, &a.TTLVerifyEvidence, &a.CreatedAt, &a.UpdatedAt); err != nil {
 		return nil, err
 	}
 	a.Metadata = map[string]any{}
@@ -369,6 +374,71 @@ func (d *DB) ListManualRevokedIntranetArtifacts(taskID int64) ([]*IntranetArtifa
 FROM intranet_artifacts
 WHERE task_id=$1 AND metadata ? 'manual_revoke'
 ORDER BY id DESC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*IntranetArtifact{}
+	for rows.Next() {
+		a, err := scanIntranetArtifact(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// P13 TTL 自动回收的结果状态。verified 是平台撤销且验证通过；failed_manual 是
+// 失败后转人工队列——后者沿用人工撤销的证据口径，报告单列，不算「平台已验证清除」。
+const (
+	TTLRevokeStatusVerified     = "verified"
+	TTLRevokeStatusFailedManual = "failed_manual"
+)
+
+// MarkIntranetArtifactTTLRevoked 记录「TTL 到期撤销并验证通过」。
+// 比普通撤销多留 ttl_revoke_status/ttl_revoked_at/ttl_verify_evidence 三列，
+// 让审计能回答「这条是谁清掉的」：是平台在到期后自己撤销并验过的。
+func (d *DB) MarkIntranetArtifactTTLRevoked(id int64, evidence string) (*IntranetArtifact, error) {
+	a, err := scanIntranetArtifact(d.QueryRow(`
+UPDATE intranet_artifacts SET status='revoked', revoked_at=now(),
+    ttl_revoke_status=$3, ttl_revoked_at=now(), ttl_verify_evidence=$2,
+    evidence = CASE WHEN $2='' THEN evidence ELSE $2 END
+WHERE id=$1
+RETURNING `+intranetArtifactCols, id, strings.TrimSpace(evidence), TTLRevokeStatusVerified))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrIntranetArtifactNotFound
+	}
+	return a, err
+}
+
+// MarkIntranetArtifactTTLFailedManual 记录 TTL 撤销/验证失败并转人工队列。
+// 口径与人工撤销一致（status=revoked + metadata.manual_revoke），因此天然不会
+// 混进「平台已验证清除」；额外的 ttl_revoke_status=failed_manual 让报告能单列。
+func (d *DB) MarkIntranetArtifactTTLFailedManual(id int64, note, actor string) (*IntranetArtifact, error) {
+	note = strings.TrimSpace(note)
+	a, err := scanIntranetArtifact(d.QueryRow(`
+UPDATE intranet_artifacts SET status='revoked', revoked_at=now(),
+    ttl_revoke_status=$2, ttl_revoked_at=now(),
+    evidence = CASE WHEN coalesce(evidence,'')='' THEN $3 ELSE evidence || E'\n' || $3 END,
+    metadata = coalesce(metadata,'{}'::jsonb) || jsonb_build_object(
+        'manual_revoke', jsonb_build_object('by',$4::text,'at',now(),'note',$3::text),
+        'ttl_revoke', jsonb_build_object('status',$2::text,'at',now(),'note',$3::text))
+WHERE id=$1
+RETURNING `+intranetArtifactCols, id, TTLRevokeStatusFailedManual, note, strings.TrimSpace(actor)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrIntranetArtifactNotFound
+	}
+	return a, err
+}
+
+// ListTTLManualRevokedIntranetArtifacts 取某任务下因 TTL 撤销失败转人工的落地物，
+// 供撤离报告单列一节。它们 status 已是 revoked，不在撤销循环里。
+func (d *DB) ListTTLManualRevokedIntranetArtifacts(taskID int64) ([]*IntranetArtifact, error) {
+	rows, err := d.Query(`SELECT `+intranetArtifactCols+`
+FROM intranet_artifacts
+WHERE task_id=$1 AND ttl_revoke_status=$2
+ORDER BY id DESC`, taskID, TTLRevokeStatusFailedManual)
 	if err != nil {
 		return nil, err
 	}
