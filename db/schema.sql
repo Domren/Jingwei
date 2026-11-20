@@ -2033,12 +2033,6 @@ CREATE TABLE IF NOT EXISTS intranet_sessions (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_intranet_sessions_status ON intranet_sessions(status, id DESC);
-CREATE INDEX IF NOT EXISTS idx_intranet_sessions_task ON intranet_sessions(task_id);
-CREATE INDEX IF NOT EXISTS idx_intranet_sessions_labels ON intranet_sessions USING GIN (labels);
-DROP TRIGGER IF EXISTS trg_intranet_sessions_upd ON intranet_sessions;
-CREATE TRIGGER trg_intranet_sessions_upd BEFORE UPDATE ON intranet_sessions
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 ALTER TABLE intranet_sessions ADD COLUMN IF NOT EXISTS transport TEXT NOT NULL DEFAULT 'webshell';
 ALTER TABLE intranet_sessions ADD COLUMN IF NOT EXISTS ssh_port INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE intranet_sessions ADD COLUMN IF NOT EXISTS ssh_user TEXT NOT NULL DEFAULT '';
@@ -2046,6 +2040,12 @@ ALTER TABLE intranet_sessions ADD COLUMN IF NOT EXISTS ssh_credential_id BIGINT 
 ALTER TABLE intranet_sessions ADD COLUMN IF NOT EXISTS ssh_dial_host TEXT NOT NULL DEFAULT '';
 ALTER TABLE intranet_sessions ADD COLUMN IF NOT EXISTS ssh_dial_port INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE intranet_sessions ADD COLUMN IF NOT EXISTS labels JSONB NOT NULL DEFAULT '[]'::jsonb;
+CREATE INDEX IF NOT EXISTS idx_intranet_sessions_status ON intranet_sessions(status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_intranet_sessions_task ON intranet_sessions(task_id);
+CREATE INDEX IF NOT EXISTS idx_intranet_sessions_labels ON intranet_sessions USING GIN (labels);
+DROP TRIGGER IF EXISTS trg_intranet_sessions_upd ON intranet_sessions;
+CREATE TRIGGER trg_intranet_sessions_upd BEFORE UPDATE ON intranet_sessions
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TABLE IF NOT EXISTS intranet_session_events (
     id         BIGSERIAL PRIMARY KEY,
